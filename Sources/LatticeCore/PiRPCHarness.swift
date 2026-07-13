@@ -106,12 +106,12 @@ public final class PiRPCHarness: @unchecked Sendable {
                     }
                     owner = registeredOwner
                     continuation.yield(.harnessSessionStarted("pi:\(piThreadID)"))
-                    try Self.write(["id": "prompt", "type": "prompt", "message": prompt], to: runningTransport.input)
-                    let reader = BoundedJSONLineReader(runningTransport.output)
+                    try Self.write(["id": "prompt", "type": "prompt", "message": prompt], to: runningTransport)
+                    let reader = BoundedJSONLineReader(runningTransport)
                     var finished = false
                     while !finished {
                         guard let object = try reader.next() else { break }
-                        finished = try await parse(object, sessionID: sessionID, owner: registeredOwner, workspace: canonicalWorkspace, input: runningTransport.input, continuation: continuation)
+                        finished = try await parse(object, sessionID: sessionID, owner: registeredOwner, workspace: canonicalWorkspace, transport: runningTransport, continuation: continuation)
                     }
                     runningTransport.finish()
                     let didCancel = unregister(registeredOwner, start: start, sessionID: sessionID)
@@ -136,7 +136,7 @@ public final class PiRPCHarness: @unchecked Sendable {
         let target = processRegistry.cancel(sessionID: sessionID)
         let hadPermission = cancelPendingPermissions(target.metadata.pendingPermissionIDs)
         let stop = {
-            try? Self.write(["type": "abort"], to: target.input)
+            try? Self.write(["type": "abort"], to: target.process)
             target.process?.cancel()
         }
         if hadPermission { DispatchQueue.global().asyncAfter(deadline: .now() + 0.1, execute: stop) }
@@ -151,14 +151,14 @@ public final class PiRPCHarness: @unchecked Sendable {
         return pending?.resolve(optionID: optionID) == true
     }
 
-    private func parse(_ object: [String: Any], sessionID: UUID, owner: InteractiveProcessRegistry.Owner, workspace: URL, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) async throws -> Bool {
+    private func parse(_ object: [String: Any], sessionID: UUID, owner: InteractiveProcessRegistry.Owner, workspace: URL, transport: BoundedProcessTransport, continuation: AsyncStream<AgentEvent>.Continuation) async throws -> Bool {
         guard let type = object["type"] as? String else {
             continuation.yield(HarnessToolEventDecoder.diagnostic(provider: "Pi", object: object, reason: "Event is missing type."))
             return false
         }
         if type == "extension_ui_request" {
             guard object["id"] as? String != nil else { continuation.yield(HarnessToolEventDecoder.diagnostic(provider: "Pi", object: object, reason: "Extension UI request is missing id.")); return false }
-            try await handleExtensionUIRequest(object, sessionID: sessionID, owner: owner, workspace: workspace, input: input, continuation: continuation)
+            try await handleExtensionUIRequest(object, sessionID: sessionID, owner: owner, workspace: workspace, transport: transport, continuation: continuation)
             return false
         }
         if type == "extension_error" {
@@ -204,13 +204,33 @@ public final class PiRPCHarness: @unchecked Sendable {
     }
 
     private func register(_ pending: PendingPermission) {
-        guard processRegistry.updateMetadata(pending.owner, sessionID: pending.sessionID, {
-            $0.pendingPermissionIDs.insert(pending.requestID)
-        }) else {
+        guard processRegistry.registerPendingPermission(
+            pending.requestID,
+            owner: pending.owner,
+            sessionID: pending.sessionID
+        ) else {
             _ = pending.resolve(optionID: nil)
             return
         }
-        lock.lock(); pendingPermissions[pending.requestID] = pending; lock.unlock()
+        lock.lock()
+        pendingPermissions[pending.requestID] = pending
+        lock.unlock()
+        guard processRegistry.isPendingPermissionActive(
+            pending.requestID,
+            owner: pending.owner,
+            sessionID: pending.sessionID
+        ) else {
+            lock.lock()
+            if pendingPermissions[pending.requestID] === pending {
+                pendingPermissions[pending.requestID] = nil
+            }
+            lock.unlock()
+            processRegistry.updateMetadata(pending.owner, sessionID: pending.sessionID) {
+                $0.pendingPermissionIDs.remove(pending.requestID)
+            }
+            _ = pending.resolve(optionID: nil)
+            return
+        }
     }
 
     private func removePendingPermission(_ requestID: UUID, owner: InteractiveProcessRegistry.Owner, sessionID: UUID) {
@@ -231,11 +251,11 @@ public final class PiRPCHarness: @unchecked Sendable {
         return result.wasCancelled
     }
 
-    private func handleExtensionUIRequest(_ object: [String: Any], sessionID: UUID, owner: InteractiveProcessRegistry.Owner, workspace: URL, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) async throws {
+    private func handleExtensionUIRequest(_ object: [String: Any], sessionID: UUID, owner: InteractiveProcessRegistry.Owner, workspace: URL, transport: BoundedProcessTransport, continuation: AsyncStream<AgentEvent>.Continuation) async throws {
         guard let externalID = object["id"] as? String else { return }
         guard object["method"] as? String == "confirm",
               let request = Self.permissionRequest(from: object, workspace: workspace) else {
-            try Self.write(["type": "extension_ui_response", "id": externalID, "cancelled": true], to: input)
+            try Self.write(["type": "extension_ui_response", "id": externalID, "cancelled": true], to: transport)
             return
         }
         let pending = PendingPermission(sessionID: sessionID, owner: owner, requestID: request.id)
@@ -245,13 +265,13 @@ public final class PiRPCHarness: @unchecked Sendable {
         removePendingPermission(request.id, owner: owner, sessionID: sessionID)
         switch result {
         case .resolved(.selected("allow_once")):
-            try Self.write(["type": "extension_ui_response", "id": externalID, "confirmed": true], to: input)
+            try Self.write(["type": "extension_ui_response", "id": externalID, "confirmed": true], to: transport)
         case .resolved(.selected):
-            try Self.write(["type": "extension_ui_response", "id": externalID, "confirmed": false], to: input)
+            try Self.write(["type": "extension_ui_response", "id": externalID, "confirmed": false], to: transport)
         case .resolved(.cancelled):
-            try Self.write(["type": "extension_ui_response", "id": externalID, "cancelled": true], to: input)
+            try Self.write(["type": "extension_ui_response", "id": externalID, "cancelled": true], to: transport)
         case .timedOut:
-            try? Self.write(["type": "extension_ui_response", "id": externalID, "cancelled": true], to: input)
+            try? Self.write(["type": "extension_ui_response", "id": externalID, "cancelled": true], to: transport)
             throw PiHarnessError.permissionTimedOut
         }
     }
@@ -331,11 +351,11 @@ public final class PiRPCHarness: @unchecked Sendable {
         return String(text.prefix(600))
     }
 
-    private static func write(_ object: [String: Any], to handle: FileHandle?) throws {
-        guard let handle else { return }
+    private static func write(_ object: [String: Any], to transport: BoundedProcessTransport?) throws {
+        guard let transport else { return }
         var data = try JSONSerialization.data(withJSONObject: object)
         data.append(0x0A)
-        try handle.write(contentsOf: data)
+        try transport.write(data)
     }
 
     private static func piThinkingLevel(_ effort: ReasoningEffort) -> String {

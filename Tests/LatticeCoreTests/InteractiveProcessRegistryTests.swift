@@ -91,4 +91,42 @@ struct InteractiveProcessRegistryTests {
             pendingPermissionIDs: [permissionID]
         ))
     }
+
+    @Test func permissionRegistrationRejectsAlreadyCancelledOwner() {
+        let registry = InteractiveProcessRegistry()
+        let sessionID = UUID()
+        guard case .accepted(let owner) = registry.register(
+            process: BoundedProcessTransport(request: request),
+            input: nil,
+            for: sessionID,
+            start: registry.beginStart(for: sessionID)
+        ) else {
+            Issue.record("Owner should register")
+            return
+        }
+        _ = registry.cancel(sessionID: sessionID)
+        #expect(!registry.registerPendingPermission(UUID(), owner: owner, sessionID: sessionID))
+    }
+
+    @Test func permissionHandoffDetectsCancellationBetweenRegistryAndLocalStore() {
+        let registry = InteractiveProcessRegistry()
+        let sessionID = UUID()
+        guard case .accepted(let owner) = registry.register(
+            process: BoundedProcessTransport(request: request),
+            input: nil,
+            for: sessionID,
+            start: registry.beginStart(for: sessionID)
+        ) else {
+            Issue.record("Owner should register")
+            return
+        }
+        let requestID = UUID()
+        #expect(registry.registerPendingPermission(requestID, owner: owner, sessionID: sessionID))
+
+        // This is the exact handoff boundary: registry metadata exists, while
+        // the harness-local waiter insertion has not yet completed.
+        let target = registry.cancel(sessionID: sessionID)
+        #expect(target.metadata.pendingPermissionIDs.contains(requestID))
+        #expect(!registry.isPendingPermissionActive(requestID, owner: owner, sessionID: sessionID))
+    }
 }

@@ -143,10 +143,10 @@ public final class CodexExecHarness: @unchecked Sendable {
                         throw CodexHarnessError.message("Codex request cancelled before process registration.")
                     }
                     owner = registeredOwner
-                    let reader = BoundedJSONLineReader(transport.output)
-                    try Self.write(Self.initializeRequest(id: 1), to: transport.input)
-                    _ = try await readResponse(id: 1, sessionID: sessionID, owner: registeredOwner, from: reader, input: transport.input, continuation: continuation)
-                    try Self.write(["method": "initialized", "params": [:]], to: transport.input)
+                    let reader = BoundedJSONLineReader(transport)
+                    try Self.write(Self.initializeRequest(id: 1), to: transport)
+                    _ = try await readResponse(id: 1, sessionID: sessionID, owner: registeredOwner, from: reader, transport: transport, continuation: continuation)
+                    try Self.write(["method": "initialized", "params": [:]], to: transport)
 
                     let route = Self.executionRoute(policy: policy, workspaceWrite: workspaceWrite)
                     let method = threadID == nil ? "thread/start" : "thread/resume"
@@ -160,8 +160,8 @@ public final class CodexExecHarness: @unchecked Sendable {
                         "sandbox": route.sandbox
                     ]
                     if let threadID { threadParams["threadId"] = threadID }
-                    try Self.write(["method": method, "id": 2, "params": threadParams], to: transport.input)
-                    let threadResponse = try await readResponse(id: 2, sessionID: sessionID, owner: registeredOwner, from: reader, input: transport.input, continuation: continuation)
+                    try Self.write(["method": method, "id": 2, "params": threadParams], to: transport)
+                    let threadResponse = try await readResponse(id: 2, sessionID: sessionID, owner: registeredOwner, from: reader, transport: transport, continuation: continuation)
                     guard let result = threadResponse["result"] as? [String: Any],
                           let thread = result["thread"] as? [String: Any],
                           let activeThreadID = thread["id"] as? String else {
@@ -183,15 +183,15 @@ public final class CodexExecHarness: @unchecked Sendable {
                         turnParams["effort"] = reasoningEffort.rawValue
                         turnParams["summary"] = "auto"
                     }
-                    try Self.write(["method": "turn/start", "id": 3, "params": turnParams], to: transport.input)
-                    let turnResponse = try await readResponse(id: 3, sessionID: sessionID, owner: registeredOwner, from: reader, input: transport.input, continuation: continuation)
+                    try Self.write(["method": "turn/start", "id": 3, "params": turnParams], to: transport)
+                    let turnResponse = try await readResponse(id: 3, sessionID: sessionID, owner: registeredOwner, from: reader, transport: transport, continuation: continuation)
                     guard let turnResult = turnResponse["result"] as? [String: Any],
                           let turn = turnResult["turn"] as? [String: Any],
                           let turnID = turn["id"] as? String else {
                         throw CodexHarnessError.message(Self.responseError(turnResponse, fallback: "Codex did not start the turn."))
                     }
                     setTurnID(turnID, owner: registeredOwner, for: sessionID)
-                    let turnReportedCancellation = try await readTurn(sessionID: sessionID, owner: registeredOwner, workspace: workspace, from: reader, input: transport.input, continuation: continuation)
+                    let turnReportedCancellation = try await readTurn(sessionID: sessionID, owner: registeredOwner, workspace: workspace, from: reader, transport: transport, continuation: continuation)
                     transport.finish()
                     let didCancel = unregister(registeredOwner, start: start, sessionID: sessionID)
                     if didCancel && !turnReportedCancellation { continuation.yield(.cancelled) }
@@ -215,15 +215,14 @@ public final class CodexExecHarness: @unchecked Sendable {
 
     public func cancel(sessionID: UUID) {
         let target = processRegistry.cancel(sessionID: sessionID)
-        let input = target.input
         let threadID = target.metadata.threadID
         let turnID = target.metadata.turnID
         lock.lock()
         let pending = target.metadata.pendingPermissionIDs.compactMap { pendingPermissions[$0] }
         lock.unlock()
         pending.forEach { _ = $0.resolve(nil) }
-        if let input, let threadID, let turnID {
-            try? Self.write(["method": "turn/interrupt", "id": 99, "params": ["threadId": threadID, "turnId": turnID]], to: input)
+        if let process = target.process, let threadID, let turnID {
+            try? Self.write(["method": "turn/interrupt", "id": 99, "params": ["threadId": threadID, "turnId": turnID]], to: process)
             target.process?.cancel(after: 0.35)
         } else { target.process?.cancel() }
     }
@@ -254,13 +253,33 @@ public final class CodexExecHarness: @unchecked Sendable {
     }
 
     private func register(_ pending: PendingPermission) {
-        guard processRegistry.updateMetadata(pending.owner, sessionID: pending.sessionID, {
-            $0.pendingPermissionIDs.insert(pending.requestID)
-        }) else {
+        guard processRegistry.registerPendingPermission(
+            pending.requestID,
+            owner: pending.owner,
+            sessionID: pending.sessionID
+        ) else {
             _ = pending.resolve(nil)
             return
         }
-        lock.lock(); pendingPermissions[pending.requestID] = pending; lock.unlock()
+        lock.lock()
+        pendingPermissions[pending.requestID] = pending
+        lock.unlock()
+        guard processRegistry.isPendingPermissionActive(
+            pending.requestID,
+            owner: pending.owner,
+            sessionID: pending.sessionID
+        ) else {
+            lock.lock()
+            if pendingPermissions[pending.requestID] === pending {
+                pendingPermissions[pending.requestID] = nil
+            }
+            lock.unlock()
+            processRegistry.updateMetadata(pending.owner, sessionID: pending.sessionID) {
+                $0.pendingPermissionIDs.remove(pending.requestID)
+            }
+            _ = pending.resolve(nil)
+            return
+        }
     }
 
     private func removePendingPermission(_ requestID: UUID, owner: InteractiveProcessRegistry.Owner, sessionID: UUID) {
@@ -301,13 +320,13 @@ public final class CodexExecHarness: @unchecked Sendable {
         sessionID: UUID,
         owner: InteractiveProcessRegistry.Owner,
         from reader: BoundedJSONLineReader,
-        input: FileHandle,
+        transport: BoundedProcessTransport,
         continuation: AsyncStream<AgentEvent>.Continuation
     ) async throws -> [String: Any] {
         while let object = try reader.next() {
             if object["method"] != nil {
                 if object["id"] != nil {
-                    try await handleServerRequest(object, sessionID: sessionID, owner: owner, workspace: nil, input: input, continuation: continuation)
+                    try await handleServerRequest(object, sessionID: sessionID, owner: owner, workspace: nil, transport: transport, continuation: continuation)
                 }
                 continue
             }
@@ -324,12 +343,12 @@ public final class CodexExecHarness: @unchecked Sendable {
         owner: InteractiveProcessRegistry.Owner,
         workspace: URL,
         from reader: BoundedJSONLineReader,
-        input: FileHandle,
+        transport: BoundedProcessTransport,
         continuation: AsyncStream<AgentEvent>.Continuation
     ) async throws -> Bool {
         while let object = try reader.next() {
             if object["id"] != nil, object["method"] != nil {
-                try await handleServerRequest(object, sessionID: sessionID, owner: owner, workspace: workspace, input: input, continuation: continuation)
+                try await handleServerRequest(object, sessionID: sessionID, owner: owner, workspace: workspace, transport: transport, continuation: continuation)
                 continue
             }
             guard let method = object["method"] as? String else { continue }
@@ -348,14 +367,14 @@ public final class CodexExecHarness: @unchecked Sendable {
         sessionID: UUID,
         owner: InteractiveProcessRegistry.Owner,
         workspace: URL?,
-        input: FileHandle,
+        transport: BoundedProcessTransport,
         continuation: AsyncStream<AgentEvent>.Continuation
     ) async throws {
         guard let serverID = object["id"], let method = object["method"] as? String else { return }
         guard let workspace,
               ["item/commandExecution/requestApproval", "item/fileChange/requestApproval"].contains(method),
               let request = Self.appServerPermissionRequest(from: object, workspace: workspace) else {
-            try Self.write(["id": serverID, "error": ["code": -32601, "message": "Unsupported Codex client request: \(method)"]], to: input)
+            try Self.write(["id": serverID, "error": ["code": -32601, "message": "Unsupported Codex client request: \(method)"]], to: transport)
             return
         }
         let decisions = Set(request.options.map(\.id)).union(["cancel"])
@@ -366,11 +385,11 @@ public final class CodexExecHarness: @unchecked Sendable {
         removePendingPermission(request.id, owner: owner, sessionID: sessionID)
         switch result {
         case .resolved(.selected(let decision)):
-            try Self.write(["id": pending.serverRequestID, "result": ["decision": decision]], to: input)
+            try Self.write(["id": pending.serverRequestID, "result": ["decision": decision]], to: transport)
         case .resolved(.cancelled):
-            try Self.write(["id": pending.serverRequestID, "result": ["decision": "cancel"]], to: input)
+            try Self.write(["id": pending.serverRequestID, "result": ["decision": "cancel"]], to: transport)
         case .timedOut:
-            try? Self.write(["id": pending.serverRequestID, "result": ["decision": "cancel"]], to: input)
+            try? Self.write(["id": pending.serverRequestID, "result": ["decision": "cancel"]], to: transport)
             throw CodexHarnessError.message(PermissionTimeout.message)
         }
     }
@@ -525,10 +544,10 @@ public final class CodexExecHarness: @unchecked Sendable {
         (object["error"] as? [String: Any])?["message"] as? String ?? fallback
     }
 
-    private static func write(_ object: [String: Any], to handle: FileHandle) throws {
+    private static func write(_ object: [String: Any], to transport: BoundedProcessTransport) throws {
         var data = try JSONSerialization.data(withJSONObject: object)
         data.append(0x0A)
-        try handle.write(contentsOf: data)
+        try transport.write(data)
     }
 
     fileprivate static func parseModels(_ response: [String: Any]) -> [ProviderModel] {

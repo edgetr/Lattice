@@ -40,12 +40,14 @@ public final class BoundedProcessTransport: @unchecked Sendable {
     private let outputPipe = Pipe()
     private let stateLock = NSLock()
     private let readLock = NSLock()
+    private let writeLock = NSLock()
     private let waitLock = NSLock()
     private var started = false
     private var launching = false
     private var cleanedUp = false
     private var stopping = false
     private var processIdentifier: pid_t = 0
+    private var reapedProcessIdentifier: pid_t?
     /// Populated only after observing that the child leads its own group.
     private var processGroupIdentifier: pid_t?
     private var cachedExitStatus: Int32?
@@ -165,6 +167,8 @@ public final class BoundedProcessTransport: @unchecked Sendable {
 
     public func write(_ data: Data) throws {
         guard !data.isEmpty else { return }
+        writeLock.lock()
+        defer { writeLock.unlock() }
         if let reason = terminationReason {
             throw error(for: reason)
         }
@@ -173,6 +177,13 @@ public final class BoundedProcessTransport: @unchecked Sendable {
         } catch {
             throw BoundedProcessTransportError.readFailed(error.localizedDescription)
         }
+    }
+
+    /// Closes the provider's stdin after all preceding writes have completed.
+    public func closeInput() {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        try? inputPipe.fileHandleForWriting.close()
     }
 
     public func readLine() throws -> Data? {
@@ -286,7 +297,7 @@ public final class BoundedProcessTransport: @unchecked Sendable {
         stopping = true
         let wasStarted = started
         let spawned: SpawnedProcess?
-        if processIdentifier > 0 {
+        if processIdentifier > 0 || processGroupIdentifier != nil {
             spawned = SpawnedProcess(processIdentifier: processIdentifier, processGroupIdentifier: processGroupIdentifier)
         } else {
             spawned = nil
@@ -306,7 +317,9 @@ public final class BoundedProcessTransport: @unchecked Sendable {
     }
 
     private func cleanupPipes() {
+        writeLock.lock()
         try? inputPipe.fileHandleForWriting.close()
+        writeLock.unlock()
         try? outputPipe.fileHandleForReading.close()
         try? inputPipe.fileHandleForReading.close()
         try? outputPipe.fileHandleForWriting.close()
@@ -433,28 +446,34 @@ public final class BoundedProcessTransport: @unchecked Sendable {
     }
 
     private func forceStop(_ process: SpawnedProcess, grace: TimeInterval) {
+        let childWasReaped = hasReapedProcess(process.processIdentifier)
         if let group = process.processGroupIdentifier,
-           processExists(process.processIdentifier) || processGroupExists(group) {
+           processGroupExists(group) {
             signalProcessGroup(group, signal: SIGTERM)
-        } else if processExists(process.processIdentifier) {
+        } else if !childWasReaped, processExists(process.processIdentifier) {
             _ = kill(process.processIdentifier, SIGTERM)
         }
         waitUntilStopped(process, timeout: grace)
+        let childIsReaped = hasReapedProcess(process.processIdentifier)
         if let group = process.processGroupIdentifier,
-           processExists(process.processIdentifier) || processGroupExists(group) {
+           processGroupExists(group) {
             signalProcessGroup(group, signal: SIGKILL)
-        } else if processExists(process.processIdentifier) {
+        } else if !childIsReaped, processExists(process.processIdentifier) {
             _ = kill(process.processIdentifier, SIGKILL)
         }
         waitUntilStopped(process, timeout: max(0.1, grace))
-        _ = reapIfExited(process.processIdentifier)
+        if !hasReapedProcess(process.processIdentifier) {
+            _ = reapIfExited(process.processIdentifier)
+        }
     }
 
     private func waitUntilStopped(_ process: SpawnedProcess, timeout: TimeInterval) {
         let deadline = Date().addingTimeInterval(max(0, timeout))
-        while (processExists(process.processIdentifier)
-            || process.processGroupIdentifier.map(processGroupExists) == true),
-            Date() < deadline {
+        while Date() < deadline {
+            let childExited = reapIfExited(process.processIdentifier) != nil || hasReapedProcess(process.processIdentifier)
+            let childExists = !childExited && processExists(process.processIdentifier)
+            let groupExists = process.processGroupIdentifier.map(processGroupExists) == true
+            if !childExists && !groupExists { return }
             Thread.sleep(forTimeInterval: 0.01)
         }
     }
@@ -492,14 +511,32 @@ public final class BoundedProcessTransport: @unchecked Sendable {
                 if let status {
                     stateLock.lock()
                     cachedExitStatus = status
+                    reapedProcessIdentifier = processIdentifier
+                    if self.processIdentifier == processIdentifier {
+                        self.processIdentifier = 0
+                    }
                     stateLock.unlock()
                 }
                 return status
             }
             if result == 0 { return nil }
             if errno == EINTR { continue }
+            if errno == ECHILD {
+                return cachedStatus(for: processIdentifier)
+            }
             return nil
         }
+    }
+
+    private func cachedStatus(for processIdentifier: pid_t) -> Int32? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard self.processIdentifier == processIdentifier || reapedProcessIdentifier == processIdentifier else { return nil }
+        return cachedExitStatus
+    }
+
+    private func hasReapedProcess(_ processIdentifier: pid_t) -> Bool {
+        cachedStatus(for: processIdentifier) != nil
     }
 
     private func terminationStatus(from waitStatus: Int32) -> Int32? {

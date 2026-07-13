@@ -78,8 +78,8 @@ public final class AntigravityCLIHarness: @unchecked Sendable {
                         throw NSError(domain: "AntigravityCLIHarness", code: 1, userInfo: [NSLocalizedDescriptionKey: "Antigravity request cancelled before process registration."])
                     }
                     owner = registeredOwner
-                    try transport.input.write(contentsOf: promptData)
-                    try transport.input.close()
+                    try transport.write(promptData)
+                    transport.closeInput()
                     while let data = try transport.readChunk() {
                         continuation.yield(.assistantDelta(String(decoding: data, as: UTF8.self)))
                     }

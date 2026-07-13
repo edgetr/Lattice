@@ -59,19 +59,28 @@ struct BoundedJSONLineBuffer {
 }
 
 final class BoundedJSONLineReader {
-    private let handle: FileHandle
+    private let readChunk: () throws -> Data?
     private var buffer: BoundedJSONLineBuffer
     private var pending: [[String: Any]] = []
 
     init(_ handle: FileHandle, maximumFrameBytes: Int = ProtocolFrameLimits.maximumJSONLineBytes) {
-        self.handle = handle
+        self.readChunk = {
+            try handle.read(upToCount: ProtocolFrameLimits.readChunkBytes) ?? Data()
+        }
+        self.buffer = BoundedJSONLineBuffer(maximumFrameBytes: maximumFrameBytes)
+    }
+
+    init(_ transport: BoundedProcessTransport, maximumFrameBytes: Int = ProtocolFrameLimits.maximumJSONLineBytes) {
+        self.readChunk = {
+            try transport.readChunk(maxLength: ProtocolFrameLimits.readChunkBytes) ?? Data()
+        }
         self.buffer = BoundedJSONLineBuffer(maximumFrameBytes: maximumFrameBytes)
     }
 
     func next() throws -> [String: Any]? {
         if !pending.isEmpty { return pending.removeFirst() }
         while true {
-            let chunk = try handle.read(upToCount: ProtocolFrameLimits.readChunkBytes) ?? Data()
+            let chunk = try readChunk() ?? Data()
             if chunk.isEmpty {
                 pending = try buffer.finish()
                 return pending.isEmpty ? nil : pending.removeFirst()

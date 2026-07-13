@@ -149,6 +149,27 @@ final class InteractiveProcessRegistry: @unchecked Sendable {
         return entry.metadata
     }
 
+    /// Atomically attaches a permission waiter to a live, uncancelled owner.
+    /// Callers must insert the waiter into their local store and then verify it
+    /// with `isPendingPermissionActive`; that closes the registry/store handoff.
+    func registerPendingPermission(_ requestID: UUID, owner: Owner, sessionID: UUID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var entry = entries[sessionID],
+              entry.owner == owner,
+              !cancelledOwners.contains(owner) else { return false }
+        entry.metadata.pendingPermissionIDs.insert(requestID)
+        entries[sessionID] = entry
+        return true
+    }
+
+    func isPendingPermissionActive(_ requestID: UUID, owner: Owner, sessionID: UUID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = entries[sessionID], entry.owner == owner else { return false }
+        return !cancelledOwners.contains(owner) && entry.metadata.pendingPermissionIDs.contains(requestID)
+    }
+
     func unregister(_ owner: Owner, sessionID: UUID) -> UnregistrationResult {
         lock.lock()
         defer { lock.unlock() }
