@@ -163,6 +163,7 @@ final class AppState: ObservableObject {
     @Published var columnVisibility: NavigationSplitViewVisibility = .all
     /// Last measured conversations workspace width; used only for split-column adaptation.
     private var lastMeasuredWorkspaceWidth: CGFloat = 0
+    private var activeConnectionRefreshes = 0
     /// Visibility last written by adaptive layout; used to distinguish user-driven toggles.
     private var lastAutoAppliedColumnVisibility: NavigationSplitViewVisibility?
     /// When true, do not auto-change columns until the window is comfortably wide again.
@@ -198,6 +199,7 @@ final class AppState: ObservableObject {
     @Published var expandedProviderModelIDs: Set<String> = []
     @Published var cliBusyProviders: Set<String> = []
     @Published var cliActionMessages: [String: String] = [:]
+    @Published private(set) var isRefreshingConnections = false
     @Published var cliActionStartedAt: [String: Date] = [:]
     @Published var cliActionEstimatedSeconds: [String: TimeInterval] = [:]
     @Published var pendingCLIInstallProvider: String?
@@ -523,6 +525,17 @@ final class AppState: ObservableObject {
         selectedSession.map { contextBudgetEstimate(for: $0) }
     }
     var visibleCodexModels: [ProviderModel] { codexModels.filter { isModelEnabled("codex:\($0.id)") } }
+    var hasConnectedProviderCatalog: Bool {
+        codexReady || codex.isInstalled || grokReady || grok.isInstalled || openCodeReady || openCode.isInstalled || antigravityAuthenticated || antigravityInstalled || !codexModels.isEmpty || !grokModels.isEmpty || !openCodeModels.isEmpty || !antigravityModels.isEmpty
+    }
+
+    var hasProviderCatalogProblem: Bool {
+        ["codex", "grok", "opencode", "antigravity"].compactMap { cliActionMessages[$0] }.contains { CLIActionStatusPolicy.messageIndicatesProblem($0) }
+    }
+
+    var providerCatalogProblemMessage: String? {
+        ["codex", "grok", "opencode", "antigravity"].compactMap { cliActionMessages[$0] }.first(where: { CLIActionStatusPolicy.messageIndicatesProblem($0) })
+    }
     var visibleGrokModels: [ProviderModel] { grokModels.filter { isModelEnabled("grok:\($0.id)") } }
     var visibleOpenCodeModels: [ProviderModel] { openCodeModels.filter { isModelEnabled("opencode:\($0.id)") } }
     var visibleAntigravityModels: [ProviderModel] { antigravityModels.filter { isModelEnabled("antigravity:\($0.id)") } }
@@ -2267,6 +2280,12 @@ final class AppState: ObservableObject {
     }
 
     func refreshConnections(refreshProviderCatalogs: Bool = false) async {
+        activeConnectionRefreshes += 1
+        isRefreshingConnections = true
+        defer {
+            activeConnectionRefreshes -= 1
+            isRefreshingConnections = activeConnectionRefreshes > 0
+        }
         async let codexRefresh: Void = refreshCodexConnection()
         async let grokRefresh: Void = refreshGrokConnection()
         async let openCodeRefresh: Void = refreshOpenCodeConnection(refreshCatalog: refreshProviderCatalogs)

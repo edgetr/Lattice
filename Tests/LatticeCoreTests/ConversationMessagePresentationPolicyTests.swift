@@ -39,6 +39,27 @@ struct ConversationMessagePresentationPolicyTests {
         #expect(meta.count > "Assistant message, ".count)
     }
 
+    @Test func accessibilityMetadataAnnouncesGeneratingStateOnlyWhenRequested() {
+        let date = Date(timeIntervalSince1970: 1_710_000_000)
+        let normal = MessageTimestampPresentationPolicy.accessibilityMetadata(
+            role: .assistant,
+            date: date,
+            locale: Locale(identifier: "en_US_POSIX"),
+            timeZone: TimeZone(secondsFromGMT: 0)!
+        )
+        let generating = MessageTimestampPresentationPolicy.accessibilityMetadata(
+            role: .assistant,
+            date: date,
+            isGenerating: true,
+            locale: Locale(identifier: "en_US_POSIX"),
+            timeZone: TimeZone(secondsFromGMT: 0)!
+        )
+
+        #expect(!normal.contains("Generating response"))
+        #expect(generating.contains("Assistant message, Generating response"))
+        #expect(generating.contains("2024"))
+    }
+
     // MARK: - Provenance
 
     @Test func provenanceUsesBackendProviderAndModel() {

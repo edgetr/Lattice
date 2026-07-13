@@ -336,7 +336,9 @@ struct SessionListView: View {
                         )
                         .tag(session.id)
                         .accessibilityIdentifier(LatticeAccessibilityID.sessionRow(session.id))
+                        .accessibilityElement(children: .contain)
                         .accessibilityLabel(session.title)
+                        .accessibilityValue(SessionListAccessibilityPolicy.value(for: session))
                         .contextMenu { sessionContextMenu(for: session) }
                     }
                 }
@@ -429,13 +431,18 @@ struct SessionRow: View {
                         Image(systemName: "pin.fill")
                             .font(.caption2)
                             .foregroundStyle(.pink)
-                            .accessibilityLabel("Pinned")
+                            .accessibilityHidden(true)
                     }
                     Text(session.title)
                         .fontWeight(.medium)
                         .lineLimit(1)
+                        .accessibilityHidden(true)
                     Spacer(minLength: 4)
-                    if session.isStreaming { ProgressView().controlSize(.mini) }
+                    if session.isStreaming {
+                        ProgressView()
+                            .controlSize(.mini)
+                            .accessibilityHidden(true)
+                    }
                 }
                 if let last = session.messages.last, !last.text.isEmpty {
                     Text(last.text)
@@ -757,11 +764,13 @@ struct ProjectsView: View {
                             .accessibilityLabel("Streaming")
                     }
                     Spacer(minLength: 4)
-                    Text(session.backend.displayName)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
                 }
+
+                Text(session.backend.displayName)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
                 Text(activityDetail(for: session))
                     .font(.caption)
@@ -773,7 +782,7 @@ struct ProjectsView: View {
             .background(Color.primary.opacity(colorScheme == .dark ? 0.08 : 0.04), in: RoundedRectangle(cornerRadius: LatticeMetrics.compactRadius, style: .continuous))
             .accessibilityElement(children: .combine)
             .accessibilityLabel("Current activity for \(session.title)")
-            .accessibilityValue(activityDetail(for: session))
+            .accessibilityValue("\(session.backend.displayName) · \(activityDetail(for: session))")
         }
     }
 
@@ -860,19 +869,11 @@ struct ProjectsView: View {
                                 .accessibilityLabel("Streaming")
                         }
                     }
-                    HStack(spacing: 6) {
-                        Text("\(session.messages.count) messages")
-                        Text("·")
-                        Text(relativeUpdated(session.lastUpdated))
-                        if !session.actions.isEmpty {
-                            Text("·")
-                            Text("\(session.actions.count) actions")
-                        }
-                    }
+                    Text(workspaceSessionMetadata(for: session))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
-                    .lineLimit(1)
+                    .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 8)
                 Image(systemName: "chevron.right")
@@ -889,6 +890,14 @@ struct ProjectsView: View {
         .accessibilityLabel(session.title)
         .accessibilityHint("Opens this existing chat")
         .accessibilityValue(workspaceSessionAccessibilityValue(session))
+    }
+
+    private func workspaceSessionMetadata(for session: LatticeSession) -> String {
+        var parts = ["\(session.messages.count) messages", relativeUpdated(session.lastUpdated)]
+        if !session.actions.isEmpty {
+            parts.append("\(session.actions.count) actions")
+        }
+        return parts.joined(separator: " · ")
     }
 
     private func workspaceSessionAccessibilityValue(_ session: LatticeSession) -> String {

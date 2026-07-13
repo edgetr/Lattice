@@ -18,6 +18,7 @@ enum LatticeAccessibilityID {
     static let overlay = "lattice.overlay"
     static let overlayOpenCommandPalette = "lattice.overlay.open-command-palette"
     static let overlayOpenWorkspace = "lattice.overlay.open-workspace"
+    static let overlayExpandChat = "lattice.overlay.expand-chat"
     static let recovery = "lattice.recovery"
     static let recoveryIssuePrefix = "lattice.recovery.issue."
     static let recoveryRetryPrefix = "lattice.recovery.retry."

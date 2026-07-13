@@ -594,9 +594,22 @@ struct OverlayView: View {
             SelfEditPreviewRow(preview: preview, state: state)
         } else {
             VStack(alignment: .leading, spacing: 10) {
-                Text(state.selectedSession?.messages.last?.text ?? "Finished.")
+                HStack(spacing: 6) {
+                    Label("Response preview", systemImage: "text.alignleft")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    Text("Full response in chat")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                let response = state.selectedSession?.messages.last?.text ?? "Finished."
+                Text(response)
                     .lineLimit(4)
                     .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel("Response preview")
+                    .accessibilityValue(response)
+                    .accessibilityHint("Compact preview. Use Expand Chat to read the full response.")
                 HStack {
                     Button("Follow up") {
                         state.overlayMode = .prompt
@@ -605,6 +618,10 @@ struct OverlayView: View {
                     Spacer()
                     Button("Expand Chat") { state.overlayMode = .compactChat }
                         .buttonStyle(.borderedProminent)
+                        .accessibilityIdentifier(LatticeAccessibilityID.overlayExpandChat)
+                        .accessibilityLabel("Expand full response in chat")
+                        .accessibilityHint("Open the full response and conversation")
+                        .help("Open the full response and conversation")
                 }
             }
         }

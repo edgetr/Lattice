@@ -16,6 +16,7 @@ struct OnboardingView: View {
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var focusedField: OnboardingFocus?
+    @ScaledMetric(relativeTo: .title) private var headingFontSize: CGFloat = 28
 
     private enum OnboardingFocus: Hashable {
         case heading
@@ -82,7 +83,7 @@ struct OnboardingView: View {
     private var stepContent: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(step.title)
-                .font(.system(size: 28, weight: .semibold, design: .rounded))
+                .font(.system(size: headingFontSize, weight: .semibold, design: .rounded))
                 .fixedSize(horizontal: false, vertical: true)
                 .focusable(true)
                 .focused($focusedField, equals: .heading)

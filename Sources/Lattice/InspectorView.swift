@@ -102,9 +102,24 @@ struct ModelsView: View {
                     appleIntelligenceCard
                 }
 
-                let hasProviderCatalogState = [state.codexCatalogStatus, state.grokCatalogStatus, state.openCodeCatalogStatus]
-                    .contains { $0 == .loading || $0 == .failed }
-                if !state.codexModels.isEmpty || !state.grokModels.isEmpty || !state.openCodeModels.isEmpty || !state.antigravityModels.isEmpty || hasProviderCatalogState {
+                if state.isRefreshingConnections {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Refreshing connected provider models…")
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Refreshing connected provider models")
+                    .accessibilityAddTraits(.updatesFrequently)
+                } else if state.codexModels.isEmpty,
+                          state.grokModels.isEmpty,
+                          state.openCodeModels.isEmpty,
+                          state.antigravityModels.isEmpty,
+                          state.hasProviderCatalogProblem {
+                    catalogProblemState
+                } else if state.hasConnectedProviderCatalog
+                            || [state.codexCatalogStatus, state.grokCatalogStatus, state.openCodeCatalogStatus]
+                                .contains(where: { $0 == .loading || $0 == .failed }) {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Connected provider models").font(.headline)
                         if state.codexModels.isEmpty, state.codexCatalogStatus == .failed {
@@ -117,7 +132,7 @@ struct ModelsView: View {
                             ModelsCatalogNotice(provider: "OpenCode", state: state)
                         }
                         CatalogCardGrid(contentWidth: contentWidth, minimum: LatticeCatalogPageLayout.providerCardMinimum, maximum: LatticeCatalogPageLayout.providerCardMaximum) {
-                            if !state.codexModels.isEmpty {
+                            if state.codexReady || state.codex.isInstalled || !state.codexModels.isEmpty {
                                 ProviderModelSection(
                                     providerName: "Codex",
                                     providerID: "codex",
@@ -127,7 +142,7 @@ struct ModelsView: View {
                                     state: state
                                 ) { .codex(model: $0.id) }
                             }
-                            if !state.grokModels.isEmpty {
+                            if state.grokReady || state.grok.isInstalled || !state.grokModels.isEmpty {
                                 ProviderModelSection(
                                     providerName: "Grok",
                                     providerID: "grok",
@@ -137,7 +152,7 @@ struct ModelsView: View {
                                     state: state
                                 ) { .grok(model: $0.id) }
                             }
-                            if !state.openCodeModels.isEmpty {
+                            if state.openCodeReady || state.openCode.isInstalled || !state.openCodeModels.isEmpty {
                                 ProviderModelSection(
                                     providerName: "OpenCode",
                                     providerID: "opencode",
@@ -147,7 +162,7 @@ struct ModelsView: View {
                                     state: state
                                 ) { .openCode(model: $0.id) }
                             }
-                            if !state.antigravityModels.isEmpty {
+                            if state.antigravityAuthenticated || state.antigravityInstalled || !state.antigravityModels.isEmpty {
                                 ProviderModelSection(
                                     providerName: "Antigravity",
                                     providerID: "antigravity",
@@ -159,6 +174,10 @@ struct ModelsView: View {
                             }
                         }
                     }
+                } else if state.hasProviderCatalogProblem {
+                    catalogProblemState
+                } else {
+                    catalogEmptyState
                 }
 
                 if !state.ollamaModels.isEmpty {
@@ -177,6 +196,7 @@ struct ModelsView: View {
                                     Spacer(minLength: 8)
                                     Button("Use") { state.useBackendInChat(backend) }
                                         .disabled(!runnable)
+                                        .accessibilityHint(runnable ? "Use \(model.name) in a chat." : "Start Ollama before using this local model.")
                                         .help(runnable ? "Use \(model.name) in a chat." : "Start Ollama before using this local model.")
                                 }
                                 .padding(LatticeMetrics.cardPadding)
@@ -236,6 +256,43 @@ struct ModelsView: View {
         .toolbar { Button { Task { await state.refreshConnections(refreshProviderCatalogs: true) } } label: { Label("Refresh", systemImage: "arrow.clockwise") } }
     }
 
+    private var catalogProblemState: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Provider catalog unavailable", systemImage: "exclamationmark.triangle").font(.headline)
+            Text(state.providerCatalogProblemMessage ?? "Refresh the provider connection to try again.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Open Connections") { state.selectedSection = .connections }
+        }
+        .padding(LatticeMetrics.cardPadding)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .latticeGlass(cornerRadius: LatticeMetrics.cardRadius, interactive: true)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var catalogEmptyState: some View {
+        let copy = CatalogEmptyStatePolicy.copy(for: .noConnectedProviderModels)
+        return VStack(alignment: .leading, spacing: 8) {
+            Label(copy.title, systemImage: "square.stack.3d.up.slash").font(.headline)
+            Text(copy.message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                Button(copy.primaryActionTitle ?? "Open Connections") { state.selectedSection = .connections }
+                Button(copy.secondaryActionTitle ?? "Refresh") {
+                    Task { await state.refreshConnections(refreshProviderCatalogs: true) }
+                }
+                .buttonStyle(.link)
+            }
+        }
+        .padding(LatticeMetrics.cardPadding)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .latticeGlass(cornerRadius: LatticeMetrics.cardRadius, interactive: true)
+        .accessibilityElement(children: .contain)
+    }
+
     private var appleIntelligenceCard: some View {
         HStack(spacing: 14) {
             Image(systemName: "apple.intelligence").font(.title2).frame(width: 28)
@@ -249,6 +306,7 @@ struct ModelsView: View {
                 let runnable = state.canUseBackendInNewChat(backend)
                 Button("Use") { state.useBackendInChat(backend) }
                     .disabled(!runnable)
+                    .accessibilityHint(runnable ? "Use Apple Intelligence in a chat." : (state.backendUnavailableMessage(for: backend) ?? "Apple Intelligence is unavailable."))
                     .help(runnable ? "Use Apple Intelligence in a chat." : (state.backendUnavailableMessage(for: backend) ?? "Apple Intelligence is unavailable."))
             }
         }
@@ -284,17 +342,31 @@ struct ProviderModelSection: View {
     let unavailableDetail: String
     @ObservedObject var state: AppState
     let backend: (ProviderModel) -> ChatBackend
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var visibleModels: [ProviderModel] {
         models.filter { state.isModelEnabled("\(providerID):\($0.id)") }
     }
 
     private var statusText: String {
-        ready ? "Ready" : unavailableDetail
+        guard ready else { return unavailableDetail }
+        guard !visibleModels.isEmpty else { return "No models reported" }
+        guard visibleModels.contains(where: { state.canUseBackendInNewChat(backend($0)) }) else {
+            return "Unavailable for this chat"
+        }
+        return "Ready"
+    }
+
+    private var isReadyForCurrentChat: Bool {
+        ready && visibleModels.contains(where: { state.canUseBackendInNewChat(backend($0)) })
     }
 
     private var displayedModels: [ProviderModel] {
         state.expandedProviderModelIDs.contains(providerID) ? visibleModels : Array(visibleModels.prefix(3))
+    }
+
+    private var disclosureAnimation: Animation? {
+        reduceMotion ? nil : .easeOut(duration: 0.18)
     }
 
     var body: some View {
@@ -305,21 +377,26 @@ struct ProviderModelSection: View {
                 }
                 Text(providerName).font(.subheadline.weight(.semibold))
                 Spacer(minLength: 8)
-                Image(systemName: ready ? "checkmark.circle.fill" : "minus.circle")
+                Image(systemName: isReadyForCurrentChat ? "checkmark.circle.fill" : "minus.circle")
                     .font(.caption.weight(.semibold))
                     .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(ready ? Color.green : Color.secondary)
+                    .foregroundStyle(isReadyForCurrentChat ? Color.green : Color.secondary)
                     .accessibilityHidden(true)
                 Text(statusText)
                     .font(.caption)
-                    .foregroundStyle(ready ? Color.green : Color.secondary)
+                    .foregroundStyle(isReadyForCurrentChat ? Color.green : Color.secondary)
                     .multilineTextAlignment(.trailing)
             }
             .accessibilityElement(children: .combine)
             .accessibilityLabel(providerName)
             .accessibilityValue(statusText)
 
-            if visibleModels.isEmpty {
+            if models.isEmpty {
+                Text("No \(providerName) models have been reported yet. Retry discovery in Connections.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 4)
+            } else if visibleModels.isEmpty {
                 Text("All discovered \(providerName) models are hidden in Connections.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -338,13 +415,13 @@ struct ProviderModelSection: View {
                 }
                 if visibleModels.count > displayedModels.count {
                     Button("Show \(visibleModels.count - displayedModels.count) more") {
-                        withAnimation(.easeOut(duration: 0.18)) { state.setProviderModelsExpanded(providerID, expanded: true) }
+                        withAnimation(disclosureAnimation) { state.setProviderModelsExpanded(providerID, expanded: true) }
                     }
                     .buttonStyle(.link)
                     .font(.caption.weight(.medium))
                 } else if state.expandedProviderModelIDs.contains(providerID) && visibleModels.count > 3 {
                     Button("Show less") {
-                        withAnimation(.easeOut(duration: 0.18)) { state.setProviderModelsExpanded(providerID, expanded: false) }
+                        withAnimation(disclosureAnimation) { state.setProviderModelsExpanded(providerID, expanded: false) }
                     }
                     .buttonStyle(.link)
                     .font(.caption.weight(.medium))
@@ -365,10 +442,13 @@ struct ProviderModelRow: View {
     let backend: ChatBackend
 
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
+        HStack(alignment: .top, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(model.name).fontWeight(.medium)
+                    Text(model.name)
+                        .fontWeight(.medium)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .layoutPriority(1)
                     if model.isDefault {
                         Text("Default")
                             .font(.caption2.weight(.semibold))
@@ -381,26 +461,29 @@ struct ProviderModelRow: View {
                 Text(model.description.isEmpty ? "\(providerName) · provider-owned runtime" : model.description)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
                 let supportedReasoningOptions = state.reasoningOptions(for: backend)
                 if !supportedReasoningOptions.isEmpty {
-                        Text("Reasoning: \(supportedReasoningOptions.map { $0.effort.displayName }.joined(separator: ", "))")
+                    Text("Reasoning: \(supportedReasoningOptions.map { $0.effort.displayName }.joined(separator: ", "))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 if let contextWindow = model.contextWindow {
                     Text("Context: \(Self.formatContextWindow(contextWindow)) tokens")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
-                        .lineLimit(1)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
-                Spacer()
-                Button("Use") { state.useBackendInChat(backend) }
-                    .disabled(!ready)
-                    .help(ready ? "Use \(model.name) in a chat." : (state.backendUnavailableMessage(for: backend) ?? "\(providerName) cannot run this model through its current structured runtime."))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .layoutPriority(1)
+            Button("Use") { state.useBackendInChat(backend) }
+                .fixedSize(horizontal: true, vertical: false)
+                .disabled(!ready)
+                .accessibilityHint(ready ? "Use \(model.name) in a chat." : (state.backendUnavailableMessage(for: backend) ?? "\(providerName) cannot run this model through its current structured runtime."))
+                .help(ready ? "Use \(model.name) in a chat." : (state.backendUnavailableMessage(for: backend) ?? "\(providerName) cannot run this model through its current structured runtime."))
         }
         .padding(.vertical, 5)
     }
@@ -420,40 +503,58 @@ struct RecommendationRow: View {
         let fit = model.fit(on: state.hardware)
         let canInstall = model.canInstall(on: state.hardware)
         let lifecycle = model.lifecyclePlan(on: state.hardware)
-        HStack(spacing: 14) {
+        HStack(alignment: .top, spacing: 14) {
             Image(systemName: "cpu").font(.title2).foregroundStyle(.secondary).frame(width: 28)
             VStack(alignment: .leading, spacing: 3) {
-                HStack { Text(model.name).fontWeight(.semibold); Text(model.category).font(.caption).foregroundStyle(.secondary) }
+                Text(model.name)
+                    .fontWeight(.semibold)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(model.category)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 Text("~\(ByteCountFormatter.string(fromByteCount: Int64(model.estimatedBytes), countStyle: .memory)) · \(model.fit(on: state.hardware).rawValue.capitalized) fit")
                     .font(.caption).foregroundStyle(.secondary)
                     .monospacedDigit()
+                    .fixedSize(horizontal: false, vertical: true)
                 Text(lifecycle.summary)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 Text(model.tupleSummary)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 if state.installingModelTag == model.ollamaTag, let status = state.installStatus {
-                    Text(status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            Spacer()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .layoutPriority(1)
             if state.installingModelTag == model.ollamaTag {
                 ProgressView().controlSize(.small)
-                Button("Cancel") { state.cancelModelInstall() }
+                Button("Cancel") { state.cancelModelInstall() }.fixedSize(horizontal: true, vertical: false)
             } else if installed {
                 let backend = ChatBackend.ollama(model: model.ollamaTag)
                 let runnable = state.canUseBackendInNewChat(backend)
                 Button("Use") { state.useBackendInChat(backend) }
+                    .fixedSize(horizontal: true, vertical: false)
                     .disabled(!runnable)
+                    .accessibilityHint(runnable ? "Use \(model.name) in a chat." : "Start Ollama before using this local model.")
                     .help(runnable ? "Use \(model.name) in a chat." : "Start Ollama before using this local model.")
             } else if !state.ollamaInstalled {
-                Button("Get Ollama") { state.installOllama() }
+                Button("Get Ollama") { state.installOllama() }.fixedSize(horizontal: true, vertical: false)
             } else if !state.ollamaReady {
-                Button("Start Ollama") { state.openOllama() }
+                Button("Start Ollama") { state.openOllama() }.fixedSize(horizontal: true, vertical: false)
             } else {
+                let installHint = fit == .risky ? "This model is too close to the safe memory budget." : fit == .unsupported ? "This model exceeds the safe memory budget." : "Install with Ollama."
                 Button(canInstall ? "Install" : "Too large") { state.installModel(model) }
+                    .fixedSize(horizontal: true, vertical: false)
                     .disabled(state.installingModelTag != nil || !canInstall)
+                    .accessibilityHint(installHint)
                     .help(fit == .risky ? "This model is too close to the safe memory budget." : fit == .unsupported ? "This model exceeds the safe memory budget." : "Install with Ollama.")
             }
         }
@@ -1138,8 +1239,7 @@ struct ModelChecklist: View {
                         Toggle(isOn: Binding(get: { state.isModelEnabled("\(providerID):\(model.id)") }, set: { state.setModelEnabled("\(providerID):\(model.id)", enabled: $0) })) {
                             Text(model.name)
                                 .font(.callout)
-                                .lineLimit(1)
-                                .truncationMode(.tail)
+                                .fixedSize(horizontal: false, vertical: true)
                                 .help(model.name)
                         }
                         .toggleStyle(.checkbox)
@@ -1151,6 +1251,12 @@ struct ModelChecklist: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            Text("No models reported yet. Refresh after signing in.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityElement(children: .combine)
         }
     }
 }
@@ -1193,27 +1299,33 @@ struct ConnectionCard<Actions: View, Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 14) {
+            HStack(alignment: .top, spacing: 14) {
                 connectionIdentityMark
                     .frame(width: 30, height: 30)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(name).fontWeight(.semibold)
+                    Text(name)
+                        .fontWeight(.semibold)
+                        .fixedSize(horizontal: false, vertical: true)
                     Text(detail)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
+                        .fixedSize(horizontal: false, vertical: true)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .layoutPriority(1)
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(name)
                 .accessibilityValue(detail)
 
-                Spacer(minLength: 16)
-                actions()
+                Spacer(minLength: 0)
+                actions().fixedSize(horizontal: true, vertical: false)
                 // Shape/symbol distinguishes readiness without color alone; detail already
                 // carries the spoken status, so hide this chrome from VoiceOver.
                 ReadinessStatusIndicator(ready: ready, accessibilityStatus: detail)
                     .accessibilityHidden(true)
+                    .fixedSize(horizontal: true, vertical: false)
             }
             if showsContent {
                 content()
@@ -1242,10 +1354,12 @@ struct ConnectionCard<Actions: View, Content: View>: View {
 
 struct PageHeader: View {
     let title: String; let subtitle: String
+    @ScaledMetric(relativeTo: .title) private var titleFontSize: CGFloat = 30
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
-                .font(.system(size: 30, weight: .semibold, design: .rounded))
+                .font(.system(size: titleFontSize, weight: .semibold, design: .rounded))
                 .fixedSize(horizontal: false, vertical: true)
             Text(subtitle)
                 .foregroundStyle(.secondary)
@@ -1378,7 +1492,7 @@ struct SettingsView: View {
                 Button("Open Skills Folder") { state.openSkillsFolder() }
             }
             Section("Privacy & Security") {
-                Text("Provider harnesses are contained for workspace writes. They may still read files outside the workspace and use the network, so this is not a confidentiality boundary.")
+                Text(LatticeSettingsCopy.privacySecurityBody)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)

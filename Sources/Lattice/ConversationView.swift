@@ -420,6 +420,9 @@ struct SelfEditPreviewRow: View {
                         .foregroundStyle(.primary)
                 }
             }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(presentation.accessibilityLabel)
+            .accessibilityValue(presentation.accessibilityValue ?? presentation.headline)
             .padding(10)
             .background(.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
@@ -456,6 +459,7 @@ struct EmptyConversationView: View {
                 Text(state.copyText(for: .emptyChatTitle, fallback: "What can I help with?"))
                     .font(.title2)
                     .fontWeight(.semibold)
+                    .accessibilityAddTraits(.isHeader)
                 Text(state.activeBackend.displayName).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -780,7 +784,8 @@ struct MessageRow: View {
         .accessibilityLabel(
             MessageTimestampPresentationPolicy.accessibilityMetadata(
                 role: message.role,
-                date: message.date
+                date: message.date,
+                isGenerating: message.role == .assistant && message.text.isEmpty
             )
         )
     }
@@ -821,7 +826,10 @@ struct MessageRow: View {
         HStack(alignment: .top, spacing: 8) {
             Group {
                 if message.text.isEmpty {
-                    ProgressView().controlSize(.small).padding(.vertical, 5)
+                    ProgressView()
+                        .controlSize(.small)
+                        .padding(.vertical, 5)
+                        .accessibilityHidden(true)
                 } else {
                     VStack(alignment: .leading, spacing: 6) {
                         if message.isPinned { PinnedMessageBadge() }
@@ -1239,8 +1247,6 @@ struct ErrorRow: View {
         }
         .padding(12)
         .latticeGlass(cornerRadius: 12, tint: .red.opacity(0.08))
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(presentation.accessibilityLabel)
-        .accessibilityValue(presentation.accessibilityValue ?? presentation.headline)
+        .accessibilityElement(children: .contain)
     }
 }
