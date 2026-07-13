@@ -168,7 +168,7 @@ public enum LatticeSkillPromptBuilder {
         let id = String(token).lowercased()
         guard LatticeSkillStore.isSafeSkillID(id), !disabledSkillIDs.contains(id) else { return nil }
         guard let record = records.first(where: { $0.id == id && $0.isValid }) else { return nil }
-        guard let data = try? Data(contentsOf: record.skillURL),
+        guard let data = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: record.skillURL),
               let markdown = String(data: data, encoding: .utf8),
               !markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         let request = tokenAndRest.count == 2
@@ -315,12 +315,14 @@ public struct LatticeSkillStore: Sendable {
     /// Prefer Lattice sidecar markers; fall back to pre-rename Nisa markers for existing skills.
     private static func readSidecarText(in folder: URL, primary: String, legacy: String) -> String? {
         let primaryURL = folder.appendingPathComponent(primary)
-        if let text = try? String(contentsOf: primaryURL, encoding: .utf8) {
+        if let data = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: primaryURL),
+           let text = String(data: data, encoding: .utf8) {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty { return trimmed }
         }
         let legacyURL = folder.appendingPathComponent(legacy)
-        if let text = try? String(contentsOf: legacyURL, encoding: .utf8) {
+        if let data = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: legacyURL),
+           let text = String(data: data, encoding: .utf8) {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty { return trimmed }
         }
@@ -329,9 +331,9 @@ public struct LatticeSkillStore: Sendable {
 
     private static func readSidecarData(in folder: URL, primary: String, legacy: String) -> Data? {
         let primaryURL = folder.appendingPathComponent(primary)
-        if let data = try? Data(contentsOf: primaryURL) { return data }
+        if let data = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: primaryURL) { return data }
         let legacyURL = folder.appendingPathComponent(legacy)
-        return try? Data(contentsOf: legacyURL)
+        return try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: legacyURL)
     }
 
     public static func defaultGlobalRoots() -> [URL] {
@@ -343,11 +345,12 @@ public struct LatticeSkillStore: Sendable {
     }
 
     public func prepareDirectory() throws {
-        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        try LatticeStorePathSecurity.prepareDirectory(at: rootURL)
     }
 
     public func importGlobalSkills() throws {
         try prepareDirectory()
+        let canonicalRoot = try LatticeStorePathSecurity.canonicalDirectory(at: rootURL)
         let deletedIDs = deletedGlobalSkillIDs()
         for source in globalSkillFiles() {
             let folderID = source.deletingLastPathComponent().lastPathComponent
@@ -355,26 +358,28 @@ public struct LatticeSkillStore: Sendable {
             guard !id.isEmpty else { continue }
             guard "/\(id)" != LatticeSelfEditCommand.name else { continue }
             if deletedIDs.contains(id) { continue }
-            let targetFolder = rootURL.appendingPathComponent(id, isDirectory: true)
-            let targetSkill = targetFolder.appendingPathComponent("SKILL.md")
             let sourceData = try Data(contentsOf: source)
-            if FileManager.default.fileExists(atPath: targetSkill.path) {
-                try refreshImportedGlobalSkill(
-                    source: source,
-                    sourceData: sourceData,
-                    targetFolder: targetFolder,
-                    targetSkill: targetSkill
-                )
+            if let targetFolder = try LatticeStorePathSecurity.existingChildDirectory(named: id, under: canonicalRoot) {
+                if let targetSkill = try LatticeStorePathSecurity.existingEntry(
+                    named: "SKILL.md",
+                    under: targetFolder
+                ) {
+                    try refreshImportedGlobalSkill(source: source, sourceData: sourceData, targetFolder: targetFolder, targetSkill: targetSkill)
+                } else {
+                    try writeImportedGlobalSkill(source: source, sourceData: sourceData, targetFolder: targetFolder)
+                }
                 continue
             }
-            try writeImportedGlobalSkill(source: source, sourceData: sourceData, targetFolder: targetFolder, targetSkill: targetSkill)
+            let targetFolder = canonicalRoot.appendingPathComponent(id, isDirectory: true)
+            try writeImportedGlobalSkill(source: source, sourceData: sourceData, targetFolder: targetFolder)
         }
     }
 
     public func load() -> [LatticeSkillRecord] {
         do {
             try prepareDirectory()
-            let children = try FileManager.default.contentsOfDirectory(at: rootURL, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
+            let canonicalRoot = try LatticeStorePathSecurity.canonicalDirectory(at: rootURL)
+            let children = try FileManager.default.contentsOfDirectory(at: canonicalRoot, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
             return children.compactMap(loadRecord).sorted {
                 $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
             }
@@ -398,31 +403,54 @@ public struct LatticeSkillStore: Sendable {
             throw NSError(domain: "LatticeSkillStore", code: 1, userInfo: [NSLocalizedDescriptionKey: validation.joined(separator: " ")])
         }
         try prepareDirectory()
-        let folder = rootURL.appendingPathComponent(patch.id, isDirectory: true)
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        try patch.markdown.data(using: .utf8)?.write(to: folder.appendingPathComponent("SKILL.md"), options: .atomic)
-        try LatticeSkillSource.generated.rawValue.data(using: .utf8)?.write(to: folder.appendingPathComponent(".lattice-skill-source"), options: .atomic)
-        try? FileManager.default.removeItem(at: folder.appendingPathComponent(".lattice-original-skill-path"))
-        try? FileManager.default.removeItem(at: folder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillOriginalPathMarker))
-        try? FileManager.default.removeItem(at: folder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillSourceMarker))
-        try? FileManager.default.removeItem(at: importedGlobalBaselineURL(in: folder))
-        try? FileManager.default.removeItem(at: folder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillImportedBaselineMarker))
+        let canonicalRoot = try LatticeStorePathSecurity.canonicalDirectory(at: rootURL)
+        let folder = try LatticeStorePathSecurity.createChildDirectory(named: patch.id, under: canonicalRoot)
+        try LatticeStorePathSecurity.writeDataAtomically(
+            Data(patch.markdown.utf8),
+            to: folder.appendingPathComponent("SKILL.md"),
+            under: canonicalRoot
+        )
+        try LatticeStorePathSecurity.writeDataAtomically(
+            Data(LatticeSkillSource.generated.rawValue.utf8),
+            to: folder.appendingPathComponent(".lattice-skill-source"),
+            under: canonicalRoot
+        )
+        try LatticeStorePathSecurity.removeItem(at: folder.appendingPathComponent(".lattice-original-skill-path"), under: canonicalRoot)
+        try LatticeStorePathSecurity.removeItem(at: folder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillOriginalPathMarker), under: canonicalRoot)
+        try LatticeStorePathSecurity.removeItem(at: folder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillSourceMarker), under: canonicalRoot)
+        try LatticeStorePathSecurity.removeItem(at: importedGlobalBaselineURL(in: folder), under: canonicalRoot)
+        try LatticeStorePathSecurity.removeItem(at: folder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillImportedBaselineMarker), under: canonicalRoot)
         let ownerURL = folder.appendingPathComponent(".lattice-skill-owner-extension-id")
         if let ownerExtensionID, !ownerExtensionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            try ownerExtensionID.data(using: .utf8)?.write(to: ownerURL, options: .atomic)
-            try? FileManager.default.removeItem(at: folder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillOwnerMarker))
+            try LatticeStorePathSecurity.writeDataAtomically(
+                Data(ownerExtensionID.utf8),
+                to: ownerURL,
+                under: canonicalRoot
+            )
+            try LatticeStorePathSecurity.removeItem(at: folder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillOwnerMarker), under: canonicalRoot)
         } else {
-            try? FileManager.default.removeItem(at: ownerURL)
-            try? FileManager.default.removeItem(at: folder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillOwnerMarker))
+            try LatticeStorePathSecurity.removeItem(at: ownerURL, under: canonicalRoot)
+            try LatticeStorePathSecurity.removeItem(at: folder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillOwnerMarker), under: canonicalRoot)
         }
         try removeDeletedGlobalSkillID(patch.id)
         return folder.appendingPathComponent("SKILL.md")
     }
 
     public func snapshotSkill(id: String) -> LatticeSkillSnapshot {
-        let folder = rootURL.appendingPathComponent(id, isDirectory: true)
+        guard Self.isSafeSkillID(id),
+              let canonicalRoot = try? LatticeStorePathSecurity.canonicalDirectory(at: rootURL) else {
+            return .init(
+                id: id,
+                skillData: nil,
+                sourceRaw: nil,
+                originalPath: nil,
+                ownerExtensionID: nil,
+                wasDeletedGlobalSkill: false
+            )
+        }
+        let folder = canonicalRoot.appendingPathComponent(id, isDirectory: true)
         let skillURL = folder.appendingPathComponent("SKILL.md")
-        let data = try? Data(contentsOf: skillURL)
+        let data = try? LatticeStorePathSecurity.readData(at: skillURL, under: canonicalRoot)
         let sourceRaw = Self.readSidecarText(in: folder, primary: ".lattice-skill-source", legacy: LatticeLegacyBrandCompatibility.skillSourceMarker)
         let originalPath = Self.readSidecarText(in: folder, primary: ".lattice-original-skill-path", legacy: LatticeLegacyBrandCompatibility.skillOriginalPathMarker)
         let importedBaselineData = Self.readSidecarData(in: folder, primary: ".lattice-imported-skill-baseline", legacy: LatticeLegacyBrandCompatibility.skillImportedBaselineMarker)
@@ -442,30 +470,29 @@ public struct LatticeSkillStore: Sendable {
         guard Self.isSafeSkillID(snapshot.id) else {
             throw NSError(domain: "LatticeSkillStore", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid skill id."])
         }
-        let folder = rootURL.appendingPathComponent(snapshot.id, isDirectory: true)
+        let canonicalRoot = try LatticeStorePathSecurity.canonicalDirectory(at: rootURL)
         if let skillData = snapshot.skillData {
-            try prepareDirectory()
-            if FileManager.default.fileExists(atPath: folder.path) {
-                try FileManager.default.removeItem(at: folder)
+            if let folder = try LatticeStorePathSecurity.existingChildDirectory(named: snapshot.id, under: canonicalRoot) {
+                try LatticeStorePathSecurity.removeItem(at: folder, under: canonicalRoot)
             }
-            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            try skillData.write(to: folder.appendingPathComponent("SKILL.md"), options: .atomic)
+            let folder = try LatticeStorePathSecurity.createChildDirectory(named: snapshot.id, under: canonicalRoot)
+            try LatticeStorePathSecurity.writeDataAtomically(skillData, to: folder.appendingPathComponent("SKILL.md"), under: canonicalRoot)
             if let sourceRaw = snapshot.sourceRaw {
-                try sourceRaw.data(using: .utf8)?.write(to: folder.appendingPathComponent(".lattice-skill-source"), options: .atomic)
+                try LatticeStorePathSecurity.writeDataAtomically(Data(sourceRaw.utf8), to: folder.appendingPathComponent(".lattice-skill-source"), under: canonicalRoot)
             }
             if let originalPath = snapshot.originalPath {
-                try originalPath.data(using: .utf8)?.write(to: folder.appendingPathComponent(".lattice-original-skill-path"), options: .atomic)
+                try LatticeStorePathSecurity.writeDataAtomically(Data(originalPath.utf8), to: folder.appendingPathComponent(".lattice-original-skill-path"), under: canonicalRoot)
             }
             if let importedBaselineData = snapshot.importedBaselineData {
-                try importedBaselineData.write(to: importedGlobalBaselineURL(in: folder), options: .atomic)
+                try LatticeStorePathSecurity.writeDataAtomically(importedBaselineData, to: importedGlobalBaselineURL(in: folder), under: canonicalRoot)
             }
             if let ownerExtensionID = snapshot.ownerExtensionID {
-                try ownerExtensionID.data(using: .utf8)?.write(to: folder.appendingPathComponent(".lattice-skill-owner-extension-id"), options: .atomic)
+                try LatticeStorePathSecurity.writeDataAtomically(Data(ownerExtensionID.utf8), to: folder.appendingPathComponent(".lattice-skill-owner-extension-id"), under: canonicalRoot)
             }
-        } else if FileManager.default.fileExists(atPath: folder.path) {
+        } else if let folder = try LatticeStorePathSecurity.existingChildDirectory(named: snapshot.id, under: canonicalRoot) {
             let currentOwner = Self.readSidecarText(in: folder, primary: ".lattice-skill-owner-extension-id", legacy: LatticeLegacyBrandCompatibility.skillOwnerMarker)
             if ownerExtensionID == nil || currentOwner == ownerExtensionID {
-                try FileManager.default.removeItem(at: folder)
+                try LatticeStorePathSecurity.removeItem(at: folder, under: canonicalRoot)
             }
         }
         if snapshot.wasDeletedGlobalSkill {
@@ -479,8 +506,8 @@ public struct LatticeSkillStore: Sendable {
         guard Self.isSafeSkillID(id) else {
             throw NSError(domain: "LatticeSkillStore", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid skill id."])
         }
-        let folder = rootURL.appendingPathComponent(id, isDirectory: true)
-        guard folder.path.hasPrefix(rootURL.path), FileManager.default.fileExists(atPath: folder.path) else { return }
+        let canonicalRoot = try LatticeStorePathSecurity.canonicalDirectory(at: rootURL)
+        guard let folder = try LatticeStorePathSecurity.existingChildDirectory(named: id, under: canonicalRoot) else { return }
         let sourceRaw = Self.readSidecarText(
             in: folder,
             primary: ".lattice-skill-source",
@@ -489,7 +516,7 @@ public struct LatticeSkillStore: Sendable {
         if LatticeSkillSource(rawValue: sourceRaw ?? "") == .importedGlobal {
             try addDeletedGlobalSkillID(id)
         }
-        try FileManager.default.removeItem(at: folder)
+        try LatticeStorePathSecurity.removeItem(at: folder, under: canonicalRoot)
     }
 
     @discardableResult
@@ -497,15 +524,15 @@ public struct LatticeSkillStore: Sendable {
         guard Self.isSafeSkillID(id) else {
             throw NSError(domain: "LatticeSkillStore", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid skill id."])
         }
-        let folder = rootURL.appendingPathComponent(id, isDirectory: true)
-        guard folder.path.hasPrefix(rootURL.path), FileManager.default.fileExists(atPath: folder.path) else { return false }
+        let canonicalRoot = try LatticeStorePathSecurity.canonicalDirectory(at: rootURL)
+        guard let folder = try LatticeStorePathSecurity.existingChildDirectory(named: id, under: canonicalRoot) else { return false }
         let owner = Self.readSidecarText(
             in: folder,
             primary: ".lattice-skill-owner-extension-id",
             legacy: LatticeLegacyBrandCompatibility.skillOwnerMarker
         )
         guard owner == ownerExtensionID else { return false }
-        try FileManager.default.removeItem(at: folder)
+        try LatticeStorePathSecurity.removeItem(at: folder, under: canonicalRoot)
         return true
     }
 
@@ -688,17 +715,15 @@ public struct LatticeSkillStore: Sendable {
         return String(mapped).trimmingCharacters(in: CharacterSet(charactersIn: "-_"))
     }
 
-    private var deletedGlobalSkillIDsURL: URL {
-        rootURL.appendingPathComponent(".lattice-deleted-global-skills.json")
-    }
-
-    private var legacyDeletedGlobalSkillIDsURL: URL {
-        rootURL.appendingPathComponent(LatticeLegacyBrandCompatibility.deletedGlobalSkillsFileName)
-    }
-
     private func deletedGlobalSkillIDs() -> Set<String> {
-        let data = (try? Data(contentsOf: deletedGlobalSkillIDsURL))
-            ?? (try? Data(contentsOf: legacyDeletedGlobalSkillIDsURL))
+        guard let canonicalRoot = try? LatticeStorePathSecurity.canonicalDirectory(at: rootURL) else { return [] }
+        let data = (try? LatticeStorePathSecurity.readData(
+            at: canonicalRoot.appendingPathComponent(".lattice-deleted-global-skills.json"),
+            under: canonicalRoot
+        )) ?? (try? LatticeStorePathSecurity.readData(
+            at: canonicalRoot.appendingPathComponent(LatticeLegacyBrandCompatibility.deletedGlobalSkillsFileName),
+            under: canonicalRoot
+        ))
         guard let data,
               let ids = try? JSONDecoder().decode([String].self, from: data) else { return [] }
         return Set(ids.filter(Self.isSafeSkillID))
@@ -706,13 +731,15 @@ public struct LatticeSkillStore: Sendable {
 
     private func saveDeletedGlobalSkillIDs(_ ids: Set<String>) throws {
         try prepareDirectory()
+        let canonicalRoot = try LatticeStorePathSecurity.canonicalDirectory(at: rootURL)
+        let deletedURL = canonicalRoot.appendingPathComponent(".lattice-deleted-global-skills.json")
         let sorted = ids.sorted()
         if sorted.isEmpty {
-            try? FileManager.default.removeItem(at: deletedGlobalSkillIDsURL)
+            try LatticeStorePathSecurity.removeItem(at: deletedURL, under: canonicalRoot)
             return
         }
         let data = try JSONEncoder().encode(sorted)
-        try data.write(to: deletedGlobalSkillIDsURL, options: .atomic)
+        try LatticeStorePathSecurity.writeDataAtomically(data, to: deletedURL, under: canonicalRoot)
     }
 
     private func addDeletedGlobalSkillID(_ id: String) throws {
@@ -738,12 +765,14 @@ public struct LatticeSkillStore: Sendable {
         }
     }
 
-    private func writeImportedGlobalSkill(source: URL, sourceData: Data, targetFolder: URL, targetSkill: URL) throws {
-        try FileManager.default.createDirectory(at: targetFolder, withIntermediateDirectories: true)
-        try sourceData.write(to: targetSkill, options: .atomic)
-        try source.path.data(using: .utf8)?.write(to: targetFolder.appendingPathComponent(".lattice-original-skill-path"), options: .atomic)
-        try LatticeSkillSource.importedGlobal.rawValue.data(using: .utf8)?.write(to: targetFolder.appendingPathComponent(".lattice-skill-source"), options: .atomic)
-        try sourceData.write(to: importedGlobalBaselineURL(in: targetFolder), options: .atomic)
+    private func writeImportedGlobalSkill(source: URL, sourceData: Data, targetFolder: URL) throws {
+        let canonicalRoot = try LatticeStorePathSecurity.canonicalDirectory(at: rootURL)
+        let folder = try LatticeStorePathSecurity.createChildDirectory(named: targetFolder.lastPathComponent, under: canonicalRoot)
+        let skillURL = folder.appendingPathComponent("SKILL.md")
+        try LatticeStorePathSecurity.writeDataAtomically(sourceData, to: skillURL, under: canonicalRoot)
+        try LatticeStorePathSecurity.writeDataAtomically(Data(source.path.utf8), to: folder.appendingPathComponent(".lattice-original-skill-path"), under: canonicalRoot)
+        try LatticeStorePathSecurity.writeDataAtomically(Data(LatticeSkillSource.importedGlobal.rawValue.utf8), to: folder.appendingPathComponent(".lattice-skill-source"), under: canonicalRoot)
+        try LatticeStorePathSecurity.writeDataAtomically(sourceData, to: importedGlobalBaselineURL(in: folder), under: canonicalRoot)
     }
 
     private func refreshImportedGlobalSkill(source: URL, sourceData: Data, targetFolder: URL, targetSkill: URL) throws {
@@ -752,17 +781,18 @@ public struct LatticeSkillStore: Sendable {
         guard LatticeSkillSource(rawValue: sourceRaw ?? "") == .importedGlobal,
               originalRaw == source.path else { return }
 
-        let localData = try Data(contentsOf: targetSkill)
+        let canonicalRoot = try LatticeStorePathSecurity.canonicalDirectory(at: rootURL)
+        let localData = try LatticeStorePathSecurity.readData(at: targetSkill, under: canonicalRoot)
         let baselineURL = importedGlobalBaselineURL(in: targetFolder)
-        if let baselineData = try? Data(contentsOf: baselineURL) {
+        if let baselineData = try? LatticeStorePathSecurity.readData(at: baselineURL, under: canonicalRoot) {
             guard localData == baselineData else { return }
             if localData != sourceData {
-                try sourceData.write(to: targetSkill, options: .atomic)
+                try LatticeStorePathSecurity.writeDataAtomically(sourceData, to: targetSkill, under: canonicalRoot)
             }
-            try sourceData.write(to: baselineURL, options: .atomic)
+            try LatticeStorePathSecurity.writeDataAtomically(sourceData, to: baselineURL, under: canonicalRoot)
         } else if localData == sourceData {
             // Adopt legacy untouched imports without guessing over a locally edited copy.
-            try sourceData.write(to: baselineURL, options: .atomic)
+            try LatticeStorePathSecurity.writeDataAtomically(sourceData, to: baselineURL, under: canonicalRoot)
         }
     }
 
@@ -771,10 +801,10 @@ public struct LatticeSkillStore: Sendable {
     }
 
     private func loadRecord(_ folderURL: URL) -> LatticeSkillRecord? {
-        guard (try? folderURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return nil }
+        guard LatticeStorePathSecurity.isDirectoryWithoutFollowingSymlinks(at: folderURL) else { return nil }
         let id = folderURL.lastPathComponent
         let skillURL = folderURL.appendingPathComponent("SKILL.md")
-        guard let data = try? Data(contentsOf: skillURL),
+        guard let data = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: skillURL),
               let markdown = String(data: data, encoding: .utf8) else { return nil }
         let sourceRaw = Self.readSidecarText(in: folderURL, primary: ".lattice-skill-source", legacy: LatticeLegacyBrandCompatibility.skillSourceMarker)
         let originalRaw = Self.readSidecarText(in: folderURL, primary: ".lattice-original-skill-path", legacy: LatticeLegacyBrandCompatibility.skillOriginalPathMarker)
