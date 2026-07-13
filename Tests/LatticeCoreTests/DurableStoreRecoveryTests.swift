@@ -190,8 +190,10 @@ struct DurableStoreRecoveryTests {
         do {
             try store.save([])
             Issue.record("Blocked gate must refuse save")
+        } catch DurableStoreRecoveryError.writeBlocked(let storeName) {
+            #expect(storeName == SessionPersistence.storeName)
         } catch {
-            #expect(true)
+            Issue.record("Expected writeBlocked, got \(error)")
         }
         #expect(!FileManager.default.fileExists(atPath: url.path))
         gate.unblock()
@@ -328,11 +330,14 @@ struct DurableStoreRecoveryTests {
         do {
             _ = try DurableStoreRecovery.resetReplacingWithEmptyArray(at: url, io: io)
             Issue.record("Reset must fail when backup cannot be created")
-        } catch {
+        } catch DurableStoreRecoveryError.resetFailed(let message) {
+            #expect(message == "Reset aborted because a backup could not be created. Original left unchanged. Could not create a quarantine of sessions.json: I/O error")
             #expect((try Data(contentsOf: url)) == original)
             let leftovers = try FileManager.default.contentsOfDirectory(atPath: root.path)
                 .filter { $0.contains(".partial-") }
             #expect(leftovers.isEmpty)
+        } catch {
+            Issue.record("Expected resetFailed for backup failure, got \(error)")
         }
     }
 
@@ -368,12 +373,66 @@ struct DurableStoreRecoveryTests {
         do {
             _ = try DurableStoreRecovery.resetReplacingWithEmptyArray(at: url, io: io)
             Issue.record("Reset must fail when the preservation copy cannot be verified")
-        } catch {
+        } catch DurableStoreRecoveryError.resetFailed(let message) {
+            #expect(message.contains("Reset aborted because a backup could not be created."))
+            #expect(message.contains("Verification read failed"))
             #expect((try Data(contentsOf: url)) == original)
             let remaining = try FileManager.default.contentsOfDirectory(atPath: root.path)
             #expect(!remaining.contains { $0.hasSuffix(".backup") })
             #expect(!remaining.contains { $0.contains(".partial-") })
+        } catch {
+            Issue.record("Expected resetFailed for backup verification failure, got \(error)")
         }
+    }
+
+    @Test func resetRecoversAfterReplacementFailureWithoutLosingVerifiedBackup() throws {
+        let root = uniqueTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let url = root.appendingPathComponent("sessions.json")
+        let original = Data("preserve-before-replace-failure".utf8)
+        try original.write(to: url)
+
+        let replacementFailure = NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(EIO),
+            userInfo: [NSLocalizedDescriptionKey: "Replacement failed"]
+        )
+        let io = DurableStoreFileIO(
+            fileExists: { FileManager.default.fileExists(atPath: $0) },
+            attributesOfItem: { try FileManager.default.attributesOfItem(atPath: $0) },
+            readData: { try Data(contentsOf: $0) },
+            writeDataAtomically: { data, destination in try data.write(to: destination, options: .atomic) },
+            createDirectory: { try FileManager.default.createDirectory(at: $0, withIntermediateDirectories: true) },
+            copyItem: { try FileManager.default.copyItem(at: $0, to: $1) },
+            moveItem: { try FileManager.default.moveItem(at: $0, to: $1) },
+            removeItem: { try FileManager.default.removeItem(at: $0) },
+            replaceItem: { _, _ in throw replacementFailure }
+        )
+
+        do {
+            _ = try DurableStoreRecovery.resetReplacingWithEmptyArray(at: url, io: io)
+            Issue.record("Reset must fail when replacing the original fails")
+        } catch DurableStoreRecoveryError.resetFailed(let message) {
+            #expect(message.contains("replacing the original failed"))
+            #expect(message.contains("Replacement failed"))
+        } catch {
+            Issue.record("Expected resetFailed for replacement failure, got \(error)")
+        }
+
+        #expect((try Data(contentsOf: url)) == original)
+        let backups = try FileManager.default.contentsOfDirectory(at: root.path)
+            .filter { $0.hasSuffix(".backup") }
+        #expect(backups.count == 1)
+        if let backup = backups.first {
+            #expect((try Data(contentsOf: root.appendingPathComponent(backup))) == original)
+        }
+        let temporaryFiles = try FileManager.default.contentsOfDirectory(atPath: root.path)
+            .filter { $0.contains(".tmp-") || $0.contains(".partial-") }
+        #expect(temporaryFiles.isEmpty)
+
+        try DurableStoreRecovery.resetReplacingWithEmptyArray(at: url)
+        #expect(String(data: try Data(contentsOf: url), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) == "[]")
     }
 
     @Test func staleSourceProtectionRejectsResetWhenFileChanged() throws {
