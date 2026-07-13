@@ -349,10 +349,13 @@ struct ProviderModelRow: View {
     let backend: ChatBackend
 
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
+        HStack(alignment: .top, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(model.name).fontWeight(.medium)
+                    Text(model.name)
+                        .fontWeight(.medium)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .layoutPriority(1)
                     if model.isDefault {
                         Text("Default")
                             .font(.caption2.weight(.semibold))
@@ -365,26 +368,28 @@ struct ProviderModelRow: View {
                 Text(model.description.isEmpty ? "\(providerName) · provider-owned runtime" : model.description)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
                 let supportedReasoningOptions = state.reasoningOptions(for: backend)
                 if !supportedReasoningOptions.isEmpty {
-                        Text("Reasoning: \(supportedReasoningOptions.map { $0.effort.displayName }.joined(separator: ", "))")
+                    Text("Reasoning: \(supportedReasoningOptions.map { $0.effort.displayName }.joined(separator: ", "))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 if let contextWindow = model.contextWindow {
                     Text("Context: \(Self.formatContextWindow(contextWindow)) tokens")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
-                        .lineLimit(1)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
-                Spacer()
-                Button("Use") { state.useBackendInChat(backend) }
-                    .disabled(!ready)
-                    .help(ready ? "Use \(model.name) in a chat." : (state.backendUnavailableMessage(for: backend) ?? "\(providerName) cannot run this model through its current structured runtime."))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .layoutPriority(1)
+            Button("Use") { state.useBackendInChat(backend) }
+                .fixedSize(horizontal: true, vertical: false)
+                .disabled(!ready)
+                .help(ready ? "Use \(model.name) in a chat." : (state.backendUnavailableMessage(for: backend) ?? "\(providerName) cannot run this model through its current structured runtime."))
         }
         .padding(.vertical, 5)
     }
@@ -404,39 +409,54 @@ struct RecommendationRow: View {
         let fit = model.fit(on: state.hardware)
         let canInstall = model.canInstall(on: state.hardware)
         let lifecycle = model.lifecyclePlan(on: state.hardware)
-        HStack(spacing: 14) {
+        HStack(alignment: .top, spacing: 14) {
             Image(systemName: "cpu").font(.title2).foregroundStyle(.secondary).frame(width: 28)
             VStack(alignment: .leading, spacing: 3) {
-                HStack { Text(model.name).fontWeight(.semibold); Text(model.category).font(.caption).foregroundStyle(.secondary) }
+                Text(model.name)
+                    .fontWeight(.semibold)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(model.category)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 Text("~\(ByteCountFormatter.string(fromByteCount: Int64(model.estimatedBytes), countStyle: .memory)) · \(model.fit(on: state.hardware).rawValue.capitalized) fit")
                     .font(.caption).foregroundStyle(.secondary)
                     .monospacedDigit()
+                    .fixedSize(horizontal: false, vertical: true)
                 Text(lifecycle.summary)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 Text(model.tupleSummary)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 if state.installingModelTag == model.ollamaTag, let status = state.installStatus {
-                    Text(status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            Spacer()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .layoutPriority(1)
             if state.installingModelTag == model.ollamaTag {
                 ProgressView().controlSize(.small)
-                Button("Cancel") { state.cancelModelInstall() }
+                Button("Cancel") { state.cancelModelInstall() }.fixedSize(horizontal: true, vertical: false)
             } else if installed {
                 let backend = ChatBackend.ollama(model: model.ollamaTag)
                 let runnable = state.canUseBackendInNewChat(backend)
                 Button("Use") { state.useBackendInChat(backend) }
+                    .fixedSize(horizontal: true, vertical: false)
                     .disabled(!runnable)
                     .help(runnable ? "Use \(model.name) in a chat." : "Start Ollama before using this local model.")
             } else if !state.ollamaInstalled {
-                Button("Get Ollama") { state.installOllama() }
+                Button("Get Ollama") { state.installOllama() }.fixedSize(horizontal: true, vertical: false)
             } else if !state.ollamaReady {
-                Button("Start Ollama") { state.openOllama() }
+                Button("Start Ollama") { state.openOllama() }.fixedSize(horizontal: true, vertical: false)
             } else {
                 Button(canInstall ? "Install" : "Too large") { state.installModel(model) }
+                    .fixedSize(horizontal: true, vertical: false)
                     .disabled(state.installingModelTag != nil || !canInstall)
                     .help(fit == .risky ? "This model is too close to the safe memory budget." : fit == .unsupported ? "This model exceeds the safe memory budget." : "Install with Ollama.")
             }
@@ -1080,8 +1100,7 @@ struct ModelChecklist: View {
                         Toggle(isOn: Binding(get: { state.isModelEnabled("\(providerID):\(model.id)") }, set: { state.setModelEnabled("\(providerID):\(model.id)", enabled: $0) })) {
                             Text(model.name)
                                 .font(.callout)
-                                .lineLimit(1)
-                                .truncationMode(.tail)
+                                .fixedSize(horizontal: false, vertical: true)
                                 .help(model.name)
                         }
                         .toggleStyle(.checkbox)
@@ -1135,27 +1154,33 @@ struct ConnectionCard<Actions: View, Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 14) {
+            HStack(alignment: .top, spacing: 14) {
                 connectionIdentityMark
                     .frame(width: 30, height: 30)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(name).fontWeight(.semibold)
+                    Text(name)
+                        .fontWeight(.semibold)
+                        .fixedSize(horizontal: false, vertical: true)
                     Text(detail)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
+                        .fixedSize(horizontal: false, vertical: true)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .layoutPriority(1)
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(name)
                 .accessibilityValue(detail)
 
-                Spacer(minLength: 16)
-                actions()
+                Spacer(minLength: 0)
+                actions().fixedSize(horizontal: true, vertical: false)
                 // Shape/symbol distinguishes readiness without color alone; detail already
                 // carries the spoken status, so hide this chrome from VoiceOver.
                 ReadinessStatusIndicator(ready: ready, accessibilityStatus: detail)
                     .accessibilityHidden(true)
+                    .fixedSize(horizontal: true, vertical: false)
             }
             if showsContent {
                 content()
