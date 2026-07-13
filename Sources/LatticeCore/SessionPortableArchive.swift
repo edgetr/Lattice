@@ -1414,12 +1414,12 @@ public enum SessionPortableArchiveImporter {
     private static func backend(from route: String, model: String?) throws -> ChatBackend {
         let modelValue = model ?? ""
         switch route {
-        case "codex": return .codex(model: modelValue.isEmpty ? "gpt-5.5" : modelValue)
-        case "grok": return .grok(model: modelValue.isEmpty ? "grok" : modelValue)
-        case "opencode": return .openCode(model: modelValue.isEmpty ? "default" : modelValue)
-        case "antigravity": return .antigravity(model: modelValue.isEmpty ? "default" : modelValue)
+        case "codex": return .codex(model: modelValue)
+        case "grok": return .grok(model: modelValue)
+        case "opencode": return .openCode(model: modelValue)
+        case "antigravity": return .antigravity(model: modelValue)
         case "appleIntelligence": return .appleIntelligence
-        case "ollama": return .ollama(model: modelValue.isEmpty ? "llama3.2:latest" : modelValue)
+        case "ollama": return .ollama(model: modelValue)
         default:
             throw SessionPortableArchive.ArchiveError.invalidEnum(field: "chat.backendRoute", value: route)
         }

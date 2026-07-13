@@ -20,6 +20,84 @@ struct PolicyEngineTests {
         guard case .allow = engine.evaluate(request, under: .smart) else { Issue.record("Smart should allow reversible scoped edits"); return }
     }
 
+    @Test func smartRequiresApprovalForMaterialFileChangeWithoutReversibleEvidence() {
+        let request = ToolRequest(kind: .write, title: "Change files", detail: "Sources/App.swift", workspaceScoped: true, reversible: false)
+        guard case .requireApproval = engine.evaluate(request, under: .smart) else {
+            Issue.record("Smart must gate material file changes without provider undoability evidence")
+            return
+        }
+    }
+
+    @Test func smartRequiresApprovalForCodexFileChangeRequestWithoutProviderEvidence() throws {
+        let workspace = URL(fileURLWithPath: "/tmp/Lattice")
+        let object: [String: Any] = [
+            "method": "item/fileChange/requestApproval",
+            "params": [
+                "grantRoot": workspace.path,
+                "reason": "Update Sources/App.swift"
+            ]
+        ]
+
+        let approval = try #require(CodexExecHarness.appServerPermissionRequest(from: object, workspace: workspace))
+        let request = try #require(approval.toolRequest)
+        #expect(request.kind == .write)
+        #expect(request.workspaceScoped)
+        #expect(!request.reversible)
+        guard case .requireApproval = engine.evaluate(request, under: .smart) else {
+            Issue.record("Smart must gate Codex file-change requests without undo evidence")
+            return
+        }
+    }
+
+    @Test func smartRequiresApprovalForCodexFileChangeEventWithoutProviderEvidence() throws {
+        let workspace = URL(fileURLWithPath: "/tmp/Lattice")
+        let object: [String: Any] = [
+            "method": "item/started",
+            "params": [
+                "item": [
+                    "id": "file-change-1",
+                    "type": "fileChange",
+                    "changes": [["path": "Sources/App.swift"]]
+                ]
+            ]
+        ]
+
+        guard case .toolRequested(let request)? = CodexExecHarness.appServerEvent(from: object, workspace: workspace) else {
+            Issue.record("Expected Codex file-change tool request")
+            return
+        }
+        #expect(request.workspaceScoped)
+        #expect(!request.reversible)
+        guard case .requireApproval = engine.evaluate(request, under: .smart) else {
+            Issue.record("Smart must gate Codex file-change events without undo evidence")
+            return
+        }
+    }
+
+    @Test func smartKeepsOutOfWorkspaceCodexFileChangeApprovalGated() throws {
+        let workspace = URL(fileURLWithPath: "/tmp/Lattice")
+        let object: [String: Any] = [
+            "method": "item/started",
+            "params": [
+                "item": [
+                    "id": "file-change-outside",
+                    "type": "fileChange",
+                    "changes": [["path": "/tmp/Other/App.swift"]]
+                ]
+            ]
+        ]
+
+        guard case .toolRequested(let request)? = CodexExecHarness.appServerEvent(from: object, workspace: workspace) else {
+            Issue.record("Expected Codex out-of-workspace file-change tool request")
+            return
+        }
+        #expect(!request.workspaceScoped)
+        #expect(!request.reversible)
+        guard case .requireApproval = engine.evaluate(request, under: .smart) else {
+            Issue.record("Smart must gate Codex file changes outside selected workspace")
+            return
+        }
+    }
     @Test(arguments: ExecutionPolicy.allCases)
     func credentialsAlwaysDenied(policy: ExecutionPolicy) {
         let request = ToolRequest(kind: .credential, title: "Read token", detail: "Keychain", workspaceScoped: true, reversible: true)

@@ -114,6 +114,21 @@ struct RemoteInstallerScriptPolicyTests {
         }
     }
 
+    @Test func boundedByteAccumulationCapsStream() {
+        var buffer = Data()
+        for _ in 0..<100 {
+            _ = RemoteInstallerScriptPolicy.accumulate(byte: 7, into: &buffer, maximumByteCount: 100)
+        }
+        let exceeded = RemoteInstallerScriptPolicy.accumulate(byte: 8, into: &buffer, maximumByteCount: 100)
+        #expect(buffer.count == 100)
+        if case .exceeded(let maximum, let observed) = exceeded {
+            #expect(maximum == 100)
+            #expect(observed == 101)
+        } else {
+            Issue.record("Expected streamed byte accumulation to fail closed past cap")
+        }
+    }
+
     @Test func contentTypeRejectsHTMLAllowsShellAndMissing() {
         #expect(RemoteInstallerScriptPolicy.validateContentType(nil).message == nil)
         #expect(RemoteInstallerScriptPolicy.validateContentType("text/x-shellscript").message == nil)
@@ -145,6 +160,32 @@ struct RemoteInstallerScriptPolicyTests {
         } else {
             Issue.record("Expected digest mismatch")
         }
+    }
+
+    @Test func approvedEndpointsHavePinsAndUnknownEndpointsDoNot() {
+        for url in [approvedGrok, approvedOpenCode, approvedHermes] {
+            let pin = RemoteInstallerScriptPolicy.pinnedSHA256Hex(for: url)
+            #expect(pin?.count == 64)
+            #expect(pin?.allSatisfy(\.isHexDigit) == true)
+        }
+        #expect(RemoteInstallerScriptPolicy.pinnedSHA256Hex(for: unapproved) == nil)
+    }
+
+    @Test func unsignedAndMismatchedTrustRefuseExecution() {
+        let unsigned = RemoteInstallerScriptPolicy.trust(for: validScript)
+        #expect(RemoteInstallerScriptPolicy.executionMessage(for: unsigned)?.contains("unsigned") == true)
+
+        let mismatch = RemoteInstallerScriptPolicy.trust(
+            for: validScript,
+            expectedSHA256Hex: String(repeating: "ab", count: 32)
+        )
+        #expect(RemoteInstallerScriptPolicy.executionMessage(for: mismatch)?.contains("mismatch") == true)
+
+        let matched = RemoteInstallerScriptPolicy.trust(
+            for: validScript,
+            expectedSHA256Hex: RemoteInstallerScriptPolicy.sha256Hex(of: validScript)
+        )
+        #expect(RemoteInstallerScriptPolicy.executionMessage(for: matched) == nil)
     }
 
     @Test func evaluateDownloadCombinesContentAndTrust() {

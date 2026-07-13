@@ -50,14 +50,12 @@ public final class ACPHarness: @unchecked Sendable {
     }
 
     private final class PendingPermission: @unchecked Sendable {
-        enum Decision { case selected(String), cancelled }
+        enum Decision: Sendable { case selected(String), cancelled }
 
         let sessionID: UUID
         let requestID: UUID
         let optionIDs: Set<String>
-        private let semaphore = DispatchSemaphore(value: 0)
-        private let lock = NSLock()
-        private var decision: Decision?
+        private let waiter = PermissionWaiter<Decision>()
 
         init(sessionID: UUID, requestID: UUID, optionIDs: Set<String>) {
             self.sessionID = sessionID
@@ -67,29 +65,26 @@ public final class ACPHarness: @unchecked Sendable {
 
         @discardableResult
         func resolve(optionID: String?) -> Bool {
-            lock.lock()
-            guard decision == nil else { lock.unlock(); return false }
             if let optionID {
-                guard optionIDs.contains(optionID) else { lock.unlock(); return false }
-                decision = .selected(optionID)
-            } else {
-                decision = .cancelled
+                guard optionIDs.contains(optionID) else { return false }
+                return waiter.resolve(.selected(optionID))
             }
-            lock.unlock()
-            semaphore.signal()
-            return true
+            return waiter.resolve(.cancelled)
         }
 
-        func wait() -> Decision {
-            semaphore.wait()
-            lock.lock(); defer { lock.unlock() }
-            return decision ?? .cancelled
+        func wait(timeoutNanoseconds: UInt64) async -> PermissionWaitResult<Decision> {
+            await withTaskCancellationHandler(operation: {
+                await waiter.wait(timeoutNanoseconds: timeoutNanoseconds)
+            }, onCancel: {
+                _ = waiter.resolve(.cancelled)
+            })
         }
     }
 
     private let executableURL: URL?
     private let sandboxExecutableURL: URL?
     private let profile: Profile
+    private let permissionTimeoutNanoseconds: UInt64
     private let lock = NSLock()
     private var processes: [UUID: Process] = [:]
     private var inputs: [UUID: FileHandle] = [:]
@@ -100,11 +95,13 @@ public final class ACPHarness: @unchecked Sendable {
     public init(
         profile: Profile = .hermes,
         executableURL: URL? = nil,
-        sandboxExecutableURL: URL? = HarnessSandbox.systemExecutableURL
+        sandboxExecutableURL: URL? = HarnessSandbox.systemExecutableURL,
+        permissionTimeout: TimeInterval = 120
     ) {
         self.profile = profile
         self.executableURL = executableURL ?? ExecutableDiscovery.locate(profile.executableName)
         self.sandboxExecutableURL = sandboxExecutableURL
+        self.permissionTimeoutNanoseconds = PermissionTimeout.nanoseconds(for: permissionTimeout)
     }
 
     public var isInstalled: Bool { executableURL != nil }
@@ -150,7 +147,7 @@ public final class ACPHarness: @unchecked Sendable {
         }
     }
 
-    public func stream(prompt: String, sessionID: UUID, threadID: String?, workspace: URL, requestedModel: String) -> AsyncStream<AgentEvent> {
+    public func stream(prompt: String, sessionID: UUID, threadID: String?, workspace: URL, requestedModel: String, allowFileModification: Bool = true) -> AsyncStream<AgentEvent> {
         AsyncStream { continuation in
             let task = Task.detached(priority: .userInitiated) { [self] in
                 guard let executableURL else {
@@ -166,7 +163,8 @@ public final class ACPHarness: @unchecked Sendable {
                         executableURL: executableURL,
                         sandboxExecutableURL: sandboxExecutableURL,
                         workspace: canonicalWorkspace,
-                        scratchDirectory: scratchDirectory
+                        scratchDirectory: scratchDirectory,
+                        allowFileModification: allowFileModification
                     )
                     process.executableURL = launch.executableURL; process.arguments = launch.arguments
                     process.currentDirectoryURL = canonicalWorkspace
@@ -230,7 +228,7 @@ public final class ACPHarness: @unchecked Sendable {
 
                     sessionRequestID += 1
                     try Self.write(["jsonrpc": "2.0", "id": sessionRequestID, "method": "session/prompt", "params": ["sessionId": acpID, "prompt": [["type": "text", "text": prompt]]]], to: input.fileHandleForWriting)
-                    try readPromptResponse(id: sessionRequestID, sessionID: sessionID, workspace: canonicalWorkspace, from: reader, input: input.fileHandleForWriting, continuation: continuation)
+                    try await readPromptResponse(id: sessionRequestID, sessionID: sessionID, workspace: canonicalWorkspace, allowFileModification: allowFileModification, from: reader, input: input.fileHandleForWriting, continuation: continuation)
                     if process.isRunning { process.terminate() }
                     process.waitUntilExit()
                     let didCancel = unregister(sessionID)
@@ -291,7 +289,8 @@ public final class ACPHarness: @unchecked Sendable {
         executableURL: URL,
         sandboxExecutableURL: URL?,
         workspace: URL,
-        scratchDirectory: URL
+        scratchDirectory: URL,
+        allowFileModification: Bool = true
     ) throws -> HarnessSandbox.LaunchConfiguration {
         let runtimeDirectories = runtimeDirectoryCandidates().filter {
             var isDirectory: ObjCBool = false
@@ -300,7 +299,7 @@ public final class ACPHarness: @unchecked Sendable {
         return try HarnessSandbox.writeRestrictedLaunch(
             command: executableURL,
             arguments: profile.arguments(workspace: workspace),
-            writableDirectories: [workspace, scratchDirectory] + runtimeDirectories,
+            writableDirectories: (allowFileModification ? [workspace] : []) + [scratchDirectory] + runtimeDirectories,
             writablePaths: runtimeFileCandidates(),
             sandboxExecutableURL: sandboxExecutableURL
         )
@@ -382,10 +381,14 @@ public final class ACPHarness: @unchecked Sendable {
     }
 
     private func unregister(_ id: UUID) -> Bool {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
+        let pending = pendingPermissions.values.filter { $0.sessionID == id }
         processes[id] = nil; inputs[id] = nil; acpSessionIDs[id] = nil
         pendingPermissions = pendingPermissions.filter { $0.value.sessionID != id }
-        return cancelled.remove(id) != nil
+        let didCancel = cancelled.remove(id) != nil
+        lock.unlock()
+        pending.forEach { _ = $0.resolve(optionID: nil) }
+        return didCancel
     }
 
     private func register(_ pending: PendingPermission) {
@@ -434,7 +437,7 @@ public final class ACPHarness: @unchecked Sendable {
         }
     }
 
-    private func readPromptResponse(id: Int, sessionID: UUID, workspace: URL, from reader: BoundedJSONLineReader, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) throws {
+    private func readPromptResponse(id: Int, sessionID: UUID, workspace: URL, allowFileModification: Bool, from reader: BoundedJSONLineReader, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) async throws {
         while let object = try reader.next() {
             if object["method"] as? String == "session/update" {
                 let update = ((object["params"] as? [String: Any])?["update"] as? [String: Any])
@@ -447,7 +450,7 @@ public final class ACPHarness: @unchecked Sendable {
                 }
                 continue
             }
-            if object["method"] != nil { try answerServerRequest(object, sessionID: sessionID, workspace: workspace, to: input, continuation: continuation); continue }
+            if object["method"] != nil { try await answerServerRequest(object, sessionID: sessionID, workspace: workspace, allowFileModification: allowFileModification, to: input, continuation: continuation); continue }
             if (object["id"] as? NSNumber)?.intValue == id {
                 if let error = object["error"] as? [String: Any] { throw HarnessError.message(error["message"] as? String ?? "Hermes prompt failed.") }
                 return
@@ -456,21 +459,31 @@ public final class ACPHarness: @unchecked Sendable {
         throw HarnessError.message("ACP agent ended before completing the response.")
     }
 
-    private func answerServerRequest(_ object: [String: Any], sessionID: UUID, workspace: URL, to input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) throws {
+    private func answerServerRequest(_ object: [String: Any], sessionID: UUID, workspace: URL, allowFileModification: Bool, to input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) async throws {
         guard let id = object["id"], let method = object["method"] as? String else { return }
         guard method == "session/request_permission", let request = Self.permissionRequest(from: object, workspace: workspace) else {
             try Self.write(["jsonrpc": "2.0", "id": id, "error": ["code": -32601, "message": "Unsupported client request: \(method)"]], to: input)
             return
         }
+        if !allowFileModification, let kind = request.toolRequest?.kind, [.write, .command, .destructive, .credential, .unknown].contains(kind) {
+            try Self.write(["jsonrpc": "2.0", "id": id, "result": ["outcome": ["outcome": "cancelled"]]], to: input)
+            throw HarnessError.message("Provider file writes and commands are disabled during Lattice self-edit.")
+        }
         let pending = PendingPermission(sessionID: sessionID, requestID: request.id, optionIDs: Set(request.options.map(\.id)))
         register(pending)
         continuation.yield(.permissionRequested(request))
-        let decision = pending.wait()
+        let result = await pending.wait(timeoutNanoseconds: permissionTimeoutNanoseconds)
         removePendingPermission(request.id)
         let outcome: [String: Any]
-        switch decision {
-        case .selected(let optionID): outcome = ["outcome": "selected", "optionId": optionID]
-        case .cancelled: outcome = ["outcome": "cancelled"]
+        switch result {
+        case .resolved(.selected(let optionID)):
+            outcome = ["outcome": "selected", "optionId": optionID]
+        case .resolved(.cancelled):
+            outcome = ["outcome": "cancelled"]
+        case .timedOut:
+            outcome = ["outcome": "cancelled"]
+            try? Self.write(["jsonrpc": "2.0", "id": id, "result": ["outcome": outcome]], to: input)
+            throw HarnessError.message(PermissionTimeout.message)
         }
         try Self.write(["jsonrpc": "2.0", "id": id, "result": ["outcome": outcome]], to: input)
     }
@@ -500,29 +513,40 @@ public final class ACPHarness: @unchecked Sendable {
 
     private static func toolRequest(from toolCall: [String: Any], title: String, detail: String, workspace: URL?) -> ToolRequest {
         let rawInput = toolCall["rawInput"] as? [String: Any] ?? [:]
-        let locationMetadata = WorkspacePathScope.locationMetadata(in: toolCall)
-        let locations = locationMetadata.paths
-        let path = (rawInput["path"] as? String) ?? locations.first
-        let workspaceScoped = locationMetadata.isMalformed
-            ? false
-            : workspace.map { WorkspacePathScope.isWorkspaceScoped(path, workspace: $0) } ?? false
         return ToolRequest(
-            kind: toolKind(for: [toolCall["kind"] as? String, title, rawInput["command"] as? String].compactMap { $0 }.joined(separator: " ")),
+            kind: toolKind(
+                explicitKind: toolCall["kind"] as? String,
+                title: title,
+                command: rawInput["command"] as? String
+            ),
             title: title,
             detail: detail,
-            workspaceScoped: workspaceScoped,
+            workspaceScoped: WorkspacePathScope.isWorkspaceScoped(toolCall: toolCall, workspace: workspace),
             reversible: false
         )
     }
 
-    private static func toolKind(for value: String) -> ToolRequest.Kind {
-        let name = value.lowercased()
+    private static func toolKind(explicitKind: String?, title: String, command: String?) -> ToolRequest.Kind {
+        let explicitName = explicitKind?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let name = [explicitName, title, command]
+            .compactMap { $0 }
+            .joined(separator: " ")
+            .lowercased()
+        if name.contains("credential") || name.contains("secret") || name.contains("password") || name.contains("token") || name.contains("api key") || name.contains("keychain") {
+            return .credential
+        }
         if name.contains("delete") || name.contains("remove") { return .destructive }
         if name.contains("write") || name.contains("edit") || name.contains("patch") || name.contains("move") { return .write }
-        if name.contains("bash") || name.contains("terminal") || name.contains("execute") || name.contains("command") || name.contains("run ") { return .command }
+        if name.contains("bash") || name.contains("terminal") || name.contains("execute") || name.contains("command") || name.contains("run") { return .command }
         if name.contains("web") || name.contains("fetch") || name.contains("network") { return .network }
         if name.contains("browser") || name.contains("automation") { return .automation }
-        return .read
+        if ["read", "read_file", "list", "list_files", "search", "grep", "glob", "find", "stat", "inspect", "view"].contains(explicitName) {
+            return .read
+        }
+        if let command, !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return .command
+        }
+        return .unknown
     }
 
     private static func permissionDetail(toolCall: [String: Any]) -> String {

@@ -73,6 +73,15 @@ struct HarnessPermissionNotice: Identifiable {
     let request: ApprovalRequest
 }
 
+struct UnsafeProviderRouteAcknowledgement: Identifiable {
+    let id: String
+    let sessionID: UUID
+    let routeKey: String
+    let providerName: String
+    let modelName: String
+    let detail: String
+}
+
 private struct PreparedSubmission {
     let userText: String
     let runText: String
@@ -137,6 +146,7 @@ final class AppState: ObservableObject {
     @Published var policy: ExecutionPolicy = .ask
     @Published var privacyMode: SessionPrivacyMode = .cloudAllowed
     @Published var harnessPermissionNotices: [UUID: HarnessPermissionNotice] = [:]
+    @Published private(set) var pendingUnsafeProviderRouteAcknowledgement: UnsafeProviderRouteAcknowledgement?
     @Published var editingMessageContext: MessageEditContext?
     /// Composer draft present before the current edit began; restored when edit mode exits without a successful send.
     private var preservedComposerDraftBeforeEdit: String = ""
@@ -266,6 +276,8 @@ final class AppState: ObservableObject {
     private var activeRunIDs: [UUID: UUID] = [:]
     @Published private var runUIStates: [UUID: RunUIState] = [:]
     @Published private var globalErrorMessage: String?
+    /// Deliberately in-memory: provider tool bypass consent expires when Lattice exits.
+    private var acknowledgedUnsafeProviderRouteKeys: Set<String> = []
     /// Suppresses draft→session write-back while loading a session's draft into the composer.
     private var isApplyingComposerDraft = false
     private static let idleUnloadKey = "localModelIdleUnloadMinutes"
@@ -1357,6 +1369,10 @@ final class AppState: ObservableObject {
             setError(activeRouteStatusText ?? "Choose a connected model.", sessionID: selectedSessionID)
             return
         }
+        if let session = selectedSession,
+           !ensureUnsafeProviderRouteAcknowledged(for: session) {
+            return
+        }
         if selectedSession?.isStreaming == true {
             // Capture text first, then clear/persist only this chat's ordinary draft.
             draft = ComposerSessionDraftTransition.clearingOrdinaryDraft()
@@ -1453,6 +1469,7 @@ final class AppState: ObservableObject {
             overlayControlState = .expanded
             return false
         }
+        guard ensureUnsafeProviderRouteAcknowledged(for: sessions[index]) else { return false }
         markConversationOutgoingAction(for: id)
         if submission.startsSelfEdit {
             sessions[index].intent = .selfEdit
@@ -1482,6 +1499,7 @@ final class AppState: ObservableObject {
             overlayControlState = .expanded
             return
         }
+        guard ensureUnsafeProviderRouteAcknowledged(for: sessions[index]) else { return }
         markConversationOutgoingAction(for: id)
         sessions[index].messages[messageIndex].text = submission.userText
         sessions[index].messages.removeSubrange(sessions[index].messages.index(after: messageIndex)..<sessions[index].messages.endIndex)
@@ -1573,6 +1591,13 @@ final class AppState: ObservableObject {
     }
 
     private func startRun(for id: UUID, at index: Int, submittedText: String) {
+        // Defense in depth: every provider stream launch stays behind the same
+        // acknowledgement check, even if a future caller skips send validation.
+        guard ensureUnsafeProviderRouteAcknowledged(for: sessions[index]) else {
+            sessions[index].isStreaming = false
+            setError("Provider route blocked until its unsafe-route acknowledgement is accepted.", sessionID: id)
+            return
+        }
         sessions[index].isStreaming = true
         sessions[index].lastUpdated = .now
         globalErrorMessage = nil
@@ -1628,21 +1653,21 @@ final class AppState: ObservableObject {
             return
         }
         if harnessID == "pi", let piRoute = piRoute(for: session.backend) {
-            stream = pi.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, provider: piRoute.provider, model: piRoute.model, reasoningEffort: reasoningEffort, allowFileModification: true)
+            stream = pi.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, provider: piRoute.provider, model: piRoute.model, reasoningEffort: reasoningEffort, allowFileModification: !isExtensionSelfEdit)
         } else if harnessID == "hermes" {
-            stream = hermes.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: session.backend.displayName)
+            stream = hermes.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: session.backend.displayName, allowFileModification: !isExtensionSelfEdit)
         } else { switch session.backend {
         case .codex(let model):
             stream = codex.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, model: model, reasoningEffort: reasoningEffort, policy: session.policy)
         case .grok(let model):
-            stream = grokACP.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: model)
+            stream = grokACP.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: model, allowFileModification: !isExtensionSelfEdit)
         case .openCode(let model):
-            stream = openCodeACP.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: model)
+            stream = openCodeACP.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: model, allowFileModification: !isExtensionSelfEdit)
         case .appleIntelligence:
             let transcript = LatticeBackendMessageBuilder.transcript(session: session, submittedText: submittedText, additionalContext: additionalContext, contextPlan: contextPlan)
             stream = appleIntelligence.stream(prompt: transcript, sessionID: id)
         case .antigravity(let model):
-            stream = antigravity.stream(prompt: prompt, sessionID: id, workspace: workspace, model: model, policy: session.policy)
+            stream = antigravity.stream(prompt: prompt, sessionID: id, workspace: workspace, model: model, policy: isExtensionSelfEdit ? .ask : session.policy)
         case .ollama(let model):
             cancelLocalModelIdleUnload()
             localModelStatus = "Loaded \(model)"
@@ -1693,7 +1718,9 @@ final class AppState: ObservableObject {
         case .appleIntelligence:
             return appleIntelligenceReady
         case .ollama(let model):
-            return ollamaReady && !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            return ollamaReady
+                && !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && ollamaModels.contains(where: { $0.name == model })
         case .antigravity(let model):
             return antigravityAuthenticated && visibleAntigravityModels.contains(where: { $0.id == model })
         }
@@ -1751,7 +1778,9 @@ final class AppState: ObservableObject {
         case .appleIntelligence:
             return appleIntelligenceReady
         case .ollama(let model):
-            return ollamaReady && !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            return ollamaReady
+                && !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && ollamaModels.contains(where: { $0.name == model })
         case .antigravity(let model):
             return antigravityAuthenticated && visibleAntigravityModels.contains(where: { $0.id == model })
         }
@@ -1792,7 +1821,11 @@ final class AppState: ObservableObject {
             return appleIntelligenceStatus
         case .ollama(let model):
             if model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Choose a local model." }
-            return ollamaInstalled ? "Start Ollama before this chat can continue." : "Ollama is not installed."
+            if !ollamaInstalled { return "Ollama is not installed." }
+            if !ollamaReady { return "Start Ollama before this chat can continue." }
+            if !ollamaModels.contains(where: { $0.name == model }) {
+                return "The local model \(model) is not installed."
+            }
         case .antigravity(let model):
             if !antigravityInstalled { return "Antigravity CLI is not installed." }
             if !antigravityAuthenticated { return "Sign in to Antigravity before this chat can continue." }
@@ -1801,6 +1834,41 @@ final class AppState: ObservableObject {
             }
         }
         return "Choose a connected model."
+    }
+
+    private func ensureUnsafeProviderRouteAcknowledged(for session: LatticeSession) -> Bool {
+        let engineID = Self.engineID(for: session.backend)
+        let harnessID = effectiveHarnessID(for: session)
+        guard ProviderRouteSafetyPolicy.requiresAcknowledgement(engineID: engineID, harnessID: harnessID) else {
+            return true
+        }
+        let routeKey = ProviderRouteSafetyPolicy.routeKey(engineID: engineID, harnessID: harnessID)
+        guard !acknowledgedUnsafeProviderRouteKeys.contains(routeKey) else { return true }
+        let providerName: String
+        switch harnessID {
+        case "pi": providerName = "Pi"
+        case "hermes": providerName = "Hermes"
+        default: providerName = session.backend.harnessName
+        }
+        pendingUnsafeProviderRouteAcknowledgement = UnsafeProviderRouteAcknowledgement(
+            id: routeKey,
+            sessionID: session.id,
+            routeKey: routeKey,
+            providerName: providerName,
+            modelName: session.backend.displayName,
+            detail: ProviderRouteSafetyPolicy.acknowledgementDetail(providerName: providerName)
+        )
+        return false
+    }
+
+    func acknowledgeUnsafeProviderRoute() {
+        guard let pending = pendingUnsafeProviderRouteAcknowledgement else { return }
+        acknowledgedUnsafeProviderRouteKeys.insert(pending.routeKey)
+        pendingUnsafeProviderRouteAcknowledgement = nil
+    }
+
+    func dismissUnsafeProviderRouteAcknowledgement() {
+        pendingUnsafeProviderRouteAcknowledgement = nil
     }
 
     func stop() {
@@ -1821,6 +1889,10 @@ final class AppState: ObservableObject {
         reduceRunUI(.cancelled, for: id)
         harnessPermissionNotices[id] = nil
         persist()
+        cancelHarnessProcess(for: session, sessionID: id)
+    }
+
+    private func cancelHarnessProcess(for session: LatticeSession, sessionID id: UUID) {
         let harnessID = effectiveHarnessID(for: session)
         if harnessID == "pi" { pi.cancel(sessionID: id); return }
         if harnessID == "hermes" { hermes.cancel(sessionID: id); return }
@@ -1849,14 +1921,49 @@ final class AppState: ObservableObject {
             setError("That permission choice is not available in \(policy.rawValue) mode.", sessionID: notice.sessionID)
             return
         }
-        guard sessions.contains(where: { $0.id == notice.sessionID && $0.isStreaming }),
-              forwardHarnessPermission(notice, optionID: option.id) else {
+        guard sessions.contains(where: { $0.id == notice.sessionID && $0.isStreaming }) else {
             setError("This permission request is no longer active.", sessionID: notice.sessionID)
             harnessPermissionNotices[notice.sessionID] = nil
+            if let sessionIndex = sessions.firstIndex(where: { $0.id == notice.sessionID }) {
+                updateApprovalProvenance(
+                    id: notice.request.id,
+                    sessionIndex: sessionIndex,
+                    actor: .user,
+                    selectedOptionKind: option.kind,
+                    outcome: .stale,
+                    providerAcknowledgement: .rejectedByHarness
+                )
+            }
+            updateSessionAction(id: notice.request.id, status: .cancelled, sessionID: notice.sessionID)
+            return
+        }
+        guard forwardHarnessPermission(notice, optionID: option.id) else {
+            setError("This permission request is no longer active.", sessionID: notice.sessionID)
+            harnessPermissionNotices[notice.sessionID] = nil
+            if let sessionIndex = sessions.firstIndex(where: { $0.id == notice.sessionID }) {
+                updateApprovalProvenance(
+                    id: notice.request.id,
+                    sessionIndex: sessionIndex,
+                    actor: .user,
+                    selectedOptionKind: option.kind,
+                    outcome: .stale,
+                    providerAcknowledgement: .rejectedByHarness
+                )
+            }
             updateSessionAction(id: notice.request.id, status: .cancelled, sessionID: notice.sessionID)
             return
         }
         harnessPermissionNotices[notice.sessionID] = nil
+        if let sessionIndex = sessions.firstIndex(where: { $0.id == notice.sessionID }) {
+            updateApprovalProvenance(
+                id: notice.request.id,
+                sessionIndex: sessionIndex,
+                actor: .user,
+                selectedOptionKind: option.kind,
+                outcome: .forwarded,
+                providerAcknowledgement: .acceptedByHarness
+            )
+        }
         updateSessionAction(id: notice.request.id, status: option.isAllow ? .allowed : .denied, sessionID: notice.sessionID)
         setActivity([
             .init(
@@ -4181,11 +4288,18 @@ Lattice self-edit rules:
         if let message = RemoteInstallerScriptPolicy.validationMessage(for: url) { return (-1, Data(message.utf8)) }
         do {
             let download = try await RemoteInstallerScriptDownloader().download(from: url)
+            guard let expectedSHA256Hex = RemoteInstallerScriptPolicy.pinnedSHA256Hex(for: download.finalURL) else {
+                return (-1, Data("Provider installer redirected to an endpoint without a pinned signature.".utf8))
+            }
             let evaluation = RemoteInstallerScriptPolicy.evaluateDownload(
                 data: download.data,
-                contentType: download.contentType
+                contentType: download.contentType,
+                expectedSHA256Hex: expectedSHA256Hex
             )
             if let message = evaluation.contentMessage { return (-1, Data(message.utf8)) }
+            if let message = RemoteInstallerScriptPolicy.executionMessage(for: evaluation.trust) {
+                return (-1, Data(message.utf8))
+            }
             let scriptURL = FileManager.default.temporaryDirectory.appendingPathComponent("lattice-installer-\(UUID().uuidString).sh")
             try download.data.write(to: scriptURL, options: [.atomic])
             defer { try? FileManager.default.removeItem(at: scriptURL) }
@@ -4194,6 +4308,8 @@ Lattice self-edit rules:
                 return (-1, syntax.output.isEmpty ? Data("Downloaded installer failed shell syntax validation.".utf8) : syntax.output)
             }
             return await runCommand("bash", [scriptURL.path])
+        } catch let error as RemoteInstallerScriptDownloadError {
+            return (-1, Data(error.localizedDescription.utf8))
         } catch {
             return (-1, Data("Installer download failed: \(error.localizedDescription)".utf8))
         }
@@ -4638,6 +4754,13 @@ Lattice self-edit rules:
                 providerName: harnessID == "codex" ? "Codex" : (harnessID == "grok" ? "Grok" : (harnessID == "opencode" ? "OpenCode" : (harnessID == "pi" ? "Pi" : "Hermes"))),
                 request: request
             )
+            let automaticDecision = request.toolRequest.map { policyEngine.evaluate($0, under: sessions[index].policy) }
+            let policyReason: String = {
+                switch automaticDecision {
+                case .allow(let reason), .requireApproval(let reason), .deny(let reason): return reason
+                case nil: return "The provider requested an explicit permission decision."
+                }
+            }()
             if let messageID = sessions[index].messages.last(where: { $0.role == .assistant })?.id {
                 upsertSessionAction(.init(
                     id: request.id,
@@ -4647,21 +4770,73 @@ Lattice self-edit rules:
                     title: request.title,
                     detail: request.detail,
                     status: .waiting,
-                    workspaceScoped: request.toolRequest?.workspaceScoped ?? false
+                    workspaceScoped: request.toolRequest?.workspaceScoped ?? false,
+                    approvalProvenance: .init(
+                        harnessID: harnessID,
+                        providerName: notice.providerName,
+                        requestID: request.id,
+                        requestedOptionKinds: request.options.map(\.kind),
+                        toolKind: request.toolRequest?.kind,
+                        workspaceScoped: request.toolRequest?.workspaceScoped ?? false,
+                        policy: sessions[index].policy,
+                        policyReason: policyReason,
+                        actor: .user
+                    )
                 ), at: index)
             }
-            let automaticDecision = request.toolRequest.map { policyEngine.evaluate($0, under: sessions[index].policy) }
-            let automaticOptionID: String? = {
-                if case .some(.allow) = automaticDecision { return request.options.first(where: { $0.kind == "allow_once" })?.id }
-                if case .some(.deny) = automaticDecision { return request.options.first(where: \.isReject)?.id }
-                if sessions[index].policy == .yolo { return request.options.first(where: { $0.kind == "allow_once" })?.id }
-                return nil
-            }()
-            if let automaticOptionID, forwardHarnessPermission(notice, optionID: automaticOptionID) {
-                let allowed = request.options.first(where: { $0.id == automaticOptionID })?.isAllow == true
+            let automaticResolution = AutomaticPermissionResolutionPolicy.resolve(
+                decision: automaticDecision,
+                policy: sessions[index].policy,
+                options: request.options
+            )
+            switch automaticResolution {
+            case .forward(let optionID, let allowed):
+                guard forwardHarnessPermission(notice, optionID: optionID) else {
+                    harnessPermissionNotices[id] = nil
+                    updateApprovalProvenance(
+                        id: request.id,
+                        sessionIndex: index,
+                        actor: .automatic,
+                        selectedOptionKind: request.options.first(where: { $0.id == optionID })?.kind,
+                        outcome: .failed,
+                        providerAcknowledgement: .rejectedByHarness
+                    )
+                    updateSessionAction(id: request.id, status: allowed ? .cancelled : .denied, at: index)
+                    sessions[index].isStreaming = false
+                    activeRunIDs[id] = nil
+                    reduceRunUI(.failed("The provider rejected Lattice's automatic permission decision."), for: id)
+                    cancelHarnessProcess(for: sessions[index], sessionID: id)
+                    persist()
+                    return
+                }
+                updateApprovalProvenance(
+                    id: request.id,
+                    sessionIndex: index,
+                    actor: .automatic,
+                    selectedOptionKind: request.options.first(where: { $0.id == optionID })?.kind,
+                    outcome: .forwarded,
+                    providerAcknowledgement: .acceptedByHarness
+                )
                 updateSessionAction(id: request.id, status: allowed ? .allowed : .denied, at: index)
                 setActivity([.init(icon: allowed ? "checkmark.shield" : "xmark.shield", title: allowed ? "Allowed by \(sessions[index].policy.rawValue.capitalized) mode" : "Blocked by policy", detail: request.title)], sessionID: id)
-            } else {
+                reduceRunUI(.permissionResolved, for: id)
+            case .denyFailClosed(let reason):
+                let cancellationForwarded = forwardHarnessPermission(notice, optionID: nil)
+                harnessPermissionNotices[id] = nil
+                updateApprovalProvenance(
+                    id: request.id,
+                    sessionIndex: index,
+                    actor: .automatic,
+                    outcome: cancellationForwarded ? .forwarded : .failed,
+                    providerAcknowledgement: cancellationForwarded ? .acceptedByHarness : .unavailable
+                )
+                updateSessionAction(id: request.id, status: .denied, at: index)
+                sessions[index].isStreaming = false
+                activeRunIDs[id] = nil
+                reduceRunUI(.failed("Blocked by Lattice policy: \(reason)"), for: id)
+                cancelHarnessProcess(for: sessions[index], sessionID: id)
+                persist()
+            case .requestUser:
                 harnessPermissionNotices[id] = notice
                 setActivity([.init(icon: "hand.raised.fill", title: request.title, detail: "Waiting for your decision")], sessionID: id)
                 reduceRunUI(.permissionRequested, for: id)
@@ -4704,13 +4879,38 @@ Lattice self-edit rules:
             harnessPermissionNotices[id] = nil
             selfEditRunIDs.remove(id)
             submittedRequests[id] = nil
-            finishPendingActions(status: .failed, at: index)
+            let timedOut = message == "Permission request timed out."
+            finishPendingActions(
+                status: .failed,
+                at: index,
+                approvalOutcome: timedOut ? .timedOut : .failed,
+                providerAcknowledgement: timedOut ? .timedOut : .unavailable
+            )
             sessions[index].isStreaming = false
             reduceRunUI(.failed(message), for: id)
             if sessions[index].messages.last?.text.isEmpty == true { sessions[index].messages.removeLast() }
             persist()
             scheduleIdleUnloadIfNeeded(for: backend)
         }
+    }
+
+    private func updateApprovalProvenance(
+        id: UUID,
+        sessionIndex: Int,
+        actor: ApprovalProvenance.Actor? = nil,
+        selectedOptionKind: String? = nil,
+        outcome: ApprovalProvenance.Outcome? = nil,
+        providerAcknowledgement: ApprovalProvenance.ProviderAcknowledgement? = nil
+    ) {
+        guard let actionIndex = sessions[sessionIndex].actions.firstIndex(where: { $0.id == id }),
+              var provenance = sessions[sessionIndex].actions[actionIndex].approvalProvenance else { return }
+        if let actor { provenance.actor = actor }
+        if let selectedOptionKind { provenance.selectedOptionKind = selectedOptionKind }
+        if let outcome { provenance.outcome = outcome }
+        if let providerAcknowledgement { provenance.providerAcknowledgement = providerAcknowledgement }
+        provenance.updatedAt = .now
+        sessions[sessionIndex].actions[actionIndex].approvalProvenance = provenance
+        sessions[sessionIndex].lastUpdated = .now
     }
 
     // MARK: - Persistence recovery
@@ -5014,14 +5214,47 @@ Lattice self-edit rules:
         updateSessionAction(id: actionID, status: status, at: sessionIndex)
     }
 
-    private func finishPendingActions(status: SessionAction.Status, at sessionIndex: Int) {
+    private func finishPendingActions(
+        status: SessionAction.Status,
+        at sessionIndex: Int,
+        approvalOutcome: ApprovalProvenance.Outcome? = nil,
+        providerAcknowledgement: ApprovalProvenance.ProviderAcknowledgement? = nil
+    ) {
         guard let messageID = sessions[sessionIndex].messages.last(where: { $0.role == .assistant })?.id else { return }
+        let outcome = approvalOutcome ?? (status == .failed ? .failed : .cancelled)
+        let acknowledgement = providerAcknowledgement ?? (status == .failed ? .unavailable : .cancelled)
+        finalizePendingApprovalProvenance(
+            at: sessionIndex,
+            outcome: outcome,
+            providerAcknowledgement: acknowledgement
+        )
         if SessionActionTrail.finishPending(for: messageID, as: status, in: &sessions[sessionIndex].actions) > 0 { persist() }
     }
 
     private func finishCompletedTurnActions(at sessionIndex: Int) {
         guard let messageID = sessions[sessionIndex].messages.last(where: { $0.role == .assistant })?.id else { return }
+        finalizePendingApprovalProvenance(
+            at: sessionIndex,
+            outcome: .cancelled,
+            providerAcknowledgement: .cancelled
+        )
         if SessionActionTrail.finishCompletedTurn(for: messageID, in: &sessions[sessionIndex].actions) > 0 { persist() }
+    }
+
+    private func finalizePendingApprovalProvenance(
+        at sessionIndex: Int,
+        outcome: ApprovalProvenance.Outcome,
+        providerAcknowledgement: ApprovalProvenance.ProviderAcknowledgement
+    ) {
+        for actionIndex in sessions[sessionIndex].actions.indices {
+            guard sessions[sessionIndex].actions[actionIndex].kind == .approval,
+                  [.running, .waiting].contains(sessions[sessionIndex].actions[actionIndex].status),
+                  var provenance = sessions[sessionIndex].actions[actionIndex].approvalProvenance else { continue }
+            provenance.outcome = outcome
+            provenance.providerAcknowledgement = providerAcknowledgement
+            provenance.updatedAt = .now
+            sessions[sessionIndex].actions[actionIndex].approvalProvenance = provenance
+        }
     }
 
     private func setActivity(_ items: [ActivityItem], sessionID: UUID) {
@@ -5070,6 +5303,7 @@ Lattice self-edit rules:
         case .automation: "cursorarrow.motionlines"
         case .credential: "key"
         case .destructive: "exclamationmark.triangle"
+        case .unknown: "questionmark.circle"
         }
     }
 

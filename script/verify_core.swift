@@ -90,6 +90,64 @@ struct CoreVerification {
         let write = ToolRequest(kind: .write, title: "Write", detail: "file", workspaceScoped: true, reversible: true)
         if case .allow = policy.evaluate(read, under: .ask) { expect(true, "Ask read") } else { expect(false, "Ask read") }
         if case .requireApproval = policy.evaluate(write, under: .ask) { expect(true, "Ask write") } else { expect(false, "Ask write") }
+        let materialFileChange = ToolRequest(kind: .write, title: "Change files", detail: "Sources/App.swift", workspaceScoped: true, reversible: false)
+        if case .requireApproval = policy.evaluate(materialFileChange, under: .smart) {
+            expect(true, "Smart gates material file changes without reversible evidence")
+        } else {
+            expect(false, "Smart gates material file changes without reversible evidence")
+        }
+        let f05CodexWorkspace = URL(fileURLWithPath: "/tmp/Lattice")
+        let f05CodexApprovalObject: [String: Any] = [
+            "method": "item/fileChange/requestApproval",
+            "params": ["grantRoot": f05CodexWorkspace.path, "reason": "Update Sources/App.swift"]
+        ]
+        if let approval = CodexExecHarness.appServerPermissionRequest(from: f05CodexApprovalObject, workspace: f05CodexWorkspace),
+           let request = approval.toolRequest {
+            expect(request.workspaceScoped && !request.reversible, "Codex file-change request defaults non-reversible without undo evidence")
+            if case .requireApproval = policy.evaluate(request, under: .smart) {
+                expect(true, "Smart gates scoped Codex file-change request")
+            } else {
+                expect(false, "Smart gates scoped Codex file-change request")
+            }
+        } else {
+            expect(false, "Codex file-change request defaults non-reversible without undo evidence")
+        }
+        let f05CodexEventObject: [String: Any] = [
+            "method": "item/started",
+            "params": ["item": [
+                "id": "file-change-1",
+                "type": "fileChange",
+                "changes": [["path": "Sources/App.swift"]]
+            ]]
+        ]
+        if case .toolRequested(let request)? = CodexExecHarness.appServerEvent(from: f05CodexEventObject, workspace: f05CodexWorkspace) {
+            expect(request.workspaceScoped && !request.reversible, "Codex file-change event defaults non-reversible without undo evidence")
+            if case .requireApproval = policy.evaluate(request, under: .smart) {
+                expect(true, "Smart gates scoped Codex file-change event")
+            } else {
+                expect(false, "Smart gates scoped Codex file-change event")
+            }
+        } else {
+            expect(false, "Codex file-change event defaults non-reversible without undo evidence")
+        }
+        let f05CodexOutsideObject: [String: Any] = [
+            "method": "item/started",
+            "params": ["item": [
+                "id": "file-change-outside",
+                "type": "fileChange",
+                "changes": [["path": "/tmp/Other/App.swift"]]
+            ]]
+        ]
+        if case .toolRequested(let request)? = CodexExecHarness.appServerEvent(from: f05CodexOutsideObject, workspace: f05CodexWorkspace) {
+            expect(!request.workspaceScoped && !request.reversible, "Codex file-change scope remains fail-closed")
+            if case .requireApproval = policy.evaluate(request, under: .smart) {
+                expect(true, "Smart gates out-of-workspace Codex file-change event")
+            } else {
+                expect(false, "Smart gates out-of-workspace Codex file-change event")
+            }
+        } else {
+            expect(false, "Codex file-change scope remains fail-closed")
+        }
         let broker = LocalToolBroker(handlers: [
             .write: { request in .toolProgress(id: request.id, fraction: 1, detail: "patched") }
         ])
@@ -675,7 +733,14 @@ struct CoreVerification {
         expect(BackendAvailabilityPolicy.normalize(.codex(model: "gpt-5.4"), using: disconnectedCloud) == .ollama(model: "llama3.2:latest"), "Disconnected stale Codex model does not migrate to disconnected preferred model")
         expect(BackendAvailabilityPolicy.normalize(.openCode(model: "opencode/model"), using: disconnectedCloud) == .ollama(model: "llama3.2:latest"), "Disconnected OpenCode catalog is not treated as runnable")
         let localOnly = BackendAvailabilitySnapshot(ollamaModelNames: ["llama3.2:latest"])
-        expect(BackendAvailabilityPolicy.normalize(.ollama(model: ""), using: localOnly) == .ollama(model: "llama3.2:latest"), "Empty local backend normalizes to installed local model")
+        expect(BackendAvailabilityPolicy.normalize(.ollama(model: ""), using: localOnly) == .ollama(model: ""), "Empty local backend stays unresolved")
+        let modelLessArchive = """
+        {"format":"lattice.session.archive","version":1,"exportedAt":"2024-01-01T00:00:00Z","chat":{"title":"Model-less","backendRoute":"ollama","policy":"Ask","privacyMode":"cloudAllowed"}}
+        """
+        let modelLessImport = try! SessionPortableArchiveImporter.prepareImport(data: Data(modelLessArchive.utf8), existingSessions: [])
+        expect(modelLessImport.session.backend == .ollama(model: ""), "Model-less archive preserves empty Ollama provenance")
+        let discoveredOllama = BackendAvailabilitySnapshot(ollamaModelNames: ["qwen3:8b"])
+        expect(BackendAvailabilityPolicy.normalize(.ollama(model: "qwen3:8b"), using: discoveredOllama) == .ollama(model: "qwen3:8b"), "Discovered Ollama model recovers exact route")
         expect(ExecutionRoutePolicy.defaultHarnessID(for: "ollama") == "lattice", "Ollama defaults to Lattice harness")
         expect(ExecutionRoutePolicy.compatibleHarnessIDs(for: "ollama") == ["lattice"], "Ollama only exposes its implemented Lattice route")
         expect(ExecutionRoutePolicy.compatibleHarnessIDs(for: "codex").contains("pi"), "Codex can execute through Pi RPC")
@@ -2263,8 +2328,14 @@ struct CoreVerification {
             storedEnabledIDs: ["preview", "invalid", "missing"],
             knownIDs: []
         )
-        expect(enablement.enabledIDs == ["layout-runtime", "runtime"], "Extension enablement only keeps valid runtime extensions")
-        expect(enablement.knownIDs == ["layout-runtime", "runtime"], "Extension known set only tracks auto-enabled runtime extensions")
+        expect(enablement.enabledIDs.isEmpty, "First-seen runtime extensions stay disabled until explicitly applied")
+        expect(enablement.knownIDs == ["layout-runtime", "runtime"], "Extension known set tracks valid runtime extensions")
+        let explicitlyAppliedEnablement = LatticeExtensionEnablementPolicy.refresh(
+            records: [runtimeRecord],
+            storedEnabledIDs: ["runtime"],
+            knownIDs: []
+        )
+        expect(explicitlyAppliedEnablement.enabledIDs == ["runtime"], "Explicitly applied runtime extension remains enabled")
         let disabledKnownEnablement = LatticeExtensionEnablementPolicy.refresh(
             records: [runtimeRecord],
             storedEnabledIDs: [],
@@ -2864,6 +2935,41 @@ struct CoreVerification {
         expect(decodedFingerprintMissing.portableArchiveFingerprint == nil, "Missing portableArchiveFingerprint defaults to nil")
         expect(decodedFingerprintMissing.attachments.first?.isMissing == false, "Missing attachment isMissing defaults to false")
         expect(fingerprintSession.portableArchiveFingerprint == "abc", "Fingerprint can be stored on session metadata")
+
+        let provenanceRequestID = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
+        let provenance = ApprovalProvenance(
+            harnessID: "hermes",
+            providerName: "Hermes",
+            requestID: provenanceRequestID,
+            requestedOptionKinds: ["allow_once", "reject_once"],
+            toolKind: .write,
+            workspaceScoped: true,
+            policy: .smart,
+            policyReason: "Material changes require confirmation.",
+            actor: .user,
+            selectedOptionKind: "allow_once",
+            outcome: .forwarded,
+            providerAcknowledgement: .acceptedByHarness
+        )
+        let provenanceAction = SessionAction(
+            messageID: UUID(),
+            kind: .approval,
+            toolKind: .write,
+            title: "Approval",
+            detail: "bounded summary",
+            status: .allowed,
+            workspaceScoped: true,
+            approvalProvenance: provenance
+        )
+        let provenanceData = try! JSONEncoder().encode(provenanceAction)
+        let decodedProvenanceAction = try! JSONDecoder().decode(SessionAction.self, from: provenanceData)
+        expect(decodedProvenanceAction.approvalProvenance == provenance, "Approval provenance survives durable session JSON")
+        let redactedCLIMessage = CLIActionStatusPolicy.failureMessage(
+            prefix: "Install failed",
+            output: Data("authorization: Bearer abcdefghijklmnop sk-proj-abcdefghijklmnop\n".utf8)
+        )
+        expect(redactedCLIMessage.contains("[REDACTED]"), "CLI failure summaries redact credential-shaped output")
+        expect(!redactedCLIMessage.contains("abcdefghijklmnop"), "CLI failure summaries do not expose token material")
 
         print("Core verification passed: \(checks) checks")
     }

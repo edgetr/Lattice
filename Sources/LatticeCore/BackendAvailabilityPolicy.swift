@@ -78,24 +78,28 @@ public enum BackendAvailabilityPolicy {
     public static func normalize(_ backend: ChatBackend, using snapshot: BackendAvailabilitySnapshot) -> ChatBackend {
         switch backend {
         case .codex(let model):
+            guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return backend }
             guard snapshot.codexReady else { return snapshot.preferredBackend }
             guard !snapshot.codexModels.isEmpty else { return snapshot.codexCatalogKnown ? snapshot.preferredBackend : backend }
             if snapshot.codexModels.contains(where: { $0.id == model }) { return backend }
             return snapshot.codexModels.preferredModel.map { .codex(model: $0.id) } ?? snapshot.preferredBackend
 
         case .grok(let model):
+            guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return backend }
             guard snapshot.grokReady else { return snapshot.preferredBackend }
             guard !snapshot.grokModels.isEmpty else { return snapshot.grokCatalogKnown ? snapshot.preferredBackend : backend }
             if snapshot.grokModels.contains(where: { $0.id == model }) { return backend }
             return snapshot.grokModels.preferredModel.map { .grok(model: $0.id) } ?? snapshot.preferredBackend
 
         case .openCode(let model):
+            guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return backend }
             guard snapshot.openCodeReady else { return snapshot.preferredBackend }
             guard !snapshot.openCodeModels.isEmpty else { return snapshot.openCodeCatalogKnown ? snapshot.preferredBackend : backend }
             if snapshot.openCodeModels.contains(where: { $0.id == model }) { return backend }
             return snapshot.openCodeModels.preferredModel.map { .openCode(model: $0.id) } ?? snapshot.preferredBackend
 
         case .antigravity(let model):
+            guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return backend }
             guard snapshot.antigravityReady else { return snapshot.preferredBackend }
             guard !snapshot.antigravityModels.isEmpty else { return snapshot.preferredBackend }
             if snapshot.antigravityModels.contains(where: { $0.id == model }) { return backend }
@@ -105,7 +109,7 @@ public enum BackendAvailabilityPolicy {
             return snapshot.appleIntelligenceReady ? backend : snapshot.preferredBackend
 
         case .ollama(let model):
-            guard !model.isEmpty else { return snapshot.preferredBackend }
+            guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return backend }
             guard !snapshot.ollamaModelNames.isEmpty else { return backend }
             return snapshot.ollamaModelNames.contains(model) ? backend : snapshot.preferredBackend
         }

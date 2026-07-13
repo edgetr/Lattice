@@ -18,6 +18,7 @@ public enum RemoteInstallerScriptDownloadError: Error, LocalizedError, Sendable,
     case invalidURL(String)
     case redirectRejected(String)
     case responseRejected
+    case contentRejected(String)
     case bodyLimit(maximumByteCount: Int, observedByteCount: Int)
     case timedOut
     case transport(String)
@@ -30,6 +31,8 @@ public enum RemoteInstallerScriptDownloadError: Error, LocalizedError, Sendable,
             return message
         case .responseRejected:
             return "Provider installer download failed."
+        case .contentRejected(let message):
+            return message
         case .bodyLimit(let maximum, _):
             return "Downloaded installer exceeded Lattice's \(maximum / 1_000_000) MB safety limit."
         case .timedOut:
@@ -132,7 +135,7 @@ public final class RemoteInstallerScriptDownloader: @unchecked Sendable {
             if let message = RemoteInstallerScriptPolicy
                 .validateContentType(http.value(forHTTPHeaderField: "Content-Type"))
                 .message {
-                throw RemoteInstallerScriptDownloadError.transport(message)
+                throw RemoteInstallerScriptDownloadError.contentRejected(message)
             }
             if http.expectedContentLength >= 0,
                http.expectedContentLength > Int64(maximumByteCount) {

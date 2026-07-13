@@ -51,20 +51,16 @@ public enum HarnessToolEventDecoder {
                 : locations.joined(separator: ", ")
             let title = update["title"] as? String ?? "Hermes tool call"
             let kindName = update["kind"] as? String ?? title
-            let workspaceScoped: Bool
-            if locationMetadata.isMalformed {
-                workspaceScoped = false
-            } else if locations.isEmpty {
-                workspaceScoped = WorkspacePathScope.isWorkspaceScoped(rawInput["path"] as? String, workspace: workspace)
-            } else {
-                workspaceScoped = locations.allSatisfy { WorkspacePathScope.isWorkspaceScoped($0, workspace: workspace) }
-            }
             return .toolRequested(.init(
                 id: id,
                 kind: kind(for: kindName),
                 title: title,
                 detail: detail,
-                workspaceScoped: workspaceScoped,
+                workspaceScoped: WorkspacePathScope.isWorkspaceScoped(
+                    rawInput: update["rawInput"],
+                    locations: update["locations"],
+                    workspace: workspace
+                ),
                 reversible: false
             ))
         case "tool_call_update":
@@ -109,12 +105,17 @@ public enum HarnessToolEventDecoder {
 
     private static func kind(for rawName: String) -> ToolRequest.Kind {
         let name = rawName.lowercased()
+        if name.contains("credential") || name.contains("secret") || name.contains("password") || name.contains("token") || name.contains("api key") || name.contains("keychain") {
+            return .credential
+        }
         if name.contains("delete") || name.contains("remove") { return .destructive }
         if name.contains("write") || name.contains("edit") || name.contains("patch") || name.contains("move") { return .write }
         if name.contains("bash") || name.contains("terminal") || name.contains("execute") || name.contains("command") { return .command }
         if name.contains("web") || name.contains("fetch") || name.contains("network") { return .network }
         if name.contains("browser") || name.contains("automation") { return .automation }
-        return .read
+        let explicitReadNames = ["read", "read_file", "list", "list_files", "search", "grep", "glob", "find", "stat", "inspect", "view"]
+        if explicitReadNames.contains(name) { return .read }
+        return .unknown
     }
 
     private static func displayName(_ rawName: String) -> String {

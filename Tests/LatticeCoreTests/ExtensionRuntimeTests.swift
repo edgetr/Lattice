@@ -156,6 +156,24 @@ struct ExtensionRuntimeTests {
         try? FileManager.default.removeItem(at: global)
     }
 
+    @Test func globalSkillImportRejectsSymlinkedSourceFiles() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let global = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let globalSkill = global.appendingPathComponent("linked-skill", isDirectory: true)
+        let secret = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: globalSkill, withIntermediateDirectories: true)
+        try Data("must not be imported".utf8).write(to: secret)
+        try FileManager.default.createSymbolicLink(at: globalSkill.appendingPathComponent("SKILL.md"), withDestinationURL: secret)
+
+        let store = LatticeSkillStore(rootURL: root, globalRoots: [global])
+        try store.importGlobalSkills()
+        #expect(store.load().isEmpty)
+
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: global)
+        try? FileManager.default.removeItem(at: secret)
+    }
+
     @Test func importedSkillsMayContainFullWorkflowsBeyondGeneratedLimit() {
         let store = LatticeSkillStore(rootURL: URL(fileURLWithPath: "/tmp/unused"), globalRoots: [])
         let markdown = "# Hatch Pet\n\n" + String(repeating: "Detailed validation workflow.\n", count: 1_200)
@@ -340,6 +358,85 @@ struct ExtensionRuntimeTests {
         try? FileManager.default.removeItem(at: root)
     }
 
+    @Test func extensionStoreRejectsSymlinkedBundleForWriteLoadRollbackAndDelete() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let outside = root.deletingLastPathComponent().appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let bundle = root.appendingPathComponent("com.lattice.escape", isDirectory: true)
+        let outsideManifest = outside.appendingPathComponent("lattice-extension.json")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let sentinel = Data("outside-extension-data".utf8)
+        try sentinel.write(to: outsideManifest)
+        try FileManager.default.createSymbolicLink(at: bundle, withDestinationURL: outside)
+
+        let store = LatticeExtensionStore(rootURL: root)
+        let manifest = LatticeExtensionManifest(
+            id: "com.lattice.escape",
+            name: "Escape",
+            version: "1",
+            summary: "Symlink escape test."
+        )
+        #expect(throws: (any Error).self) {
+            try store.writeGeneratedExtension(manifest)
+        }
+        #expect(try Data(contentsOf: outsideManifest) == sentinel)
+        #expect(store.manifestData(for: manifest.id) == nil)
+        #expect(store.load().isEmpty)
+        #expect(throws: (any Error).self) {
+            try store.restoreExtension(manifestID: manifest.id, previousManifestData: JSONEncoder().encode(manifest))
+        }
+        #expect(throws: (any Error).self) {
+            try store.restoreExtension(manifestID: manifest.id, previousManifestData: nil)
+        }
+        #expect(try Data(contentsOf: outsideManifest) == sentinel)
+    }
+
+    @Test func skillStoreRejectsSymlinkedFolderForWriteLoadRollbackAndDelete() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let outside = root.deletingLastPathComponent().appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let folder = root.appendingPathComponent("escape", isDirectory: true)
+        let outsideSkill = outside.appendingPathComponent("SKILL.md")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let sentinel = Data("outside-skill-data".utf8)
+        try sentinel.write(to: outsideSkill)
+        try FileManager.default.createSymbolicLink(at: folder, withDestinationURL: outside)
+
+        let store = LatticeSkillStore(rootURL: root, globalRoots: [])
+        let patch = LatticeSkillPatch(id: "escape", title: "Escape", summary: "Symlink escape test.", markdown: "# Escape\n\nDo not follow links.")
+        #expect(throws: (any Error).self) {
+            try store.writeGeneratedSkill(patch)
+        }
+        #expect(store.load().isEmpty)
+        #expect(store.snapshotSkill(id: patch.id).skillData == nil)
+        let snapshot = LatticeSkillSnapshot(
+            id: patch.id,
+            skillData: Data("rollback".utf8),
+            sourceRaw: LatticeSkillSource.generated.rawValue,
+            originalPath: nil,
+            ownerExtensionID: nil,
+            wasDeletedGlobalSkill: false
+        )
+        #expect(throws: (any Error).self) {
+            try store.restoreSkill(snapshot)
+        }
+        #expect(throws: (any Error).self) {
+            try store.deleteSkill(id: patch.id)
+        }
+        #expect(throws: (any Error).self) {
+            _ = try store.deleteSkill(id: patch.id, ownedByExtensionID: "com.lattice.owner")
+        }
+        #expect(try Data(contentsOf: outsideSkill) == sentinel)
+    }
+
     @Test func enablementOnlyKeepsValidRuntimeExtensions() {
         let runtime = LatticeExtensionRecord(
             id: "runtime",
@@ -394,8 +491,15 @@ struct ExtensionRuntimeTests {
             storedEnabledIDs: ["preview", "invalid", "missing"],
             knownIDs: []
         )
-        #expect(result.enabledIDs == ["layout-runtime", "runtime"])
+        #expect(result.enabledIDs.isEmpty)
         #expect(result.knownIDs == ["layout-runtime", "runtime"])
+
+        let explicitlyApplied = LatticeExtensionEnablementPolicy.refresh(
+            records: [runtime],
+            storedEnabledIDs: ["runtime"],
+            knownIDs: []
+        )
+        #expect(explicitlyApplied.enabledIDs == ["runtime"])
 
         let disabledKnown = LatticeExtensionEnablementPolicy.refresh(
             records: [runtime],

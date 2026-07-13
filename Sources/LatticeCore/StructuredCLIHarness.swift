@@ -99,7 +99,9 @@ public final class StructuredCLIHarness: @unchecked Sendable {
     private static func run(_ executable: URL, arguments: [String]) async -> BoundedSubprocessResult {
         await BoundedSubprocess.run(.init(
             executableURL: executable,
-            arguments: arguments
+            arguments: arguments,
+            deadline: 30,
+            maximumOutputBytes: BoundedSubprocessRequest.defaultMaximumOutputBytes
         ))
     }
 

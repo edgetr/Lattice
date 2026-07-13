@@ -109,6 +109,23 @@ struct RecommendationTests {
         #expect(CLIActionStatusPolicy.updateMessage(status: 0, output: Data("done".utf8), beforeVersion: nil, afterVersion: nil) == "Update finished, but Lattice could not verify the active CLI version.")
     }
 
+    @Test func cliFailureMessagesRedactCredentialShapedOutput() {
+        let output = "authorization: Bearer abcdefghijklmnop session_id=session-12345678 sk-proj-abcdefghijklmnop\n"
+        let message = CLIActionStatusPolicy.failureMessage(prefix: "Install failed", output: Data(output.utf8))
+        #expect(message.contains("Install failed:"))
+        #expect(!message.contains("abcdefghijklmnop"))
+        #expect(message.contains("[REDACTED]"))
+        #expect(!message.contains("\n"))
+        #expect(message.count <= 156)
+    }
+
+    @Test func cliFailureMessagesKeepSafeSummaryAndBoundHugeOutput() {
+        let output = String(repeating: "safe detail ", count: 1_000) + "\n"
+        let message = CLIActionStatusPolicy.failureMessage(prefix: "Update failed", output: Data(output.utf8))
+        #expect(message.hasPrefix("Update failed: safe detail"))
+        #expect(message.count <= 156)
+    }
+
     @Test func grokTextCatalogDoesNotInferReasoningOptionsFromModelName() {
         let output = """
         You are logged in
@@ -230,6 +247,32 @@ struct RecommendationTests {
         let snapshot = BackendAvailabilitySnapshot(antigravityModels: models, antigravityReady: true)
         #expect(BackendAvailabilityPolicy.normalize(.antigravity(model: models[0].id), using: snapshot) == .antigravity(model: models[0].id))
         #expect(BackendAvailabilityPolicy.normalize(.antigravity(model: "Retired model"), using: snapshot) == .antigravity(model: models[0].id))
+    }
+
+    @Test func emptyModelStaysUnavailableAcrossReadyProviderRoutes() {
+        let providerModel = ProviderModel(id: "runtime-model", name: "Runtime model", isDefault: true)
+        let snapshot = BackendAvailabilitySnapshot(
+            codexModels: [providerModel],
+            grokModels: [providerModel],
+            openCodeModels: [providerModel],
+            antigravityModels: [providerModel],
+            antigravityReady: true,
+            ollamaModelNames: ["runtime-model"]
+        )
+        #expect(BackendAvailabilityPolicy.normalize(.codex(model: ""), using: snapshot) == .codex(model: ""))
+        #expect(BackendAvailabilityPolicy.normalize(.grok(model: ""), using: snapshot) == .grok(model: ""))
+        #expect(BackendAvailabilityPolicy.normalize(.openCode(model: ""), using: snapshot) == .openCode(model: ""))
+        #expect(BackendAvailabilityPolicy.normalize(.antigravity(model: ""), using: snapshot) == .antigravity(model: ""))
+        #expect(BackendAvailabilityPolicy.normalize(.ollama(model: ""), using: snapshot) == .ollama(model: ""))
+    }
+
+    @Test func ollamaModelStaysUnavailableUntilRuntimeCatalogDiscoversIt() {
+        let backend = ChatBackend.ollama(model: "qwen3:8b")
+        let emptyCatalog = BackendAvailabilitySnapshot(ollamaModelNames: [])
+        let discoveredCatalog = BackendAvailabilitySnapshot(ollamaModelNames: ["qwen3:8b"])
+
+        #expect(BackendAvailabilityPolicy.normalize(backend, using: emptyCatalog) == backend)
+        #expect(BackendAvailabilityPolicy.normalize(backend, using: discoveredCatalog) == backend)
     }
 
     @Test func hermesCompatibilityMatchesModelIdentityAcrossProviders() {

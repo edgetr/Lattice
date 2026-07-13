@@ -611,11 +611,9 @@ public enum LatticeExtensionEnablementPolicy {
         knownIDs: Set<String>
     ) -> (enabledIDs: Set<String>, knownIDs: Set<String>) {
         let runtimeIDs = Set(records.filter { $0.isValid && $0.hasRuntimePatches }.map(\.id))
-        let firstSeenRuntimeIDs = runtimeIDs.subtracting(knownIDs)
         let enabledIDs = storedEnabledIDs
             .intersection(runtimeIDs)
-            .union(firstSeenRuntimeIDs)
-        let refreshedKnownIDs = knownIDs.union(firstSeenRuntimeIDs)
+        let refreshedKnownIDs = knownIDs.union(runtimeIDs)
         return (enabledIDs, refreshedKnownIDs)
     }
 }
@@ -853,7 +851,7 @@ public struct LatticeExtensionStore: Sendable {
     }
 
     public func prepareDirectory() throws {
-        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        try LatticeStorePathSecurity.prepareDirectory(at: rootURL)
     }
 
     public func load() -> [LatticeExtensionRecord] {
@@ -919,23 +917,27 @@ public struct LatticeExtensionStore: Sendable {
             throw NSError(domain: "LatticeExtensionStore", code: 1, userInfo: [NSLocalizedDescriptionKey: validation.joined(separator: " ")])
         }
         try prepareDirectory()
-        let bundleURL = rootURL.appendingPathComponent(manifest.id, isDirectory: true)
-        try FileManager.default.createDirectory(at: bundleURL, withIntermediateDirectories: true)
+        let canonicalRoot = try LatticeStorePathSecurity.canonicalDirectory(at: rootURL)
+        let bundleURL = try LatticeStorePathSecurity.createChildDirectory(named: manifest.id, under: canonicalRoot)
         let manifestURL = bundleURL.appendingPathComponent("lattice-extension.json")
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(manifest)
-        try data.write(to: manifestURL, options: .atomic)
+        try LatticeStorePathSecurity.writeDataAtomically(data, to: manifestURL, under: canonicalRoot)
         return manifestURL
     }
 
     public func manifestData(for manifestID: String) -> Data? {
         guard Self.isSafeManifestID(manifestID) else { return nil }
-        let bundle = rootURL.appendingPathComponent(manifestID, isDirectory: true)
+        guard let canonicalRoot = try? LatticeStorePathSecurity.canonicalDirectory(at: rootURL) else { return nil }
+        let bundle = canonicalRoot.appendingPathComponent(manifestID, isDirectory: true)
+        guard LatticeStorePathSecurity.isDirectoryWithoutFollowingSymlinks(at: bundle) else { return nil }
         if let existing = firstExistingManifest(in: bundle) {
-            return try? Data(contentsOf: existing)
+            return try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: existing)
         }
-        return try? Data(contentsOf: manifestURL(for: manifestID))
+        return try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(
+            at: bundle.appendingPathComponent("lattice-extension.json")
+        )
     }
 
     public func restoreExtension(manifestID: String, previousManifestData: Data?) throws {
@@ -951,31 +953,36 @@ public struct LatticeExtensionStore: Sendable {
             guard validation.isEmpty else {
                 throw NSError(domain: "LatticeExtensionStore", code: 3, userInfo: [NSLocalizedDescriptionKey: validation.joined(separator: " ")])
             }
-            let bundleURL = rootURL.appendingPathComponent(manifestID, isDirectory: true)
-            try FileManager.default.createDirectory(at: bundleURL, withIntermediateDirectories: true)
-            try previousManifestData.write(to: bundleURL.appendingPathComponent("lattice-extension.json"), options: .atomic)
+            let canonicalRoot = try LatticeStorePathSecurity.canonicalDirectory(at: rootURL)
+            let bundleURL = try LatticeStorePathSecurity.createChildDirectory(named: manifestID, under: canonicalRoot)
+            try LatticeStorePathSecurity.writeDataAtomically(
+                previousManifestData,
+                to: bundleURL.appendingPathComponent("lattice-extension.json"),
+                under: canonicalRoot
+            )
         } else {
-            let bundleURL = rootURL.appendingPathComponent(manifestID, isDirectory: true)
-            if FileManager.default.fileExists(atPath: bundleURL.path) {
-                try FileManager.default.removeItem(at: bundleURL)
+            let canonicalRoot = try LatticeStorePathSecurity.canonicalDirectory(at: rootURL)
+            if let bundleURL = try LatticeStorePathSecurity.existingChildDirectory(named: manifestID, under: canonicalRoot) {
+                try LatticeStorePathSecurity.removeItem(at: bundleURL, under: canonicalRoot)
             }
         }
     }
 
     private func manifestCandidates() throws -> [(manifest: URL, bundle: URL)] {
-        let children = try FileManager.default.contentsOfDirectory(at: rootURL, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
+        let canonicalRoot = try LatticeStorePathSecurity.canonicalDirectory(at: rootURL)
+        let children = try FileManager.default.contentsOfDirectory(at: canonicalRoot, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
         var results: [(URL, URL)] = []
         for child in children {
-            let values = try child.resourceValues(forKeys: [.isDirectoryKey])
-            if values.isDirectory == true {
+            if LatticeStorePathSecurity.isDirectoryWithoutFollowingSymlinks(at: child) {
                 if let manifest = firstExistingManifest(in: child) {
                     results.append((manifest, child))
                 }
-            } else if child.lastPathComponent.hasSuffix(".latticeextension.json")
+            } else if LatticeStorePathSecurity.isRegularFileWithoutFollowingSymlinks(at: child),
+                      (child.lastPathComponent.hasSuffix(".latticeextension.json")
                         || child.lastPathComponent == "lattice-extension.json"
                         || child.lastPathComponent.hasSuffix(LatticeLegacyBrandCompatibility.extensionManifestSuffix)
-                        || child.lastPathComponent == LatticeLegacyBrandCompatibility.extensionManifestFileName {
-                results.append((child, child.deletingLastPathComponent()))
+                        || child.lastPathComponent == LatticeLegacyBrandCompatibility.extensionManifestFileName) {
+                results.append((child, canonicalRoot))
             }
         }
         return results
@@ -983,15 +990,18 @@ public struct LatticeExtensionStore: Sendable {
 
     private func firstExistingManifest(in bundle: URL) -> URL? {
         let primary = bundle.appendingPathComponent("lattice-extension.json")
-        if FileManager.default.fileExists(atPath: primary.path) { return primary }
+        if LatticeStorePathSecurity.isRegularFileWithoutFollowingSymlinks(at: primary) { return primary }
         let legacy = bundle.appendingPathComponent(LatticeLegacyBrandCompatibility.extensionManifestFileName)
-        if FileManager.default.fileExists(atPath: legacy.path) { return legacy }
+        if LatticeStorePathSecurity.isRegularFileWithoutFollowingSymlinks(at: legacy) { return legacy }
         return nil
     }
 
     private func loadRecord(manifestURL: URL, bundleURL: URL) -> LatticeExtensionRecord {
         do {
-            let manifest = try JSONDecoder().decode(LatticeExtensionManifest.self, from: Data(contentsOf: manifestURL))
+            let manifest = try JSONDecoder().decode(
+                LatticeExtensionManifest.self,
+                from: LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: manifestURL)
+            )
             return .init(
                 id: manifest.id,
                 name: manifest.name,
@@ -1305,12 +1315,6 @@ public struct LatticeExtensionStore: Sendable {
             }
         }
         return messages
-    }
-
-    private func manifestURL(for manifestID: String) -> URL {
-        rootURL
-            .appendingPathComponent(manifestID, isDirectory: true)
-            .appendingPathComponent("lattice-extension.json")
     }
 
     private static func isSafeManifestID(_ id: String) -> Bool {

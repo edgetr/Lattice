@@ -63,7 +63,18 @@ struct SessionPortableArchiveTests {
                     detail: "token=replay-me",
                     status: .waiting,
                     createdAt: fixedDate,
-                    updatedAt: fixedDate
+                    updatedAt: fixedDate,
+                    approvalProvenance: .init(
+                        harnessID: "provider-only-harness-secret",
+                        providerName: "provider-only-name",
+                        requestID: UUID(uuidString: "99999999-9999-9999-9999-999999999999")!,
+                        requestedOptionKinds: ["allow_once"],
+                        toolKind: .write,
+                        workspaceScoped: true,
+                        policy: .ask,
+                        policyReason: "provider-only-policy-evidence",
+                        actor: .user
+                    )
                 ),
                 SessionAction(
                     id: UUID(),
@@ -96,6 +107,9 @@ struct SessionPortableArchiveTests {
         let text = try #require(String(data: data, encoding: .utf8))
         #expect(text.contains("lattice.session.archive"))
         #expect(!text.contains(threadID))
+        #expect(!text.contains("provider-only-harness-secret"))
+        #expect(!text.contains("provider-only-name"))
+        #expect(!text.contains("99999999-9999-9999-9999-999999999999"))
         #expect(!text.contains("unsent composer draft"))
         #expect(!text.contains("/Users/secret"))
         #expect(!text.contains(sessionID.uuidString))
@@ -341,6 +355,27 @@ struct SessionPortableArchiveTests {
         #expect(plan.session.draft.isEmpty)
         #expect(plan.session.backend == .appleIntelligence)
         #expect(plan.session.harnessThreadID == nil)
+    }
+
+    @Test func modelLessArchivesPreserveMissingAndEmptyModelForEveryModelRoute() throws {
+        let routes = ["codex", "grok", "opencode", "antigravity", "ollama"]
+        for model in [String?.none, ""] {
+            for route in routes {
+                let modelField = model.map { "\"backendModel\":\(jsonString($0))," } ?? ""
+                let archive = """
+                {"format":"lattice.session.archive","version":1,"exportedAt":"2024-01-01T00:00:00Z","chat":{"title":"Model-less","backendRoute":"\(route)",\(modelField)"policy":"Ask","privacyMode":"cloudAllowed"}}
+                """
+                let plan = try SessionPortableArchiveImporter.prepareImport(data: Data(archive.utf8), existingSessions: [])
+                switch route {
+                case "codex": #expect(plan.session.backend == .codex(model: ""))
+                case "grok": #expect(plan.session.backend == .grok(model: ""))
+                case "opencode": #expect(plan.session.backend == .openCode(model: ""))
+                case "antigravity": #expect(plan.session.backend == .antigravity(model: ""))
+                case "ollama": #expect(plan.session.backend == .ollama(model: ""))
+                default: Issue.record("Unexpected route \(route)")
+                }
+            }
+        }
     }
 
     // 7. Collision-safe remapped IDs + no overwrite
