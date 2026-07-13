@@ -805,7 +805,7 @@ struct CoreVerification {
         expect(unknownCatalog.preferredBackend == .ollama(model: ""), "Missing Codex catalog does not invent a preferred Codex model")
         let allHidden = BackendAvailabilitySnapshot(codexModels: [], codexCatalogKnown: true, codexInstalled: true)
         expect(BackendAvailabilityPolicy.normalize(.codex(model: "hidden"), using: allHidden) == .ollama(model: ""), "All hidden cloud models produce non-runnable fallback")
-        expect(BackendAvailabilityPolicy.normalize(.codex(model: ""), using: allHidden) == .ollama(model: ""), "Known empty Codex catalog does not invent a model for empty selection")
+        expect(BackendAvailabilityPolicy.normalize(.codex(model: ""), using: allHidden) == .codex(model: ""), "Known empty Codex catalog preserves the explicit no-model selection")
         let discoveredCatalog = BackendAvailabilitySnapshot(
             codexModels: [
                 .init(id: "gpt-discovered", name: "Discovered", isDefault: true),

@@ -421,8 +421,8 @@ struct SelfEditPreviewRow: View {
                 }
             }
             .accessibilityElement(children: .combine)
-            .accessibilityLabel(presentation.accessibilityLabel)
-            .accessibilityValue(presentation.accessibilityValue ?? presentation.headline)
+            .accessibilityLabel("If you apply this")
+            .accessibilityValue(review.acceptanceSummary)
             .padding(10)
             .background(.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
