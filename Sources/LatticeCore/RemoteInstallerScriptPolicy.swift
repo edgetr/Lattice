@@ -77,11 +77,25 @@ public enum RemoteInstallerScriptPolicy {
         "https://hermes-agent.nousresearch.com/install.sh"
     ]
 
+    /// Release-reviewed SHA-256 pins for the approved installer bodies. Provider script changes
+    /// fail closed until a new pin is reviewed and shipped.
+    public static let pinnedSHA256HexByEndpoint: [String: String] = [
+        "https://x.ai/cli/install.sh": "2019f38002a2beab27f65b928db5d33d2bbe8c2828e4e41081ac23ec33b7a658",
+        "https://opencode.ai/install": "fc3c1b2123f49b6df545a7622e5127d21cd794b15134fc3b66e1ca49f7fb297e",
+        "https://hermes-agent.nousresearch.com/install.sh": "c2e4326c1660bd45f64321996eb15bda35e7a4649e32a310495a61972a2804c8"
+    ]
+
     // MARK: URL surface
 
     /// Validates a single absolute URL against Lattice installer rules.
     public static func validationMessage(for url: URL) -> String? {
         validate(url: url).message
+    }
+
+    /// Returns the local release pin for an approved endpoint. Unknown endpoints have no pin.
+    public static func pinnedSHA256Hex(for url: URL) -> String? {
+        guard validate(url: url).isAccepted else { return nil }
+        return pinnedSHA256HexByEndpoint[normalizeEndpoint(url)]
     }
 
     public static func validate(url: URL) -> RemoteInstallerURLValidation {
@@ -202,6 +216,20 @@ public enum RemoteInstallerScriptPolicy {
         return .ok(buffer)
     }
 
+    /// Appends one streamed byte without allowing the body buffer past the cap.
+    @discardableResult
+    public static func accumulate(
+        byte: UInt8,
+        into buffer: inout Data,
+        maximumByteCount: Int = maximumByteCount
+    ) -> BoundedBodyAccumulation {
+        guard buffer.count < maximumByteCount else {
+            return .exceeded(maximumByteCount: maximumByteCount, observedByteCount: maximumByteCount + 1)
+        }
+        buffer.append(byte)
+        return buffer.isEmpty ? .empty : .ok(buffer)
+    }
+
     /// Accumulates an entire body from discrete chunks with a hard cap.
     public static func accumulate(
         chunks: [Data],
@@ -274,6 +302,12 @@ public enum RemoteInstallerScriptPolicy {
             return (typeMessage, trust(for: data, expectedSHA256Hex: expectedSHA256Hex))
         }
         return (validationMessage(for: data), trust(for: data, expectedSHA256Hex: expectedSHA256Hex))
+    }
+
+    /// Execution requires an authenticated body. Content and syntax checks never establish trust.
+    public static func executionMessage(for trust: InstallerScriptTrust) -> String? {
+        guard !trust.isAuthenticated else { return nil }
+        return "Refusing to execute installer: \(trust.summary)"
     }
 
     // MARK: Helpers
