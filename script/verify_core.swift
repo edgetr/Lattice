@@ -171,6 +171,50 @@ struct CoreVerification {
         let brokerAuditData = try! JSONEncoder().encode(brokerAudit)
         expect((try! JSONDecoder().decode([ToolAuditRecord].self, from: brokerAuditData)).map(\.decision) == brokerAudit.map(\.decision), "Tool broker audit is durable data")
 
+        // Route capability disclosure (P0): truthful controls before run; live providers are unbrokered.
+        let codexAskRoute = CodexProviderExecutionRoute.resolve(policy: .ask)
+        expect(codexAskRoute.approvalPolicy == "on-request" && codexAskRoute.sandbox == "read-only", "Codex Ask maps to on-request + read-only")
+        let codexAskWriteRoute = CodexProviderExecutionRoute.resolve(policy: .ask, workspaceWrite: true)
+        expect(codexAskWriteRoute.sandbox == "workspace-write", "Codex Ask with explicit workspaceWrite maps to workspace-write")
+        let codexSmartRoute = CodexProviderExecutionRoute.resolve(policy: .smart)
+        expect(codexSmartRoute.approvalPolicy == "on-request" && codexSmartRoute.sandbox == "workspace-write", "Codex Smart maps to on-request + workspace-write")
+        let codexYoloRoute = CodexProviderExecutionRoute.resolve(policy: .yolo)
+        expect(codexYoloRoute.approvalPolicy == "never" && codexYoloRoute.sandbox == "danger-full-access", "Codex YOLO maps to never + danger-full-access")
+        let codexYoloCapability = RouteCapability.resolve(harnessID: "codex", policy: .yolo)
+        expect(codexYoloCapability.brokerMediation == .notMediated, "Codex YOLO is not LocalToolBroker-mediated")
+        expect(codexYoloCapability.writeContainmentKind == .none && codexYoloCapability.writeContainment.assurance == .absent, "Codex YOLO write containment is absent")
+        expect(codexYoloCapability.approvalBehaviorKind == .disabled, "Codex YOLO approvals are disabled")
+        expect(codexYoloCapability.writeContainment.detail.contains(codexYoloRoute.sandbox), "Codex capability derives from the same provider route mapping")
+        let grokSmart = RouteCapability.resolve(harnessID: "grok", policy: .smart)
+        expect(grokSmart.executionOwner == .providerOwned && grokSmart.brokerMediation == .notMediated, "Grok ACP remains provider-owned and unbrokered")
+        expect(grokSmart.writeContainmentKind == .latticeMacOSWriteContainment, "Grok ACP uses Lattice macOS write containment")
+        expect(grokSmart.fileReadRestriction.assurance == .absent && grokSmart.networkRestriction.assurance == .absent, "Grok ACP does not claim read/network restriction")
+        let piAsk = RouteCapability.resolve(harnessID: "pi", policy: .ask)
+        expect(piAsk.writeContainmentKind == .latticeMacOSWriteContainment && piAsk.brokerMediation == .notMediated, "Pi uses Lattice write containment but remains unbrokered")
+        expect(piAsk.fileReadRestriction.assurance == .absent && piAsk.networkRestriction.assurance == .absent, "Pi does not claim read/network restriction")
+        let antigravityAsk = RouteCapability.resolve(harnessID: "antigravity", policy: .ask)
+        expect(antigravityAsk.approvalBehaviorKind == .planOnly && antigravityAsk.writeContainmentKind == .providerDeclaredSandbox, "Antigravity Ask is plan-only with provider-declared sandbox")
+        expect(antigravityAsk.structuredEvents.assurance == .absent, "Antigravity transcript route does not claim structured tool events")
+        let antigravityYolo = RouteCapability.resolve(harnessID: "antigravity", policy: .yolo)
+        expect(antigravityYolo.approvalBehaviorKind == .disabled, "Antigravity YOLO disables provider permissions")
+        let latticeLocal = RouteCapability.resolve(harnessID: "lattice", policy: .smart)
+        expect(latticeLocal.executionOwner == .noDelegatedTools && latticeLocal.brokerMediation == .notApplicable, "Local lattice routes have no delegated tools and are not broker-mediated")
+        let unknownRoute = RouteCapability.resolve(harnessID: "mystery-agent", policy: .ask)
+        expect(unknownRoute.brokerMediation == .notMediated && unknownRoute.writeContainment.assurance == .unknown, "Unknown harness falls back conservatively")
+        expect(RouteConnectionCaption.caption(forHarnessID: "codex") == "Provider-owned tools · policy-dependent sandbox", "Codex Connections caption is policy-agnostic")
+        expect(RouteConnectionCaption.caption(forHarnessID: "grok") == "Lattice write containment · provider-owned tools", "ACP Connections caption is truthful and invariant")
+        expect(RouteConnectionCaption.caption(forHarnessID: "antigravity") == "Provider sandbox option · transcript route", "Antigravity Connections caption is truthful and invariant")
+        let privacyBody = LatticeSettingsCopy.privacySecurityBody
+        expect(privacyBody.localizedCaseInsensitiveContains("LocalToolBroker") && privacyBody.localizedCaseInsensitiveContains("route- and policy-dependent"), "Privacy copy discloses unbrokered provider tools and non-universal containment")
+        expect(!privacyBody.localizedCaseInsensitiveContains("tool writes are limited to the selected workspace"), "Privacy copy no longer claims universal workspace write limits")
+        for harnessID in RouteCapability.knownHarnessIDs {
+            for policy in ExecutionPolicy.allCases {
+                let capability = RouteCapability.resolve(harnessID: harnessID, policy: policy)
+                expect(capability.brokerMediation != .mediatedByLocalToolBroker, "No known live harness claims LocalToolBroker mediation (\(harnessID)/\(policy.rawValue))")
+                expect(!capability.warnings.isEmpty, "Every known route surfaces a conservative warning (\(harnessID)/\(policy.rawValue))")
+            }
+        }
+
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = SessionPersistence(fileURL: root.appendingPathComponent("sessions.json"))
         let responseMessage = ChatMessage(role: .assistant, text: "Done")
@@ -429,8 +473,10 @@ struct CoreVerification {
             && productContext.contains("Apply/Discard")
             && productContext.contains("matching YAML frontmatter")
             && productContext.contains("Antigravity")
-            && productContext.contains("roadmap features"),
-            "Backend product instructions explain current Lattice surfaces, context handling, self-edit review behavior, generated skill standards, and roadmap limits"
+            && productContext.contains("roadmap features")
+            && productContext.localizedCaseInsensitiveContains("LocalToolBroker")
+            && productContext.localizedCaseInsensitiveContains("route-specific"),
+            "Backend product instructions explain current Lattice surfaces, context handling, self-edit review behavior, generated skill standards, truthful route controls, and roadmap limits"
         )
         expect(LatticeContinuationPolicy.canContinue(session), "Continuation is available after a visible assistant response")
         expect(!LatticeContinuationPolicy.canContinue(LatticeSession(title: "Streaming", messages: session.messages, backend: .codex(model: "gpt-5.4"), isStreaming: true)), "Continuation is hidden while streaming")
@@ -713,9 +759,23 @@ struct CoreVerification {
         )
         expect(BackendAvailabilityPolicy.normalize(.codex(model: "hidden"), using: visibleFallback) == .grok(model: "grok-1"), "Hidden Codex model falls back to visible provider model")
         let unknownCatalog = BackendAvailabilitySnapshot(codexModels: [], codexCatalogKnown: false, codexInstalled: true)
-        expect(BackendAvailabilityPolicy.normalize(.codex(model: "gpt-5.5"), using: unknownCatalog) == .codex(model: "gpt-5.5"), "Unknown Codex catalog preserves installed fallback")
+        expect(BackendAvailabilityPolicy.normalize(.codex(model: "gpt-5.5"), using: unknownCatalog) == .codex(model: "gpt-5.5"), "Unknown Codex catalog preserves explicit model provenance")
+        expect(BackendAvailabilityPolicy.normalize(.codex(model: ""), using: unknownCatalog) == .codex(model: ""), "Unknown Codex catalog preserves empty model sentinel without inventing a slug")
+        expect(unknownCatalog.preferredBackend == .ollama(model: ""), "Missing Codex catalog does not invent a preferred Codex model")
         let allHidden = BackendAvailabilitySnapshot(codexModels: [], codexCatalogKnown: true, codexInstalled: true)
         expect(BackendAvailabilityPolicy.normalize(.codex(model: "hidden"), using: allHidden) == .ollama(model: ""), "All hidden cloud models produce non-runnable fallback")
+        expect(BackendAvailabilityPolicy.normalize(.codex(model: ""), using: allHidden) == .ollama(model: ""), "Known empty Codex catalog does not invent a model for empty selection")
+        let discoveredCatalog = BackendAvailabilitySnapshot(
+            codexModels: [
+                .init(id: "gpt-discovered", name: "Discovered", isDefault: true),
+                .init(id: "gpt-other", name: "Other")
+            ],
+            codexCatalogKnown: true,
+            codexInstalled: true
+        )
+        expect(BackendAvailabilityPolicy.normalize(.codex(model: ""), using: discoveredCatalog) == .codex(model: "gpt-discovered"), "Discovered Codex catalog replaces empty selection with preferred model")
+        expect(BackendAvailabilityPolicy.normalize(.codex(model: "retired"), using: discoveredCatalog) == .codex(model: "gpt-discovered"), "Discovered Codex catalog replaces stale selection with preferred model")
+        expect(BackendAvailabilityPolicy.normalize(.codex(model: "gpt-other"), using: discoveredCatalog) == .codex(model: "gpt-other"), "Discovered Codex catalog preserves known membership without version heuristics")
         let disconnectedCloud = BackendAvailabilitySnapshot(
             codexModels: [.init(id: "gpt-5.5", name: "GPT-5.5", isDefault: true)],
             grokModels: [.init(id: "grok-4", name: "Grok 4", isDefault: true)],
@@ -774,6 +834,33 @@ struct CoreVerification {
             "params": ["command": "open /tmp", "cwd": "/tmp", "availableDecisions": ["accept", "decline"]]
         ]
         expect(CodexExecHarness.appServerPermissionRequest(from: outsideCodexApprovalObject, workspace: codexWorkspace)?.toolRequest?.workspaceScoped == false, "Codex command approval detects out-of-workspace execution")
+        let missingRootCodexApprovalObject: [String: Any] = [
+            "method": "item/fileChange/requestApproval",
+            "params": ["reason": "Apply patch"]
+        ]
+        expect(CodexExecHarness.appServerPermissionRequest(from: missingRootCodexApprovalObject, workspace: codexWorkspace)?.toolRequest?.workspaceScoped == false, "Codex file approval fails closed without grantRoot")
+        let emptyRootCodexApprovalObject: [String: Any] = [
+            "method": "item/fileChange/requestApproval",
+            "params": ["grantRoot": "", "reason": "Apply patch"]
+        ]
+        expect(CodexExecHarness.appServerPermissionRequest(from: emptyRootCodexApprovalObject, workspace: codexWorkspace)?.toolRequest?.workspaceScoped == false, "Codex file approval fails closed with empty grantRoot")
+        let emptyCodexFileChange: [String: Any] = [
+            "method": "item/started",
+            "params": ["item": ["type": "fileChange", "id": "file-empty", "changes": []]]
+        ]
+        if case .toolRequested(let request)? = CodexExecHarness.appServerEvent(from: emptyCodexFileChange, workspace: codexWorkspace) {
+            expect(!request.workspaceScoped, "Codex empty file-change metadata fails closed")
+        } else { expect(false, "Codex empty file-change event is projected") }
+        let outsideScopeParent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let outsideScopeDirectory = outsideScopeParent.appendingPathComponent("outside", isDirectory: true)
+        try! FileManager.default.createDirectory(at: outsideScopeDirectory, withIntermediateDirectories: true)
+        let outsideScopeSibling = outsideScopeParent.appendingPathComponent("sibling.txt")
+        try! Data("outside".utf8).write(to: outsideScopeSibling)
+        let outsideScopeLink = codexWorkspace.appendingPathComponent("escape")
+        try! FileManager.default.createSymbolicLink(at: outsideScopeLink, withDestinationURL: outsideScopeDirectory)
+        expect(!WorkspacePathScope.isScoped("escape/new.txt", under: codexWorkspace), "Workspace scope resolves outside symlink before nonexistent child")
+        expect(!WorkspacePathScope.isScoped("escape/../sibling.txt", under: codexWorkspace), "Workspace scope resolves symlink before dot-dot traversal")
+        try? FileManager.default.removeItem(at: outsideScopeParent)
         let codexDeltaObject: [String: Any] = ["method": "item/agentMessage/delta", "params": ["delta": "Hello"]]
         if case .assistantDelta(let delta)? = CodexExecHarness.appServerEvent(from: codexDeltaObject, workspace: codexWorkspace) {
             expect(delta == "Hello", "Codex app-server text delta")
@@ -869,8 +956,6 @@ struct CoreVerification {
         let codexTurnRequest = try! JSONSerialization.jsonObject(with: Data(contentsOf: codexTurnRequestURL)) as! [String: Any]
         let codexTurnParams = codexTurnRequest["params"] as! [String: Any]
         expect(codexTurnRequest["method"] as? String == "turn/start" && codexTurnParams["effort"] as? String == "high" && codexTurnParams["summary"] as? String == "auto", "Codex starts the turn with model reasoning and visible summary settings")
-        try? FileManager.default.removeItem(at: codexWorkspace)
-
         let permissionObject: [String: Any] = [
             "method": "session/request_permission",
             "params": [
@@ -907,6 +992,7 @@ struct CoreVerification {
         ]
         expect(HermesACPHarness.permissionRequest(from: hermesPathPermissionObject, workspace: codexWorkspace)?.toolRequest?.kind == .write, "Hermes edit permission is typed")
         expect(HermesACPHarness.permissionRequest(from: hermesPathPermissionObject, workspace: codexWorkspace)?.toolRequest?.workspaceScoped == true, "Hermes relative edit path is workspace-scoped")
+        try? FileManager.default.removeItem(at: codexWorkspace)
         let hermesToolStart: [String: Any] = [
             "method": "session/update",
             "params": ["update": [
@@ -2859,6 +2945,12 @@ struct CoreVerification {
         expect(importPlan.session.attachments.allSatisfy { $0.path.hasPrefix(SessionPortableArchive.missingAttachmentScheme) }, "Imported attachment paths use non-resolvable missing scheme")
         expect(importPlan.session.actions.allSatisfy { $0.status != .running && $0.status != .waiting }, "Imported actions are inert terminal summaries")
         expect(importPlan.session.lastUpdated == archiveSession.lastUpdated, "Import preserves the exported chat timestamp")
+        let modelLessCodexArchive = #"{"format":"lattice.session.archive","version":1,"exportedAt":"2024-01-01T00:00:00Z","includeQueuedFollowUps":false,"chat":{"title":"No model","backendRoute":"codex","policy":"Ask","privacyMode":"cloudAllowed","messages":[],"attachments":[],"actions":[],"queuedFollowUps":[]}}"#
+        let modelLessCodexPlan = try! SessionPortableArchiveImporter.prepareImport(data: Data(modelLessCodexArchive.utf8), existingSessions: [])
+        expect(modelLessCodexPlan.session.backend == .codex(model: ""), "Model-less Codex archive imports as a non-runnable empty sentinel")
+        let explicitCodexArchive = #"{"format":"lattice.session.archive","version":1,"exportedAt":"2024-01-01T00:00:00Z","includeQueuedFollowUps":false,"chat":{"title":"Explicit model","backendRoute":"codex","backendModel":"archive-model-provenance","policy":"Ask","privacyMode":"cloudAllowed","messages":[],"attachments":[],"actions":[],"queuedFollowUps":[]}}"#
+        let explicitCodexPlan = try! SessionPortableArchiveImporter.prepareImport(data: Data(explicitCodexArchive.utf8), existingSessions: [])
+        expect(explicitCodexPlan.session.backend == .codex(model: "archive-model-provenance"), "Codex archive preserves explicit model provenance without rewriting it")
         expect(importPlan.session.queuedFollowUps.isEmpty, "Default export excludes queued follow-ups on import")
         expect(importPlan.preview.messageCount == 2, "Import preview reports message count")
         expect(importPlan.preview.attachmentCount == 1, "Import preview reports attachment count")

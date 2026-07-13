@@ -220,7 +220,7 @@ public enum LatticeSettingsCopy: Sendable {
         "When idle unload is on, Lattice asks Ollama to unload the active local model after the chosen number of idle minutes. Set to Off to keep models loaded until Ollama’s own defaults apply."
 
     public static let privacySecurityBody =
-        "Provider harnesses run with workspace write containment: tool writes are limited to the selected workspace. File reads and network access are not confidentiality-contained—models and CLIs may still read outside the workspace or contact remote services when a route allows it. Prefer Local Only privacy on a chat when you need cloud routes blocked."
+        "Write containment is route- and policy-dependent, not universal. ACP and Pi harnesses use Lattice macOS write containment; Codex uses a provider-configured sandbox that can be read-only, workspace-write, or absent (YOLO danger-full-access); Antigravity only passes a provider sandbox option that Lattice does not independently verify. Live provider tools do not pass through LocalToolBroker, so broker credential denial does not apply on those paths. File reads and network are not confidentiality-contained where tools run—models and CLIs may still read outside the workspace or contact remote services. Prefer Local Only privacy on a chat when you need cloud routes blocked. Do not treat the sandbox as prompt-injection or exfiltration prevention."
 
     public static let extensionsFolderHelp =
         "Opens Lattice’s user extensions directory in Finder."
@@ -257,11 +257,11 @@ public enum LatticeOnboardingStep: Int, CaseIterable, Sendable, Equatable, Compa
         case .welcome:
             return "Lattice is a macOS workspace for chatting with local and connected coding agents. This short guide explains the basics. Nothing is installed and no preferences change until you act."
         case .chooseWorkspace:
-            return "Chats can bind to a folder so harness tools stay write-contained to that workspace. You can choose a folder now or skip and set one later from a chat’s inspector."
+            return "Chats can bind to a folder used as the selected workspace for harness tools. Write containment depends on the route and execution policy—inspect Route controls before a run. You can choose a folder now or skip and set one later from a chat’s inspector."
         case .localVersusCloud:
-            return "Local routes use Apple Intelligence or Ollama on this Mac. Cloud routes use connected provider CLIs (for example Codex, Grok, OpenCode). Per-chat Model privacy can block cloud routes. Writes stay workspace-contained; reads and network are not confidentiality-contained."
+            return "Local routes use Apple Intelligence or Ollama on this Mac and have no delegated tool loop in this product path. Cloud routes use connected provider CLIs (for example Codex, Grok, OpenCode). Per-chat Model privacy can block cloud routes. Write containment, approvals, and broker mediation are route- and policy-specific—not universal. Reads and network are not confidentiality-contained where tools run."
         case .ready:
-            return "Open Connections to sign in or install provider CLIs when you need them. Use Models to pick a route, and Extensions & Skills for user-owned customizations. You can reopen this guide later if Settings is wired to show it."
+            return "Open Connections to sign in or install provider CLIs when you need them. Use Models to pick a route, inspect Route controls for what that route enforces, and use Extensions & Skills for user-owned customizations. You can reopen this guide later if Settings is wired to show it."
         }
     }
 

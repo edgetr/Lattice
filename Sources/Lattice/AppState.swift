@@ -477,6 +477,16 @@ final class AppState: ObservableObject {
         return sessions.first { $0.id == id }
     }
 
+    /// Truthful controls for the selected chat's harness route and execution policy.
+    /// Live provider tools do not pass through `LocalToolBroker` today.
+    var selectedRouteCapability: RouteCapability? {
+        guard let session = selectedSession else { return nil }
+        return RouteCapability.resolve(
+            harnessID: effectiveHarnessID(for: session),
+            policy: session.policy
+        )
+    }
+
     var editingMessageID: UUID? { editingMessageContext?.messageID }
 
     var activeBackend: ChatBackend { selectedSession?.backend ?? defaultBackend }

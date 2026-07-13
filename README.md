@@ -48,15 +48,15 @@ Provider CLIs are optional and are not redistributed with Lattice. Authenticatio
 
 ### Safety and privacy
 
-Each session has explicit execution and privacy choices:
+Each session has explicit execution and privacy choices. What they enforce depends on the selected harness—inspect **Route controls** in the chat inspector before running:
 
-- **Ask** requests approval for material or non-reversible tool work when the provider protocol supports it.
-- **Smart** may allow reversible, workspace-scoped edits while asking for broader actions.
-- **YOLO** allows delegated tool calls where implemented, while still respecting OS and credential boundaries.
+- **Ask** requests approval for material or non-reversible tool work when the provider protocol can forward requests (Codex on-request; ACP/Pi permission surfaces). Antigravity Ask stays plan-only.
+- **Smart** may auto-allow scoped reads after a provider permission request arrives on ACP routes; current ACP write requests remain approval-gated because their metadata is conservatively non-reversible. Codex uses on-request approvals with a provider workspace-write sandbox. Antigravity Smart stays plan-only.
+- **YOLO** is explicitly high-trust: Codex disables provider approvals and uses danger-full-access (no write containment); ACP/Pi may auto-allow after requests; Antigravity skips provider permissions. Live provider tools do **not** pass through `LocalToolBroker`.
 - **Cloud allowed** permits connected cloud and local routes.
 - **Local only** blocks routes classified as cloud and keeps execution on available local backends.
 
-The macOS harness sandbox is a **write-containment control**, not a confidentiality boundary. It limits writes outside configured roots where used, but provider processes may still have broad read and network access. Do not treat local-only mode as encryption, or YOLO mode as isolation from secrets.
+Where Lattice applies `sandbox-exec`, it is a **write-containment control**, not a confidentiality boundary: reads and network remain allowed. Codex sandbox settings are provider-configured, not Lattice `sandbox-exec`. Antigravity only receives a provider sandbox option that Lattice does not independently verify. Local lattice chat (Apple Intelligence / Ollama) has no delegated tool loop. Do not treat local-only mode as encryption, YOLO as isolation from secrets, or any route as prompt-injection or exfiltration prevention.
 
 ## Requirements
 

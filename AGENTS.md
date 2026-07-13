@@ -62,6 +62,16 @@ Use `./script/build_and_run.sh --release-check` for packaging, distribution, or 
 - For substantial changes, document the problem, the GPT-5.6/Codex contribution, the human product or engineering decisions, and the verification performed.
 - Keep the submission narrative problem-first: Lattice exists to reduce fragmented, opaque agent workflows while retaining developer control.
 
+## Codex subagents
+
+- All subagents spawned for this repository must use `gpt-5.6-luna`; never spawn `gpt-5.6-sol` subagents.
+- Use Luna `high` for bounded exploration, focused review, and scoped implementation. Use Luna `xhigh` for large, ambiguous, security-sensitive, architectural, or cross-cutting review.
+- Use project roles from `.codex/agents/`: `explorer`, `default`, and `worker` are Luna high; `reviewer` and `luna_xhigh` are Luna xhigh.
+- If the active surface cannot honor one of these configured roles, do not silently fall back to Sol. Keep work in the parent thread or report the limitation.
+- Keep `agents.max_depth = 1` unless the user explicitly requests recursive delegation. Direct children must not create further fan-out.
+- For code-review subagents, default to read-only work. Findings are evidence for the parent to judge, not authorization to edit.
+- Use the `caveman` skill for subagent review reports when the initiating prompt requests it: terse output, full technical substance.
+
 ## Coding conventions
 
 - Follow the existing Swift 6 style and prefer small, intention-revealing types.

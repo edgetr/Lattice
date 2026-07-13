@@ -67,9 +67,6 @@ public struct BackendAvailabilitySnapshot: Hashable, Sendable {
         if let localModel = ollamaModelNames.first {
             return .ollama(model: localModel)
         }
-        if codexReady && codexInstalled && !codexCatalogKnown {
-            return .codex(model: "gpt-5.5")
-        }
         return .ollama(model: "")
     }
 }

@@ -1,6 +1,7 @@
+import Darwin
 import Foundation
 
-enum WorkspacePathScope {
+public enum WorkspacePathScope {
     struct LocationMetadata {
         let paths: [String]
         let isMalformed: Bool
@@ -50,6 +51,10 @@ enum WorkspacePathScope {
         pathIsWorkspaceScoped(path, workspace: workspace)
     }
 
+    public static func isScoped(_ rawPath: String?, under workspace: URL) -> Bool {
+        pathIsWorkspaceScoped(rawPath, workspace: workspace)
+    }
+
     private static func pathEvidence(rawInput: Any?, locations: Any?) -> [String?] {
         var evidence: [String?] = []
         if let rawInput {
@@ -75,13 +80,38 @@ enum WorkspacePathScope {
 
     private static func pathIsWorkspaceScoped(_ path: String?, workspace: URL) -> Bool {
         guard let path, isSupportedPOSIXPathEvidence(path), workspace.isFileURL else { return false }
-        let root = workspace.standardizedFileURL.resolvingSymlinksInPath().path
-        let candidate = (path.hasPrefix("/") ? URL(fileURLWithPath: path) : workspace.appendingPathComponent(path))
-            .standardizedFileURL
-            .resolvingSymlinksInPath()
-            .path
-        guard !root.isEmpty, !candidate.isEmpty else { return false }
+        guard let root = realPath(workspace.path),
+              let candidate = canonicalizeCandidate(path, workspace: workspace) else { return false }
         return candidate == root || candidate.hasPrefix(root + "/")
+    }
+
+    private static func canonicalizeCandidate(_ rawPath: String, workspace: URL) -> String? {
+        let absolute = rawPath.hasPrefix("/")
+            ? rawPath
+            : URL(fileURLWithPath: workspace.path, isDirectory: true).appendingPathComponent(rawPath).path
+        var current = absolute
+        var missingSuffix: [String] = []
+        while true {
+            var info = stat()
+            if lstat(current, &info) == 0 {
+                guard let ancestor = realPath(current) else { return nil }
+                return missingSuffix.reversed().reduce(ancestor) { path, component in
+                    (path as NSString).appendingPathComponent(component)
+                }
+            }
+            guard errno == ENOENT else { return nil }
+            let parent = (current as NSString).deletingLastPathComponent
+            let name = (current as NSString).lastPathComponent
+            guard parent != current, !name.isEmpty, name != ".", name != ".." else { return nil }
+            missingSuffix.append(name)
+            current = parent
+        }
+    }
+
+    private static func realPath(_ path: String) -> String? {
+        guard let pointer = realpath(path, nil) else { return nil }
+        defer { free(pointer) }
+        return String(cString: pointer)
     }
 
     private static func isSupportedPOSIXPathEvidence(_ path: String) -> Bool {

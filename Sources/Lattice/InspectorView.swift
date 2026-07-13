@@ -10,7 +10,7 @@ struct InspectorView: View {
                     LabeledContent("Provider", value: session.backend.harnessName)
                     LabeledContent("Model", value: session.backend.displayName)
                     if let reasoning = session.reasoningEffort { LabeledContent("Reasoning", value: reasoning.displayName) }
-                    Picker("Workspace rules", selection: Binding(
+                    Picker("Execution policy", selection: Binding(
                         get: { session.policy },
                         set: { state.setSessionPolicy($0) }
                     )) {
@@ -20,6 +20,8 @@ struct InspectorView: View {
                     }
                     .pickerStyle(.segmented)
                     .disabled(session.isStreaming)
+                    .accessibilityLabel("Execution policy")
+                    .accessibilityHint("Controls how this chat handles approvals and provider tool risk for the selected harness.")
                     Picker("Model privacy", selection: Binding(
                         get: { session.privacyMode },
                         set: { state.setSessionPrivacyMode($0) }
@@ -45,6 +47,43 @@ struct InspectorView: View {
                             .help(state.canStartLocalOnlyChat ? "Create a fresh chat with a local backend" : "Make Apple Intelligence or Ollama available in Connections first")
                         }
                     }
+                }
+                if let capability = state.selectedRouteCapability {
+                    Section("Route controls") {
+                        LabeledContent("Owner", value: capability.executionOwner.displayName)
+                        LabeledContent("Tool broker", value: capability.brokerMediation.displayName)
+                        LabeledContent("Write containment", value: capability.writeContainment.displayValue)
+                            .accessibilityValue(capability.writeContainment.detail)
+                            .help(capability.writeContainment.detail)
+                        LabeledContent("Approvals", value: capability.approvalBehavior.displayValue)
+                            .accessibilityValue(capability.approvalBehavior.detail)
+                            .help(capability.approvalBehavior.detail)
+                        capabilityRow("File reads", capability.fileReadRestriction)
+                        capabilityRow("Network", capability.networkRestriction)
+                        capabilityRow("Credentials", capability.credentialReadProtection)
+                        capabilityRow("Events", capability.structuredEvents)
+                        capabilityRow("Resume", capability.providerSessionResume)
+                        capabilityRow("Cancel", capability.cancellation)
+                        if let warning = capability.primaryWarning {
+                            Text(warning)
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .accessibilityLabel("Route warning")
+                                .accessibilityValue(warning)
+                        }
+                        if capability.warnings.count > 1 {
+                            ForEach(Array(capability.warnings.dropFirst().enumerated()), id: \.offset) { _, warning in
+                                Text(warning)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel("Route controls")
+                    .accessibilityHint("What the selected harness and execution policy actually enforce before a run.")
                 }
                 if case .codex = session.backend, let usage = state.codexUsage {
                     Section("Usage") {
@@ -84,6 +123,12 @@ struct InspectorView: View {
             }
         }
         .formStyle(.grouped).padding(.top, 8)
+    }
+
+    private func capabilityRow(_ title: String, _ capability: RouteCapabilityDetail) -> some View {
+        LabeledContent(title, value: capability.displayValue)
+            .accessibilityValue(capability.detail)
+            .help(capability.detail)
     }
 }
 
@@ -617,6 +662,11 @@ struct ConnectionsView: View {
                     } content: {
                         VStack(alignment: .leading, spacing: 12) {
                             CLIMetadata(version: state.codexCLIVersion, latestVersion: state.codexLatestCLIVersion, updateInfo: nil)
+                            if let caption = RouteConnectionCaption.caption(forHarnessID: "codex") {
+                                Text(caption)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                             CLIActionMessage(provider: "codex", state: state)
                             ModelChecklist(providerID: "codex", models: state.codexModels, state: state)
                         }
@@ -642,8 +692,8 @@ struct ConnectionsView: View {
                     } content: {
                         VStack(alignment: .leading, spacing: 12) {
                             CLIMetadata(version: state.grokCLIInfo.currentVersion, latestVersion: nil, updateInfo: state.grokCLIInfo)
-                            if state.grokReady {
-                                Text("Workspace sandbox · approval forwarding")
+                            if state.grokReady, let caption = RouteConnectionCaption.caption(forHarnessID: "grok") {
+                                Text(caption)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -672,8 +722,8 @@ struct ConnectionsView: View {
                     } content: {
                         VStack(alignment: .leading, spacing: 14) {
                             CLIMetadata(version: state.openCodeCLIVersion, latestVersion: state.openCodeLatestCLIVersion, updateInfo: nil)
-                            if state.openCodeReady {
-                                Text("Workspace sandbox · approval forwarding")
+                            if state.openCodeReady, let caption = RouteConnectionCaption.caption(forHarnessID: "opencode") {
+                                Text(caption)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -717,9 +767,11 @@ struct ConnectionsView: View {
                         VStack(alignment: .leading, spacing: 10) {
                             if state.antigravityInstalled {
                                 CLIMetadata(version: state.antigravityCLIVersion, latestVersion: state.antigravityLatestCLIVersion, updateInfo: nil)
-                                Label("Direct CLI chat · sandboxed workspace", systemImage: "checkmark.shield")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                if let caption = RouteConnectionCaption.caption(forHarnessID: "antigravity") {
+                                    Label(caption, systemImage: "shield.slash")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
                             } else {
                                 Label("Official Homebrew cask", systemImage: "shippingbox")
                                     .font(.caption)
@@ -749,9 +801,11 @@ struct ConnectionsView: View {
                         VStack(alignment: .leading, spacing: 10) {
                             if state.piInstalled {
                                 CLIMetadata(version: state.piCLIVersion, latestVersion: state.piLatestCLIVersion, updateInfo: state.piCLIInfo)
-                                Label("Workspace sandbox · approval-gated mutations", systemImage: "lock.shield")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                if let caption = RouteConnectionCaption.caption(forHarnessID: "pi") {
+                                    Label(caption, systemImage: "lock.shield")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                             CLIActionMessage(provider: "pi", state: state)
                         }
@@ -777,9 +831,11 @@ struct ConnectionsView: View {
                         VStack(alignment: .leading, spacing: 10) {
                             if state.hermesInstalled {
                                 CLIMetadata(version: state.hermesCLIInfo.currentVersion, latestVersion: nil, updateInfo: state.hermesCLIInfo)
-                                Label("Workspace sandbox · approval forwarding", systemImage: "lock.shield")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                if let caption = RouteConnectionCaption.caption(forHarnessID: "hermes") {
+                                    Label(caption, systemImage: "lock.shield")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                             CLIActionMessage(provider: "hermes", state: state)
                         }
