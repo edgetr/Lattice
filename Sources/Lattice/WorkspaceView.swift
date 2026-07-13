@@ -316,7 +316,9 @@ struct SessionListView: View {
                         )
                         .tag(session.id)
                         .accessibilityIdentifier(LatticeAccessibilityID.sessionRow(session.id))
+                        .accessibilityElement(children: .contain)
                         .accessibilityLabel(session.title)
+                        .accessibilityValue(SessionListAccessibilityPolicy.value(for: session))
                         .contextMenu { sessionContextMenu(for: session) }
                     }
                 }
@@ -409,13 +411,18 @@ struct SessionRow: View {
                         Image(systemName: "pin.fill")
                             .font(.caption2)
                             .foregroundStyle(.pink)
-                            .accessibilityLabel("Pinned")
+                            .accessibilityHidden(true)
                     }
                     Text(session.title)
                         .fontWeight(.medium)
                         .lineLimit(1)
+                        .accessibilityHidden(true)
                     Spacer(minLength: 4)
-                    if session.isStreaming { ProgressView().controlSize(.mini) }
+                    if session.isStreaming {
+                        ProgressView()
+                            .controlSize(.mini)
+                            .accessibilityHidden(true)
+                    }
                 }
                 if let last = session.messages.last, !last.text.isEmpty {
                     Text(last.text)
