@@ -389,6 +389,7 @@ struct ProviderModelRow: View {
             Button("Use") { state.useBackendInChat(backend) }
                 .fixedSize(horizontal: true, vertical: false)
                 .disabled(!ready)
+                .accessibilityHint(ready ? "Use \(model.name) in a chat." : (state.backendUnavailableMessage(for: backend) ?? "\(providerName) cannot run this model through its current structured runtime."))
                 .help(ready ? "Use \(model.name) in a chat." : (state.backendUnavailableMessage(for: backend) ?? "\(providerName) cannot run this model through its current structured runtime."))
         }
         .padding(.vertical, 5)
