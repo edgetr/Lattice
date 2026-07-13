@@ -684,7 +684,10 @@ struct OverlayView: View {
                     .accessibilityValue(reason)
             }
             MorphingControl(
-                state: $state.overlayControlState,
+                state: Binding(
+                    get: { state.overlayControlState },
+                    set: { state.overlayControlState = $0 }
+                ),
                 text: $state.draft,
                 compactTitle: state.copyText(for: .askButton, fallback: "Ask Lattice"),
                 expandedPlaceholder: state.copyText(for: .promptPlaceholder, fallback: "What do you need?"),

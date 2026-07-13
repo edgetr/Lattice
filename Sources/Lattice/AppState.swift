@@ -25,8 +25,6 @@ enum WorkspaceSection: String, CaseIterable, Identifiable {
     }
 }
 
-enum OverlayMode: String, CaseIterable { case idle, prompt, context, running, result, compactChat }
-
 struct EditableSelfEditSkillDraft: Equatable {
     var title: String
     var summary: String
@@ -65,19 +63,7 @@ struct EditableSelfEditOperationPreviewDraft: Equatable {
     var detail: String
 }
 
-struct ActivityItem: Identifiable {
-    let id: UUID
-    let icon: String
-    let title: String
-    let detail: String
-
-    init(id: UUID = UUID(), icon: String, title: String, detail: String) {
-        self.id = id
-        self.icon = icon
-        self.title = title
-        self.detail = detail
-    }
-}
+typealias ActivityItem = RunUIActivity
 
 struct HarnessPermissionNotice: Identifiable {
     let id = UUID()
@@ -147,14 +133,9 @@ final class AppState: ObservableObject {
     @Published var pendingDeleteExtensionRecord: LatticeExtensionRecord?
     @Published var showDeleteSkillConfirmation = false
     @Published var pendingDeleteSkillRecord: LatticeSkillRecord?
-    @Published var overlayMode: OverlayMode = .idle
     @Published var isOverlayVisible = false
     @Published var policy: ExecutionPolicy = .ask
     @Published var privacyMode: SessionPrivacyMode = .cloudAllowed
-    @Published var activity: [ActivityItem] = []
-    @Published var activitySessionID: UUID?
-    @Published var errorMessage: String?
-    @Published var errorMessageSessionID: UUID?
     @Published var harnessPermissionNotices: [UUID: HarnessPermissionNotice] = [:]
     @Published var editingMessageContext: MessageEditContext?
     /// Composer draft present before the current edit began; restored when edit mode exits without a successful send.
@@ -162,10 +143,6 @@ final class AppState: ObservableObject {
     @Published var copiedMessageID: UUID?
     @Published var defaultBackend: ChatBackend
     @Published var ollamaModels: [OllamaModel] = []
-    @Published var composerState: MorphingControlState = .expanded
-    @Published var activeComposerState: MorphingControlState?
-    @Published var activeComposerStateSessionID: UUID?
-    @Published var overlayControlState: MorphingControlState = .expanded
     @Published var columnVisibility: NavigationSplitViewVisibility = .all
     /// Last measured conversations workspace width; used only for split-column adaptation.
     private var lastMeasuredWorkspaceWidth: CGFloat = 0
@@ -280,6 +257,8 @@ final class AppState: ObservableObject {
     private var submittedRequests: [UUID: String] = [:]
     private var selfEditRunIDs: Set<UUID> = []
     private var activeRunIDs: [UUID: UUID] = [:]
+    @Published private var runUIStates: [UUID: RunUIState] = [:]
+    @Published private var globalErrorMessage: String?
     /// Suppresses draft→session write-back while loading a session's draft into the composer.
     private var isApplyingComposerDraft = false
     private static let idleUnloadKey = "localModelIdleUnloadMinutes"
@@ -474,6 +453,20 @@ final class AppState: ObservableObject {
     var activeBackend: ChatBackend { selectedSession?.backend ?? defaultBackend }
     var activePrivacyMode: SessionPrivacyMode { selectedSession?.privacyMode ?? privacyMode }
     var activeHarnessID: String { selectedSession.map(effectiveHarnessID(for:)) ?? selectedRouteHarnessID }
+    var overlayMode: OverlayMode {
+        get { selectedRunUIState?.overlayMode ?? .idle }
+        set { updateSelectedRunUI { $0.overlayMode = newValue } }
+    }
+    var activity: [ActivityItem] { selectedRunUIState?.activity ?? [] }
+    var errorMessage: String? { selectedRunUIState?.errorMessage ?? globalErrorMessage }
+    var composerState: MorphingControlState {
+        get { selectedRunUIState?.composerState ?? .expanded }
+        set { updateSelectedRunUI { $0.composerState = newValue } }
+    }
+    var overlayControlState: MorphingControlState {
+        get { selectedRunUIState?.overlayControlState ?? .expanded }
+        set { updateSelectedRunUI { $0.overlayControlState = newValue } }
+    }
     var activeReasoningOptions: [ReasoningOption] { reasoningOptions(for: activeBackend, harnessID: activeHarnessID) }
     var activeReasoningEffort: ReasoningEffort? { selectedSession?.reasoningEffort ?? defaultReasoning(for: activeBackend, harnessID: activeHarnessID) }
     var isSelectedSessionRouteLocked: Bool {
@@ -549,25 +542,34 @@ final class AppState: ObservableObject {
         return routeUnavailableMessage(for: session)
     }
     func visibleErrorMessage(for sessionID: UUID) -> String? {
-        guard let errorMessage else { return nil }
-        guard let errorMessageSessionID else { return errorMessage }
-        return errorMessageSessionID == sessionID ? errorMessage : nil
+        runUIStates[sessionID]?.errorMessage ?? globalErrorMessage
     }
     func visibleActivity(for sessionID: UUID) -> [ActivityItem] {
-        activitySessionID == sessionID ? activity : []
+        runUIStates[sessionID]?.activity ?? []
     }
     func visibleComposerState(for sessionID: UUID) -> MorphingControlState {
-        if activeComposerStateSessionID == sessionID, let activeComposerState {
-            return activeComposerState
-        }
-        return composerState
+        runUIStates[sessionID]?.composerState ?? .expanded
     }
     func setVisibleComposerState(_ state: MorphingControlState, for sessionID: UUID?) {
-        if let sessionID, activeComposerStateSessionID == sessionID {
-            activeComposerState = state
-        } else {
-            composerState = state
-        }
+        guard let sessionID else { return }
+        reduceRunUI(.setComposerState(state), for: sessionID)
+    }
+
+    private var selectedRunUIState: RunUIState? {
+        selectedSessionID.flatMap { runUIStates[$0] }
+    }
+
+    private func updateSelectedRunUI(_ update: (inout RunUIState) -> Void) {
+        guard let sessionID = selectedSessionID else { return }
+        var state = runUIStates[sessionID] ?? RunUIState()
+        update(&state)
+        runUIStates[sessionID] = state
+    }
+
+    private func reduceRunUI(_ action: RunUIAction, for sessionID: UUID) {
+        var state = runUIStates[sessionID] ?? RunUIState()
+        RunUIReducer.reduce(action, into: &state)
+        runUIStates[sessionID] = state
     }
 
     func contextBudgetEstimate(for session: LatticeSession) -> LatticeContextBudgetEstimate {
@@ -1188,6 +1190,7 @@ final class AppState: ObservableObject {
     func clearConversationScrollState(for sessionID: UUID) {
         conversationScrollStates.removeValue(forKey: sessionID)
         conversationOutgoingActionSequence.removeValue(forKey: sessionID)
+        runUIStates.removeValue(forKey: sessionID)
         if conversationJumpAffordances[sessionID] != nil {
             conversationJumpAffordances.removeValue(forKey: sessionID)
         }
@@ -1197,6 +1200,8 @@ final class AppState: ObservableObject {
         conversationScrollStates.removeAll()
         conversationOutgoingActionSequence.removeAll()
         conversationJumpAffordances.removeAll()
+        runUIStates.removeAll()
+        globalErrorMessage = nil
     }
 
     func publishConversationJumpAffordance(for sessionID: UUID) {
@@ -1247,7 +1252,7 @@ final class AppState: ObservableObject {
             selfEditPreviews = updated
         }
         harnessPermissionNotices[context.sessionID] = nil
-        if activitySessionID == context.sessionID { clearActivity() }
+        clearActivity(for: context.sessionID)
         clearError()
         persist()
     }
@@ -1536,11 +1541,8 @@ final class AppState: ObservableObject {
     private func startRun(for id: UUID, at index: Int, submittedText: String) {
         sessions[index].isStreaming = true
         sessions[index].lastUpdated = .now
-        clearError()
-        clearActivity()
-        overlayMode = .running
-        setActiveComposerState(.progress(0.1), sessionID: id)
-        overlayControlState = .progress(0.1)
+        globalErrorMessage = nil
+        reduceRunUI(.started, for: id)
         persist()
 
         let session = sessions[index]
@@ -1782,13 +1784,7 @@ final class AppState: ObservableObject {
         if sessions[index].messages.last?.role == .assistant, sessions[index].messages.last?.text.isEmpty == true {
             sessions[index].messages.removeLast()
         }
-        if selectedSessionID == id {
-            clearActivity()
-            overlayMode = .result
-            clearActiveComposerState()
-            composerState = .expanded
-            overlayControlState = .expanded
-        }
+        reduceRunUI(.cancelled, for: id)
         harnessPermissionNotices[id] = nil
         persist()
         let harnessID = effectiveHarnessID(for: session)
@@ -1835,11 +1831,7 @@ final class AppState: ObservableObject {
                 detail: notice.request.title
             )
         ], sessionID: notice.sessionID)
-        setActiveComposerState(.progress(0.5), sessionID: notice.sessionID)
-        if selectedSessionID == notice.sessionID {
-            overlayControlState = .progress(0.5)
-            overlayMode = .running
-        }
+        reduceRunUI(.permissionResolved, for: notice.sessionID)
     }
 
     private func forwardHarnessPermission(_ notice: HarnessPermissionNotice, optionID: String?) -> Bool {
@@ -4625,15 +4617,15 @@ Lattice self-edit rules:
             } else {
                 harnessPermissionNotices[id] = notice
                 setActivity([.init(icon: "hand.raised.fill", title: request.title, detail: "Waiting for your decision")], sessionID: id)
-                setActiveComposerState(.approval, sessionID: id)
-                if selectedSessionID == id { overlayControlState = .approval }
+                reduceRunUI(.permissionRequested, for: id)
             }
         case .metric: break
         case .completed:
             activeRunIDs[id] = nil
             harnessPermissionNotices[id] = nil
             finishCompletedTurnActions(at: index)
-            sessions[index].isStreaming = false; clearActivity(); clearActiveComposerState(); overlayMode = .result; composerState = .expanded; overlayControlState = .expanded
+            sessions[index].isStreaming = false
+            reduceRunUI(.completed, for: id)
             let request = submittedRequests[id]
             if selfEditRunIDs.remove(id) != nil {
                 _ = prepareGeneratedExtensionPreview(at: index, request: request)
@@ -4647,7 +4639,9 @@ Lattice self-edit rules:
             harnessPermissionNotices[id] = nil
             selfEditRunIDs.remove(id)
             finishPendingActions(status: .cancelled, at: index)
-            sessions[index].isStreaming = false; clearActivity(); clearActiveComposerState(); overlayMode = .result; composerState = .expanded; overlayControlState = .expanded; persist()
+            sessions[index].isStreaming = false
+            reduceRunUI(.cancelled, for: id)
+            persist()
             scheduleIdleUnloadIfNeeded(for: backend)
         case .failed(let message):
             activeRunIDs[id] = nil
@@ -4655,9 +4649,10 @@ Lattice self-edit rules:
             selfEditRunIDs.remove(id)
             submittedRequests[id] = nil
             finishPendingActions(status: .failed, at: index)
-            sessions[index].isStreaming = false; clearActivity(); clearActiveComposerState(); setError(message, sessionID: id)
+            sessions[index].isStreaming = false
+            reduceRunUI(.failed(message), for: id)
             if sessions[index].messages.last?.text.isEmpty == true { sessions[index].messages.removeLast() }
-            overlayMode = .prompt; composerState = .expanded; overlayControlState = .expanded; persist()
+            persist()
             scheduleIdleUnloadIfNeeded(for: backend)
         }
     }
@@ -4974,40 +4969,40 @@ Lattice self-edit rules:
     }
 
     private func setActivity(_ items: [ActivityItem], sessionID: UUID) {
-        activity = items
-        activitySessionID = sessionID
+        reduceRunUI(.setActivity(items), for: sessionID)
     }
 
     private func upsertActivity(_ item: ActivityItem, sessionID: UUID) {
-        var items = activitySessionID == sessionID ? activity : []
-        if let index = items.firstIndex(where: { $0.id == item.id }) { items[index] = item }
-        else { items.append(item) }
-        setActivity(Array(items.suffix(4)), sessionID: sessionID)
+        reduceRunUI(.upsertActivity(item), for: sessionID)
     }
 
-    private func clearActivity() {
-        activity = []
-        activitySessionID = nil
+    private func clearActivity(for sessionID: UUID? = nil) {
+        guard let sessionID = sessionID ?? selectedSessionID else { return }
+        reduceRunUI(.clearActivity, for: sessionID)
     }
 
     private func setActiveComposerState(_ state: MorphingControlState, sessionID: UUID) {
-        activeComposerState = state
-        activeComposerStateSessionID = sessionID
+        reduceRunUI(.setComposerState(state), for: sessionID)
     }
 
-    private func clearActiveComposerState() {
-        activeComposerState = nil
-        activeComposerStateSessionID = nil
+    private func clearActiveComposerState(for sessionID: UUID? = nil) {
+        guard let sessionID = sessionID ?? selectedSessionID else { return }
+        reduceRunUI(.setComposerState(.expanded), for: sessionID)
     }
 
     private func setError(_ message: String, sessionID: UUID? = nil) {
-        errorMessage = message
-        errorMessageSessionID = sessionID
+        if let sessionID {
+            reduceRunUI(.setError(message), for: sessionID)
+        } else {
+            globalErrorMessage = message
+        }
     }
 
     private func clearError() {
-        errorMessage = nil
-        errorMessageSessionID = nil
+        globalErrorMessage = nil
+        if let selectedSessionID {
+            reduceRunUI(.clearError, for: selectedSessionID)
+        }
     }
 
     private static func activityIcon(for kind: ToolRequest.Kind) -> String {
