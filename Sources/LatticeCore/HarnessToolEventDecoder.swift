@@ -39,20 +39,27 @@ public enum HarnessToolEventDecoder {
         switch type {
         case "tool_call":
             let rawInput = update["rawInput"] as? [String: Any] ?? [:]
-            let locations = (update["locations"] as? [[String: Any]] ?? []).compactMap { $0["path"] as? String }
+            let locationMetadata = WorkspacePathScope.locationMetadata(in: update)
+            let locations = locationMetadata.paths
             let detail = locations.isEmpty
                 ? detail(input: rawInput, fallback: contentText(update["content"]) ?? "Tool call")
                 : locations.joined(separator: ", ")
             let title = update["title"] as? String ?? "Hermes tool call"
             let kindName = update["kind"] as? String ?? title
+            let workspaceScoped: Bool
+            if locationMetadata.isMalformed {
+                workspaceScoped = false
+            } else if locations.isEmpty {
+                workspaceScoped = WorkspacePathScope.isWorkspaceScoped(rawInput["path"] as? String, workspace: workspace)
+            } else {
+                workspaceScoped = locations.allSatisfy { WorkspacePathScope.isWorkspaceScoped($0, workspace: workspace) }
+            }
             return .toolRequested(.init(
                 id: id,
                 kind: kind(for: kindName),
                 title: title,
                 detail: detail,
-                workspaceScoped: locations.isEmpty
-                    ? isWorkspaceScoped(rawInput["path"] as? String, workspace: workspace)
-                    : locations.allSatisfy { isWorkspaceScoped($0, workspace: workspace) },
+                workspaceScoped: workspaceScoped,
                 reversible: false
             ))
         case "tool_call_update":
@@ -93,14 +100,6 @@ public enum HarnessToolEventDecoder {
 
     private static func displayName(_ rawName: String) -> String {
         rawName.replacingOccurrences(of: "_", with: " ")
-    }
-
-    private static func isWorkspaceScoped(_ path: String?, workspace: URL) -> Bool {
-        guard let path, !path.isEmpty else { return false }
-        let root = workspace.standardizedFileURL.resolvingSymlinksInPath().path
-        let candidate = (path.hasPrefix("/") ? URL(fileURLWithPath: path) : workspace.appendingPathComponent(path))
-            .standardizedFileURL.resolvingSymlinksInPath().path
-        return candidate == root || candidate.hasPrefix(root + "/")
     }
 
     static func stableID(for value: String) -> UUID {
