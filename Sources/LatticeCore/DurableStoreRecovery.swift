@@ -1,0 +1,575 @@
+import Foundation
+import CryptoKit
+
+// MARK: - Evidence-rich load results
+
+/// Classifies durable JSON-array store load failures that require recovery UI.
+/// Missing storage is intentionally not a failure — it is the normal empty state.
+public enum DurableStoreIssueKind: String, Sendable, Hashable, Codable {
+    case corrupt
+    case unreadable
+
+    public var displayName: String {
+        switch self {
+        case .corrupt: "Corrupt or invalid JSON"
+        case .unreadable: "Unreadable"
+        }
+    }
+}
+
+/// Evidence captured when a durable store cannot be loaded.
+public struct DurableStoreIssue: Sendable, Hashable, Identifiable, Codable {
+    public let storeID: String
+    public let storeName: String
+    public let filePath: String
+    public let kind: DurableStoreIssueKind
+    public let summary: String
+    public let technicalDetails: String
+    public let observedModificationDate: Date?
+    public let observedFileSize: Int?
+    public let observedContentFingerprint: String?
+
+    public var id: String { storeID }
+    public var fileURL: URL { URL(fileURLWithPath: filePath) }
+
+    public init(
+        storeID: String,
+        storeName: String,
+        filePath: String,
+        kind: DurableStoreIssueKind,
+        summary: String,
+        technicalDetails: String,
+        observedModificationDate: Date? = nil,
+        observedFileSize: Int? = nil,
+        observedContentFingerprint: String? = nil
+    ) {
+        self.storeID = storeID
+        self.storeName = storeName
+        self.filePath = filePath
+        self.kind = kind
+        self.summary = summary
+        self.technicalDetails = technicalDetails
+        self.observedModificationDate = observedModificationDate
+        self.observedFileSize = observedFileSize
+        self.observedContentFingerprint = observedContentFingerprint
+    }
+}
+
+/// Typed load outcome. Missing remains the normal empty state.
+public enum DurableStoreLoadResult<Value: Sendable>: Sendable {
+    case missing
+    case loaded(Value)
+    case failed(DurableStoreIssue)
+
+    public var issue: DurableStoreIssue? {
+        if case .failed(let issue) = self { return issue }
+        return nil
+    }
+
+    public var isWriteBlocked: Bool {
+        if case .failed = self { return true }
+        return false
+    }
+}
+
+// MARK: - Write gate
+
+/// Blocks normal persistence writes for a store until recovery resolves the failure.
+public final class DurableStoreWriteGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var blocked = false
+
+    public init(blocked: Bool = false) {
+        self.blocked = blocked
+    }
+
+    public var isBlocked: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return blocked
+    }
+
+    public func block() {
+        lock.lock(); blocked = true; lock.unlock()
+    }
+
+    public func unblock() {
+        lock.lock(); blocked = false; lock.unlock()
+    }
+}
+
+// MARK: - Injectable filesystem
+
+/// Injectable IO surface so recovery is testable without AppKit and without unreliable chmod.
+public struct DurableStoreFileIO: Sendable {
+    public var fileExists: @Sendable (String) -> Bool
+    public var attributesOfItem: @Sendable (String) throws -> [FileAttributeKey: Any]
+    public var readData: @Sendable (URL) throws -> Data
+    public var writeDataAtomically: @Sendable (Data, URL) throws -> Void
+    public var createDirectory: @Sendable (URL) throws -> Void
+    public var copyItem: @Sendable (URL, URL) throws -> Void
+    public var moveItem: @Sendable (URL, URL) throws -> Void
+    public var removeItem: @Sendable (URL) throws -> Void
+    public var replaceItem: @Sendable (URL, URL) throws -> Void
+
+    public init(
+        fileExists: @escaping @Sendable (String) -> Bool = { FileManager.default.fileExists(atPath: $0) },
+        attributesOfItem: @escaping @Sendable (String) throws -> [FileAttributeKey: Any] = { try FileManager.default.attributesOfItem(atPath: $0) },
+        readData: @escaping @Sendable (URL) throws -> Data = { try Data(contentsOf: $0) },
+        writeDataAtomically: @escaping @Sendable (Data, URL) throws -> Void = { try $0.write(to: $1, options: .atomic) },
+        createDirectory: @escaping @Sendable (URL) throws -> Void = {
+            try FileManager.default.createDirectory(at: $0, withIntermediateDirectories: true)
+        },
+        copyItem: @escaping @Sendable (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
+        moveItem: @escaping @Sendable (URL, URL) throws -> Void = { try FileManager.default.moveItem(at: $0, to: $1) },
+        removeItem: @escaping @Sendable (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) },
+        replaceItem: @escaping @Sendable (URL, URL) throws -> Void = { original, replacement in
+            _ = try FileManager.default.replaceItemAt(original, withItemAt: replacement)
+        }
+    ) {
+        self.fileExists = fileExists
+        self.attributesOfItem = attributesOfItem
+        self.readData = readData
+        self.writeDataAtomically = writeDataAtomically
+        self.createDirectory = createDirectory
+        self.copyItem = copyItem
+        self.moveItem = moveItem
+        self.removeItem = removeItem
+        self.replaceItem = replaceItem
+    }
+
+    public static let `default` = DurableStoreFileIO()
+}
+
+// MARK: - Errors
+
+public enum DurableStoreRecoveryError: Error, LocalizedError, Sendable, Equatable {
+    case destinationExists(path: String)
+    case sourceMissing(path: String)
+    case sourceChanged(path: String)
+    case backupFailed(message: String)
+    case resetFailed(message: String)
+    case exportFailed(message: String)
+    case writeBlocked(storeName: String)
+    case operationFailed(message: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .destinationExists(let path):
+            return "A file already exists at \(path). Choose a different destination."
+        case .sourceMissing(let path):
+            return "The original file is no longer present at \(path)."
+        case .sourceChanged(let path):
+            return "The file at \(path) changed after the failure was observed. Retry loading before resetting."
+        case .backupFailed(let message),
+             .resetFailed(let message),
+             .exportFailed(let message),
+             .operationFailed(let message):
+            return message
+        case .writeBlocked(let storeName):
+            return "Writing to \(storeName) is blocked until recovery is complete."
+        }
+    }
+}
+
+public struct DurableStorePreserveResult: Sendable, Equatable {
+    public let preservedURL: URL
+    public let note: String?
+
+    public init(preservedURL: URL, note: String? = nil) {
+        self.preservedURL = preservedURL
+        self.note = note
+    }
+}
+
+public enum DurableStorePreserveKind: String, Sendable {
+    case backup
+    case quarantine
+}
+
+// MARK: - Recovery primitives
+
+/// Focused, AppKit-free recovery primitives for durable JSON array stores.
+public enum DurableStoreRecovery: Sendable {
+    public static let emptyJSONArray = Data("[]\n".utf8)
+
+    public static func enforceWritable(gate: DurableStoreWriteGate, storeName: String = "this store") throws {
+        if gate.isBlocked {
+            throw DurableStoreRecoveryError.writeBlocked(storeName: storeName)
+        }
+    }
+
+    /// Classifies Foundation/POSIX/Cocoa read failures using direct error evidence (not localized strings alone).
+    public static func isUnreadableError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == NSCocoaErrorDomain {
+            let codes: Set<Int> = [
+                NSFileReadNoPermissionError,
+                NSFileReadUnknownError,
+                NSFileReadCorruptFileError,
+                NSFileLockingError,
+                NSFileReadInvalidFileNameError
+            ]
+            if codes.contains(nsError.code) { return true }
+        }
+        if nsError.domain == NSPOSIXErrorDomain {
+            let codes: Set<Int> = [Int(EACCES), Int(EPERM), Int(EIO), Int(EBUSY), Int(EAGAIN)]
+            if codes.contains(nsError.code) { return true }
+        }
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? Error {
+            return isUnreadableError(underlying)
+        }
+        return false
+    }
+
+    public static func isNotFoundError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == NSCocoaErrorDomain,
+           nsError.code == NSFileReadNoSuchFileError || nsError.code == NSFileNoSuchFileError {
+            return true
+        }
+        if nsError.domain == NSPOSIXErrorDomain, nsError.code == Int(ENOENT) {
+            return true
+        }
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? Error {
+            return isNotFoundError(underlying)
+        }
+        return false
+    }
+
+    public static func contentFingerprint(for data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    public static func observation(
+        of fileURL: URL,
+        io: DurableStoreFileIO = .default
+    ) -> (modificationDate: Date?, fileSize: Int?, fingerprint: String?) {
+        let attrs = try? io.attributesOfItem(fileURL.path)
+        let modificationDate = attrs?[.modificationDate] as? Date
+        let fileSize = (attrs?[.size] as? NSNumber)?.intValue
+        let fingerprint = (try? io.readData(fileURL)).map(contentFingerprint(for:))
+        return (modificationDate, fileSize, fingerprint)
+    }
+
+    /// Loads a JSON array store. Missing is normal empty; corrupt/unreadable become failed issues.
+    public static func loadJSONArray<Element: Decodable & Sendable>(
+        from fileURL: URL,
+        as elementType: Element.Type = Element.self,
+        storeID: String,
+        storeName: String,
+        io: DurableStoreFileIO = .default
+    ) -> DurableStoreLoadResult<[Element]> {
+        let observed = observation(of: fileURL, io: io)
+        let data: Data
+        do {
+            data = try io.readData(fileURL)
+        } catch {
+            if isNotFoundError(error) {
+                return .missing
+            }
+            return .failed(
+                makeIssue(
+                    storeID: storeID,
+                    storeName: storeName,
+                    fileURL: fileURL,
+                    kind: .unreadable,
+                    summary: "\(storeName) could not be read. Lattice left the original file untouched.",
+                    error: error,
+                    dataPreview: nil,
+                    observation: observed
+                )
+            )
+        }
+
+        do {
+            let decoded = try JSONDecoder().decode([Element].self, from: data)
+            return .loaded(decoded)
+        } catch {
+            return .failed(
+                makeIssue(
+                    storeID: storeID,
+                    storeName: storeName,
+                    fileURL: fileURL,
+                    kind: .corrupt,
+                    summary: "\(storeName) contains invalid or corrupt JSON. Lattice left the original file untouched.",
+                    error: error,
+                    dataPreview: data,
+                    observation: (
+                        observed.modificationDate,
+                        observed.fileSize ?? data.count,
+                        contentFingerprint(for: data)
+                    )
+                )
+            )
+        }
+    }
+
+    /// Non-destructive export. Refuses to replace an existing destination.
+    public static func exportCopy(
+        of fileURL: URL,
+        to destinationURL: URL,
+        io: DurableStoreFileIO = .default
+    ) throws {
+        guard io.fileExists(fileURL.path) else {
+            throw DurableStoreRecoveryError.sourceMissing(path: fileURL.path)
+        }
+        if io.fileExists(destinationURL.path) {
+            throw DurableStoreRecoveryError.destinationExists(path: destinationURL.path)
+        }
+        do {
+            try io.createDirectory(destinationURL.deletingLastPathComponent())
+            try io.copyItem(fileURL, destinationURL)
+        } catch let recovery as DurableStoreRecoveryError {
+            throw recovery
+        } catch {
+            throw DurableStoreRecoveryError.exportFailed(
+                message: "Could not export a copy: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    /// Creates a collision-safe backup/quarantine copy next to the original. Never replaces an existing backup.
+    public static func preserveCopy(
+        of fileURL: URL,
+        kind: DurableStorePreserveKind = .backup,
+        io: DurableStoreFileIO = .default,
+        now: Date = Date(),
+        uniqueToken: String = UUID().uuidString
+    ) throws -> DurableStorePreserveResult {
+        guard io.fileExists(fileURL.path) else {
+            throw DurableStoreRecoveryError.sourceMissing(path: fileURL.path)
+        }
+        let preservedURL = try uniquePreserveURL(
+            for: fileURL,
+            kind: kind,
+            now: now,
+            uniqueToken: uniqueToken,
+            io: io
+        )
+        let temporaryURL = preservedURL
+            .deletingLastPathComponent()
+            .appendingPathComponent(".\(preservedURL.lastPathComponent).partial-\(UUID().uuidString)")
+        do {
+            try io.copyItem(fileURL, temporaryURL)
+        } catch {
+            try? io.removeItem(temporaryURL)
+            throw DurableStoreRecoveryError.backupFailed(
+                message: "Could not create a \(kind.rawValue) of \(fileURL.lastPathComponent): \(error.localizedDescription)"
+            )
+        }
+        guard io.fileExists(temporaryURL.path) else {
+            try? io.removeItem(temporaryURL)
+            throw DurableStoreRecoveryError.backupFailed(
+                message: "\(kind.rawValue.capitalized) temporary copy was not created near \(fileURL.path)."
+            )
+        }
+        let original: Data
+        let copy: Data
+        do {
+            original = try io.readData(fileURL)
+            copy = try io.readData(temporaryURL)
+        } catch {
+            try? io.removeItem(temporaryURL)
+            throw DurableStoreRecoveryError.backupFailed(
+                message: "\(kind.rawValue.capitalized) could not be verified for \(fileURL.lastPathComponent); original left unchanged. \(error.localizedDescription)"
+            )
+        }
+        guard original == copy else {
+            try? io.removeItem(temporaryURL)
+            throw DurableStoreRecoveryError.backupFailed(
+                message: "\(kind.rawValue.capitalized) verification failed for \(fileURL.lastPathComponent); original left unchanged."
+            )
+        }
+        do {
+            try io.moveItem(temporaryURL, preservedURL)
+        } catch {
+            try? io.removeItem(temporaryURL)
+            throw DurableStoreRecoveryError.backupFailed(
+                message: "Could not finalize the verified \(kind.rawValue) of \(fileURL.lastPathComponent): \(error.localizedDescription)"
+            )
+        }
+        guard io.fileExists(preservedURL.path) else {
+            throw DurableStoreRecoveryError.backupFailed(
+                message: "\(kind.rawValue.capitalized) was not finalized at \(preservedURL.path)."
+            )
+        }
+        return .init(
+            preservedURL: preservedURL,
+            note: "Original left in place at \(fileURL.path)."
+        )
+    }
+
+    /// Creates a verified backup/quarantine copy, then atomically replaces the original with a valid empty JSON array.
+    /// If backup cannot be created, the original is never touched.
+    /// When `expected` is provided, rejects stale sources that changed after the failure was observed.
+    public static func resetReplacingWithEmptyArray(
+        at fileURL: URL,
+        expected: DurableStoreIssue? = nil,
+        io: DurableStoreFileIO = .default,
+        now: Date = Date(),
+        uniqueToken: String = UUID().uuidString
+    ) throws -> DurableStorePreserveResult {
+        if !io.fileExists(fileURL.path) {
+            if expected != nil {
+                throw DurableStoreRecoveryError.sourceMissing(path: fileURL.path)
+            }
+            try writeEmptyArray(at: fileURL, io: io)
+            return .init(preservedURL: fileURL, note: "No original existed; wrote a new empty store.")
+        }
+
+        if let expected {
+            try ensureSourceMatchesExpected(fileURL: fileURL, expected: expected, io: io)
+        }
+
+        let preserved: DurableStorePreserveResult
+        do {
+            preserved = try preserveCopy(of: fileURL, kind: .quarantine, io: io, now: now, uniqueToken: uniqueToken)
+        } catch {
+            throw DurableStoreRecoveryError.resetFailed(
+                message: "Reset aborted because a backup could not be created. Original left unchanged. \(error.localizedDescription)"
+            )
+        }
+
+        do {
+            try writeEmptyArray(at: fileURL, io: io)
+        } catch {
+            throw DurableStoreRecoveryError.resetFailed(
+                message: "Backup was saved to \(preserved.preservedURL.path), but replacing the original failed: \(error.localizedDescription)"
+            )
+        }
+
+        return .init(
+            preservedURL: preserved.preservedURL,
+            note: "Original preserved; new empty JSON array installed."
+        )
+    }
+
+    public static func uniquePreserveURL(
+        for fileURL: URL,
+        kind: DurableStorePreserveKind = .backup,
+        now: Date = Date(),
+        uniqueToken: String = UUID().uuidString,
+        io: DurableStoreFileIO = .default
+    ) throws -> URL {
+        let directory = fileURL.deletingLastPathComponent()
+        let baseName = sanitizeFileNameComponent(fileURL.lastPathComponent)
+        let timestamp = utcTimestamp(now)
+        let token = sanitizeFileNameComponent(
+            String(uniqueToken.replacingOccurrences(of: "-", with: "").prefix(8)).lowercased()
+        )
+        // Required suffix style: .corrupt-<UTC timestamp>-<unique>.backup
+        // Both backup and quarantine use the same visible corrupt marker so users can identify failed originals.
+        let label = "corrupt"
+        var candidate = directory.appendingPathComponent("\(baseName).\(label)-\(timestamp)-\(token).backup")
+        var attempt = 1
+        while io.fileExists(candidate.path) {
+            attempt += 1
+            candidate = directory.appendingPathComponent("\(baseName).\(label)-\(timestamp)-\(token)-\(attempt).backup")
+            if attempt > 64 {
+                throw DurableStoreRecoveryError.backupFailed(
+                    message: "Could not allocate a unique backup name near \(directory.path)."
+                )
+            }
+        }
+        return candidate
+    }
+
+    public static func ensureSourceMatchesExpected(
+        fileURL: URL,
+        expected: DurableStoreIssue,
+        io: DurableStoreFileIO = .default
+    ) throws {
+        let current = observation(of: fileURL, io: io)
+        if let expectedSize = expected.observedFileSize {
+            guard current.fileSize == expectedSize else {
+                throw DurableStoreRecoveryError.sourceChanged(path: fileURL.path)
+            }
+        }
+        if let expectedFingerprint = expected.observedContentFingerprint {
+            guard current.fingerprint == expectedFingerprint else {
+                throw DurableStoreRecoveryError.sourceChanged(path: fileURL.path)
+            }
+        }
+        if let expectedDate = expected.observedModificationDate {
+            guard let currentDate = current.modificationDate,
+                  abs(expectedDate.timeIntervalSince(currentDate)) <= 0.001 else {
+                throw DurableStoreRecoveryError.sourceChanged(path: fileURL.path)
+            }
+        }
+    }
+
+    // MARK: - Helpers
+
+    private static func writeEmptyArray(at fileURL: URL, io: DurableStoreFileIO) throws {
+        try io.createDirectory(fileURL.deletingLastPathComponent())
+        let temporary = fileURL.appendingPathExtension("tmp-\(UUID().uuidString)")
+        do {
+            try io.writeDataAtomically(emptyJSONArray, temporary)
+            if io.fileExists(fileURL.path) {
+                try io.replaceItem(fileURL, temporary)
+            } else {
+                try io.moveItem(temporary, fileURL)
+            }
+        } catch {
+            try? io.removeItem(temporary)
+            throw error
+        }
+        if io.fileExists(temporary.path) {
+            try? io.removeItem(temporary)
+        }
+    }
+
+    private static func sanitizeFileNameComponent(_ value: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+        let scalars = value.unicodeScalars.map { allowed.contains($0) ? Character($0) : "-" }
+        let cleaned = String(scalars)
+            .replacingOccurrences(of: "--+", with: "-", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-."))
+        return cleaned.isEmpty ? "store" : cleaned
+    }
+
+    private static func utcTimestamp(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        return formatter.string(from: date)
+    }
+
+    private static func makeIssue(
+        storeID: String,
+        storeName: String,
+        fileURL: URL,
+        kind: DurableStoreIssueKind,
+        summary: String,
+        error: Error,
+        dataPreview: Data?,
+        observation: (modificationDate: Date?, fileSize: Int?, fingerprint: String?)
+    ) -> DurableStoreIssue {
+        let nsError = error as NSError
+        var lines: [String] = [
+            "Path: \(fileURL.path)",
+            "Category: \(kind.rawValue)",
+            "Domain: \(nsError.domain)",
+            "Code: \(nsError.code)",
+            "Description: \(nsError.localizedDescription)"
+        ]
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+            lines.append("Underlying: \(underlying.domain) (\(underlying.code)) \(underlying.localizedDescription)")
+        }
+        if let dataPreview {
+            lines.append("Byte length: \(dataPreview.count)")
+        }
+        return DurableStoreIssue(
+            storeID: storeID,
+            storeName: storeName,
+            filePath: fileURL.path,
+            kind: kind,
+            summary: summary,
+            technicalDetails: lines.joined(separator: "\n"),
+            observedModificationDate: observation.modificationDate,
+            observedFileSize: observation.fileSize,
+            observedContentFingerprint: observation.fingerprint
+        )
+    }
+}

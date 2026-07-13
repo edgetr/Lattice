@@ -1,0 +1,55 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon\r
+._*
+.Spotlight-V100
+.Trashes
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Xcode
+DerivedData/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xccheckout
+*.xcscmblueprint
+
+# Packaged output and release artifacts
+dist/
+artifacts/
+*.app
+*.dmg
+*.pkg
+*.xcarchive
+*.zip
+
+# Local editor and agent state
+.vscode/
+.idea/
+.codex/
+*.swp
+*.swo
+*~
+
+# Logs, profiling, and coverage
+*.log
+*.trace
+*.profraw
+*.profdata
+coverage/
+
+# Secrets and local environment overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.mobileprovision
+
+# Unrelated packaged extensions/binaries
+*.vsix

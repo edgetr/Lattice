@@ -1,0 +1,91 @@
+{
+  "features" : [
+    "refractivity"
+  ],
+  "fill" : {
+    "automatic-gradient" : "extended-srgb:0.94902,0.41961,0.21961,1.00000"
+  },
+  "groups" : [
+    {
+      "name" : "Flower Center",
+      "layers" : [
+        {
+          "glass" : true,
+          "image-name" : "06-flower-center.svg",
+          "name" : "00 Flower Center Top"
+        }
+      ],
+      "lighting" : "combined",
+      "blur" : {
+        "enabled" : false,
+        "value" : 0
+      },
+      "refractivity" : {
+        "depth" : 0,
+        "enabled" : false,
+        "strength" : 0
+      },
+      "shadow" : {
+        "kind" : "none",
+        "opacity" : 0
+      },
+      "specular" : "inside",
+      "translucency" : {
+        "enabled" : false,
+        "value" : 0
+      }
+    },
+    {
+      "name" : "Petals",
+      "layers" : [
+        {
+          "glass" : true,
+          "image-name" : "05-petal.svg",
+          "name" : "05 Petal Magenta — top"
+        },
+        {
+          "image-name" : "04-petal.svg",
+          "name" : "04 Petal Rose"
+        },
+        {
+          "image-name" : "03-petal.svg",
+          "name" : "03 Petal Pink"
+        },
+        {
+          "image-name" : "02-petal.svg",
+          "name" : "02 Petal Blush"
+        },
+        {
+          "blend-mode" : "normal",
+          "image-name" : "01-petal.svg",
+          "name" : "01 Petal Peach — bottom"
+        }
+      ],
+      "lighting" : "individual",
+      "blur" : {
+        "enabled" : true,
+        "value" : 0.08
+      },
+      "refractivity" : {
+        "depth" : 0.22,
+        "enabled" : true,
+        "strength" : 0.22
+      },
+      "shadow" : {
+        "kind" : "none",
+        "opacity" : 0
+      },
+      "specular" : "inside",
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.34
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}

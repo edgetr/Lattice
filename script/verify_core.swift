@@ -1,0 +1,2868 @@
+import Foundation
+import Darwin
+import LatticeCore
+
+@main
+struct CoreVerification {
+    static func main() async {
+        signal(SIGPIPE, SIG_IGN)
+        var checks = 0
+        func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
+            guard condition() else { fputs("FAILED: \(message)\n", stderr); exit(1) }
+            checks += 1
+        }
+
+        let editChat = UUID()
+        let otherChat = UUID()
+        let editContext = MessageEditContext(sessionID: editChat, messageID: UUID())
+        expect(editContext.belongs(to: editChat), "Message edit remains scoped to its originating chat")
+        expect(!editContext.belongs(to: otherChat), "Message edit does not leak into another chat")
+        expect(!editContext.belongs(to: nil), "Message edit is cancelled when no chat is selected")
+        let editBegin = MessageEditDraftState.begin(sessionID: editChat, messageID: UUID(), messageText: "edited", currentDraft: "prior draft", existing: nil)
+        expect(editBegin.draft == "edited" && editBegin.state.preservedComposerDraft == "prior draft", "Edit begin preserves prior composer draft")
+        let editSwitch = MessageEditDraftState.begin(sessionID: editChat, messageID: UUID(), messageText: "second", currentDraft: "edited", existing: editBegin.state)
+        expect(editSwitch.state.preservedComposerDraft == "prior draft", "Switching edit target keeps original preserved draft")
+        expect(MessageEditDraftState.cancel(editSwitch.state) == "prior draft", "Canceling edit restores preserved composer draft")
+        expect(MessageEditDraftState.complete(editSwitch.state) == "prior draft", "Successful edit send retains pre-edit ordinary draft")
+        expect(ComposerSessionDraftTransition.initialComposerDraft(selectedID: editChat, storedDraftForSelected: "restored\n  exactly  ") == "restored\n  exactly  ", "Initial restored selection loads its exact durable draft")
+        expect(ComposerSessionDraftTransition.initialComposerDraft(selectedID: otherChat, storedDraftForSelected: "") == "", "Initial restored selection preserves an exact empty draft")
+        expect(ComposerSessionDraftTransition.initialComposerDraft(selectedID: nil, storedDraftForSelected: "must not leak") == "", "No initial selection starts with an empty composer")
+        let leaveA = ComposerSessionDraftTransition.selecting(from: editChat, to: otherChat, composerText: "alpha\n  draft  ", edit: nil, storedDraftForNext: "beta")
+        expect(leaveA.previousSessionDraft == "alpha\n  draft  " && leaveA.composerDraft == "beta", "Two-chat draft switch preserves exact whitespace")
+        let leaveEmpty = ComposerSessionDraftTransition.selecting(from: otherChat, to: editChat, composerText: "", edit: nil, storedDraftForNext: "alpha\n  draft  ")
+        expect(leaveEmpty.previousSessionDraft == "" && leaveEmpty.composerDraft == "alpha\n  draft  ", "Empty ordinary draft restores exact empty state")
+        let editLeave = ComposerSessionDraftTransition.selecting(
+            from: editChat,
+            to: otherChat,
+            composerText: "transient edit text",
+            edit: MessageEditDraftState(context: MessageEditContext(sessionID: editChat, messageID: UUID()), preservedComposerDraft: "ordinary A"),
+            storedDraftForNext: "ordinary B"
+        )
+        expect(editLeave.previousSessionDraft == "ordinary A" && editLeave.composerDraft == "ordinary B" && editLeave.clearsEditState, "Chat switch while editing restores ordinary draft and never writes edit text")
+        expect(ComposerSessionDraftTransition.clearingOrdinaryDraft() == "", "Ordinary send/queue clears only the ordinary draft")
+        expect(ComposerSessionDraftTransition.preservingOrdinaryDraft("keep") == "keep", "Failed validation preserves ordinary draft")
+        let streamingTarget = UUID()
+        if case .cancelTargetThenDelete(let id) = SessionDeletionPolicy.decision(forStreamingTarget: streamingTarget, isStreaming: true) {
+            expect(id == streamingTarget, "Streaming deletion cancels the target session by its own id")
+        } else {
+            expect(false, "Streaming deletion cancels the target session by its own id")
+        }
+        expect(SessionDeletionPolicy.decision(forStreamingTarget: streamingTarget, isStreaming: false) == .deleteIdle, "Idle deletion does not cancel a run")
+        expect(LatticeApplicationSupport.productFolderName == "Lattice", "Application Support product folder is Lattice")
+        expect(LatticeApplicationSupport.legacyProductFolderName == "Nisa", "Legacy Application Support folder remains documented for migration")
+        expect(LatticeLegacyBrandCompatibility.extensionManifestOpeningTag == "<nisa-extension-manifest>", "Legacy extension tag is isolated for compatibility reads")
+        let selectionPaletteItems = [
+            LatticeCommandPaletteItem(id: "new-chat", title: "New Chat", detail: "Start a fresh conversation"),
+            LatticeCommandPaletteItem(id: "continue", title: "Continue Response", detail: "Resume", isEnabled: false, disabledReason: "No response"),
+            LatticeCommandPaletteItem(id: "models", title: "Show Models", detail: "Catalog")
+        ]
+        expect(LatticeCommandPaletteSelection.clampedSelection(selectedID: nil, in: selectionPaletteItems) == "new-chat", "Palette selection defaults to first enabled item")
+        expect(LatticeCommandPaletteSelection.clampedSelection(selectedID: "continue", in: selectionPaletteItems) == "new-chat", "Palette clamp refuses disabled selection")
+        expect(LatticeCommandPaletteSelection.selectionAfterHover(hoveredID: "models", in: selectionPaletteItems) == "models", "Palette hover adopts enabled shared selection")
+        expect(LatticeCommandPaletteSelection.selectionAfterHover(hoveredID: "continue", in: selectionPaletteItems) == nil, "Palette hover ignores disabled rows without clearing selection")
+        expect(LatticeCommandPaletteSelection.movedSelection(selectedID: "new-chat", in: selectionPaletteItems, delta: 1) == "models", "Palette arrow navigation skips disabled items")
+        expect(LatticeCommandPaletteSelection.movedSelection(selectedID: "models", in: selectionPaletteItems, delta: -1) == "new-chat", "Palette arrows continue from hovered/shared selection")
+        expect(LatticeCommandPaletteSelection.movedSelection(selectedID: "new-chat", in: selectionPaletteItems, delta: -1) == "new-chat", "Palette up-arrow clamps at first enabled row")
+        expect(LatticeCommandPaletteSelection.movedSelection(selectedID: "models", in: selectionPaletteItems, delta: 1) == "models", "Palette down-arrow clamps at last enabled row")
+        expect(LatticeCommandPaletteSelection.executableSelection(selectedID: "continue", in: selectionPaletteItems) == nil, "Palette refuses to execute disabled selection")
+        expect(LatticeCommandPaletteSelection.executableSelection(selectedID: nil, in: selectionPaletteItems) == nil, "Palette refuses to execute empty selection")
+        expect(LatticeCommandPaletteSelection.executableSelection(selectedID: "models", in: selectionPaletteItems)?.id == "models", "Palette executes enabled selection")
+        let filteredPalette = LatticeCommandPaletteMatcher.filtered(selectionPaletteItems, query: "models")
+        expect(LatticeCommandPaletteSelection.clampedSelection(selectedID: "new-chat", in: filteredPalette) == "models", "Palette filter clamps to enabled visible row")
+        expect(ExecutionRoutePolicy.compatibleHarnessIDs(for: "antigravity") == ["antigravity"], "Antigravity exposes its direct CLI harness route")
+        let antigravityModels = [ProviderModel(id: "Gemini 3.5 Flash (High)", name: "Gemini 3.5 Flash (High)", isDefault: true)]
+        let antigravitySnapshot = BackendAvailabilitySnapshot(antigravityModels: antigravityModels, antigravityReady: true)
+        expect(BackendAvailabilityPolicy.normalize(.antigravity(model: "Retired"), using: antigravitySnapshot) == .antigravity(model: antigravityModels[0].id), "Antigravity stale models normalize to its available default")
+        let importedSkillStore = LatticeSkillStore(rootURL: FileManager.default.temporaryDirectory, globalRoots: [])
+        let longImportedSkill = "# Hatch Pet\n\n" + String(repeating: "Detailed validation workflow.\n", count: 1_200)
+        let importedSkillIssues = importedSkillStore.validateExistingSkill(id: "hatch-pet", markdown: longImportedSkill)
+        expect(longImportedSkill.count > 24_000 && importedSkillIssues.isEmpty, "Full imported skills are not rejected by the generated-skill size limit")
+        let disabledOnlyPalette = [
+            LatticeCommandPaletteItem(id: "continue", title: "Continue Response", detail: "Resume", isEnabled: false, disabledReason: "No response")
+        ]
+        expect(LatticeCommandPaletteSelection.clampedSelection(selectedID: "continue", in: disabledOnlyPalette) == nil, "Palette clamp is nil when no enabled rows remain")
+        let legacyManifestJSON = "{\"schemaVersion\":1,\"id\":\"com.lattice.legacy\",\"name\":\"Legacy\",\"version\":\"1\",\"summary\":\"Legacy.\"}"
+        expect((try? LatticeExtensionManifestEnvelope.decode(from: "<nisa-extension-manifest>\(legacyManifestJSON)</nisa-extension-manifest>"))?.id == "com.lattice.legacy", "Envelope accepts legacy nisa tags")
+        expect((try? LatticeExtensionManifestEnvelope.decode(from: "<lattice-extension-manifest>\(legacyManifestJSON)</lattice-extension-manifest>"))?.id == "com.lattice.legacy", "Envelope decodes lattice tags")
+
+        let policy = DeterministicPolicyEngine()
+        let read = ToolRequest(kind: .read, title: "Read", detail: "file", workspaceScoped: true, reversible: true)
+        let write = ToolRequest(kind: .write, title: "Write", detail: "file", workspaceScoped: true, reversible: true)
+        if case .allow = policy.evaluate(read, under: .ask) { expect(true, "Ask read") } else { expect(false, "Ask read") }
+        if case .requireApproval = policy.evaluate(write, under: .ask) { expect(true, "Ask write") } else { expect(false, "Ask write") }
+        let broker = LocalToolBroker(handlers: [
+            .write: { request in .toolProgress(id: request.id, fraction: 1, detail: "patched") }
+        ])
+        if case .requiresApproval(let approval) = await broker.submit(write, policy: .ask) {
+            expect(approval.toolRequest == write, "Tool broker returns original gated write request")
+            expect(approval.options.map(\.id) == ["allow_once", "reject_once"], "Ask broker exposes only one-shot approval and denial")
+        } else { expect(false, "Tool broker gates Ask writes before execution") }
+        if case .executed(.toolProgress(let id, let fraction, let detail)) = await broker.submit(write, policy: .smart) {
+            expect(id == write.id && fraction == 1 && detail == "patched", "Tool broker executes registered Smart write handler")
+        } else { expect(false, "Tool broker executes registered Smart write handler") }
+        let credential = ToolRequest(kind: .credential, title: "Token", detail: "Keychain", workspaceScoped: true, reversible: false)
+        if case .denied(let reason) = await broker.submit(credential, policy: .yolo) {
+            expect(reason.contains("Credential"), "Tool broker denies credentials before handler lookup")
+        } else { expect(false, "Tool broker denies credentials before handler lookup") }
+        let missingBroker = LocalToolBroker()
+        if case .failed(let reason) = await missingBroker.submit(read, policy: .ask) {
+            expect(reason.contains("noHandler"), "Tool broker fails closed without a registered handler")
+        } else { expect(false, "Tool broker fails closed without a registered handler") }
+        let brokerAudit = await broker.auditSnapshot()
+        expect(brokerAudit.map(\.decision) == [.approvalRequired, .allowed, .executed, .denied], "Tool broker records authorization and execution audit")
+        let brokerAuditData = try! JSONEncoder().encode(brokerAudit)
+        expect((try! JSONDecoder().decode([ToolAuditRecord].self, from: brokerAuditData)).map(\.decision) == brokerAudit.map(\.decision), "Tool broker audit is durable data")
+
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let store = SessionPersistence(fileURL: root.appendingPathComponent("sessions.json"))
+        let responseMessage = ChatMessage(role: .assistant, text: "Done")
+        let persistedAction = SessionAction(messageID: responseMessage.id, kind: .tool, toolKind: .write, title: "Edit App.swift", detail: "Sources/App.swift", status: .completed, workspaceScoped: true)
+        let session = LatticeSession(title: "Real session", messages: [.init(role: .user, text: "Hello"), responseMessage], backend: .codex(model: "gpt-5.4"), harnessID: "pi", harnessThreadID: "thread", attachments: [.init(path: "/tmp/a")], actions: [persistedAction], draft: "keep me\nexactly", isPinned: true)
+        try! store.save([session])
+        expect(store.load() == [session], "Session round trip")
+        expect(store.load().first?.actions == [persistedAction], "Canonical action trail round trip")
+        expect(store.load().first?.attachments.first?.name == "a", "Attachment metadata round trip")
+        expect(store.load().first?.harnessID == "pi", "Harness selection round trip")
+        expect(store.load().first?.isPinned == true, "Pinned chat state round trip")
+        expect(store.load().first?.draft == "keep me\nexactly", "Per-chat ordinary draft round trip")
+        let draftChatA = LatticeSession(title: "Draft A", backend: .codex(model: "gpt-5.4"), draft: "alpha\n  spaced  ")
+        let draftChatB = LatticeSession(title: "Draft B", backend: .codex(model: "gpt-5.4"), draft: "")
+        try! store.save([draftChatA, draftChatB])
+        let restoredDrafts = store.load()
+        expect(restoredDrafts.first(where: { $0.id == draftChatA.id })?.draft == "alpha\n  spaced  ", "Two-chat drafts restore independently with whitespace")
+        expect(restoredDrafts.first(where: { $0.id == draftChatB.id })?.draft == "", "Empty chat draft restores exact empty state")
+        var legacyDraftObject = try! JSONSerialization.jsonObject(with: JSONEncoder().encode(LatticeSession(title: "Legacy", backend: .codex(model: "gpt-5.4")))) as! [String: Any]
+        legacyDraftObject["draft"] = nil
+        let legacyDraftDecoded = try! JSONDecoder().decode(LatticeSession.self, from: JSONSerialization.data(withJSONObject: legacyDraftObject))
+        expect(legacyDraftDecoded.draft == "", "Legacy Codable sessions default draft to empty")
+        let draftBranchSource = LatticeSession(title: "Source", messages: [.init(role: .user, text: "First")], backend: .codex(model: "gpt-5.4"), draft: "source draft")
+        let draftBranch = SessionTranscriptMutation.branchFromMessage(messageID: draftBranchSource.messages[0].id, in: draftBranchSource)
+        expect(draftBranch?.draft == "", "Branch starts with empty ordinary draft and does not copy source draft")
+        let privateSession = LatticeSession(title: "Private", backend: .ollama(model: "llama3.2:latest"), privacyMode: .localOnly)
+        try! store.save([privateSession])
+        expect(store.load().first?.privacyMode == .localOnly, "Session privacy mode round trip")
+        let olderPinned = LatticeSession(title: "Older pinned", backend: .codex(model: "gpt-5.4"), isPinned: true, lastUpdated: Date(timeIntervalSince1970: 1))
+        let newerUnpinned = LatticeSession(title: "Newer unpinned", backend: .codex(model: "gpt-5.4"), lastUpdated: Date(timeIntervalSince1970: 2))
+        expect(LatticeSessionListOrdering.sorted([newerUnpinned, olderPinned]).map(\.id) == [olderPinned.id, newerUnpinned.id], "Pinned chats sort before newer unpinned chats")
+        let queuedFollowUp = QueuedFollowUp(text: "Then compare the calmer logo options")
+        let queuedSession = LatticeSession(title: "Queued chat", messages: [.init(role: .user, text: "Start")], backend: .codex(model: "gpt-5.4"), queuedFollowUps: [queuedFollowUp])
+        try! store.save([queuedSession])
+        expect(store.load().first?.queuedFollowUps == [queuedFollowUp], "Queued follow-ups round trip with the session")
+
+        // Durable store recovery: missing vs corrupt vs unreadable, backup/reset, write gate.
+        let recoveryRoot = FileManager.default.temporaryDirectory.appendingPathComponent("recovery-\(UUID().uuidString)", isDirectory: true)
+        try! FileManager.default.createDirectory(at: recoveryRoot, withIntermediateDirectories: true)
+        let missingURL = recoveryRoot.appendingPathComponent("missing-sessions.json")
+        if case .missing = SessionPersistence(fileURL: missingURL).loadResult() {
+            expect(true, "Missing sessions file is normal empty load result")
+        } else {
+            expect(false, "Missing sessions file is normal empty load result")
+        }
+        let corruptURL = recoveryRoot.appendingPathComponent("sessions.json")
+        let corruptBytes = Data("{not-valid-json".utf8)
+        try! corruptBytes.write(to: corruptURL)
+        let corruptStore = SessionPersistence(fileURL: corruptURL)
+        if case .failed(let issue) = corruptStore.loadResult() {
+            expect(issue.kind == .corrupt, "Corrupt sessions JSON is .corrupt failure")
+            expect(issue.storeID == SessionPersistence.storeID, "Corrupt issue names sessions store")
+            expect((try? Data(contentsOf: corruptURL)) == corruptBytes, "Corrupt load never mutates original bytes")
+            expect(corruptStore.load().isEmpty, "Compatibility load still returns empty for corrupt without writing")
+        } else {
+            expect(false, "Corrupt sessions JSON is .corrupt failure")
+        }
+        let permissionError = NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES), userInfo: [NSLocalizedDescriptionKey: "Permission denied"])
+        let unreadableIO = DurableStoreFileIO(
+            fileExists: { _ in true },
+            attributesOfItem: { _ in [.size: 4, .modificationDate: Date(timeIntervalSince1970: 42)] },
+            readData: { _ in throw permissionError }
+        )
+        if case .failed(let unreadableIssue) = SessionPersistence(fileURL: corruptURL, io: unreadableIO).loadResult() {
+            expect(unreadableIssue.kind == .unreadable, "Permission denial classifies as unreadable")
+            expect(unreadableIssue.observedFileSize == 4, "Unreadable issue captures observed size")
+        } else {
+            expect(false, "Permission denial classifies as unreadable")
+        }
+        let inaccessibleIO = DurableStoreFileIO(
+            fileExists: { _ in false },
+            attributesOfItem: { _ in throw permissionError },
+            readData: { _ in throw permissionError }
+        )
+        if case .failed(let inaccessibleIssue) = SessionPersistence(fileURL: corruptURL, io: inaccessibleIO).loadResult() {
+            expect(inaccessibleIssue.kind == .unreadable, "Failed existence probe does not hide permission denial as missing")
+        } else {
+            expect(false, "Failed existence probe does not hide permission denial as missing")
+        }
+        expect(DurableStoreRecovery.isUnreadableError(NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoPermissionError)), "Cocoa no-permission is unreadable")
+        expect(DurableStoreRecovery.isNotFoundError(NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoSuchFileError)), "Cocoa no-such-file is not-found")
+        let backupNow = Date(timeIntervalSince1970: 1_800_000_000)
+        let backupResult = try! DurableStoreRecovery.preserveCopy(of: corruptURL, kind: .backup, now: backupNow, uniqueToken: "aabbccdd")
+        expect(backupResult.preservedURL.lastPathComponent.contains(".corrupt-"), "Backup uses corrupt-timestamp suffix")
+        expect(backupResult.preservedURL.pathExtension == "backup", "Backup uses .backup extension")
+        expect((try? Data(contentsOf: backupResult.preservedURL)) == corruptBytes, "Backup preserves original bytes")
+        expect((try? Data(contentsOf: corruptURL)) == corruptBytes, "Backup leaves original in place")
+        let collisionBackup = try! DurableStoreRecovery.preserveCopy(of: corruptURL, kind: .backup, now: backupNow, uniqueToken: "aabbccdd")
+        expect(collisionBackup.preservedURL.path != backupResult.preservedURL.path, "Backup never replaces existing backup name")
+        expect(FileManager.default.fileExists(atPath: backupResult.preservedURL.path), "Prior backup survives collision-safe naming")
+        let backupPartials = (try? FileManager.default.contentsOfDirectory(atPath: recoveryRoot.path))?.filter { $0.contains(".partial-") } ?? []
+        expect(backupPartials.isEmpty, "Successful backup leaves no partial artifacts")
+        let exportDest = recoveryRoot.appendingPathComponent("export-existing.json")
+        try! Data("taken".utf8).write(to: exportDest)
+        do {
+            try DurableStoreRecovery.exportCopy(of: corruptURL, to: exportDest)
+            expect(false, "Export refuses existing destination")
+        } catch DurableStoreRecoveryError.destinationExists {
+            expect((try? String(contentsOf: exportDest, encoding: .utf8)) == "taken", "Refused export leaves destination unchanged")
+            expect((try? Data(contentsOf: corruptURL)) == corruptBytes, "Refused export leaves source unchanged")
+        } catch {
+            expect(false, "Export refuses existing destination")
+        }
+        let freeExport = recoveryRoot.appendingPathComponent("export-free.json")
+        try! DurableStoreRecovery.exportCopy(of: corruptURL, to: freeExport)
+        expect((try? Data(contentsOf: freeExport)) == corruptBytes, "Export copies original bytes to free destination")
+        let jobsCorruptURL = recoveryRoot.appendingPathComponent("self-edit-jobs.json")
+        let previewsCorruptURL = recoveryRoot.appendingPathComponent("self-edit-previews.json")
+        try! Data("bad-jobs".utf8).write(to: jobsCorruptURL)
+        try! Data("bad-previews".utf8).write(to: previewsCorruptURL)
+        if case .failed(let jobIssue) = LatticeExtensionJobStore(fileURL: jobsCorruptURL).loadResult() {
+            expect(jobIssue.kind == .corrupt && jobIssue.storeID == LatticeExtensionJobStore.storeID, "Self-edit jobs report corrupt independently")
+        } else {
+            expect(false, "Self-edit jobs report corrupt independently")
+        }
+        if case .failed(let previewIssue) = LatticeExtensionPreviewStore(fileURL: previewsCorruptURL).loadResult() {
+            expect(previewIssue.kind == .corrupt && previewIssue.storeID == LatticeExtensionPreviewStore.storeID, "Self-edit previews report corrupt independently")
+        } else {
+            expect(false, "Self-edit previews report corrupt independently")
+        }
+        expect((try? Data(contentsOf: jobsCorruptURL)) == Data("bad-jobs".utf8), "Jobs corrupt load preserves original")
+        expect((try? Data(contentsOf: previewsCorruptURL)) == Data("bad-previews".utf8), "Previews corrupt load preserves original")
+        let gate = DurableStoreWriteGate()
+        let gatedStore = SessionPersistence(fileURL: recoveryRoot.appendingPathComponent("gated.json"), writeGate: gate)
+        gate.block()
+        do {
+            try gatedStore.save([])
+            expect(false, "Write gate blocks session saves during recovery")
+        } catch {
+            expect(true, "Write gate blocks session saves during recovery")
+        }
+        gate.unblock()
+        try! gatedStore.save([])
+        expect(FileManager.default.fileExists(atPath: gatedStore.fileURL.path), "Write gate allows saves after unblock")
+        let resetURL = recoveryRoot.appendingPathComponent("reset-me.json")
+        let resetOriginal = Data("reset-source".utf8)
+        try! resetOriginal.write(to: resetURL)
+        let resetResult = try! DurableStoreRecovery.resetReplacingWithEmptyArray(at: resetURL)
+        expect((try? Data(contentsOf: resetResult.preservedURL)) == resetOriginal, "Reset preserves original in quarantine backup")
+        expect(String(data: try! Data(contentsOf: resetURL), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) == "[]", "Reset installs empty JSON array")
+        if case .loaded(let emptySessions) = SessionPersistence(fileURL: resetURL).loadResult() {
+            expect(emptySessions.isEmpty, "Reset sessions store loads as empty success")
+        } else {
+            expect(false, "Reset sessions store loads as empty success")
+        }
+        let staleURL = recoveryRoot.appendingPathComponent("stale.json")
+        try! Data("v1".utf8).write(to: staleURL)
+        let staleIssue: DurableStoreIssue
+        if case .failed(let issue) = DurableStoreRecovery.loadJSONArray(from: staleURL, as: LatticeSession.self, storeID: "sessions", storeName: "Chat sessions") {
+            staleIssue = issue
+        } else {
+            staleIssue = DurableStoreIssue(storeID: "sessions", storeName: "Chat sessions", filePath: staleURL.path, kind: .corrupt, summary: "x", technicalDetails: "x")
+            expect(false, "Stale protection fixture starts corrupt")
+        }
+        try! Data("v2-changed".utf8).write(to: staleURL)
+        do {
+            _ = try DurableStoreRecovery.resetReplacingWithEmptyArray(at: staleURL, expected: staleIssue)
+            expect(false, "Reset rejects stale source that changed after failure")
+        } catch DurableStoreRecoveryError.sourceChanged {
+            expect((try? String(contentsOf: staleURL, encoding: .utf8)) == "v2-changed", "Rejected stale reset leaves changed original")
+        } catch {
+            expect(false, "Reset rejects stale source that changed after failure")
+        }
+        let disappearedURL = recoveryRoot.appendingPathComponent("disappeared.json")
+        try! Data("corrupt".utf8).write(to: disappearedURL)
+        if case .failed(let disappearedIssue) = DurableStoreRecovery.loadJSONArray(from: disappearedURL, as: LatticeSession.self, storeID: "sessions", storeName: "Chat sessions") {
+            try! FileManager.default.removeItem(at: disappearedURL)
+            do {
+                _ = try DurableStoreRecovery.resetReplacingWithEmptyArray(at: disappearedURL, expected: disappearedIssue)
+                expect(false, "Reset refuses when the observed original disappeared")
+            } catch DurableStoreRecoveryError.sourceMissing {
+                expect(!FileManager.default.fileExists(atPath: disappearedURL.path), "Missing observed original is not silently replaced")
+            } catch {
+                expect(false, "Reset reports disappeared observed original as sourceMissing")
+            }
+        } else {
+            expect(false, "Disappearing reset fixture starts corrupt")
+        }
+        let failBackupURL = recoveryRoot.appendingPathComponent("fail-backup.json")
+        let failBackupOriginal = Data("must-remain".utf8)
+        try! failBackupOriginal.write(to: failBackupURL)
+        let copyFailIO = DurableStoreFileIO(
+            fileExists: { FileManager.default.fileExists(atPath: $0) },
+            attributesOfItem: { try FileManager.default.attributesOfItem(atPath: $0) },
+            readData: { try Data(contentsOf: $0) },
+            writeDataAtomically: { data, url in try data.write(to: url, options: .atomic) },
+            createDirectory: { try FileManager.default.createDirectory(at: $0, withIntermediateDirectories: true) },
+            copyItem: { _, _ in throw NSError(domain: NSPOSIXErrorDomain, code: Int(EIO), userInfo: [NSLocalizedDescriptionKey: "I/O error"]) },
+            moveItem: { try FileManager.default.moveItem(at: $0, to: $1) },
+            removeItem: { try FileManager.default.removeItem(at: $0) },
+            replaceItem: { original, replacement in _ = try FileManager.default.replaceItemAt(original, withItemAt: replacement) }
+        )
+        do {
+            _ = try DurableStoreRecovery.resetReplacingWithEmptyArray(at: failBackupURL, io: copyFailIO)
+            expect(false, "Reset fails closed when backup cannot be created")
+        } catch {
+            expect((try? Data(contentsOf: failBackupURL)) == failBackupOriginal, "Failed reset leaves original bytes unchanged")
+            let failedBackupPartials = (try? FileManager.default.contentsOfDirectory(atPath: recoveryRoot.path))?.filter { $0.contains(".partial-") } ?? []
+            expect(failedBackupPartials.isEmpty, "Failed backup cleans temporary artifacts")
+        }
+        let failVerificationURL = recoveryRoot.appendingPathComponent("fail-verification.json")
+        let failVerificationOriginal = Data("must-remain-unverified".utf8)
+        try! failVerificationOriginal.write(to: failVerificationURL)
+        let verificationFailIO = DurableStoreFileIO(
+            fileExists: { FileManager.default.fileExists(atPath: $0) },
+            attributesOfItem: { try FileManager.default.attributesOfItem(atPath: $0) },
+            readData: { url in
+                if url.lastPathComponent.contains(".partial-") {
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(EIO), userInfo: [NSLocalizedDescriptionKey: "Verification read failed"])
+                }
+                return try Data(contentsOf: url)
+            },
+            writeDataAtomically: { data, url in try data.write(to: url, options: .atomic) },
+            createDirectory: { try FileManager.default.createDirectory(at: $0, withIntermediateDirectories: true) },
+            copyItem: { try FileManager.default.copyItem(at: $0, to: $1) },
+            moveItem: { try FileManager.default.moveItem(at: $0, to: $1) },
+            removeItem: { try FileManager.default.removeItem(at: $0) },
+            replaceItem: { original, replacement in _ = try FileManager.default.replaceItemAt(original, withItemAt: replacement) }
+        )
+        do {
+            _ = try DurableStoreRecovery.resetReplacingWithEmptyArray(at: failVerificationURL, io: verificationFailIO)
+            expect(false, "Reset fails closed when backup verification cannot complete")
+        } catch {
+            expect((try? Data(contentsOf: failVerificationURL)) == failVerificationOriginal, "Unverified backup never permits original replacement")
+            let remainingRecoveryFiles = (try? FileManager.default.contentsOfDirectory(atPath: recoveryRoot.path)) ?? []
+            expect(!remainingRecoveryFiles.contains { $0.hasPrefix("fail-verification.json.corrupt-") && $0.hasSuffix(".backup") }, "Failed backup verification removes the unusable copy")
+            expect(!remainingRecoveryFiles.contains { $0.contains(".partial-") }, "Failed backup verification removes temporary copy")
+        }
+        // Retry after external repair restores runtime interrupted state.
+        let repairURL = recoveryRoot.appendingPathComponent("repair.json")
+        try! Data("{bad".utf8).write(to: repairURL)
+        let repairStore = SessionPersistence(fileURL: repairURL)
+        expect({ if case .failed = repairStore.loadResult() { return true }; return false }(), "Repair fixture starts failed")
+        let repairResponse = ChatMessage(role: .assistant, text: "Partial")
+        let repairAction = SessionAction(messageID: repairResponse.id, kind: .tool, toolKind: .command, title: "Build", detail: "$ build", status: .running)
+        let repairSession = LatticeSession(title: "Repair", messages: [repairResponse], backend: .codex(model: "gpt-5.4"), actions: [repairAction], isStreaming: true)
+        try! JSONEncoder().encode([repairSession]).write(to: repairURL, options: .atomic)
+        if case .loaded(let repaired) = repairStore.loadResult() {
+            expect(repaired.first?.isStreaming == false, "Repaired sessions restore non-streaming runtime state")
+            expect(repaired.first?.actions.first?.status == .interrupted, "Repaired sessions mark pending actions interrupted")
+        } else {
+            expect(false, "Repaired sessions restore non-streaming runtime state")
+        }
+        try? FileManager.default.removeItem(at: recoveryRoot)
+
+        expect(LatticeContinuationPolicy.prompt == "Continue from where you left off.", "Continuation prompt is explicit transcript text")
+        let productContext = LatticeProductInstructions.current
+        expect(
+            productContext.contains("Extensions & Skills")
+            && productContext.contains("right sidebar/inspector")
+            && productContext.contains("native auto-compaction where the CLI supports it")
+            && productContext.contains("visible-transcript handoff")
+            && productContext.contains("Review Lattice change")
+            && productContext.contains("Apply/Discard")
+            && productContext.contains("matching YAML frontmatter")
+            && productContext.contains("Antigravity")
+            && productContext.contains("roadmap features"),
+            "Backend product instructions explain current Lattice surfaces, context handling, self-edit review behavior, generated skill standards, and roadmap limits"
+        )
+        expect(LatticeContinuationPolicy.canContinue(session), "Continuation is available after a visible assistant response")
+        expect(!LatticeContinuationPolicy.canContinue(LatticeSession(title: "Streaming", messages: session.messages, backend: .codex(model: "gpt-5.4"), isStreaming: true)), "Continuation is hidden while streaming")
+        expect(!LatticeContinuationPolicy.canContinue(LatticeSession(title: "Empty assistant", messages: [.init(role: .user, text: "Start"), .init(role: .assistant, text: " ")], backend: .codex(model: "gpt-5.4"))), "Continuation is hidden for empty assistant placeholders")
+        expect(!LatticeContinuationPolicy.canContinue(LatticeSession(title: "User ended", messages: [.init(role: .user, text: "Start")], backend: .codex(model: "gpt-5.4"))), "Continuation is hidden when the last turn is not assistant")
+        let contextSession = LatticeSession(
+            title: "Budget",
+            messages: [.init(role: .user, text: String(repeating: "a", count: 40))],
+            backend: .codex(model: "gpt-5.4"),
+            attachments: [.init(path: "/tmp/Lattice/PLAN.md")]
+        )
+        let contextEstimate = LatticeContextBudgetEstimator.estimate(session: contextSession, draft: String(repeating: "b", count: 20), tokenLimit: 100)
+        expect(contextEstimate.transcriptTokens > 0 && contextEstimate.draftTokens == 5, "Context budget estimates visible transcript and draft text")
+        expect(contextEstimate.attachmentTokens > 8, "Context budget accounts for attached path metadata")
+        expect(contextEstimate.status == .comfortable, "Context budget classifies comfortable usage")
+        expect(LatticeContextBudgetEstimate(tokenLimit: 100, transcriptTokens: 75, draftTokens: 0, attachmentTokens: 0).status == .tight, "Context budget classifies tight usage")
+        expect(LatticeContextBudgetEstimate(tokenLimit: 100, transcriptTokens: 90, draftTokens: 0, attachmentTokens: 0).status == .nearLimit, "Context budget classifies near-limit usage")
+        expect(LatticeContextBudgetEstimate(tokenLimit: 100, transcriptTokens: 101, draftTokens: 0, attachmentTokens: 0).status == .overLimit, "Context budget classifies over-limit usage")
+        expect(ProviderModelMetadata.contextWindow(from: ["limit": ["context": 200_000]]) == 200_000, "Provider model metadata parses nested context windows")
+        expect(ProviderModelMetadata.contextWindow(from: ["contextWindow": "128k"]) == 128_000, "Provider model metadata parses abbreviated context windows")
+        expect(
+            LatticeContextBudgetEstimator.tokenLimit(for: .openCode(model: "opencode/qwen3-coder"), openCodeModels: [.init(id: "opencode/qwen3-coder", name: "Qwen3 Coder", contextWindow: 64_000)]) == 64_000,
+            "Context budget uses model-specific provider context windows when available"
+        )
+        let healthyResumedCLI = LatticeSession(
+            title: "Resumed CLI",
+            messages: [.init(role: .user, text: "Previous"), .init(role: .assistant, text: "Answer"), .init(role: .user, text: "Next"), .init(role: .assistant, text: "")],
+            backend: .codex(model: "gpt-5.4"),
+            harnessThreadID: "thread-1"
+        )
+        let rawContextPlan = LatticeContextHandoffPlanner.plan(session: healthyResumedCLI, submittedText: "Next", existingHarnessThreadID: healthyResumedCLI.harnessThreadID, compactionThreshold: 0.95)
+        expect(rawContextPlan.prompt == "Next" && !rawContextPlan.resetsHarnessSession, "Context handoff leaves healthy resumed CLI sessions on raw prompt path")
+        let restoredCLI = LatticeSession(
+            title: "Restored CLI",
+            messages: [.init(role: .user, text: "Original request"), .init(role: .assistant, text: "Original answer"), .init(role: .user, text: "Continue"), .init(role: .assistant, text: "")],
+            backend: .openCode(model: "opencode/model")
+        )
+        let missingThreadPlan = LatticeContextHandoffPlanner.plan(session: restoredCLI, submittedText: "Continue", additionalContext: "\n\nAttached paths:\n/tmp/a.swift", existingHarnessThreadID: nil)
+        expect(missingThreadPlan.usesVisibleTranscriptHandoff && missingThreadPlan.resetsHarnessSession && !missingThreadPlan.didCompact, "Context handoff sends full visible transcript when CLI thread is missing")
+        expect(missingThreadPlan.prompt.contains("[User] Original request") && missingThreadPlan.prompt.contains("[Assistant] Original answer") && missingThreadPlan.prompt.contains("/tmp/a.swift"), "Context handoff prompt contains prior transcript and attachments")
+        let oversizedFullHandoffPlan = LatticeContextHandoffPlanner.plan(
+            session: restoredCLI,
+            submittedText: "Continue",
+            tokenLimit: 70,
+            existingHarnessThreadID: nil,
+            compactionThreshold: 0.99
+        )
+        expect(oversizedFullHandoffPlan.usesVisibleTranscriptHandoff && !oversizedFullHandoffPlan.didCompact, "Context preflight can identify an oversized full handoff without auto-compacting")
+        expect(
+            oversizedFullHandoffPlan.deliveryIssue?.contains("visible transcript handoff") == true
+            && oversizedFullHandoffPlan.deliveryIssue?.contains("compacted") == false,
+            "Context preflight reports oversized full handoffs without claiming compaction"
+        )
+        let oversizedCurrentPlan = LatticeContextHandoffPlanner.plan(
+            session: LatticeSession(title: "Oversized skill", messages: [.init(role: .user, text: "Run skill"), .init(role: .assistant, text: "")], backend: .ollama(model: "small")),
+            submittedText: String(repeating: "large injected skill workflow ", count: 220),
+            tokenLimit: 1_000,
+            existingHarnessThreadID: "structured-message-list"
+        )
+        expect(oversizedCurrentPlan.deliveryIssue?.contains("does not leave usable room") == true, "Context preflight blocks a current skill or self-edit payload that cannot fit even without prior history")
+        expect(!oversizedCurrentPlan.didCompact, "Context preflight does not misrepresent an oversized current payload as successfully compacted")
+        let largeContext = String(repeating: "older context ", count: 120)
+        let nearLimitCLI = LatticeSession(
+            title: "Near limit CLI",
+            messages: [
+                .init(role: .user, text: largeContext),
+                .init(role: .assistant, text: largeContext),
+                .init(role: .user, text: largeContext),
+                .init(role: .assistant, text: largeContext),
+                .init(role: .user, text: largeContext),
+                .init(role: .assistant, text: "Recent answer"),
+                .init(role: .user, text: "Now answer this"),
+                .init(role: .assistant, text: "")
+            ],
+            backend: .grok(model: "grok-code-fast-1"),
+            harnessThreadID: "grok-acp:existing"
+        )
+        let compactPlan = LatticeContextHandoffPlanner.plan(session: nearLimitCLI, submittedText: "Now answer this", tokenLimit: 120, existingHarnessThreadID: nearLimitCLI.harnessThreadID, compactionThreshold: 0.5)
+        expect(compactPlan.prompt == "Now answer this" && !compactPlan.usesVisibleTranscriptHandoff && !compactPlan.didCompact && !compactPlan.resetsHarnessSession, "Near-limit resumed CLI sessions stay intact so the provider owns its native context lifecycle")
+        let recoveredCompactPlan = LatticeContextHandoffPlanner.plan(session: nearLimitCLI, submittedText: "Now answer this", tokenLimit: 120, existingHarnessThreadID: nil, compactionThreshold: 0.5)
+        expect(recoveredCompactPlan.usesVisibleTranscriptHandoff && recoveredCompactPlan.didCompact && recoveredCompactPlan.resetsHarnessSession, "Missing CLI sessions receive a bounded compacted visible handoff")
+        expect(recoveredCompactPlan.prompt.contains("Older messages condensed by Lattice") && recoveredCompactPlan.prompt.contains("Current user request:\nNow answer this"), "Recovered CLI handoff preserves condensed history and current request")
+        let healthyStructuredPlan = LatticeContextHandoffPlanner.plan(session: nearLimitCLI, submittedText: "Now answer this", tokenLimit: 20_000, existingHarnessThreadID: "structured-message-list", managementMode: .latticeManagedVisibleTranscript, compactionThreshold: 0.95)
+        let healthyStructuredMessages = LatticeBackendMessageBuilder.structuredMessages(session: nearLimitCLI, submittedText: "Now answer this", contextPlan: healthyStructuredPlan)
+        expect(!healthyStructuredPlan.usesVisibleTranscriptHandoff && healthyStructuredMessages.count == nearLimitCLI.messages.count - 1, "Structured backends keep normal message history while under context budget")
+        let compactStructuredPlan = LatticeContextHandoffPlanner.plan(session: nearLimitCLI, submittedText: "Now answer this", tokenLimit: 120, existingHarnessThreadID: "structured-message-list", managementMode: .latticeManagedVisibleTranscript, compactionThreshold: 0.5)
+        let compactStructuredMessages = LatticeBackendMessageBuilder.structuredMessages(session: nearLimitCLI, submittedText: "Now answer this", contextPlan: compactStructuredPlan)
+        expect(compactStructuredPlan.didCompact && compactStructuredMessages.count == 1 && compactStructuredMessages.first?.role == .user, "Structured backends switch to one compacted handoff message near the context limit")
+        expect(compactStructuredMessages.first?.text.contains("Lattice visible transcript handoff (compacted)") == true && compactStructuredMessages.first?.text.contains("Current user request:\nNow answer this") == true, "Structured backend compaction sends the same bounded handoff prompt")
+        expect(LatticeBackendMessageBuilder.transcript(session: nearLimitCLI, submittedText: "Now answer this", contextPlan: compactStructuredPlan) == compactStructuredPlan.prompt, "Transcript backends use the compacted handoff prompt near the context limit")
+        let hugeVisibleHistory = String(repeating: "Detailed old context that should be summarized or omitted safely. ", count: 500)
+        let adaptiveCompactionSession = LatticeSession(
+            title: "Adaptive compaction",
+            messages: [
+                .init(role: .user, text: hugeVisibleHistory),
+                .init(role: .assistant, text: hugeVisibleHistory),
+                .init(role: .user, text: hugeVisibleHistory),
+                .init(role: .assistant, text: hugeVisibleHistory),
+                .init(role: .user, text: "Current request"),
+                .init(role: .assistant, text: "")
+            ],
+            backend: .ollama(model: "small")
+        )
+        let adaptivePlan = LatticeContextHandoffPlanner.plan(
+            session: adaptiveCompactionSession,
+            submittedText: "Please continue with the current task and preserve only the context needed to answer correctly.",
+            tokenLimit: 260,
+            existingHarnessThreadID: "structured-message-list",
+            managementMode: .latticeManagedVisibleTranscript,
+            compactionThreshold: 0.5
+        )
+        expect(adaptivePlan.didCompact && adaptivePlan.deliveryIssue == nil, "Adaptive visible-transcript compaction fits when the current request itself fits")
+        expect(LatticeContextBudgetEstimator.estimateTokens(in: adaptivePlan.prompt) < 260, "Adaptive compaction reserves room for the current request and handoff instructions")
+        let injectedBackendPrompt = "Lattice skill invocation: /subagents\n" + String(repeating: "large injected skill instructions ", count: 90)
+        let smallVisibleSkillSession = LatticeSession(
+            title: "Injected prompt estimate",
+            messages: [
+                .init(role: .user, text: "Earlier compact request"),
+                .init(role: .assistant, text: "Earlier compact answer"),
+                .init(role: .user, text: "/subagents do this"),
+                .init(role: .assistant, text: "")
+            ],
+            backend: .ollama(model: "qwen3:8b")
+        )
+        let visibleOnlyEstimate = LatticeContextBudgetEstimator.estimate(session: smallVisibleSkillSession, draft: "/subagents do this", tokenLimit: 220)
+        let backendPayloadEstimate = LatticeContextBudgetEstimator.estimateBackendPayload(session: smallVisibleSkillSession, submittedText: injectedBackendPrompt, tokenLimit: 220)
+        expect(visibleOnlyEstimate.status == .comfortable && backendPayloadEstimate.status == .overLimit, "Backend payload context estimate accounts for injected prompts hidden behind short visible commands")
+        let injectedPlan = LatticeContextHandoffPlanner.plan(
+            session: smallVisibleSkillSession,
+            submittedText: injectedBackendPrompt,
+            tokenLimit: 220,
+            existingHarnessThreadID: "structured-message-list",
+            managementMode: .latticeManagedVisibleTranscript
+        )
+        expect(injectedPlan.didCompact && injectedPlan.usesVisibleTranscriptHandoff, "Context planner counts injected backend prompts, not only the short visible slash command")
+        expect(injectedPlan.prompt.contains("Lattice skill invocation: /subagents"), "Compacted handoff preserves injected backend prompt as the current request")
+        let encodedSession = try! JSONEncoder().encode(session)
+        var legacyObject = try! JSONSerialization.jsonObject(with: encodedSession) as! [String: Any]
+        legacyObject["actions"] = nil
+        legacyObject["queuedFollowUps"] = nil
+        legacyObject["isPinned"] = nil
+        legacyObject["privacyMode"] = nil
+        let legacyData = try! JSONSerialization.data(withJSONObject: legacyObject)
+        expect((try! JSONDecoder().decode(LatticeSession.self, from: legacyData)).actions.isEmpty, "Legacy sessions migrate with an empty action trail")
+        expect((try! JSONDecoder().decode(LatticeSession.self, from: legacyData)).queuedFollowUps.isEmpty, "Legacy sessions migrate with an empty follow-up queue")
+        expect((try! JSONDecoder().decode(LatticeSession.self, from: legacyData)).isPinned == false, "Legacy sessions migrate as unpinned")
+        expect((try! JSONDecoder().decode(LatticeSession.self, from: legacyData)).privacyMode == .cloudAllowed, "Legacy sessions default to cloud-allowed privacy")
+        expect(ChatBackend.appleIntelligence.isLocal && ChatBackend.ollama(model: "llama3.2:latest").isLocal, "Local chat backends identify as local")
+        expect(!ChatBackend.codex(model: "gpt-5.5").isLocal && !ChatBackend.grok(model: "grok").isLocal && !ChatBackend.openCode(model: "opencode").isLocal, "Cloud chat backends identify as non-local")
+        expect(SessionPrivacyPolicy.allows(.codex(model: "gpt-5.5"), in: .cloudAllowed), "Cloud-allowed privacy accepts provider routes")
+        expect(!SessionPrivacyPolicy.allows(.codex(model: "gpt-5.5"), in: .localOnly), "Local-only privacy rejects provider routes")
+        expect(SessionPrivacyPolicy.allows(.ollama(model: "llama3.2:latest"), in: .localOnly), "Local-only privacy accepts local models")
+        expect(SessionPrivacyPolicy.blockedMessage(for: .grok(model: "grok"), in: .localOnly)?.contains("Local-only") == true, "Local-only privacy gives a route-specific blocked reason")
+        let pinnedMessage = ChatMessage(role: .assistant, text: "Important answer", isPinned: true)
+        let pinnedMessageData = try! JSONEncoder().encode(pinnedMessage)
+        expect((try! JSONDecoder().decode(ChatMessage.self, from: pinnedMessageData)).isPinned, "Pinned message state round trip")
+        var legacyMessageObject = try! JSONSerialization.jsonObject(with: pinnedMessageData) as! [String: Any]
+        legacyMessageObject["isPinned"] = nil
+        let legacyMessageData = try! JSONSerialization.data(withJSONObject: legacyMessageObject)
+        expect((try! JSONDecoder().decode(ChatMessage.self, from: legacyMessageData)).isPinned == false, "Legacy messages migrate as unpinned")
+        var trail = [persistedAction]
+        let waitingApproval = SessionAction(messageID: responseMessage.id, kind: .approval, title: "Allow edit", detail: "Sources/App.swift", status: .waiting)
+        SessionActionTrail.upsert(waitingApproval, in: &trail)
+        expect(SessionActionTrail.update(id: persistedAction.id, status: .failed, in: &trail), "Action trail correlates status by ID")
+        expect(trail.first?.status == .failed, "Action trail status updates")
+        expect(SessionActionTrail.finishPending(for: responseMessage.id, as: .cancelled, in: &trail) == 1 && trail.last?.status == .cancelled, "Pending action lifecycle closes truthfully")
+        SessionActionTrail.prune(in: &trail, keepingMessageIDs: [])
+        expect(trail.isEmpty, "Rerun pruning removes orphaned actions")
+        let firstUser = ChatMessage(role: .user, text: "First")
+        let firstAssistant = ChatMessage(role: .assistant, text: "First reply", isPinned: true)
+        let secondUser = ChatMessage(role: .user, text: "Second")
+        let secondAssistant = ChatMessage(role: .assistant, text: "Second reply")
+        let retainedAction = SessionAction(messageID: firstAssistant.id, kind: .tool, title: "Read", detail: "README.md", status: .completed)
+        let removedAction = SessionAction(messageID: secondAssistant.id, kind: .tool, title: "Write", detail: "README.md", status: .completed)
+        var deletionSession = LatticeSession(
+            title: "First",
+            messages: [firstUser, firstAssistant, secondUser, secondAssistant],
+            backend: .codex(model: "gpt-5.4"),
+            harnessID: "pi",
+            harnessThreadID: "provider-thread",
+            workspacePath: "/tmp/Lattice",
+            attachments: [.init(path: "/tmp/Lattice/PLAN.md")],
+            policy: .smart,
+            privacyMode: .localOnly,
+            actions: [retainedAction, removedAction],
+            queuedFollowUps: [.init(text: "Later")],
+            isPinned: true
+        )
+        let branch = SessionTranscriptMutation.branchFromMessage(messageID: secondUser.id, in: deletionSession)!
+        expect(branch.id != deletionSession.id && branch.title.hasPrefix("Branch:"), "Branching creates a separate visible chat")
+        expect(branch.messages.map(\.id) == [firstUser.id, firstAssistant.id, secondUser.id], "Branching copies visible transcript up to the selected message")
+        expect(branch.messages.first(where: { $0.id == firstAssistant.id })?.isPinned == true, "Branching preserves retained pinned messages")
+        expect(branch.actions == [retainedAction] && branch.harnessThreadID == nil, "Branching prunes later actions and resets hidden provider context")
+        expect(branch.backend == deletionSession.backend && branch.harnessID == deletionSession.harnessID && branch.workspacePath == deletionSession.workspacePath && branch.policy == deletionSession.policy && branch.privacyMode == deletionSession.privacyMode, "Branching preserves route, workspace, policy, and privacy")
+        expect(branch.attachments == deletionSession.attachments && branch.queuedFollowUps.isEmpty && !branch.isPinned && !branch.isStreaming, "Branching preserves context but clears queue, pin, and streaming state")
+        expect(SessionTranscriptMutation.branchFromMessage(messageID: UUID(), in: deletionSession) == nil, "Branching ignores stale message identifiers")
+        expect(SessionTranscriptMutation.branchFromMessage(messageID: firstUser.id, in: LatticeSession(title: "Running", messages: [firstUser], backend: .codex(model: "gpt-5.4"), isStreaming: true)) == nil, "Branching is disabled while streaming")
+        expect(SessionTranscriptMutation.deleteMessageAndFollowing(messageID: secondUser.id, in: &deletionSession), "Message deletion truncates a transcript branch")
+        expect(deletionSession.messages.map(\.id) == [firstUser.id, firstAssistant.id], "Message deletion removes the selected message and every later message")
+        expect(deletionSession.actions == [retainedAction] && deletionSession.harnessThreadID == nil, "Message deletion prunes orphaned actions and resets hidden provider context")
+        expect(!SessionTranscriptMutation.deleteMessageAndFollowing(messageID: UUID(), in: &deletionSession), "Message deletion ignores stale message identifiers")
+        expect(SessionTranscriptMutation.deleteMessageAndFollowing(messageID: firstUser.id, in: &deletionSession) && deletionSession.messages.isEmpty && deletionSession.title == "New chat" && deletionSession.intent == nil, "Deleting the first user turn restores a clean unstarted chat")
+        let searchAssistant = ChatMessage(role: .assistant, text: "I checked the build.")
+        let searchAction = SessionAction(messageID: searchAssistant.id, kind: .tool, toolKind: .command, title: "Run verifier", detail: "swift verify_core emitted sandbox denial details", status: .completed, workspaceScoped: true)
+        let searchSession = LatticeSession(title: "Release audit", messages: [.init(role: .user, text: "Ship check"), searchAssistant], backend: .openCode(model: "opencode/qwen3-coder"), harnessID: "hermes", workspacePath: "/tmp/Lattice", attachments: [.init(path: "/tmp/Lattice/PLAN.md")], actions: [searchAction])
+        expect(searchSession.matchesSearch("release audit"), "Session search matches title tokens")
+        expect(searchSession.matchesSearch("sandbox denial"), "Session search matches action detail/tool output tokens")
+        expect(searchSession.matchesSearch("PLAN.md"), "Session search matches attachment names")
+        expect(searchSession.matchesSearch("hermes qwen3"), "Session search matches route and model tokens")
+        expect(!searchSession.matchesSearch("unrelated token"), "Session search rejects unrelated token sets")
+        expect(session.matchesSearch("pinned"), "Session search matches pinned state")
+        let pinnedMessageSearchSession = LatticeSession(title: "Pinned transcript", messages: [.init(role: .assistant, text: "Keep this answer", isPinned: true)], backend: .codex(model: "gpt-5.4"))
+        expect(pinnedMessageSearchSession.matchesSearch("pinned answer"), "Session search matches pinned message state")
+        let queuedSearchSession = LatticeSession(title: "Queued search", messages: [], backend: .codex(model: "gpt-5.4"), queuedFollowUps: [.init(text: "Remember the lavender follow-up")])
+        expect(queuedSearchSession.matchesSearch("lavender follow-up"), "Session search matches queued follow-up text")
+        expect(LatticeSession(title: "Privacy", backend: .ollama(model: "llama3.2:latest"), privacyMode: .localOnly).matchesSearch("local-only private"), "Session search matches local-only privacy state")
+        var completedTurnActions = [
+            SessionAction(messageID: responseMessage.id, kind: .tool, toolKind: .command, title: "Build", detail: "$ swift build", status: .running),
+            SessionAction(messageID: responseMessage.id, kind: .approval, title: "Allow edit", detail: "Sources/App.swift", status: .waiting),
+            SessionAction(messageID: responseMessage.id, kind: .tool, toolKind: .write, title: "Patch", detail: "Sources/App.swift", status: .failed)
+        ]
+        expect(SessionActionTrail.finishCompletedTurn(for: responseMessage.id, in: &completedTurnActions) == 2, "Completed turn closes only open actions")
+        expect(completedTurnActions.map(\.status) == [.completed, .cancelled, .failed], "Completed turn marks tools complete and stale approvals cancelled")
+        let interruptedAction = SessionAction(messageID: responseMessage.id, kind: .tool, toolKind: .command, title: "Build", detail: "$ swift build", status: .running)
+        try! store.save([LatticeSession(title: "Interrupted action", messages: [responseMessage], backend: .codex(model: "gpt-5.4"), actions: [interruptedAction], isStreaming: true)])
+        let recovered = store.load().first
+        expect(recovered?.isStreaming == false && recovered?.actions.first?.status == .interrupted, "Restoration closes orphaned running actions")
+        let selfEditSession = LatticeSession(title: "Lattice self-edit", backend: .grok(model: "grok"), intent: .selfEdit)
+        try! store.save([selfEditSession])
+        expect(store.load().first?.intent == .selfEdit, "Self-edit intent round trip")
+        expect(LatticeSelfEditCommand.prompt(in: "/self-edit make the composer calmer") == "make the composer calmer", "Self-edit slash command parses prompt")
+        expect(LatticeSelfEditCommand.prompt(in: "/self-editor nope") == nil, "Self-edit slash command requires exact command")
+        expect(LatticeSelfEditCommand.prompt(in: "make Lattice glassy") == nil, "Plain Lattice wording does not trigger self-edit")
+        expect(LatticeAppCommandCatalog.suggestions(for: "/").first?.invocation == "/self-edit", "Slash command catalog exposes self-edit")
+        expect(LatticeAppCommandCatalog.suggestions(for: "/self").first?.id == "self-edit", "Slash command catalog filters self-edit")
+        expect(LatticeAppCommandCatalog.completion(for: "/")?.id == "self-edit", "Slash command catalog completes single command")
+        expect(LatticeAppCommandCatalog.completion(for: "/self")?.id == "self-edit", "Slash command catalog completes typed prefix")
+        expect(LatticeAppCommandCatalog.suggestions(for: "/self-edit ").isEmpty, "Slash command catalog hides after inserted command")
+        expect(LatticeAppCommandCatalog.completion(for: "/self-edit ") == nil, "Slash command catalog does not complete after separator")
+        expect(LatticeAppCommandCatalog.suggestions(for: "/self-edit make it calmer").isEmpty, "Slash command catalog hides after command token")
+        expect(LatticeAppCommandCatalog.suggestions(for: "self-edit").isEmpty, "Slash command catalog requires slash prefix")
+        let templateCommand = LatticePromptTemplate(invocation: "/brief", title: "Brief", detail: "Make concise", prompt: "Make this concise.").command
+        expect(LatticeAppCommandCatalog.suggestions(for: "/b", commands: LatticeAppCommandCatalog.all + [templateCommand]).first?.invocation == "/brief", "Extension prompt template appears in slash suggestions")
+        expect(LatticeAppCommandCatalog.completion(for: "/b", commands: LatticeAppCommandCatalog.all + [templateCommand])?.replacementText == "Make this concise.", "Extension prompt template inserts prompt text")
+        let duplicateTemplateCommand = LatticePromptTemplate(invocation: "/brief", title: "Brief Again", detail: "Other prompt", prompt: "Use this other prompt.").command
+        let deduplicatedTemplateSuggestions = LatticeAppCommandCatalog.suggestions(for: "/b", commands: LatticeAppCommandCatalog.all + [templateCommand, duplicateTemplateCommand])
+        expect(deduplicatedTemplateSuggestions.map(\.replacementText) == ["Make this concise."], "Duplicate extension prompt template invocation keeps first command")
+        expect(LatticeAppCommandCatalog.completion(for: "/b", commands: LatticeAppCommandCatalog.all + [templateCommand, duplicateTemplateCommand])?.replacementText == "Make this concise.", "Duplicate extension prompt template still completes")
+        let skillBriefCommand = LatticeAppCommand(id: "skill:brief", invocation: "/brief", title: "Brief Skill", detail: "Run the skill")
+        let skillFirstCompletion = LatticeAppCommandCatalog.completion(for: "/b", commands: LatticeAppCommandCatalog.all + [skillBriefCommand, templateCommand])
+        expect(skillFirstCompletion?.id == "skill:brief" && skillFirstCompletion?.replacementText == nil, "Slash command suggestions prefer enabled skills over colliding prompt templates")
+        let paletteItems = [
+            LatticeCommandPaletteItem(id: "new-chat", title: "New Chat", detail: "Start a fresh conversation", keywords: ["session"]),
+            LatticeCommandPaletteItem(id: "continue", title: "Continue Response", detail: "Resume the selected assistant answer", keywords: ["more"], isEnabled: false, disabledReason: "No completed assistant response"),
+            LatticeCommandPaletteItem(id: "models", title: "Show Models", detail: "Review connected provider models", keywords: ["provider catalog"]),
+            LatticeCommandPaletteItem(id: "open-skills-folder", title: "Open Skills Folder", detail: "Show Lattice’s shared SKILL.md folder", keywords: ["skills", "agents", "application support"])
+        ]
+        expect(LatticeCommandPaletteMatcher.filtered(paletteItems, query: "").map(\.id) == ["new-chat", "continue", "models", "open-skills-folder"], "Command palette keeps source order for empty search")
+        expect(LatticeCommandPaletteMatcher.filtered(paletteItems, query: "provider models").map(\.id) == ["models"], "Command palette matches multi-token detail and keyword search")
+        expect(LatticeCommandPaletteMatcher.filtered(paletteItems, query: "fresh session").map(\.id) == ["new-chat"], "Command palette matches keyword-backed commands")
+        expect(LatticeCommandPaletteMatcher.filtered(paletteItems, query: "skill md").map(\.id) == ["open-skills-folder"], "Command palette exposes the shared skills folder")
+        expect(LatticeCommandPaletteMatcher.firstEnabled(in: paletteItems, query: "response") == nil, "Command palette does not auto-run disabled matches")
+        expect(LatticeCommandPaletteMatcher.firstEnabled(in: paletteItems, query: "show")?.id == "models", "Command palette selects first enabled filtered command")
+        let route = EngineHarnessSelection(engineID: "codex", harnessID: "codex")
+        let routeData = try! JSONEncoder().encode(route)
+        expect((try! JSONDecoder().decode(EngineHarnessSelection.self, from: routeData)) == route, "Engine harness route round trip")
+        let staleRoute = EngineHarnessSelection(engineID: "xai", harnessID: "hermes")
+        let staleRouteData = try! JSONEncoder().encode(staleRoute)
+        expect((try! JSONDecoder().decode(EngineHarnessSelection.self, from: staleRouteData)).harnessID == "hermes", "Legacy route remains decodable")
+        let normalizedRoute = ExecutionRoutePolicy.normalize(staleRoute, fallbackEngineID: "codex", fallbackHarnessID: "codex")
+        expect(normalizedRoute == EngineHarnessSelection(engineID: "codex", harnessID: "codex"), "Unqualified execution route normalized")
+        expect(ExecutionRoutePolicy.normalize(route, fallbackEngineID: "codex", fallbackHarnessID: "codex") == route, "Qualified execution route preserved")
+        expect(ExecutionRoutePolicy.normalize(EngineHarnessSelection(engineID: "codex", harnessID: "grok"), fallbackEngineID: "opencode", fallbackHarnessID: "opencode") == EngineHarnessSelection(engineID: "codex", harnessID: "codex"), "Incompatible execution route normalized")
+        let visibleFallback = BackendAvailabilitySnapshot(
+            codexModels: [],
+            grokModels: [.init(id: "grok-1", name: "Grok 1", isDefault: true)],
+            codexCatalogKnown: true,
+            grokCatalogKnown: true,
+            codexInstalled: true
+        )
+        expect(BackendAvailabilityPolicy.normalize(.codex(model: "hidden"), using: visibleFallback) == .grok(model: "grok-1"), "Hidden Codex model falls back to visible provider model")
+        let unknownCatalog = BackendAvailabilitySnapshot(codexModels: [], codexCatalogKnown: false, codexInstalled: true)
+        expect(BackendAvailabilityPolicy.normalize(.codex(model: "gpt-5.5"), using: unknownCatalog) == .codex(model: "gpt-5.5"), "Unknown Codex catalog preserves installed fallback")
+        let allHidden = BackendAvailabilitySnapshot(codexModels: [], codexCatalogKnown: true, codexInstalled: true)
+        expect(BackendAvailabilityPolicy.normalize(.codex(model: "hidden"), using: allHidden) == .ollama(model: ""), "All hidden cloud models produce non-runnable fallback")
+        let disconnectedCloud = BackendAvailabilitySnapshot(
+            codexModels: [.init(id: "gpt-5.5", name: "GPT-5.5", isDefault: true)],
+            grokModels: [.init(id: "grok-4", name: "Grok 4", isDefault: true)],
+            openCodeModels: [.init(id: "opencode/model", name: "OpenCode Model", isDefault: true)],
+            codexReady: false,
+            grokReady: false,
+            openCodeReady: false,
+            codexCatalogKnown: true,
+            grokCatalogKnown: true,
+            openCodeCatalogKnown: true,
+            ollamaModelNames: ["llama3.2:latest"],
+            codexInstalled: true
+        )
+        expect(BackendAvailabilityPolicy.normalize(.codex(model: "gpt-5.5"), using: disconnectedCloud) == .ollama(model: "llama3.2:latest"), "Disconnected provider catalog falls back to runnable local model")
+        expect(BackendAvailabilityPolicy.normalize(.codex(model: "gpt-5.4"), using: disconnectedCloud) == .ollama(model: "llama3.2:latest"), "Disconnected stale Codex model does not migrate to disconnected preferred model")
+        expect(BackendAvailabilityPolicy.normalize(.openCode(model: "opencode/model"), using: disconnectedCloud) == .ollama(model: "llama3.2:latest"), "Disconnected OpenCode catalog is not treated as runnable")
+        let localOnly = BackendAvailabilitySnapshot(ollamaModelNames: ["llama3.2:latest"])
+        expect(BackendAvailabilityPolicy.normalize(.ollama(model: ""), using: localOnly) == .ollama(model: "llama3.2:latest"), "Empty local backend normalizes to installed local model")
+        expect(ExecutionRoutePolicy.defaultHarnessID(for: "ollama") == "lattice", "Ollama defaults to Lattice harness")
+        expect(ExecutionRoutePolicy.compatibleHarnessIDs(for: "ollama") == ["lattice"], "Ollama only exposes its implemented Lattice route")
+        expect(ExecutionRoutePolicy.compatibleHarnessIDs(for: "codex").contains("pi"), "Codex can execute through Pi RPC")
+        expect(ExecutionRoutePolicy.compatibleHarnessIDs(for: "opencode").contains("hermes"), "Compatible OpenCode models can execute through Hermes ACP")
+        expect(!ExecutionRoutePolicy.compatibleHarnessIDs(for: "apple").contains("codex"), "Apple does not expose Codex harness")
+        try? FileManager.default.removeItem(at: root)
+
+        let codexWorkspace = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try! FileManager.default.createDirectory(at: codexWorkspace, withIntermediateDirectories: true)
+        let codexApprovalObject: [String: Any] = [
+            "method": "item/commandExecution/requestApproval",
+            "id": 77,
+            "params": [
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "command-1",
+                "startedAtMs": 1,
+                "command": "swift build",
+                "cwd": codexWorkspace.path,
+                "availableDecisions": ["accept", "acceptForSession", "decline", "cancel"]
+            ]
+        ]
+        let codexApproval = CodexExecHarness.appServerPermissionRequest(from: codexApprovalObject, workspace: codexWorkspace)
+        expect(codexApproval?.toolRequest?.kind == .command && codexApproval?.toolRequest?.workspaceScoped == true, "Codex command approval is workspace classified")
+        expect(codexApproval?.options.map(\.id) == ["accept", "acceptForSession", "decline", "cancel"], "Codex approval decisions preserve server capabilities")
+        expect(codexApproval?.options.first(where: { $0.id == "acceptForSession" })?.kind == "allow_session", "Codex session approval is classified as session-scoped")
+        expect(ApprovalOptionPolicy.visibleOptions(codexApproval?.options ?? [], under: .smart).map(\.id) == ["accept", "acceptForSession", "decline"], "Smart exposes Codex session approval")
+        let outsideCodexApprovalObject: [String: Any] = [
+            "method": "item/commandExecution/requestApproval",
+            "id": 78,
+            "params": ["command": "open /tmp", "cwd": "/tmp", "availableDecisions": ["accept", "decline"]]
+        ]
+        expect(CodexExecHarness.appServerPermissionRequest(from: outsideCodexApprovalObject, workspace: codexWorkspace)?.toolRequest?.workspaceScoped == false, "Codex command approval detects out-of-workspace execution")
+        let codexDeltaObject: [String: Any] = ["method": "item/agentMessage/delta", "params": ["delta": "Hello"]]
+        if case .assistantDelta(let delta)? = CodexExecHarness.appServerEvent(from: codexDeltaObject, workspace: codexWorkspace) {
+            expect(delta == "Hello", "Codex app-server text delta")
+        } else { expect(false, "Codex app-server text delta") }
+        let codexCommandStart: [String: Any] = ["method": "item/started", "params": ["item": ["type": "commandExecution", "id": "command-1", "command": "swift build", "cwd": codexWorkspace.path, "status": "inProgress"]]]
+        let codexCommandEnd: [String: Any] = ["method": "item/completed", "params": ["item": ["type": "commandExecution", "id": "command-1", "command": "swift build", "cwd": codexWorkspace.path, "status": "completed"]]]
+        var codexCommandID: UUID?
+        if case .toolRequested(let request)? = CodexExecHarness.appServerEvent(from: codexCommandStart, workspace: codexWorkspace) {
+            codexCommandID = request.id
+            expect(request.detail == "$ swift build" && request.workspaceScoped, "Codex command activity starts with scoped detail")
+        } else { expect(false, "Codex command activity starts") }
+        if case .toolProgress(let id, let fraction, let detail)? = CodexExecHarness.appServerEvent(from: codexCommandEnd, workspace: codexWorkspace) {
+            expect(id == codexCommandID && fraction == 1 && detail == "Completed", "Codex command activity correlates completion")
+        } else { expect(false, "Codex command activity completes") }
+        let codexReasoningSummary: [String: Any] = ["method": "item/reasoning/summaryTextDelta", "params": ["itemId": "reasoning-1", "delta": "Inspecting the affected view."]]
+        if case .reasoningSummary(_, let delta)? = CodexExecHarness.appServerEvent(from: codexReasoningSummary, workspace: codexWorkspace) {
+            expect(delta == "Inspecting the affected view.", "Codex visible reasoning summary is projected")
+        } else { expect(false, "Codex visible reasoning summary is projected") }
+        let codexPrivateReasoning: [String: Any] = ["method": "item/reasoning/textDelta", "params": ["itemId": "reasoning-1", "delta": "private chain of thought"]]
+        expect(CodexExecHarness.appServerEvent(from: codexPrivateReasoning, workspace: codexWorkspace) == nil, "Codex private reasoning text is not projected")
+        let codexPlanUpdate: [String: Any] = [
+            "method": "turn/plan/updated",
+            "params": [
+                "turnId": "turn-1",
+                "explanation": "Update the chat surface",
+                "plan": [["step": "Inspect", "status": "completed"], ["step": "Verify", "status": "inProgress"]]
+            ]
+        ]
+        if case .plan(_, let title, let steps)? = CodexExecHarness.appServerEvent(from: codexPlanUpdate, workspace: codexWorkspace) {
+            expect(title == "Plan" && steps == ["Update the chat surface", "Completed — Inspect", "In progress — Verify"], "Codex plan updates are projected")
+        } else { expect(false, "Codex plan updates are projected") }
+
+        let reasoningAction = SessionAction(messageID: responseMessage.id, kind: .reasoning, title: "Reasoning summary", detail: "Inspect", status: .running)
+        var reasoningActions = [reasoningAction]
+        expect(SessionActionTrail.appendDetail(id: reasoningAction.id, delta: " then verify", in: &reasoningActions) && reasoningActions[0].detail == "Inspect then verify", "Reasoning summary deltas append to durable activity")
+
+        let codexDecisionURL = codexWorkspace.appendingPathComponent("approval-response.json")
+        let codexThreadRequestURL = codexWorkspace.appendingPathComponent("thread-request.json")
+        let codexTurnRequestURL = codexWorkspace.appendingPathComponent("turn-request.json")
+        let fakeCodexURL = codexWorkspace.appendingPathComponent("codex")
+        let fakeCodexScript = """
+        #!/bin/zsh
+        IFS= read -r initialize
+        print -r -- '{"id":1,"result":{"userAgent":"fake-codex"}}'
+        IFS= read -r initialized
+        IFS= read -r thread_request
+        print -r -- "$thread_request" > "\(codexThreadRequestURL.path)"
+        print -r -- '{"id":2,"result":{"thread":{"id":"thread-native","turns":[]}}}'
+        IFS= read -r turn_request
+        print -r -- "$turn_request" > "\(codexTurnRequestURL.path)"
+        print -r -- '{"id":3,"result":{"turn":{"id":"turn-native","status":"inProgress","items":[]}}}'
+        print -r -- '{"method":"item/agentMessage/delta","params":{"threadId":"thread-native","turnId":"turn-native","itemId":"message-1","delta":"Native reply"}}'
+        print -r -- '{"method":"item/started","params":{"threadId":"thread-native","turnId":"turn-native","item":{"type":"commandExecution","id":"command-native","command":"swift build","cwd":"\(codexWorkspace.path)","processId":null,"source":"agent","status":"inProgress","commandActions":[],"aggregatedOutput":null,"exitCode":null,"durationMs":null}}}'
+        print -r -- '{"method":"item/commandExecution/requestApproval","id":77,"params":{"threadId":"thread-native","turnId":"turn-native","itemId":"command-native","startedAtMs":1,"command":"swift build","cwd":"\(codexWorkspace.path)","availableDecisions":["accept","decline","cancel"]}}'
+        IFS= read -r approval
+        print -r -- "$approval" > "\(codexDecisionURL.path)"
+        print -r -- '{"method":"item/completed","params":{"threadId":"thread-native","turnId":"turn-native","item":{"type":"commandExecution","id":"command-native","command":"swift build","cwd":"\(codexWorkspace.path)","processId":null,"source":"agent","status":"completed","commandActions":[],"aggregatedOutput":"ok","exitCode":0,"durationMs":2}}}'
+        print -r -- '{"method":"turn/completed","params":{"threadId":"thread-native","turn":{"id":"turn-native","status":"completed","items":[],"error":null}}}'
+        """
+        try! Data(fakeCodexScript.utf8).write(to: fakeCodexURL)
+        try! FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCodexURL.path)
+        let fakeCodex = CodexExecHarness(executableURL: fakeCodexURL)
+        let fakeCodexSessionID = UUID()
+        var sawNativeThread = false
+        var sawNativeDelta = false
+        var sawNativePermission = false
+        var sawNativeToolStart = false
+        var sawNativeToolEnd = false
+        var sawNativeCompletion = false
+        var nativeToolID: UUID?
+        for await event in fakeCodex.stream(prompt: "Reply and build", sessionID: fakeCodexSessionID, threadID: nil, workspace: codexWorkspace, model: "gpt-test", reasoningEffort: .high, policy: .smart) {
+            if case .harnessSessionStarted(let id) = event { sawNativeThread = id == "thread-native" }
+            if case .assistantDelta(let delta) = event { sawNativeDelta = delta == "Native reply" }
+            if case .toolRequested(let request) = event { nativeToolID = request.id; sawNativeToolStart = request.detail == "$ swift build" }
+            if case .toolProgress(let id, let fraction, _) = event { sawNativeToolEnd = id == nativeToolID && fraction == 1 }
+            if case .permissionRequested(let request) = event {
+                sawNativePermission = true
+                expect(!fakeCodex.respondToPermission(sessionID: UUID(), requestID: request.id, optionID: "accept"), "Codex rejects cross-session permission response")
+                expect(!fakeCodex.respondToPermission(sessionID: fakeCodexSessionID, requestID: request.id, optionID: "unknown"), "Codex rejects unknown permission option")
+                expect(fakeCodex.respondToPermission(sessionID: fakeCodexSessionID, requestID: request.id, optionID: "accept"), "Codex accepts active permission option")
+            }
+            if case .completed = event { sawNativeCompletion = true }
+        }
+        expect(sawNativeThread && sawNativeDelta, "Codex app-server thread and streaming lifecycle")
+        expect(sawNativePermission, "Codex app-server approval forwarded")
+        expect(sawNativeToolStart && sawNativeToolEnd, "Codex app-server tool activity forwarded")
+        expect(sawNativeCompletion, "Codex app-server turn completion forwarded")
+        let codexPermissionResponse = try! String(contentsOf: codexDecisionURL, encoding: .utf8)
+        expect(codexPermissionResponse.contains("\"decision\":\"accept\""), "Codex app-server approval response written")
+        let codexThreadRequest = try! JSONSerialization.jsonObject(with: Data(contentsOf: codexThreadRequestURL)) as! [String: Any]
+        let codexThreadParams = codexThreadRequest["params"] as! [String: Any]
+        expect(codexThreadRequest["method"] as? String == "thread/start" && codexThreadParams["sandbox"] as? String == "workspace-write", "Codex starts a native writable thread for Smart mode")
+        let codexTurnRequest = try! JSONSerialization.jsonObject(with: Data(contentsOf: codexTurnRequestURL)) as! [String: Any]
+        let codexTurnParams = codexTurnRequest["params"] as! [String: Any]
+        expect(codexTurnRequest["method"] as? String == "turn/start" && codexTurnParams["effort"] as? String == "high" && codexTurnParams["summary"] as? String == "auto", "Codex starts the turn with model reasoning and visible summary settings")
+        try? FileManager.default.removeItem(at: codexWorkspace)
+
+        let permissionObject: [String: Any] = [
+            "method": "session/request_permission",
+            "params": [
+                "toolCall": [
+                    "title": "Run formatter",
+                    "kind": "execute",
+                    "rawInput": ["command": "swiftformat .", "description": "Format workspace"]
+                ],
+                "options": [
+                    ["optionId": "allow_once", "name": "Allow once", "kind": "allow_once"],
+                    ["optionId": "deny", "name": "Deny", "kind": "reject_once"]
+                ]
+            ]
+        ]
+        let parsedPermission = HermesACPHarness.permissionRequest(from: permissionObject, workspace: codexWorkspace)
+        expect(parsedPermission?.title == "Run formatter", "Hermes permission title parsed")
+        expect(parsedPermission?.detail.contains("swiftformat .") == true, "Hermes permission command parsed")
+        expect(parsedPermission?.options.map(\.id) == ["allow_once", "deny"], "Hermes permission options parsed")
+        expect(parsedPermission?.toolRequest?.kind == .command, "Hermes permission command is typed")
+        expect(parsedPermission?.toolRequest?.workspaceScoped == false, "Hermes permission without a path is not assumed workspace-scoped")
+        let hermesPathPermissionObject: [String: Any] = [
+            "method": "session/request_permission",
+            "params": [
+                "toolCall": [
+                    "title": "Edit app",
+                    "kind": "edit",
+                    "rawInput": ["path": "Sources/App.swift"]
+                ],
+                "options": [
+                    ["optionId": "allow_once", "name": "Allow once", "kind": "allow_once"],
+                    ["optionId": "deny", "name": "Deny", "kind": "reject_once"]
+                ]
+            ]
+        ]
+        expect(HermesACPHarness.permissionRequest(from: hermesPathPermissionObject, workspace: codexWorkspace)?.toolRequest?.kind == .write, "Hermes edit permission is typed")
+        expect(HermesACPHarness.permissionRequest(from: hermesPathPermissionObject, workspace: codexWorkspace)?.toolRequest?.workspaceScoped == true, "Hermes relative edit path is workspace-scoped")
+        let hermesToolStart: [String: Any] = [
+            "method": "session/update",
+            "params": ["update": [
+                "sessionUpdate": "tool_call", "toolCallId": "call-1", "title": "edit Sources/App.swift", "kind": "edit",
+                "locations": [["path": "Sources/App.swift"]], "rawInput": ["path": "Sources/App.swift"]
+            ]]
+        ]
+        let hermesToolEnd: [String: Any] = [
+            "method": "session/update",
+            "params": ["update": ["sessionUpdate": "tool_call_update", "toolCallId": "call-1", "status": "completed"]]
+        ]
+        var hermesToolID: UUID?
+        if case .toolRequested(let request)? = HarnessToolEventDecoder.hermesEvent(from: hermesToolStart, workspace: root) {
+            hermesToolID = request.id
+            expect(request.kind == .write && request.detail == "Sources/App.swift", "Hermes tool path projected")
+        } else { expect(false, "Hermes tool start projected") }
+        if case .toolProgress(let id, let fraction, let detail)? = HarnessToolEventDecoder.hermesEvent(from: hermesToolEnd, workspace: root) {
+            expect(id == hermesToolID && fraction == 1 && detail == "Completed", "Hermes tool completion correlated")
+        } else { expect(false, "Hermes tool completion projected") }
+        let permissionOptions = [
+            ApprovalOption(id: "allow_once", name: "Allow once", kind: "allow_once"),
+            ApprovalOption(id: "allow_session", name: "Allow for session", kind: "allow_session"),
+            ApprovalOption(id: "allow_always", name: "Allow always", kind: "allow_always"),
+            ApprovalOption(id: "deny", name: "Deny", kind: "reject_once"),
+            ApprovalOption(id: "deny_always", name: "Deny always", kind: "reject_always")
+        ]
+        expect(ApprovalOptionPolicy.visibleOptions(permissionOptions, under: .ask).map(\.id) == ["allow_once", "deny"], "Ask exposes one-turn ACP decisions")
+        expect(ApprovalOptionPolicy.visibleOptions(permissionOptions, under: .smart).map(\.id) == ["allow_once", "allow_session", "deny"], "Smart exposes session-scoped ACP approval")
+        expect(ApprovalOptionPolicy.visibleOptions(permissionOptions, under: .yolo).map(\.id) == ["allow_once", "allow_session", "allow_always", "deny"], "YOLO policy excludes persistent rejection")
+        expect(!ApprovalOptionPolicy.isVisible(permissionOptions[2], under: .ask), "Ask rejects hidden permanent allow decisions")
+        expect(!ApprovalOptionPolicy.isVisible(permissionOptions[2], under: .smart), "Smart rejects hidden permanent allow decisions")
+        expect(ApprovalOptionPolicy.isVisible(permissionOptions[2], under: .yolo), "YOLO can expose permanent allow decisions")
+        expect(!ApprovalOptionPolicy.isVisible(permissionOptions[4], under: .yolo), "YOLO still rejects permanent deny decisions")
+        let providerNativeOptions = [
+            ApprovalOption(id: "accept", name: "Allow once", kind: "allow_once"),
+            ApprovalOption(id: "acceptForSession", name: "Allow for session", kind: "allow_session"),
+            ApprovalOption(id: "acceptAlways", name: "Allow always", kind: "allow_always"),
+            ApprovalOption(id: "decline", name: "Deny", kind: "reject_once"),
+            ApprovalOption(id: "cancel", name: "Stop", kind: "reject_always")
+        ]
+        expect(ApprovalOptionPolicy.visibleOptions(providerNativeOptions, under: .smart).map(\.id) == ["accept", "acceptForSession", "decline"], "Smart exposes provider-native session approval by kind")
+
+        let fakeHarnessRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try! FileManager.default.createDirectory(at: fakeHarnessRoot, withIntermediateDirectories: true)
+        let fakeHarnessURL = fakeHarnessRoot.appendingPathComponent("fake-hermes")
+        let decisionURL = fakeHarnessRoot.appendingPathComponent("permission-response.json")
+        let acpSessionRequestURL = fakeHarnessRoot.appendingPathComponent("session-request.json")
+        let hermesInsideURL = fakeHarnessRoot.appendingPathComponent("sandbox-inside.txt")
+        let hermesOutsideRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try! FileManager.default.createDirectory(at: hermesOutsideRoot, withIntermediateDirectories: true)
+        let hermesOutsideURL = hermesOutsideRoot.appendingPathComponent("sandbox-outside.txt")
+        let fakeHarnessScript = """
+        #!/bin/zsh
+        print -r -- inside > '\(hermesInsideURL.path)'
+        print -r -- outside > '\(hermesOutsideURL.path)' 2>/dev/null || true
+        IFS= read -r initialize
+        print -r -- '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+        IFS= read -r session
+        print -r -- "$session" > '\(acpSessionRequestURL.path)'
+        print -r -- '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"fake-session","models":{"currentModelId":"model-1","availableModels":[{"modelId":"model-1","name":"Model One"}]}}}'
+        IFS= read -r prompt
+        print -r -- '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session","update":{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"Run formatter","kind":"execute","rawInput":{"command":"swiftformat ."}}}}'
+        print -r -- '{"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"sessionId":"fake-session","toolCall":{"toolCallId":"call-1","title":"Run formatter","kind":"execute","rawInput":{"command":"swiftformat .","description":"Format workspace"}},"options":[{"optionId":"allow_once","name":"Allow once","kind":"allow_once"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]}}'
+        while IFS= read -r permission; do
+          [[ "$permission" == *'"id":99'* ]] && break
+        done
+        print -r -- "$permission" > '\(decisionURL.path)'
+        print -r -- '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"completed"}}}'
+        print -r -- '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+        """
+        try! Data(fakeHarnessScript.utf8).write(to: fakeHarnessURL)
+        try! FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeHarnessURL.path)
+        let fakeHarness = HermesACPHarness(executableURL: fakeHarnessURL)
+        let fakeSessionID = UUID()
+        var sawPermission = false
+        var sawCompletion = false
+        var sawHermesToolStart = false
+        var sawHermesToolEnd = false
+        for await event in fakeHarness.stream(prompt: "Format", sessionID: fakeSessionID, threadID: nil, workspace: fakeHarnessRoot, requestedModel: "Model One") {
+            if case .toolRequested(let request) = event { sawHermesToolStart = request.detail.contains("swiftformat .") }
+            if case .toolProgress(_, let fraction, _) = event { sawHermesToolEnd = fraction == 1 }
+            if case .permissionRequested(let request) = event {
+                sawPermission = true
+                expect(!fakeHarness.respondToPermission(sessionID: UUID(), requestID: request.id, optionID: "allow_once"), "Hermes rejects cross-session permission response")
+                expect(!fakeHarness.respondToPermission(sessionID: fakeSessionID, requestID: request.id, optionID: "unknown"), "Hermes rejects unknown permission option")
+                expect(fakeHarness.respondToPermission(sessionID: fakeSessionID, requestID: request.id, optionID: "allow_once"), "Hermes accepts active permission option")
+            }
+            if case .completed = event { sawCompletion = true }
+        }
+        expect(sawPermission, "Hermes permission event forwarded")
+        expect(sawCompletion, "Hermes continues after permission response")
+        expect(sawHermesToolStart && sawHermesToolEnd, "Hermes tool activity forwarded")
+        let permissionResponse = try! String(contentsOf: decisionURL, encoding: .utf8)
+        expect(permissionResponse.contains("\"outcome\":\"selected\"") && permissionResponse.contains("\"optionId\":\"allow_once\""), "Hermes selected permission response written")
+        let acpSessionRequest = try! String(contentsOf: acpSessionRequestURL, encoding: .utf8)
+        expect(acpSessionRequest.contains("\"method\":\"session/new\"") && !acpSessionRequest.contains("session\\/new"), "ACP transport preserves protocol method names without escaped slashes")
+        expect(FileManager.default.fileExists(atPath: hermesInsideURL.path), "Sandboxed Hermes process can write workspace")
+        expect(!FileManager.default.fileExists(atPath: hermesOutsideURL.path), "Sandboxed Hermes process cannot write outside workspace")
+        let fakeGrokACP = HermesACPHarness(profile: .grok, executableURL: fakeHarnessURL)
+        let fakeGrokSessionID = UUID()
+        var fakeGrokThreadID: String?
+        var sawGrokPermission = false
+        var sawGrokCompletion = false
+        for await event in fakeGrokACP.stream(prompt: "Format", sessionID: fakeGrokSessionID, threadID: nil, workspace: fakeHarnessRoot, requestedModel: "Model One") {
+            if case .harnessSessionStarted(let id) = event { fakeGrokThreadID = id }
+            if case .permissionRequested(let request) = event {
+                sawGrokPermission = fakeGrokACP.respondToPermission(sessionID: fakeGrokSessionID, requestID: request.id, optionID: "allow_once")
+            }
+            if case .completed = event { sawGrokCompletion = true }
+        }
+        expect(fakeGrokThreadID == "grok-acp:fake-session", "Grok ACP session identity is durable and provider-scoped")
+        expect(sawGrokPermission && sawGrokCompletion, "Grok ACP permission and completion lifecycle")
+        let acpCatalog = [HarnessModel(id: "provider/model-one", name: "Model One"), HarnessModel(id: "provider/model-two", name: "Model Two")]
+        expect(ACPHarness.bestMatch(for: "provider/model-one", in: acpCatalog)?.id == "provider/model-one", "ACP exact model match qualifies runnable model")
+        expect(ACPHarness.bestMatch(for: "provider/missing", in: acpCatalog) == nil, "ACP missing model does not qualify as runnable")
+        let fakeOpenCodeURL = fakeHarnessRoot.appendingPathComponent("fake-opencode")
+        let openCodeConfigRequestURL = fakeHarnessRoot.appendingPathComponent("opencode-config-request.json")
+        let openCodeDecisionURL = fakeHarnessRoot.appendingPathComponent("opencode-permission-response.json")
+        let fakeOpenCodeScript = """
+        #!/bin/zsh
+        IFS= read -r initialize
+        print -r -- '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+        IFS= read -r session
+        print -r -- '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"open-session","configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"opencode/other","options":[{"value":"opencode/other","name":"Other"},{"value":"opencode/model-one","name":"Model One"}]}]}}'
+        IFS= read -r config
+        print -r -- "$config" > '\(openCodeConfigRequestURL.path)'
+        print -r -- '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"opencode/model-one","options":[{"value":"opencode/other","name":"Other"},{"value":"opencode/model-one","name":"Model One"}]}]}}'
+        IFS= read -r prompt
+        print -r -- '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"open-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"OpenCode ACP"}}}}'
+        print -r -- '{"jsonrpc":"2.0","id":199,"method":"session/request_permission","params":{"sessionId":"open-session","toolCall":{"toolCallId":"open-call","title":"Run check","kind":"execute","rawInput":{"command":"swift test"}},"options":[{"optionId":"allow_once","name":"Allow once","kind":"allow_once"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]}}'
+        while IFS= read -r permission; do
+          [[ "$permission" == *'"id":199'* ]] && break
+        done
+        print -r -- "$permission" > '\(openCodeDecisionURL.path)'
+        print -r -- '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
+        """
+        try! Data(fakeOpenCodeScript.utf8).write(to: fakeOpenCodeURL)
+        try! FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeOpenCodeURL.path)
+        let fakeOpenCodeACP = ACPHarness(profile: .openCode, executableURL: fakeOpenCodeURL)
+        let fakeOpenCodeSessionID = UUID()
+        var fakeOpenCodeThreadID: String?
+        var sawOpenCodeText = false
+        var sawOpenCodePermission = false
+        var sawOpenCodeCompletion = false
+        for await event in fakeOpenCodeACP.stream(prompt: "Check", sessionID: fakeOpenCodeSessionID, threadID: nil, workspace: fakeHarnessRoot, requestedModel: "opencode/model-one") {
+            if case .harnessSessionStarted(let id) = event { fakeOpenCodeThreadID = id }
+            if case .assistantDelta(let text) = event { sawOpenCodeText = text == "OpenCode ACP" }
+            if case .permissionRequested(let request) = event {
+                sawOpenCodePermission = fakeOpenCodeACP.respondToPermission(sessionID: fakeOpenCodeSessionID, requestID: request.id, optionID: "allow_once")
+            }
+            if case .completed = event { sawOpenCodeCompletion = true }
+        }
+        expect(fakeOpenCodeThreadID == "opencode-acp:open-session", "OpenCode ACP session identity is durable and provider-scoped")
+        expect(sawOpenCodeText && sawOpenCodePermission && sawOpenCodeCompletion, "OpenCode ACP streaming, permission, and completion lifecycle")
+        let openCodeConfigRequest = try! String(contentsOf: openCodeConfigRequestURL, encoding: .utf8)
+        expect(openCodeConfigRequest.contains("\"method\":\"session/set_config_option\"") && openCodeConfigRequest.contains("\"value\":\"opencode/model-one\""), "OpenCode ACP selects models through session configuration")
+        let openCodePermissionResponse = try! String(contentsOf: openCodeDecisionURL, encoding: .utf8)
+        expect(openCodePermissionResponse.contains("\"optionId\":\"allow_once\""), "OpenCode ACP permission response written")
+        let unavailableHermes = HermesACPHarness(executableURL: fakeHarnessURL, sandboxExecutableURL: nil)
+        var unavailableHermesFailure = ""
+        for await event in unavailableHermes.stream(prompt: "Format", sessionID: UUID(), threadID: nil, workspace: fakeHarnessRoot, requestedModel: "Model One") {
+            if case .failed(let message) = event { unavailableHermesFailure = message }
+        }
+        expect(unavailableHermesFailure.contains("workspace sandbox is unavailable"), "Hermes refuses launch without sandbox")
+        try? FileManager.default.removeItem(at: fakeHarnessRoot)
+        try? FileManager.default.removeItem(at: hermesOutsideRoot)
+
+        let fakeCancelRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try! FileManager.default.createDirectory(at: fakeCancelRoot, withIntermediateDirectories: true)
+        let fakeCancelURL = fakeCancelRoot.appendingPathComponent("fake-hermes")
+        let cancelledDecisionURL = fakeCancelRoot.appendingPathComponent("permission-response.json")
+        let fakeCancelScript = fakeHarnessScript.replacingOccurrences(of: decisionURL.path, with: cancelledDecisionURL.path)
+        try! Data(fakeCancelScript.utf8).write(to: fakeCancelURL)
+        try! FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCancelURL.path)
+        let cancellingHarness = HermesACPHarness(executableURL: fakeCancelURL)
+        let cancellingSessionID = UUID()
+        var sawCancellation = false
+        for await event in cancellingHarness.stream(prompt: "Format", sessionID: cancellingSessionID, threadID: nil, workspace: fakeCancelRoot, requestedModel: "Model One") {
+            if case .permissionRequested = event { cancellingHarness.cancel(sessionID: cancellingSessionID) }
+            if case .cancelled = event { sawCancellation = true }
+        }
+        expect(sawCancellation, "Hermes cancellation remains cancelled after prompt response")
+        let cancelledPermissionResponse = try! String(contentsOf: cancelledDecisionURL, encoding: .utf8)
+        expect(cancelledPermissionResponse.contains("\"outcome\":\"cancelled\""), "Hermes pending permission cancelled before turn stop")
+        try? FileManager.default.removeItem(at: fakeCancelRoot)
+
+        let sandboxRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let sandboxWorkspace = sandboxRoot.appendingPathComponent("workspace", isDirectory: true)
+        let sandboxState = sandboxRoot.appendingPathComponent("state", isDirectory: true)
+        let sandboxOutside = sandboxRoot.appendingPathComponent("outside", isDirectory: true)
+        try! FileManager.default.createDirectory(at: sandboxWorkspace, withIntermediateDirectories: true)
+        try! FileManager.default.createDirectory(at: sandboxState, withIntermediateDirectories: true)
+        try! FileManager.default.createDirectory(at: sandboxOutside, withIntermediateDirectories: true)
+        let canonicalSandboxWorkspace = try! HarnessSandbox.canonicalDirectory(sandboxWorkspace)
+        let canonicalSandboxState = try! HarnessSandbox.canonicalDirectory(sandboxState)
+        let canonicalSandboxOutside = try! HarnessSandbox.canonicalDirectory(sandboxOutside)
+        try! FileManager.default.createSymbolicLink(at: canonicalSandboxWorkspace.appendingPathComponent("escape"), withDestinationURL: canonicalSandboxOutside)
+        let insideFile = canonicalSandboxWorkspace.appendingPathComponent("inside.txt")
+        let stateFile = canonicalSandboxState.appendingPathComponent("session.txt")
+        let outsideFile = canonicalSandboxOutside.appendingPathComponent("outside.txt")
+        let escapedFile = canonicalSandboxOutside.appendingPathComponent("escaped.txt")
+        let sandboxCommand = "printf inside > \"$0\"; printf state > \"$1\"; printf outside > \"$2\" 2>/dev/null || true; printf escaped > \"$3\" 2>/dev/null || true"
+        let sandboxLaunch = try! HarnessSandbox.writeRestrictedLaunch(
+            command: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", sandboxCommand, insideFile.path, stateFile.path, outsideFile.path, canonicalSandboxWorkspace.appendingPathComponent("escape/escaped.txt").path],
+            writableDirectories: [canonicalSandboxWorkspace, canonicalSandboxState]
+        )
+        let sandboxProcess = Process()
+        let sandboxError = Pipe()
+        sandboxProcess.executableURL = sandboxLaunch.executableURL
+        sandboxProcess.arguments = sandboxLaunch.arguments
+        sandboxProcess.standardError = sandboxError
+        try! sandboxProcess.run()
+        sandboxProcess.waitUntilExit()
+        let sandboxErrorText = String(decoding: sandboxError.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        expect(sandboxProcess.terminationStatus == 0, "Workspace sandbox process starts")
+        expect(FileManager.default.fileExists(atPath: insideFile.path), "Workspace sandbox permits workspace write")
+        expect(FileManager.default.fileExists(atPath: stateFile.path), "Workspace sandbox permits explicit state write")
+        expect(!FileManager.default.fileExists(atPath: outsideFile.path), "Workspace sandbox denies outside write")
+        expect(!FileManager.default.fileExists(atPath: escapedFile.path), "Workspace sandbox denies symlink escape")
+        expect(sandboxErrorText.components(separatedBy: "Operation not permitted").count >= 3, "Workspace sandbox reports denied writes")
+        do {
+            _ = try HarnessSandbox.writeRestrictedLaunch(command: URL(fileURLWithPath: "/bin/true"), arguments: [], writableDirectories: [sandboxWorkspace], sandboxExecutableURL: nil)
+            expect(false, "Missing workspace sandbox fails closed")
+        } catch HarnessSandboxError.unavailable {
+            expect(true, "Missing workspace sandbox fails closed")
+        } catch {
+            expect(false, "Missing workspace sandbox fails closed")
+        }
+        try? FileManager.default.removeItem(at: sandboxRoot)
+
+        let piWorkspace = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try! FileManager.default.createDirectory(at: piWorkspace, withIntermediateDirectories: true)
+        let piRequestObject: [String: Any] = [
+            "type": "extension_ui_request",
+            "id": "gate-1",
+            "method": "confirm",
+            "message": "{\"toolName\":\"write\",\"input\":{\"path\":\"Sources/App.swift\",\"content\":\"ok\"}}"
+        ]
+        let parsedPiPermission = PiRPCHarness.permissionRequest(from: piRequestObject, workspace: piWorkspace)
+        expect(parsedPiPermission?.title == "Pi wants to use write", "Pi write permission title parsed")
+        expect(parsedPiPermission?.detail == "Sources/App.swift", "Pi write path parsed")
+        expect(parsedPiPermission?.toolRequest?.workspaceScoped == true, "Pi relative write is workspace scoped")
+        let externalPiRequest: [String: Any] = [
+            "type": "extension_ui_request",
+            "id": "gate-2",
+            "method": "confirm",
+            "message": "{\"toolName\":\"edit\",\"input\":{\"path\":\"/tmp/outside.txt\"}}"
+        ]
+        expect(PiRPCHarness.permissionRequest(from: externalPiRequest, workspace: piWorkspace)?.toolRequest?.workspaceScoped == false, "Pi external edit crosses workspace scope")
+        expect(PiRPCHarness.permissionRequest(from: ["type": "extension_ui_request", "id": "gate-3", "method": "confirm", "message": "{\"toolName\":\"read\",\"input\":{\"path\":\"file\"}}"], workspace: piWorkspace) == nil, "Pi ignores unguarded read dialogs")
+        let piToolStart: [String: Any] = ["type": "tool_execution_start", "toolCallId": "pi-call-1", "toolName": "bash", "args": ["command": "swift build"]]
+        let piToolEnd: [String: Any] = ["type": "tool_execution_end", "toolCallId": "pi-call-1", "toolName": "bash", "isError": false]
+        var piToolID: UUID?
+        if case .toolRequested(let request)? = HarnessToolEventDecoder.piEvent(from: piToolStart, workspace: piWorkspace) {
+            piToolID = request.id
+            expect(request.kind == .command && request.detail == "$ swift build", "Pi tool command projected")
+        } else { expect(false, "Pi tool start projected") }
+        if case .toolProgress(let id, let fraction, let detail)? = HarnessToolEventDecoder.piEvent(from: piToolEnd, workspace: piWorkspace) {
+            expect(id == piToolID && fraction == 1 && detail == "Completed", "Pi tool completion correlated")
+        } else { expect(false, "Pi tool completion projected") }
+        let piExtensionURL = piWorkspace.appendingPathComponent("lattice-permission-gate.js")
+        try! PiRPCHarness.installPermissionExtension(at: piExtensionURL)
+        let piExtensionSource = try! String(contentsOf: piExtensionURL, encoding: .utf8)
+        expect(piExtensionSource.contains("write") && piExtensionSource.contains("edit") && piExtensionSource.contains("bash"), "Pi permission extension gates mutation tools")
+
+        let fakePiURL = piWorkspace.appendingPathComponent("fake-pi")
+        let piDecisionURL = piWorkspace.appendingPathComponent("permission-response.json")
+        let fakePiScript = """
+        #!/bin/zsh
+        IFS= read -r prompt
+        print -r -- '{"type":"tool_execution_start","toolCallId":"pi-call-1","toolName":"write","args":{"path":"Sources/App.swift","content":"ok"}}'
+        print -r -- '{"type":"extension_ui_request","id":"gate-1","method":"confirm","title":"Lattice permission request","message":"{\\"toolName\\":\\"write\\",\\"input\\":{\\"path\\":\\"Sources/App.swift\\",\\"content\\":\\"ok\\"}}"}'
+        while IFS= read -r permission; do
+          [[ "$permission" == *'"type":"extension_ui_response"'* ]] && break
+        done
+        print -r -- "$permission" > '\(piDecisionURL.path)'
+        print -r -- '{"type":"tool_execution_end","toolCallId":"pi-call-1","toolName":"write","result":{"content":[{"type":"text","text":"ok"}]},"isError":false}'
+        print -r -- '{"type":"agent_end"}'
+        """
+        try! Data(fakePiScript.utf8).write(to: fakePiURL)
+        try! FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakePiURL.path)
+        let fakePi = PiRPCHarness(executableURL: fakePiURL, permissionExtensionURL: piExtensionURL)
+        let fakePiSessionID = UUID()
+        var sawPiPermission = false
+        var sawPiCompletion = false
+        var sawPiToolStart = false
+        var sawPiToolEnd = false
+        for await event in fakePi.stream(prompt: "Edit", sessionID: fakePiSessionID, threadID: nil, workspace: piWorkspace, provider: "test", model: "model", reasoningEffort: nil, allowFileModification: true) {
+            if case .toolRequested(let request) = event { sawPiToolStart = request.detail == "Sources/App.swift" }
+            if case .toolProgress(_, let fraction, _) = event { sawPiToolEnd = fraction == 1 }
+            if case .permissionRequested(let request) = event {
+                sawPiPermission = true
+                expect(!fakePi.respondToPermission(sessionID: UUID(), requestID: request.id, optionID: "allow_once"), "Pi rejects cross-session permission response")
+                expect(!fakePi.respondToPermission(sessionID: fakePiSessionID, requestID: request.id, optionID: "unknown"), "Pi rejects unknown permission option")
+                expect(fakePi.respondToPermission(sessionID: fakePiSessionID, requestID: request.id, optionID: "allow_once"), "Pi accepts active permission option")
+            }
+            if case .completed = event { sawPiCompletion = true }
+        }
+        expect(sawPiPermission, "Pi permission event forwarded")
+        expect(sawPiCompletion, "Pi continues after permission response")
+        expect(sawPiToolStart && sawPiToolEnd, "Pi tool activity forwarded")
+        let piPermissionResponse = try! String(contentsOf: piDecisionURL, encoding: .utf8)
+        expect(piPermissionResponse.contains("\"confirmed\":true"), "Pi confirmed permission response written")
+
+        let cancellingPiDecisionURL = piWorkspace.appendingPathComponent("cancelled-permission-response.json")
+        let cancellingPiURL = piWorkspace.appendingPathComponent("fake-pi-cancel")
+        let cancellingPiScript = fakePiScript.replacingOccurrences(of: piDecisionURL.path, with: cancellingPiDecisionURL.path)
+        try! Data(cancellingPiScript.utf8).write(to: cancellingPiURL)
+        try! FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cancellingPiURL.path)
+        let cancellingPi = PiRPCHarness(executableURL: cancellingPiURL, permissionExtensionURL: piExtensionURL)
+        let cancellingPiSessionID = UUID()
+        var sawPiCancellation = false
+        var sawPiCompletionAfterCancel = false
+        for await event in cancellingPi.stream(prompt: "Edit", sessionID: cancellingPiSessionID, threadID: nil, workspace: piWorkspace, provider: "test", model: "model", reasoningEffort: nil, allowFileModification: true) {
+            if case .permissionRequested = event { cancellingPi.cancel(sessionID: cancellingPiSessionID) }
+            if case .cancelled = event { sawPiCancellation = true }
+            if case .completed = event { sawPiCompletionAfterCancel = true }
+        }
+        expect(sawPiCancellation && !sawPiCompletionAfterCancel, "Pi cancellation remains cancelled after permission response")
+        let cancelledPiPermissionResponse = try! String(contentsOf: cancellingPiDecisionURL, encoding: .utf8)
+        expect(cancelledPiPermissionResponse.contains("\"cancelled\":true"), "Pi pending permission cancelled before turn stop")
+        let unavailablePi = PiRPCHarness(executableURL: fakePiURL, permissionExtensionURL: piExtensionURL, sandboxExecutableURL: nil)
+        var unavailablePiFailure = ""
+        for await event in unavailablePi.stream(prompt: "Edit", sessionID: UUID(), threadID: nil, workspace: piWorkspace, provider: "test", model: "model", reasoningEffort: nil, allowFileModification: true) {
+            if case .failed(let message) = event { unavailablePiFailure = message }
+        }
+        expect(unavailablePiFailure.contains("workspace sandbox is unavailable"), "Pi refuses write-capable launch without sandbox")
+        try? FileManager.default.removeItem(at: piWorkspace)
+
+        let hardware = HardwareProfile(chipName: "Test", physicalMemoryBytes: 16 * 1_073_741_824)
+        let small = LocalModelRecommendation(id: "small", name: "Small", ollamaTag: "small", parameterCountB: 3, quantizationBits: 4, category: "Fast", contextTokens: 8_192)
+        let fastLongContext = LocalModelRecommendation(id: "fast-long", name: "Fast Long", ollamaTag: "fast-long", parameterCountB: 4, quantizationBits: 4, category: "Fast", contextTokens: 262_144)
+        expect(small.fit(on: hardware) == .comfortable, "Hardware fit")
+        expect(small.canInstall(on: hardware), "Install gate for fitting model")
+        expect(small.serveProfile == .quick, "Serve profile inference")
+        expect(fastLongContext.serveProfile == .quick, "Category intent wins over context size")
+        expect(small.lifecyclePlan(on: hardware).idleUnloadMinutes == 3, "Quick model idle unload plan")
+        expect(small.lifecyclePlan(on: hardware).preloadAllowed, "Small comfortable model can preload")
+        let criticalHardware = HardwareProfile(chipName: "Test", physicalMemoryBytes: 16 * 1_073_741_824, thermalState: "Critical")
+        expect(criticalHardware.safeModelBudgetBytes < hardware.safeModelBudgetBytes, "Thermal budget reduction")
+        expect(!small.tupleSummary.contains("ollama") && !small.tupleSummary.contains("lattice") && small.tupleSummary.contains("context"), "Recommendation tuple hides internal routing labels")
+        expect(LocalModelCatalog.recommendations(for: hardware, category: "Fast").first?.fit(on: hardware) == .comfortable, "Catalog ranking prefers fitting models")
+        expect(LocalModelCatalog.recommendations(for: hardware, category: "Coding", fitOnly: true).allSatisfy { $0.canInstall(on: hardware) }, "Fit-only recommendations hide oversized local models")
+        let fullCodingCount = LocalModelCatalog.recommendations(for: hardware, category: "Coding", fitOnly: false).count
+        let fitCodingCount = LocalModelCatalog.recommendations(for: hardware, category: "Coding", fitOnly: true).count
+        expect(LocalModelCatalog.hiddenOversizedRecommendationCount(for: hardware, category: "Coding") == fullCodingCount - fitCodingCount, "Hidden oversized recommendation count matches filtered catalog")
+        expect(ExecutableDiscovery.locate("../tool", path: "/bin:/usr/bin") == nil, "Executable validation")
+        expect(CodexExecHarness().isInstalled, "Codex discovery")
+        let directCLI = CLIInstallSnapshot(executablePath: "/Users/test/.opencode/bin/opencode", homebrewPrefix: "/opt/homebrew", npmPrefix: "/Users/test/.local", homebrewFormulaInstalled: true, npmPackageInstalled: true)
+        expect(CLIInstallResolver.source(for: directCLI, directPathMarkers: ["/.opencode/bin/"]) == .direct, "Direct CLI source wins")
+        let directPlan = CLIInstallResolver.updatePlan(executableName: "opencode", source: .direct, homebrewFormula: "opencode", npmPackage: "opencode-ai", selfUpdateArguments: ["upgrade"], directArguments: ["upgrade", "--method", "curl"])
+        expect(directPlan == CLIUpdateCommandPlan(source: .direct, executable: "opencode", arguments: ["upgrade", "--method", "curl"]), "Direct CLI update plan")
+        let piNPMInstall = CLIInstallResolver.packageInstallPlan(npmPackage: "@earendil-works/pi-coding-agent", npmAvailable: true, pnpmAvailable: true)
+        expect(piNPMInstall == CLIUpdateCommandPlan(source: .npmGlobal, executable: "npm", arguments: ["install", "-g", "@earendil-works/pi-coding-agent@latest"]), "Pi install uses its published npm package")
+        let piPNPMInstall = CLIInstallResolver.packageInstallPlan(npmPackage: "@earendil-works/pi-coding-agent", npmAvailable: false, pnpmAvailable: true)
+        expect(piPNPMInstall == CLIUpdateCommandPlan(source: .pnpmGlobal, executable: "pnpm", arguments: ["add", "-g", "@earendil-works/pi-coding-agent@latest"]), "Pi install falls back to pnpm")
+        expect(CLIInstallResolver.packageInstallPlan(npmPackage: "package", npmAvailable: false, pnpmAvailable: false) == nil, "Package install fails closed without a package manager")
+        expect(CLIInstallResolver.codexInstallPlan(homebrewAvailable: true, npmAvailable: true, pnpmAvailable: true) == CLIUpdateCommandPlan(source: .homebrewCask, executable: "brew", arguments: ["install", "--cask", "codex"]), "Codex install prefers official Homebrew cask")
+        expect(CLIInstallResolver.codexInstallPlan(homebrewAvailable: false, npmAvailable: true, pnpmAvailable: true) == CLIUpdateCommandPlan(source: .npmGlobal, executable: "npm", arguments: ["install", "-g", "@openai/codex@latest"]), "Codex install falls back to official npm package")
+        expect(CLIInstallResolver.codexInstallPlan(homebrewAvailable: false, npmAvailable: false, pnpmAvailable: true) == CLIUpdateCommandPlan(source: .pnpmGlobal, executable: "pnpm", arguments: ["add", "-g", "@openai/codex@latest"]), "Codex install falls back to official package through pnpm")
+        expect(CLIInstallResolver.codexInstallPlan(homebrewAvailable: false, npmAvailable: false, pnpmAvailable: false) == nil, "Codex install fails closed without a supported package manager")
+        expect(RemoteInstallerScriptPolicy.validationMessage(for: URL(string: "https://x.ai/cli/install.sh")!) == nil, "Remote installer policy allows the exact official Grok endpoint")
+        expect(RemoteInstallerScriptPolicy.validationMessage(for: URL(string: "https://opencode.ai/install")!) == nil, "Remote installer policy allows the exact official OpenCode endpoint")
+        expect(RemoteInstallerScriptPolicy.validationMessage(for: URL(string: "https://hermes-agent.nousresearch.com/install.sh")!) == nil, "Remote installer policy allows the exact official Hermes endpoint")
+        expect(RemoteInstallerScriptPolicy.validationMessage(for: URL(string: "https://antigravity.google/cli/install.sh")!) != nil, "Remote installer policy rejects the unverified Antigravity endpoint")
+        expect(RemoteInstallerScriptPolicy.validationMessage(for: Data("#!/bin/bash\nset -e\necho install\n".utf8)) == nil, "Remote installer policy accepts a bounded UTF-8 shell script")
+        expect(RemoteInstallerScriptPolicy.validationMessage(for: Data("<html>not a script</html>".utf8)) != nil, "Remote installer policy rejects provider error pages")
+        expect(RemoteInstallerScriptPolicy.validationMessage(for: Data(repeating: 65, count: RemoteInstallerScriptPolicy.maximumByteCount + 1)) != nil, "Remote installer policy rejects oversized downloads")
+        expect(ExecutableDiscovery.locate("bash") != nil, "Executable discovery includes the system shell used for staged installer validation")
+        let brewCLI = CLIInstallSnapshot(executablePath: "/opt/homebrew/bin/codex", homebrewPrefix: "/opt/homebrew", homebrewCaskInstalled: true, npmPackageInstalled: true)
+        expect(CLIInstallResolver.source(for: brewCLI) == .homebrewCask, "Homebrew cask source")
+        let brewPlan = CLIInstallResolver.updatePlan(executableName: "codex", source: .homebrewCask, homebrewCask: "codex")
+        expect(brewPlan == CLIUpdateCommandPlan(source: .homebrewCask, executable: "brew", arguments: ["upgrade", "--cask", "codex"]), "Homebrew cask update plan")
+        let rawUpdateInfo = CLIUpdateInfo(updateAvailable: true, detail: "Update available: 1048 commits behind — run 'hermes update'")
+        expect(rawUpdateInfo.statusText == "Update available", "Raw CLI update text is not surfaced")
+        expect(CLIVersionDisplayPolicy.targetVersion(currentVersion: "0.13.0", latestVersion: "0.14.0") == "0.14.0", "CLI target version uses latest version")
+        expect(CLIVersionDisplayPolicy.updateActionTitle("Update CLI", currentVersion: "codex 0.13.0", latestVersion: "codex 0.14.0") == "Update CLI (0.14.0)", "CLI update title displays target version")
+        expect(CLIVersionDisplayPolicy.updateActionTitle("Update CLI", currentVersion: "0.14.0", latestVersion: "v0.14.0") == "Update CLI", "CLI update title hides current version")
+        expect(CLIVersionDisplayPolicy.normalizedVersion("Update available: 0.13.0 → v0.14.0") == "0.14.0", "CLI parser extracts newest version from update text")
+        expect(CLIVersionDisplayPolicy.normalizedVersion("Update available: 1048 commits behind") == nil, "CLI parser rejects non-version counters")
+        expect(CLIVersionDisplayPolicy.targetVersion(currentVersion: nil, latestVersion: "v0.15.0") == "0.15.0", "CLI target version shows known latest version without current version")
+        expect(CLIVersionDisplayPolicy.releaseNotes(from: "Update available\nRelease notes:\n- Better ACP restore\n- Fix cancellation") == "- Better ACP restore\n- Fix cancellation", "CLI release note parser extracts provider notes")
+        expect(CLIVersionDisplayPolicy.releaseNotes(from: "Update available: 1048 commits behind") == nil, "CLI release note parser ignores generic update banners")
+        expect(CLIUpdateInfo(latestVersion: "0.15.0", updateAvailable: true).statusText == "Update available · 0.15.0", "CLI update status includes target version")
+        expect(CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: "0.13.0", latestVersion: "0.14.0"), "CLI update availability compares semantic versions")
+        expect(!CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: "0.141.0", latestVersion: "0.141.0"), "Current CLI does not show an update")
+        expect(!CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: "0.141.0", latestVersion: "0.140.0"), "Older catalog version does not show an update")
+        expect(CLIActionStatusPolicy.signInMessage(providerName: "OpenCode", commandSucceeded: true, readyAfterRefresh: true).isEmpty, "Verified sign in clears action message")
+        expect(CLIActionStatusPolicy.signInMessage(providerName: "OpenCode", commandSucceeded: false, readyAfterRefresh: false) == "Sign in failed for OpenCode.", "Failed sign in remains visible")
+        expect(CLIActionStatusPolicy.signInMessage(providerName: "OpenCode", commandSucceeded: true, readyAfterRefresh: false) == "Sign in finished, but Lattice could not verify a runnable OpenCode connection.", "Unverified sign in remains visible")
+        expect(CLIActionStatusPolicy.signInMessage(providerName: "OpenCode", commandSucceeded: false, readyAfterRefresh: true).isEmpty, "Refreshed readiness overrides stale command status")
+        expect(CLIActionStatusPolicy.messageIndicatesProblem("pi installed, but it is not on PATH yet."), "PATH warning is styled as a problem")
+        expect(CLIActionStatusPolicy.messageIndicatesProblem("Active CLI stayed on 1.0.0."), "Unchanged version warning is styled as a problem")
+        expect(!CLIActionStatusPolicy.messageIndicatesProblem("Update available"), "Available update is not styled as a failure")
+        expect(CLIActionStatusPolicy.installMessage(executableName: "pi", status: 1, output: Data("network failed".utf8), executableAvailableAfterRefresh: true) == "Install failed: network failed", "Install failure is not hidden by an existing executable")
+        expect(CLIActionStatusPolicy.installMessage(executableName: "pi", status: 0, output: Data(), executableAvailableAfterRefresh: false) == "pi installed, but it is not on PATH yet.", "Install success without PATH reports PATH issue")
+        expect(CLIActionStatusPolicy.installMessage(executableName: "pi", status: 0, output: Data(), executableAvailableAfterRefresh: true).isEmpty, "Verified install clears action message")
+        expect(CLIActionStatusPolicy.updateMessage(status: 1, output: Data("permission denied".utf8), beforeVersion: "1.0.0", afterVersion: "1.0.0") == "Update failed: permission denied", "Update failure reports command error")
+        expect(CLIActionStatusPolicy.updateMessage(status: 0, output: Data(), beforeVersion: "1.0.0", afterVersion: "1.1.0").isEmpty, "Update with changed active version clears action message")
+        expect(CLIActionStatusPolicy.updateMessage(status: 0, output: Data(), beforeVersion: nil, afterVersion: "1.1.0").isEmpty, "Update with newly verified active version clears action message")
+        expect(CLIActionStatusPolicy.updateMessage(status: 0, output: Data("Already up to date".utf8), beforeVersion: "1.0.0", afterVersion: "1.0.0").isEmpty, "Up-to-date update output clears action message")
+        expect(CLIActionStatusPolicy.updateMessage(status: 0, output: Data("done".utf8), beforeVersion: "1.0.0", afterVersion: "1.0.0") == "Active CLI stayed on 1.0.0.", "Unchanged active CLI version is reported")
+        expect(CLIActionStatusPolicy.updateMessage(status: 0, output: Data("done".utf8), beforeVersion: "1.0.0", afterVersion: nil) == "Update finished, but Lattice could not verify the active CLI version.", "Update that loses active version visibility is reported as unverifiable")
+        expect(CLIActionStatusPolicy.updateMessage(status: 0, output: Data("done".utf8), beforeVersion: nil, afterVersion: nil) == "Update finished, but Lattice could not verify the active CLI version.", "Unverifiable update success stays visible")
+        let fakeOpenCodeModelsRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try! FileManager.default.createDirectory(at: fakeOpenCodeModelsRoot, withIntermediateDirectories: true)
+        let fakeOpenCodeModelsURL = fakeOpenCodeModelsRoot.appendingPathComponent("opencode")
+        let fakeOpenCodeRefreshMarker = fakeOpenCodeModelsRoot.appendingPathComponent("refreshed")
+        let fakeOpenCodeModelsScript = """
+        #!/bin/sh
+        if [ "$1" = "models" ] && [ "$2" = "--refresh" ]; then
+          printf refreshed > "\(fakeOpenCodeRefreshMarker.path)"
+          exit 0
+        fi
+        if [ "$1" = "models" ] && [ "$2" = "opencode" ]; then
+          printf '%s\\n' '{"id":"qwen3-coder","providerID":"opencode","name":"Qwen3 Coder","limit":{"context":64000},"variants":{"low":{},"medium":{},"high":{"reasoningEffort":"high"}}}'
+          exit 0
+        fi
+        if [ "$1" = "models" ] && [ "$2" = "opencode-go" ]; then
+          printf '%s\\n' '{"id":"deepseek-v4-pro","providerID":"opencode-go","name":"DeepSeek V4 Pro","contextWindow":"128k","variants":{"thinking":{"reasoningEffort":"thinking"},"max":{}}}'
+          exit 0
+        fi
+        exit 1
+        """
+        try! Data(fakeOpenCodeModelsScript.utf8).write(to: fakeOpenCodeModelsURL)
+        try! FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeOpenCodeModelsURL.path)
+        let parsedOpenCodeModels = await StructuredCLIHarness(kind: .openCode, executableURL: fakeOpenCodeModelsURL).models(refreshCache: true)
+        let qwenReasoning = parsedOpenCodeModels.first { $0.id == "opencode/qwen3-coder" }?.reasoningOptions.map(\.effort) ?? []
+        let goReasoning = parsedOpenCodeModels.first { $0.id == "opencode-go/deepseek-v4-pro" }?.reasoningOptions.map(\.effort) ?? []
+        expect(qwenReasoning == [.low, .medium, .high], "OpenCode reasoning variants are discovered")
+        expect(parsedOpenCodeModels.first { $0.id == "opencode/qwen3-coder" }?.defaultReasoningEffort == .medium, "OpenCode reasoning default prefers medium")
+        expect(parsedOpenCodeModels.first { $0.id == "opencode/qwen3-coder" }?.contextWindow == 64_000, "OpenCode model context limit is parsed from provider metadata")
+        expect(goReasoning == [.max, .thinking], "OpenCode Go reasoning variants are discovered")
+        expect(parsedOpenCodeModels.first { $0.id == "opencode-go/deepseek-v4-pro" }?.contextWindow == 128_000, "OpenCode model context limit supports abbreviated provider metadata")
+        expect(FileManager.default.fileExists(atPath: fakeOpenCodeRefreshMarker.path), "OpenCode explicit refresh updates the provider model cache before reading catalogs")
+        try? FileManager.default.removeItem(at: fakeOpenCodeModelsRoot)
+
+        let parsedGrokTextModels = StructuredCLIHarness.parseModels(Data("""
+        You are logged in
+        * grok-thinking-test (default)
+        - grok-reasoning-test
+        """.utf8), kind: .grok)
+        expect(parsedGrokTextModels.count == 2, "Grok text model catalog parses models")
+        expect(parsedGrokTextModels.allSatisfy { $0.reasoningOptions.isEmpty }, "Grok text model catalog does not infer reasoning options from names")
+        expect(parsedGrokTextModels.first { $0.id == "grok-thinking-test" }?.isDefault == true, "Grok text model catalog preserves default marker")
+        let parsedGrokStructuredModel = StructuredCLIHarness.parseModels(Data("""
+        {"id":"grok-structured","name":"Grok Structured","isDefault":true,"reasoningOptions":["high","low"],"defaultReasoningEffort":"high","model_context_window":131072}
+        """.utf8), kind: .grok).first
+        expect(parsedGrokStructuredModel?.reasoningOptions.map(\.effort) == [.low, .high], "Grok structured model catalog exposes declared reasoning options")
+        expect(parsedGrokStructuredModel?.defaultReasoningEffort == .high, "Grok structured model catalog preserves declared default reasoning")
+        expect(parsedGrokStructuredModel?.contextWindow == 131_072, "Grok structured model catalog preserves declared context window")
+        let reasoningCodexModels = [
+            ProviderModel(id: "gpt", name: "GPT", reasoningOptions: [ReasoningOption(effort: .low), ReasoningOption(effort: .high)], defaultReasoningEffort: .high)
+        ]
+        let reasoningGrokModels = [
+            ProviderModel(id: "grok-structured", name: "Grok Structured", reasoningOptions: [ReasoningOption(effort: .high)], defaultReasoningEffort: .high)
+        ]
+        let reasoningOpenCodeModels = [
+            ProviderModel(id: "opencode-go/deepseek", name: "DeepSeek", reasoningOptions: [ReasoningOption(effort: .thinking)], defaultReasoningEffort: .thinking)
+        ]
+        expect(ReasoningCapabilityPolicy.options(for: .codex(model: "gpt"), harnessID: "codex", codexModels: reasoningCodexModels, grokModels: reasoningGrokModels, openCodeModels: reasoningOpenCodeModels).map(\.effort) == [.low, .high], "Codex reasoning options remain available on Codex route")
+        expect(ReasoningCapabilityPolicy.defaultEffort(for: .codex(model: "gpt"), harnessID: "codex", codexModels: reasoningCodexModels, grokModels: reasoningGrokModels, openCodeModels: reasoningOpenCodeModels) == .high, "Codex reasoning default remains available on Codex route")
+        expect(ReasoningCapabilityPolicy.options(for: .grok(model: "grok-structured"), harnessID: "grok", codexModels: reasoningCodexModels, grokModels: reasoningGrokModels, openCodeModels: reasoningOpenCodeModels).isEmpty, "Grok reasoning options stay hidden until Grok execution supports them")
+        expect(ReasoningCapabilityPolicy.defaultEffort(for: .grok(model: "grok-structured"), harnessID: "grok", codexModels: reasoningCodexModels, grokModels: reasoningGrokModels, openCodeModels: reasoningOpenCodeModels) == nil, "Grok reasoning default stays hidden until Grok execution supports it")
+        expect(ReasoningCapabilityPolicy.options(for: .openCode(model: "opencode-go/deepseek"), harnessID: "opencode", codexModels: reasoningCodexModels, grokModels: reasoningGrokModels, openCodeModels: reasoningOpenCodeModels).isEmpty, "Plain OpenCode route hides reasoning options")
+        expect(ReasoningCapabilityPolicy.options(for: .openCode(model: "opencode-go/deepseek"), harnessID: "pi", codexModels: reasoningCodexModels, grokModels: reasoningGrokModels, openCodeModels: reasoningOpenCodeModels).map(\.effort) == [.thinking], "Pi-backed OpenCode route exposes reasoning options")
+        expect(ReasoningCapabilityPolicy.defaultEffort(for: .openCode(model: "opencode-go/deepseek"), harnessID: "pi", codexModels: reasoningCodexModels, grokModels: reasoningGrokModels, openCodeModels: reasoningOpenCodeModels) == .thinking, "Pi-backed OpenCode route exposes reasoning default")
+
+        let backendSnapshot = BackendAvailabilitySnapshot(
+            codexModels: [
+                ProviderModel(id: "gpt-5.4", name: "GPT-5.4"),
+                ProviderModel(id: "gpt-5.5", name: "GPT-5.5", isDefault: true)
+            ],
+            grokModels: [ProviderModel(id: "grok-4", name: "Grok 4", isDefault: true)],
+            openCodeModels: [ProviderModel(id: "qwen3-coder", name: "Qwen3 Coder", isDefault: true)],
+            appleIntelligenceReady: false,
+            ollamaModelNames: ["llama3.2:latest"],
+            codexInstalled: true
+        )
+        expect(BackendAvailabilityPolicy.normalize(.antigravity(model: "composer"), using: backendSnapshot) == .codex(model: "gpt-5.5"), "Antigravity chat backend normalized")
+        expect(BackendAvailabilityPolicy.normalize(.appleIntelligence, using: backendSnapshot) == .codex(model: "gpt-5.5"), "Unavailable Apple backend normalized")
+        expect(BackendAvailabilityPolicy.normalize(.ollama(model: "missing:latest"), using: backendSnapshot) == .codex(model: "gpt-5.5"), "Missing Ollama model normalized")
+        expect(BackendAvailabilityPolicy.normalize(.openCode(model: "old-opencode"), using: backendSnapshot) == .openCode(model: "qwen3-coder"), "Stale OpenCode model normalized")
+
+        let extensionRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let strictEnvelope = """
+        <lattice-extension-manifest>
+        {"schemaVersion":1,"id":"com.lattice.strict","name":"Strict","version":"1","summary":"Strict manifest."}
+        </lattice-extension-manifest>
+        """
+        expect((try! LatticeExtensionManifestEnvelope.decode(from: strictEnvelope)).id == "com.lattice.strict", "Self-edit manifest envelope decodes exact manifest")
+        do {
+            _ = try LatticeExtensionManifestEnvelope.decode(from: "Here is the change.\n\(strictEnvelope)")
+            expect(false, "Self-edit manifest envelope rejects extra text")
+        } catch {
+            expect(error.localizedDescription.contains("extra text"), "Self-edit manifest envelope rejects extra text")
+        }
+        do {
+            _ = try LatticeExtensionManifestEnvelope.decode(from: "\(strictEnvelope)\n\(strictEnvelope)")
+            expect(false, "Self-edit manifest envelope rejects duplicate manifests")
+        } catch {
+            expect(error.localizedDescription.contains("extra text") || error.localizedDescription.contains("more than one"), "Self-edit manifest envelope rejects duplicate manifests")
+        }
+        do {
+            _ = try LatticeExtensionManifestEnvelope.decode(from: "<lattice-extension-manifest>{\"schemaVersion\":1,</lattice-extension-manifest>")
+            expect(false, "Self-edit manifest envelope rejects invalid JSON")
+        } catch {
+            expect(error.localizedDescription.contains("invalid"), "Self-edit manifest envelope rejects invalid JSON")
+        }
+        let manifest = LatticeExtensionManifest(
+            id: "com.lattice.theme-pack",
+            name: "Theme Pack",
+            version: "1.0.0",
+            summary: "Changes local UI styling.",
+            permissions: [.editUI],
+            entrypoint: "extension.json",
+            uiTargets: ["overlay"],
+            stylePatches: [.init(target: .overlay, tintHex: "#FF4FA3", cornerRadius: 24)]
+        )
+        let extensionBundle = extensionRoot.appendingPathComponent(manifest.id, isDirectory: true)
+        try! FileManager.default.createDirectory(at: extensionBundle, withIntermediateDirectories: true)
+        let manifestData = try! JSONEncoder().encode(manifest)
+        try! manifestData.write(to: extensionBundle.appendingPathComponent("lattice-extension.json"))
+        let extensionStore = LatticeExtensionStore(rootURL: extensionRoot)
+        let loadedExtensions = extensionStore.load()
+        expect(loadedExtensions.count == 1, "Extension load")
+        expect(loadedExtensions.first?.isValid == true, "Extension validation")
+        expect(loadedExtensions.first?.stylePatches.first?.target == .overlay, "Extension style patch")
+        let duplicateRoot = extensionRoot.appendingPathComponent("duplicates", isDirectory: true)
+        let duplicateA = duplicateRoot.appendingPathComponent("a", isDirectory: true)
+        let duplicateB = duplicateRoot.appendingPathComponent("b", isDirectory: true)
+        try! FileManager.default.createDirectory(at: duplicateA, withIntermediateDirectories: true)
+        try! FileManager.default.createDirectory(at: duplicateB, withIntermediateDirectories: true)
+        let duplicateOne = LatticeExtensionManifest(id: "com.lattice.duplicate", name: "Duplicate A", version: "1", summary: "First.", permissions: [.editUI], stylePatches: [.init(target: .composer, tintHex: "#88CCFF")])
+        let duplicateTwo = LatticeExtensionManifest(id: "COM.LATTICE.DUPLICATE", name: "Duplicate B", version: "1", summary: "Second.", permissions: [.editUI], stylePatches: [.init(target: .overlay, tintHex: "#88CCFF")])
+        try! JSONEncoder().encode(duplicateOne).write(to: duplicateA.appendingPathComponent("lattice-extension.json"))
+        try! JSONEncoder().encode(duplicateTwo).write(to: duplicateB.appendingPathComponent("lattice-extension.json"))
+        let duplicateRecords = LatticeExtensionStore(rootURL: duplicateRoot).load()
+        expect(duplicateRecords.count == 2, "Duplicate extension ids both load for review")
+        expect(duplicateRecords.allSatisfy { !$0.isValid }, "Duplicate extension ids are invalid")
+        expect(duplicateRecords.allSatisfy { $0.validationMessages.contains { $0.contains("Duplicate extension id") } }, "Duplicate extension ids explain validation failure")
+        expect(extensionStore.validate(LatticeExtensionManifest(id: "COM.LATTICE.UPPERCASE", name: "Uppercase", version: "1", summary: "Uses uppercase id.")).contains("Id must be lowercase."), "Extension manifest id rejects uppercase")
+        let badDisplayMetadata = LatticeExtensionManifest(id: "bad-display-metadata", name: " Calmer\nLattice ", version: " 1\n.0 ", summary: " Softens\napp tone ")
+        let badDisplayMetadataMessages = extensionStore.validate(badDisplayMetadata)
+        expect(badDisplayMetadataMessages.contains("Name must not have leading or trailing whitespace."), "Extension manifest name rejects surrounding whitespace")
+        expect(badDisplayMetadataMessages.contains("Name must be one line."), "Extension manifest name rejects newlines")
+        expect(badDisplayMetadataMessages.contains("Version must not have leading or trailing whitespace."), "Extension manifest version rejects surrounding whitespace")
+        expect(badDisplayMetadataMessages.contains("Version must be one line."), "Extension manifest version rejects newlines")
+        expect(badDisplayMetadataMessages.contains("Summary must not have leading or trailing whitespace."), "Extension manifest summary rejects surrounding whitespace")
+        expect(badDisplayMetadataMessages.contains("Summary must be one line."), "Extension manifest summary rejects newlines")
+        let previousData = try! Data(contentsOf: extensionBundle.appendingPathComponent("lattice-extension.json"))
+        let replacement = LatticeExtensionManifest(
+            id: "com.lattice.theme-pack",
+            name: "Theme Pack",
+            version: "1.1.0",
+            summary: "Changes composer styling.",
+            permissions: [.editUI],
+            uiTargets: ["composer"],
+            stylePatches: [.init(target: .composer, tintHex: "#88CCFF", cornerRadius: 18)],
+            layoutPatches: [.init(target: .composer, density: .compact)],
+            copyPatches: [.init(target: .askButton, text: "Ask softly")],
+            promptTemplates: [
+                .init(invocation: "/summarize", title: "Summarize", detail: "Five bullets", prompt: "Summarize this in five bullets.")
+            ],
+            skillPatches: [
+                .init(id: "subagents", title: "Subagents", summary: "Use helper agents.", markdown: "# Subagents\n\nUse bounded helper agents.")
+            ],
+            operationPreviews: [
+                .init(targetSurfaceID: "composer", operation: .relayout, summary: "Make the composer compact.", detail: "Executable when backed by a composer layout patch."),
+                .init(targetSurfaceID: "extensions", operation: .addSkill, summary: "Add subagents skill.", detail: "Executable when backed by a skill patch.")
+            ]
+        )
+        _ = try! extensionStore.writeGeneratedExtension(replacement)
+        expect(replacement.hasRuntimePatches, "Extension detects real runtime patches")
+        expect(extensionStore.load().first?.version == "1.1.0", "Generated extension overwrite")
+        expect(extensionStore.load().first?.hasRuntimePatches == true, "Loaded extension detects real runtime patches")
+        expect(extensionStore.load().first?.layoutPatches == replacement.layoutPatches, "Extension layout patches load")
+        expect(extensionStore.load().first?.copyPatches == replacement.copyPatches, "Extension copy patches load")
+        expect(extensionStore.load().first?.promptTemplates == replacement.promptTemplates, "Extension prompt templates load")
+        expect(extensionStore.load().first?.skillPatches == replacement.skillPatches, "Extension skill patches load")
+        expect(replacement.promptTemplates.first?.command.replacementText == "Summarize this in five bullets.", "Prompt template becomes an inserting command")
+        expect(extensionStore.load().first?.operationPreviews == replacement.operationPreviews, "Extension operation previews load")
+        let skillRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let globalRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let globalSkillFolder = globalRoot.appendingPathComponent("subagents", isDirectory: true)
+        let reservedGlobalSkillFolder = globalRoot.appendingPathComponent("self-edit", isDirectory: true)
+        try! FileManager.default.createDirectory(at: globalSkillFolder, withIntermediateDirectories: true)
+        try! FileManager.default.createDirectory(at: reservedGlobalSkillFolder, withIntermediateDirectories: true)
+        try! Data("# Subagents\n\nUse helper agents.".utf8).write(to: globalSkillFolder.appendingPathComponent("SKILL.md"))
+        try! Data("# Self Edit\n\nReserved collision.".utf8).write(to: reservedGlobalSkillFolder.appendingPathComponent("SKILL.md"))
+        let skillStore = LatticeSkillStore(rootURL: skillRoot, globalRoots: [globalRoot])
+        try! skillStore.importGlobalSkills()
+        let importedSkills = skillStore.load()
+        expect(importedSkills.first?.id == "subagents", "Global skills import into Lattice skills folder")
+        expect(!importedSkills.contains { $0.id == "self-edit" }, "Global skills cannot import over Lattice's reserved self-edit command")
+        if let importedSkill = importedSkills.first {
+            expect(LatticeSkillPromptBuilder.command(for: importedSkill).invocation == "/subagents", "Imported skill becomes a slash command")
+        } else {
+            expect(false, "Imported skill becomes a slash command")
+        }
+        let legacySidecarRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let legacyImportedFolder = legacySidecarRoot.appendingPathComponent("legacy-import", isDirectory: true)
+        try! FileManager.default.createDirectory(at: legacyImportedFolder, withIntermediateDirectories: true)
+        try! Data("# Legacy Import\n\nImported skill.".utf8).write(to: legacyImportedFolder.appendingPathComponent("SKILL.md"))
+        try! Data(LatticeSkillSource.importedGlobal.rawValue.utf8).write(
+            to: legacyImportedFolder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillSourceMarker)
+        )
+        let legacySidecarStore = LatticeSkillStore(rootURL: legacySidecarRoot, globalRoots: [])
+        try! legacySidecarStore.deleteSkill(id: "legacy-import")
+        expect(!FileManager.default.fileExists(atPath: legacyImportedFolder.path), "Legacy imported-skill sidecar retains deletion semantics")
+        let legacyOwnedFolder = legacySidecarRoot.appendingPathComponent("legacy-owned", isDirectory: true)
+        try! FileManager.default.createDirectory(at: legacyOwnedFolder, withIntermediateDirectories: true)
+        try! Data("# Legacy Owned\n\nOwned skill.".utf8).write(to: legacyOwnedFolder.appendingPathComponent("SKILL.md"))
+        try! Data("com.lattice.owner".utf8).write(
+            to: legacyOwnedFolder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillOwnerMarker)
+        )
+        expect((try! legacySidecarStore.deleteSkill(id: "legacy-owned", ownedByExtensionID: "com.lattice.other")) == false, "Legacy owner sidecar rejects wrong-owner deletion")
+        expect(try! legacySidecarStore.deleteSkill(id: "legacy-owned", ownedByExtensionID: "com.lattice.owner"), "Legacy owner sidecar authorizes matching-owner deletion")
+        if let invocation = LatticeSkillPromptBuilder.invocation(in: "/subagents split this into helper tasks", records: importedSkills, disabledSkillIDs: []) {
+            let prompt = LatticeSkillPromptBuilder.prompt(for: invocation)
+            expect(invocation.userRequest == "split this into helper tasks" && prompt.contains("# Subagents") && prompt.contains("Lattice skill invocation: /subagents"), "Enabled skill invocation injects SKILL.md into backend prompt")
+            let visibleSkillMessage = ChatMessage(role: .user, text: "/subagents split this into helper tasks")
+            let structuredSkillSession = LatticeSession(
+                title: "Skill chat",
+                messages: [.init(role: .user, text: "Earlier"), .init(role: .assistant, text: "Earlier answer"), visibleSkillMessage, .init(role: .assistant, text: "")],
+                backend: .ollama(model: "qwen3:8b")
+            )
+            let backendMessages = LatticeBackendMessageBuilder.structuredMessages(session: structuredSkillSession, submittedText: prompt, additionalContext: "\n\nAttached paths:\n/tmp/a.swift")
+            expect(backendMessages.last?.text.contains("Lattice skill invocation: /subagents") == true && backendMessages.last?.text.contains("/tmp/a.swift") == true, "Structured local routes receive injected skill prompt and attachments")
+            expect(structuredSkillSession.messages[2].text == "/subagents split this into helper tasks", "Visible skill invocation remains unchanged in canonical transcript")
+        } else {
+            expect(false, "Enabled skill invocation injects SKILL.md into backend prompt")
+        }
+        expect(LatticeSkillPromptBuilder.invocation(in: "/subagents split this", records: importedSkills, disabledSkillIDs: ["subagents"]) == nil, "Disabled skills are not invoked")
+        let generatedReviewSkill = LatticeSkillPatch(id: "review-buddy", title: "Review Buddy", summary: "Review changes.", markdown: "# Review Buddy\n\nReview patches for risk.")
+        let generatedReviewPreview = LatticeSkillPatchPreviewBuilder.preview(for: generatedReviewSkill)
+        expect(generatedReviewPreview.command == "/review-buddy", "Skill preview shows generated slash command")
+        expect(generatedReviewPreview.fileName == "SKILL.md", "Skill preview identifies generated skill file")
+        expect(generatedReviewPreview.summary == "Review changes.", "Skill preview uses explicit summary")
+        expect(generatedReviewPreview.markdownLineCount == 3 && generatedReviewPreview.markdownCharacterCount == generatedReviewSkill.markdown.count, "Skill preview reports markdown size")
+        let fallbackSkillPreview = LatticeSkillPatchPreviewBuilder.preview(for: .init(id: "quiet-mode", title: "Quiet Mode", summary: "", markdown: "# Quiet Mode\n\nKeep replies calm."))
+        expect(fallbackSkillPreview.summary == "Quiet Mode", "Skill preview falls back to markdown heading when summary is empty")
+        let reservedSkill = LatticeSkillPatch(id: "self-edit", title: "Self Edit", summary: "Reserved.", markdown: "# Self Edit\n\nReserved.")
+        expect(LatticeSkillStore.validate(reservedSkill).contains { $0.contains("cannot replace /self-edit") }, "Skills cannot replace Lattice's reserved self-edit command")
+        let shallowGeneratedSkill = LatticeSkillPatch(id: "shallow", title: "Shallow", summary: "Too short.", markdown: "# Shallow\n\nDo the task.")
+        expect(LatticeSkillStore.validateGenerated(shallowGeneratedSkill).contains(where: { $0.contains("at least 600 characters") }), "Self-edit rejects shallow generated skills without rejecting imported skill compatibility")
+        let canonicalSubagentsTemplateSkill = LatticeSkillPatch(
+            id: "subagents",
+            title: "Subagents",
+            summary: "Use parallel helper agents for independent subtasks.",
+            markdown: LatticeGeneratedSkillTemplate.subagentsMarkdown
+        )
+        expect(LatticeSkillStore.validateGenerated(canonicalSubagentsTemplateSkill).isEmpty, "Self-edit's canonical subagents skill template satisfies generated skill quality rules")
+        expect(
+            LatticeGeneratedSkillTemplate.subagentsMarkdown.contains("1.")
+            && LatticeGeneratedSkillTemplate.subagentsMarkdown.contains("## Guardrails")
+            && LatticeGeneratedSkillTemplate.subagentsMarkdown.contains("## Verification"),
+            "Self-edit generated skill template demonstrates numbered workflow, guardrails, and verification"
+        )
+        let shallowGeneratedManifest = LatticeExtensionManifest(
+            id: "com.lattice.shallow-skill",
+            name: "Shallow Skill",
+            version: "1.0.0",
+            summary: "Adds a shallow generated skill.",
+            permissions: [.editUI],
+            skillPatches: [shallowGeneratedSkill]
+        )
+        expect(extensionStore.validate(shallowGeneratedManifest).isEmpty, "General extension validation remains compatible with short manually installed skills")
+        expect(
+            LatticeSelfEditGeneratedSkillValidationPolicy.validationMessages(for: shallowGeneratedManifest).contains { $0.contains("Skill shallow: Generated skill markdown must be at least 600 characters") },
+            "Self-edit generated-skill validation rejects shallow skills before preview edits can be applied"
+        )
+        let paddedGenericMarkdown = """
+        ---
+        name: generic-helper
+        description: Use this skill for many different tasks whenever the user asks for help with anything in Lattice.
+        ---
+
+        # Generic Helper
+
+        This deliberately padded introduction is long enough to avoid a simple character-count-only check, but it still does not provide a reusable operating procedure with real decisions, concrete limits, or evidence requirements. It keeps repeating that the assistant should help carefully and be useful without explaining how to perform the work. It should therefore fail generated skill validation even though it has the required headings and frontmatter.
+
+        ## Quick start
+
+        Help the user.
+
+        ## Workflow
+
+        1. Read the request.
+        2. Do it.
+
+        ## Guardrails
+
+        Be careful.
+
+        ## Verification
+
+        Make sure it is good.
+        """
+        let paddedGenericSkill = LatticeSkillPatch(id: "generic-helper", title: "Generic Helper", summary: "Generic help.", markdown: paddedGenericMarkdown)
+        let paddedGenericMessages = LatticeSkillStore.validateGenerated(paddedGenericSkill)
+        expect(paddedGenericMessages.contains { $0.contains("Workflow section must include at least three numbered steps") } && paddedGenericMessages.contains { $0.contains("Quick Start section is too thin") }, "Self-edit rejects padded but generic generated skills")
+        let richGeneratedMarkdown = """
+        ---
+        name: change-reviewer
+        description: Review proposed changes when a user needs scope, risk, rollback, and verification guidance before applying them.
+        ---
+
+        # Change Reviewer
+
+        ## Quick start
+
+        Read the proposed change list, identify executable effects, and give a plain-language recommendation before any mutation occurs.
+
+        ## Workflow
+
+        1. Compare the proposed artifact with the currently active version and ignore unchanged fields.
+        2. Trace every changed setting to its user-visible effect and identify conflicts, stale state, or missing prerequisites.
+        3. Separate reversible application-owned changes from provider credentials, workspace files, operating-system permissions, and recorded-only plans.
+        4. Explain what applying the review changes, what remains untouched, and what revision would reduce unnecessary scope.
+        5. Confirm that rollback data exists for every executable effect before recommending Apply.
+
+        ## Guardrails
+
+        Never describe a recorded-only proposal as executable. Do not infer access to source code, app bundles, credentials, or unrelated extensions. Reject stale previews and surface uncertainty instead of inventing evidence.
+
+        ## Verification
+
+        Verify identifiers, changed values, ownership, enablement, permissions, and rollback coverage. Report an Apply, Revise, or Discard recommendation with the evidence needed to make the decision without reading the complete manifest.
+        """
+        let richGeneratedSkill = LatticeSkillPatch(id: "change-reviewer", title: "Change Reviewer", summary: "Review change scope, risk, and rollback before applying.", markdown: richGeneratedMarkdown)
+        expect(LatticeSkillStore.validateGenerated(richGeneratedSkill).isEmpty, "Self-edit accepts substantive generated skills with reusable workflow, guardrails, and verification")
+        let unclosedFrontmatterMarkdown = richGeneratedMarkdown.replacingOccurrences(
+            of: "\n---\n\n# Change Reviewer",
+            with: "\n\n# Change Reviewer"
+        )
+        let unclosedFrontmatterSkill = LatticeSkillPatch(id: "change-reviewer", title: "Change Reviewer", summary: "Malformed frontmatter.", markdown: unclosedFrontmatterMarkdown)
+        expect(LatticeSkillStore.validateGenerated(unclosedFrontmatterSkill).contains { $0.contains("YAML frontmatter") }, "Self-edit rejects generated skills with unclosed YAML frontmatter")
+        let extraFrontmatterMarkdown = richGeneratedMarkdown.replacingOccurrences(
+            of: "description: Review proposed changes when a user needs scope, risk, rollback, and verification guidance before applying them.\n---",
+            with: "description: Review proposed changes when a user needs scope, risk, rollback, and verification guidance before applying them.\nversion: 1\n---"
+        )
+        let extraFrontmatterSkill = LatticeSkillPatch(id: "change-reviewer", title: "Change Reviewer", summary: "Malformed frontmatter.", markdown: extraFrontmatterMarkdown)
+        expect(LatticeSkillStore.validateGenerated(extraFrontmatterSkill).contains { $0.contains("only contain name and description") }, "Self-edit rejects generated skills with non-portable frontmatter keys")
+        let duplicateFrontmatterMarkdown = richGeneratedMarkdown.replacingOccurrences(
+            of: "name: change-reviewer\n",
+            with: "name: change-reviewer\nname: other-reviewer\n"
+        )
+        let duplicateFrontmatterSkill = LatticeSkillPatch(id: "change-reviewer", title: "Change Reviewer", summary: "Malformed frontmatter.", markdown: duplicateFrontmatterMarkdown)
+        expect(LatticeSkillStore.validateGenerated(duplicateFrontmatterSkill).contains { $0.contains("must not repeat keys") }, "Self-edit rejects generated skills with duplicate frontmatter keys")
+        let malformedFrontmatterMarkdown = richGeneratedMarkdown.replacingOccurrences(
+            of: "description: Review proposed changes when a user needs scope, risk, rollback, and verification guidance before applying them.\n",
+            with: "description: Review proposed changes when a user needs scope, risk, rollback, and verification guidance before applying them.\nnot a key value pair\n"
+        )
+        let malformedFrontmatterSkill = LatticeSkillPatch(id: "change-reviewer", title: "Change Reviewer", summary: "Malformed frontmatter.", markdown: malformedFrontmatterMarkdown)
+        expect(LatticeSkillStore.validateGenerated(malformedFrontmatterSkill).contains { $0.contains("key: value pairs") }, "Self-edit rejects generated skills with malformed frontmatter lines")
+        let priorReviewManifest = LatticeExtensionManifest(
+            id: "com.lattice.review-test",
+            name: "Review Test",
+            version: "1.1.0",
+            summary: "Changes only the prompt placeholder.",
+            permissions: [.editUI],
+            copyPatches: [.init(target: .promptPlaceholder, text: "Old prompt")],
+            skillPatches: [richGeneratedSkill]
+        )
+        let updatedReviewManifest = LatticeExtensionManifest(
+            id: "com.lattice.review-test",
+            name: "Review Test",
+            version: "1.1.0",
+            summary: "Changes only the prompt placeholder.",
+            permissions: [.editUI],
+            copyPatches: [.init(target: .promptPlaceholder, text: "Ask Lattice calmly")],
+            skillPatches: [richGeneratedSkill]
+        )
+        let changeReview = LatticeExtensionChangeReviewBuilder.review(current: updatedReviewManifest, previous: priorReviewManifest)
+        expect(changeReview.changes == ["Change prompt placeholder text to “Ask Lattice calmly”."], "Self-edit review excludes unchanged extension and skill fields")
+        expect(changeReview.hasChanges, "Self-edit review reports actual change presence")
+        expect(changeReview.acceptanceSummary.contains("Applying makes") && changeReview.acceptanceSummary.contains("Nothing else in Lattice is modified") && changeReview.acceptanceSummary.contains("roll it back"), "Self-edit review explains Apply impact and rollback without requiring manifest inspection")
+        let noOpReview = LatticeExtensionChangeReviewBuilder.review(current: priorReviewManifest, previous: priorReviewManifest)
+        expect(!noOpReview.hasChanges && noOpReview.acceptanceSummary.contains("does not change"), "Self-edit no-op reviews are detectable before Apply")
+        let removalReviewManifest = LatticeExtensionManifest(
+            id: "com.lattice.review-test",
+            name: "Review Test",
+            version: "1.1.0",
+            summary: "Changes only the prompt placeholder.",
+            permissions: [.editUI],
+            copyPatches: [],
+            skillPatches: [],
+            operationPreviews: []
+        )
+        let removalReview = LatticeExtensionChangeReviewBuilder.review(current: removalReviewManifest, previous: priorReviewManifest)
+        expect(
+            removalReview.changes.contains("Restore the default prompt placeholder text.")
+                && removalReview.changes.contains("Remove the /change-reviewer skill owned by this extension."),
+            "Self-edit review lists removed copy and skill changes instead of hiding removals"
+        )
+        expect(removalReview.acceptanceSummary.contains("roll it back"), "Self-edit removal reviews explain rollback availability")
+        let recordedOperationReviewManifest = LatticeExtensionManifest(
+            id: "com.lattice.recorded-operation-review",
+            name: "Recorded Operation Review",
+            version: "1.0.0",
+            summary: "Records a roadmap operation.",
+            permissions: [.editUI],
+            operationPreviews: [.init(targetSurfaceID: "models", operation: .addModelRecommendation, summary: "Add a battery-aware model recommendation.", detail: "Requires a future recommendation schema.")]
+        )
+        let recordedOperationReview = LatticeExtensionChangeReviewBuilder.review(current: recordedOperationReviewManifest, previous: nil)
+        expect(recordedOperationReview.changes == ["Record add model recommendation for models: Add a battery-aware model recommendation. Requires a future recommendation schema."], "Self-edit review shows recorded-only operation changes instead of hiding them")
+        expect(recordedOperationReview.acceptanceSummary.contains("does not change Lattice's runtime behavior"), "Self-edit operation-only review explains that Apply records metadata without executing it")
+        expect(recordedOperationReview.acceptanceSummary.contains("roll it back"), "Self-edit recorded-only reviews explain rollback availability")
+        let executableOperationReviewManifest = LatticeExtensionManifest(
+            id: "com.lattice.executable-operation-review",
+            name: "Executable Operation Review",
+            version: "1.0.0",
+            summary: "Adds a skill.",
+            permissions: [.editUI],
+            skillPatches: [richGeneratedSkill],
+            operationPreviews: [.init(targetSurfaceID: "extensions", operation: .addSkill, summary: "Add a reusable review skill.")]
+        )
+        let executableOperationReview = LatticeExtensionChangeReviewBuilder.review(current: executableOperationReviewManifest, previous: nil)
+        expect(executableOperationReview.changes.count == 1 && executableOperationReview.changes.first?.contains("/change-reviewer skill") == true, "Self-edit review hides executable operation preview rows that would duplicate actual skill changes")
+        let mixedOperationReviewManifest = LatticeExtensionManifest(
+            id: "com.lattice.mixed-operation-review",
+            name: "Mixed Operation Review",
+            version: "1.0.0",
+            summary: "Changes copy and records a model roadmap plan.",
+            permissions: [.editUI],
+            copyPatches: [.init(target: .promptPlaceholder, text: "Ask Lattice")],
+            operationPreviews: [.init(targetSurfaceID: "models", operation: .addModelRecommendation, summary: "Add a calmer default model recommendation.", detail: "Requires a future model recommendation runtime.")]
+        )
+        let mixedOperationReview = LatticeExtensionChangeReviewBuilder.review(current: mixedOperationReviewManifest, previous: nil)
+        expect(mixedOperationReview.changes.contains("Change prompt placeholder text to “Ask Lattice”.") && mixedOperationReview.changes.contains("Record add model recommendation for models: Add a calmer default model recommendation. Requires a future model recommendation runtime."), "Self-edit mixed reviews show both runtime changes and recorded plans")
+        expect(mixedOperationReview.acceptanceSummary.contains("runtime changes") && mixedOperationReview.acceptanceSummary.contains("future-operation plan") && mixedOperationReview.acceptanceSummary.contains("Recorded plans do not change Lattice's runtime behavior yet"), "Self-edit mixed reviews separate applied runtime changes from recorded-only plans")
+        expect(LatticeSelfEditApplyStatusPolicy.status(for: mixedOperationReviewManifest).contains("future-operation plan") && !LatticeSelfEditApplyStatusPolicy.status(for: mixedOperationReviewManifest).contains("unsupported"), "Self-edit Apply status uses non-technical wording for recorded-only plans")
+        expect(LatticeSelfEditApplyStatusPolicy.status(for: recordedOperationReviewManifest).contains("No runtime change was applied"), "Self-edit Apply status explains recorded-only reviews")
+        expect(LatticeSelfEditReviewCopy.readyStatus == "Lattice change ready for review." && !LatticeSelfEditReviewCopy.readyStatus.localizedCaseInsensitiveContains("accept") && !LatticeSelfEditReviewCopy.readyStatus.localizedCaseInsensitiveContains("discard"), "Self-edit assistant status stays concise and leaves decisions to the review card")
+        expect(LatticeSelfEditReviewDecision.parse("Looks good, accept.") == .accept, "Self-edit review accepts a clear conversational decision")
+        expect(LatticeSelfEditReviewDecision.parse("yes, apply it") == .accept, "Self-edit review accepts clear yes/apply wording")
+        expect(LatticeSelfEditReviewDecision.parse("please approve this") == .accept, "Self-edit review accepts clear approve wording")
+        expect(LatticeSelfEditReviewDecision.parse("go ahead and apply it") == .accept, "Self-edit review accepts clear go-ahead wording")
+        expect(LatticeSelfEditReviewDecision.parse("discard this change") == .discard, "Self-edit review discards a clear conversational decision")
+        expect(LatticeSelfEditReviewDecision.parse("yes, reject it") == .discard, "Self-edit review discards clear reject wording")
+        expect(LatticeSelfEditReviewDecision.parse("throw it away") == .discard, "Self-edit review discards clear throw-away wording")
+        expect(LatticeSelfEditReviewDecision.parse("please cancel it") == .discard, "Self-edit review discards clear cancel wording")
+        expect(LatticeSelfEditReviewDecision.parse("drop this proposal") == .discard, "Self-edit review discards clear proposal-drop wording")
+        expect(LatticeSelfEditReviewDecision.parse("Can you change this part in the plan?") == nil, "Self-edit revision prompts are not mistaken for accept or discard decisions")
+        expect(LatticeSelfEditReviewDecision.parse("Please remove the prompt template.") == nil, "Self-edit targeted edit prompts are not mistaken for discard decisions")
+        expect(LatticeSelfEditReviewDecision.parse("Do not accept this") == nil, "Self-edit review does not accept ambiguous or negated language")
+        expect(LatticeSelfEditReviewDecision.parse("please don't discard this") == nil, "Self-edit review does not discard negated language")
+        _ = try! skillStore.writeGeneratedSkill(generatedReviewSkill, ownerExtensionID: "com.lattice.review")
+        expect(Set(skillStore.load().map(\.id)) == ["subagents", "review-buddy"], "Generated skills write into Lattice skills folder")
+        expect(skillStore.load().first { $0.id == "review-buddy" }?.ownerExtensionID == "com.lattice.review", "Generated extension-owned skills record their owner")
+        let skillsWithOwnedReview = skillStore.load()
+        if let ownedReviewSkill = skillsWithOwnedReview.first(where: { $0.id == "review-buddy" }) {
+            expect(!LatticeSkillActivationPolicy.isEnabled(ownedReviewSkill, disabledSkillIDs: [], enabledExtensionIDs: []), "Disabled owning extension disables its skill")
+            expect(LatticeSkillActivationPolicy.isEnabled(ownedReviewSkill, disabledSkillIDs: [], enabledExtensionIDs: ["com.lattice.review"]), "Enabled owning extension activates its skill")
+            expect(!LatticeSkillActivationPolicy.isEnabled(ownedReviewSkill, disabledSkillIDs: ["review-buddy"], enabledExtensionIDs: ["com.lattice.review"]), "Explicit skill toggle still overrides enabled owner")
+        } else {
+            expect(false, "Extension-owned skill activation policy")
+        }
+        let ownerDisabledSkillIDs = LatticeSkillActivationPolicy.effectiveDisabledSkillIDs(records: skillsWithOwnedReview, disabledSkillIDs: [], enabledExtensionIDs: [])
+        expect(ownerDisabledSkillIDs == ["review-buddy"], "Disabled owner only suppresses its owned skills")
+        expect(LatticeSkillPromptBuilder.invocation(in: "/review-buddy inspect this", records: skillsWithOwnedReview, disabledSkillIDs: ownerDisabledSkillIDs) == nil, "Disabled extension-owned skill cannot invoke")
+        let ownerEnabledSkillIDs = LatticeSkillActivationPolicy.effectiveDisabledSkillIDs(records: skillsWithOwnedReview, disabledSkillIDs: [], enabledExtensionIDs: ["com.lattice.review"])
+        expect(LatticeSkillPromptBuilder.invocation(in: "/review-buddy inspect this", records: skillsWithOwnedReview, disabledSkillIDs: ownerEnabledSkillIDs)?.skillID == "review-buddy", "Re-enabled extension restores owned skill invocation")
+        let wrongOwnerDeletedSkill = try! skillStore.deleteSkill(id: "review-buddy", ownedByExtensionID: "com.lattice.other")
+        expect(!wrongOwnerDeletedSkill && skillStore.load().contains { $0.id == "review-buddy" }, "Wrong extension cannot delete another extension's skill")
+        let rightOwnerDeletedSkill = try! skillStore.deleteSkill(id: "review-buddy", ownedByExtensionID: "com.lattice.review")
+        expect(rightOwnerDeletedSkill, "Owning extension reports owned skill deletion")
+        expect(Set(skillStore.load().map(\.id)) == ["subagents"], "Owning extension can delete its generated skill")
+        let existingSkillSnapshot = skillStore.snapshotSkill(id: "subagents")
+        let overrideSkill = LatticeSkillPatch(id: "subagents", title: "Subagents Override", summary: "Override.", markdown: "# Subagents Override\n\nOverride.")
+        _ = try! skillStore.writeGeneratedSkill(overrideSkill, ownerExtensionID: "com.lattice.override")
+        expect(skillStore.load().first?.ownerExtensionID == "com.lattice.override", "Overwritten skill records new owning extension")
+        let overrideManifest = LatticeExtensionManifest(
+            id: "com.lattice.override",
+            name: "Override",
+            version: "1.0.0",
+            summary: "Overrides a skill.",
+            permissions: [.editUI],
+            skillPatches: [overrideSkill]
+        )
+        let overrideManifestData = try! JSONEncoder().encode(overrideManifest)
+        let deletionBaselineJob = LatticeExtensionJobRecord(
+            sessionID: UUID(),
+            harnessThreadID: nil,
+            request: "Override subagents",
+            manifestID: "com.lattice.override",
+            manifestName: "Override",
+            summary: "Overrides a skill.",
+            previousManifestData: nil,
+            previousSkillSnapshots: [existingSkillSnapshot],
+            previousDisabledSkillIDs: ["subagents"],
+            appliedManifestData: overrideManifestData,
+            status: .applied
+        )
+        let deletionBaseline = LatticeExtensionDeletionRollbackPolicy.baseline(
+            manifestID: "com.lattice.override",
+            currentManifestData: overrideManifestData,
+            jobs: [deletionBaselineJob]
+        )
+        expect(deletionBaseline?.previousSkillSnapshots == [existingSkillSnapshot], "Extension deletion can recover previous skill snapshots from the matching applied self-edit job")
+        expect(deletionBaseline?.previousDisabledSkillIDs == ["subagents"], "Extension deletion can recover previous skill enablement from the matching applied self-edit job")
+        expect(LatticeExtensionDeletionRollbackPolicy.baseline(manifestID: "com.lattice.override", currentManifestData: Data("changed".utf8), jobs: [deletionBaselineJob]) == nil, "Extension deletion ignores stale skill rollback baselines after later extension edits")
+        try! skillStore.restoreSkill(deletionBaseline!.previousSkillSnapshots[0], removingCurrentIfOwnedBy: "com.lattice.override")
+        expect(skillStore.load().first?.source == .importedGlobal && skillStore.load().first?.ownerExtensionID == nil, "Skill snapshot restores previous imported skill")
+        let missingSkillSnapshot = skillStore.snapshotSkill(id: "new-skill")
+        _ = try! skillStore.writeGeneratedSkill(.init(id: "new-skill", title: "New Skill", summary: "Temporary.", markdown: "# New Skill\n\nTemporary."), ownerExtensionID: "com.lattice.new")
+        try! skillStore.restoreSkill(missingSkillSnapshot, removingCurrentIfOwnedBy: "com.lattice.other")
+        expect(skillStore.load().contains { $0.id == "new-skill" }, "Skill snapshot restore does not remove wrong owner")
+        try! skillStore.restoreSkill(missingSkillSnapshot, removingCurrentIfOwnedBy: "com.lattice.new")
+        expect(!skillStore.load().contains { $0.id == "new-skill" }, "Skill snapshot restore removes newly-created owned skill")
+        try! skillStore.deleteSkill(id: "subagents")
+        expect(skillStore.load().isEmpty, "Imported global skills can be deleted")
+        try! skillStore.importGlobalSkills()
+        expect(skillStore.load().isEmpty, "Deleted imported global skills do not reappear on refresh")
+        _ = try! skillStore.writeGeneratedSkill(.init(id: "subagents", title: "Subagents", summary: "Generated replacement.", markdown: "# Subagents\n\nGenerated replacement."))
+        expect(skillStore.load().first?.source == .generated, "Generated skill with deleted import id can be recreated")
+
+        let syncSkillRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let syncGlobalRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let syncGlobalFolder = syncGlobalRoot.appendingPathComponent("shared-skill", isDirectory: true)
+        let syncGlobalURL = syncGlobalFolder.appendingPathComponent("SKILL.md")
+        let syncLocalURL = syncSkillRoot.appendingPathComponent("shared-skill/SKILL.md")
+        try! FileManager.default.createDirectory(at: syncGlobalFolder, withIntermediateDirectories: true)
+        let syncFirst = Data("# Shared Skill\n\nFirst global version.".utf8)
+        let syncSecond = Data("# Shared Skill\n\nSecond global version.".utf8)
+        let syncThird = Data("# Shared Skill\n\nThird global version.".utf8)
+        let syncLocalEdit = Data("# Shared Skill\n\nLocally customized in Lattice.".utf8)
+        try! syncFirst.write(to: syncGlobalURL)
+        let syncSkillStore = LatticeSkillStore(rootURL: syncSkillRoot, globalRoots: [syncGlobalRoot])
+        try! syncSkillStore.importGlobalSkills()
+        try! syncSecond.write(to: syncGlobalURL, options: .atomic)
+        try! syncSkillStore.importGlobalSkills()
+        expect((try? Data(contentsOf: syncLocalURL)) == syncSecond, "Untouched imported skills synchronize later global SKILL.md updates")
+        let syncSnapshot = syncSkillStore.snapshotSkill(id: "shared-skill")
+        expect(syncSnapshot.importedBaselineData == syncSecond, "Imported skill snapshots retain their synchronization baseline")
+        _ = try! syncSkillStore.writeGeneratedSkill(.init(id: "shared-skill", title: "Temporary", summary: "Temporary override.", markdown: "# Temporary\n\nTemporary override."), ownerExtensionID: "com.lattice.sync")
+        try! syncSkillStore.restoreSkill(syncSnapshot, removingCurrentIfOwnedBy: "com.lattice.sync")
+        try! syncThird.write(to: syncGlobalURL, options: .atomic)
+        try! syncSkillStore.importGlobalSkills()
+        expect((try? Data(contentsOf: syncLocalURL)) == syncThird, "Restored imported skills continue synchronizing after an extension override")
+        try! syncLocalEdit.write(to: syncLocalURL, options: .atomic)
+        try! Data("# Shared Skill\n\nFourth global version.".utf8).write(to: syncGlobalURL, options: .atomic)
+        try! syncSkillStore.importGlobalSkills()
+        expect((try? Data(contentsOf: syncLocalURL)) == syncLocalEdit, "Global skill synchronization preserves locally edited Lattice copies")
+        _ = try! syncSkillStore.writeGeneratedSkill(.init(id: "shared-skill", title: "Generated", summary: "Generated replacement.", markdown: "# Generated\n\nGenerated replacement."))
+        try! syncSkillStore.importGlobalSkills()
+        expect(syncSkillStore.load().first?.source == .generated && (try? Data(contentsOf: syncLocalURL)) == Data("# Generated\n\nGenerated replacement.".utf8), "Global skill synchronization never overwrites generated replacements")
+        try? FileManager.default.removeItem(at: syncSkillRoot)
+        try? FileManager.default.removeItem(at: syncGlobalRoot)
+
+        try! extensionStore.restoreExtension(manifestID: replacement.id, previousManifestData: previousData)
+        expect(extensionStore.load().first?.version == "1.0.0", "Extension rollback restores previous manifest")
+        let mismatchedRollback = LatticeExtensionManifest(id: "com.lattice.other-theme", name: "Other", version: "1.0.0", summary: "Wrong target.")
+        do {
+            try extensionStore.restoreExtension(manifestID: replacement.id, previousManifestData: JSONEncoder().encode(mismatchedRollback))
+            expect(false, "Extension rollback rejects mismatched manifest id")
+        } catch {
+            expect(error.localizedDescription.contains("does not match"), "Extension rollback rejects mismatched manifest id")
+        }
+        expect(extensionStore.load().first?.id == manifest.id, "Rejected rollback keeps existing extension manifest")
+        try! extensionStore.restoreExtension(manifestID: replacement.id, previousManifestData: nil)
+        expect(extensionStore.load().isEmpty, "Extension rollback removes new manifest")
+        let jobStore = LatticeExtensionJobStore(fileURL: extensionRoot.appendingPathComponent("self-edit-jobs.json"))
+        let job = LatticeExtensionJobRecord(
+            sessionID: UUID(),
+            harnessThreadID: "thread-1",
+            request: "Make Lattice warmer",
+            manifestID: replacement.id,
+            manifestName: replacement.name,
+            summary: replacement.summary,
+            previousManifestData: previousData,
+            previousDisabledSkillIDs: ["subagents"],
+            previousEnabled: false,
+            appliedManifestData: Data("applied-manifest".utf8),
+            appliedEnabled: true
+        )
+        let recordedJobs = try! jobStore.record(job, in: [])
+        expect(recordedJobs.first?.manifestID == replacement.id, "Self-edit job persisted")
+        expect(recordedJobs.first?.previousEnabled == false, "Self-edit job persisted previous enabled state")
+        expect(recordedJobs.first?.previousSkillSnapshots.isEmpty == true, "Self-edit job persists empty skill rollback snapshots")
+        expect(recordedJobs.first?.previousDisabledSkillIDs == ["subagents"], "Self-edit job persists prior skill enablement")
+        expect(recordedJobs.first?.appliedManifestData == Data("applied-manifest".utf8), "Self-edit job persists applied manifest conflict baseline")
+        expect(recordedJobs.first?.appliedEnabled == true, "Self-edit job persists applied extension enablement baseline")
+        let recordedOnlyJob = LatticeExtensionJobRecord(
+            sessionID: UUID(),
+            harnessThreadID: nil,
+            request: "Move the composer",
+            manifestID: "recorded-only",
+            manifestName: "Recorded Only",
+            summary: "No runtime patch.",
+            previousManifestData: nil,
+            status: .recorded,
+            statusDetail: "Recorded plan."
+        )
+        expect(recordedOnlyJob.canRollback, "Recorded self-edit plans can be rolled back")
+        let jobData = try! JSONEncoder().encode(job)
+        var legacyJobObject = try! JSONSerialization.jsonObject(with: jobData) as! [String: Any]
+        legacyJobObject.removeValue(forKey: "previousEnabled")
+        legacyJobObject.removeValue(forKey: "previousSkillSnapshots")
+        legacyJobObject.removeValue(forKey: "previousDisabledSkillIDs")
+        legacyJobObject.removeValue(forKey: "appliedManifestData")
+        legacyJobObject.removeValue(forKey: "appliedSkillSnapshots")
+        legacyJobObject.removeValue(forKey: "appliedEnabled")
+        let legacyJobData = try! JSONSerialization.data(withJSONObject: legacyJobObject)
+        let legacyJob = try! JSONDecoder().decode(LatticeExtensionJobRecord.self, from: legacyJobData)
+        expect(legacyJob.previousEnabled == nil, "Legacy self-edit jobs decode without previous enabled state")
+        expect(legacyJob.previousSkillSnapshots.isEmpty, "Legacy self-edit jobs decode without skill snapshots")
+        expect(legacyJob.previousDisabledSkillIDs == nil, "Legacy self-edit jobs decode without skill enablement snapshots")
+        expect(legacyJob.appliedManifestData == nil && legacyJob.appliedSkillSnapshots.isEmpty, "Legacy self-edit jobs decode without applied conflict baselines")
+        expect(legacyJob.appliedEnabled == nil, "Legacy self-edit jobs decode without applied extension enablement baseline")
+        let revertedJobs = try! jobStore.markReverted(job.id, detail: "Rolled back", in: recordedJobs)
+        expect(revertedJobs.first?.status == .reverted, "Self-edit job rollback persisted")
+        let previewStore = LatticeExtensionPreviewStore(fileURL: extensionRoot.appendingPathComponent("self-edit-previews.json"))
+        let preview = LatticeExtensionPreviewRecord(
+            sessionID: job.sessionID!,
+            harnessThreadID: job.harnessThreadID,
+            request: "Preview warmer UI",
+            manifest: replacement,
+            previousManifestData: previousData
+        )
+        let recordedPreviews = try! previewStore.record(preview, in: [])
+        expect(recordedPreviews.first?.manifest == replacement, "Self-edit preview persisted")
+        expect(previewStore.load().first?.previousManifestData == previousData, "Self-edit preview rollback baseline persisted")
+        let editableManifest = LatticeExtensionManifest(
+            id: "com.lattice.skills",
+            name: "Lattice Skills",
+            version: "1",
+            summary: "Adds skills.",
+            permissions: [.editUI],
+            stylePatches: [.init(target: .composer, tintHex: "#223344", accentHex: "#8899AA", cornerRadius: 18)],
+            layoutPatches: [.init(target: .composer, density: .compact)],
+            copyPatches: [.init(target: .promptPlaceholder, text: "Ask Lattice")],
+            promptTemplates: [.init(invocation: "/review", title: "Review", detail: "Review a change", prompt: "Review this change.")],
+            skillPatches: [
+                .init(id: "review-buddy", title: "Review Buddy", summary: "Review changes.", markdown: "# Review Buddy\n\nReview patches for risk."),
+                .init(id: "subagents", title: "Subagents", summary: "Use helpers.", markdown: "# Subagents\n\nUse helper agents.")
+            ],
+            operationPreviews: [.init(targetSurfaceID: "extensions", operation: .addSkill, summary: "Add skills.", detail: "Creates reusable skills.")]
+        )
+        let editablePreview = LatticeExtensionPreviewRecord(
+            sessionID: job.sessionID!,
+            harnessThreadID: job.harnessThreadID,
+            request: "Add better skills",
+            manifest: editableManifest,
+            previousManifestData: previousData,
+            previousSkillSnapshots: [
+                .init(id: "review-buddy", skillData: nil, sourceRaw: nil, originalPath: nil, ownerExtensionID: nil, wasDeletedGlobalSkill: false),
+                .init(id: "subagents", skillData: nil, sourceRaw: nil, originalPath: nil, ownerExtensionID: nil, wasDeletedGlobalSkill: false)
+            ],
+            previousDisabledSkillIDs: ["review-buddy"],
+            previousEnabled: false,
+            createdAt: Date(timeIntervalSince1970: 123)
+        )
+        let editedMetadataPreview = LatticeExtensionPreviewEditor.replacingMetadata(
+            in: editablePreview,
+            name: "Better Skills",
+            version: "1.1.0",
+            summary: "Adds reviewed reusable skills."
+        )
+        let metadataIdentityPreserved = editedMetadataPreview.id == editablePreview.id && editedMetadataPreview.sessionID == editablePreview.sessionID
+        expect(metadataIdentityPreserved, "Self-edit metadata preview edits preserve preview identity")
+        let metadataRollbackBaselinesPreserved = editedMetadataPreview.previousManifestData == previousData && editedMetadataPreview.previousSkillSnapshots == editablePreview.previousSkillSnapshots
+        expect(metadataRollbackBaselinesPreserved, "Self-edit metadata preview edits preserve rollback baselines")
+        let metadataEnablementBaselinesPreserved = editedMetadataPreview.previousDisabledSkillIDs == ["review-buddy"] && editedMetadataPreview.previousEnabled == false && editedMetadataPreview.createdAt == editablePreview.createdAt
+        expect(metadataEnablementBaselinesPreserved, "Self-edit metadata preview edits preserve enablement baselines")
+        expect(editedMetadataPreview.manifest.id == editableManifest.id, "Self-edit metadata preview edits preserve manifest id")
+        expect(editedMetadataPreview.manifest.name == "Better Skills", "Self-edit metadata preview edits replace name")
+        expect(editedMetadataPreview.manifest.version == "1.1.0", "Self-edit metadata preview edits replace version")
+        expect(editedMetadataPreview.manifest.summary == "Adds reviewed reusable skills.", "Self-edit metadata preview edits replace summary")
+        expect(editedMetadataPreview.manifest.skillPatches == editableManifest.skillPatches, "Self-edit metadata preview edits leave skill patches unchanged")
+        let metadataReview = LatticeExtensionChangeReviewBuilder.review(current: editedMetadataPreview.manifest, previous: editableManifest)
+        expect(
+            metadataReview.changes.contains("Rename the extension to “Better Skills”.")
+                && metadataReview.changes.contains("Update the extension version to 1.1.0.")
+                && metadataReview.changes.contains("Update the extension summary to “Adds reviewed reusable skills.”."),
+            "Self-edit review lists extension metadata updates instead of applying hidden visible changes"
+        )
+        let editedStylePreview = try! LatticeExtensionPreviewEditor.replacingStylePatch(
+            in: editablePreview,
+            index: 0,
+            tintHex: "#334455",
+            accentHex: "#AABBCC",
+            cornerRadius: 24
+        )
+        expect(editedStylePreview.previousManifestData == editablePreview.previousManifestData, "Self-edit style preview edits preserve manifest rollback baseline")
+        expect(editedStylePreview.manifest.stylePatches[0].tintHex == "#334455", "Self-edit style preview edits replace tint")
+        expect(editedStylePreview.manifest.stylePatches[0].accentHex == "#AABBCC", "Self-edit style preview edits replace accent")
+        expect(editedStylePreview.manifest.stylePatches[0].cornerRadius == 24, "Self-edit style preview edits replace corner radius")
+        expect(editedStylePreview.manifest.layoutPatches == editableManifest.layoutPatches, "Self-edit style preview edits leave layout patches unchanged")
+        let editedLayoutPreview = try! LatticeExtensionPreviewEditor.replacingLayoutPatch(in: editablePreview, index: 0, density: .spacious)
+        expect(editedLayoutPreview.previousSkillSnapshots == editablePreview.previousSkillSnapshots, "Self-edit layout preview edits preserve skill rollback baselines")
+        expect(editedLayoutPreview.manifest.layoutPatches[0].density == .spacious, "Self-edit layout preview edits replace density")
+        expect(editedLayoutPreview.manifest.stylePatches == editableManifest.stylePatches, "Self-edit layout preview edits leave style patches unchanged")
+        let editedCopyPreview = try! LatticeExtensionPreviewEditor.replacingCopyPatch(in: editablePreview, target: .promptPlaceholder, text: "Ask calmly")
+        expect(editedCopyPreview.previousSkillSnapshots == editablePreview.previousSkillSnapshots, "Self-edit copy preview edits preserve skill rollback baselines")
+        expect(editedCopyPreview.previousDisabledSkillIDs == ["review-buddy"], "Self-edit copy preview edits preserve skill enablement baselines")
+        expect(editedCopyPreview.manifest.copyPatches.first { $0.target == .promptPlaceholder }?.text == "Ask calmly", "Self-edit copy preview edits replace selected copy")
+        expect(editedCopyPreview.manifest.promptTemplates == editableManifest.promptTemplates, "Self-edit copy preview edits leave templates unchanged")
+        let editedTemplatePreview = try! LatticeExtensionPreviewEditor.replacingPromptTemplate(
+            in: editablePreview,
+            originalInvocation: "/review",
+            invocation: "/careful-review",
+            title: "Careful Review",
+            detail: "Review for risk",
+            prompt: "Review this change for correctness and risk."
+        )
+        expect(editedTemplatePreview.previousManifestData == editablePreview.previousManifestData, "Self-edit template preview edits preserve manifest rollback baseline")
+        expect(editedTemplatePreview.manifest.promptTemplates.first?.invocation == "/careful-review", "Self-edit template preview edits replace invocation")
+        expect(editedTemplatePreview.manifest.promptTemplates.first?.title == "Careful Review", "Self-edit template preview edits replace title")
+        expect(editedTemplatePreview.manifest.copyPatches == editableManifest.copyPatches, "Self-edit template preview edits leave copy patches unchanged")
+        let editedOperationPreview = try! LatticeExtensionPreviewEditor.replacingOperationPreview(
+            in: editablePreview,
+            index: 0,
+            summary: "Add safer reusable skills.",
+            detail: "Creates skill commands after Apply."
+        )
+        expect(editedOperationPreview.previousEnabled == false, "Self-edit operation preview edits preserve extension enablement baseline")
+        expect(editedOperationPreview.manifest.operationPreviews[0].summary == "Add safer reusable skills.", "Self-edit operation preview edits replace summary")
+        expect(editedOperationPreview.manifest.operationPreviews[0].detail == "Creates skill commands after Apply.", "Self-edit operation preview edits replace detail")
+        expect(editedOperationPreview.manifest.skillPatches == editableManifest.skillPatches, "Self-edit operation preview edits leave skill patches unchanged")
+        let editedPreview = try! LatticeExtensionPreviewEditor.replacingSkillPatch(
+            in: editablePreview,
+            skillID: "review-buddy",
+            title: "Careful Reviewer",
+            summary: "Review patches carefully.",
+            markdown: "# Careful Reviewer\n\nCheck risks and edge cases."
+        )
+        let previewIdentityPreserved = editedPreview.id == editablePreview.id && editedPreview.sessionID == editablePreview.sessionID
+        expect(previewIdentityPreserved, "Self-edit skill preview edits preserve preview identity")
+        let rollbackBaselinesPreserved = editedPreview.previousManifestData == previousData && editedPreview.previousSkillSnapshots == editablePreview.previousSkillSnapshots
+        expect(rollbackBaselinesPreserved, "Self-edit skill preview edits preserve rollback baselines")
+        let enablementBaselinesPreserved = editedPreview.previousDisabledSkillIDs == ["review-buddy"] && editedPreview.previousEnabled == false && editedPreview.createdAt == editablePreview.createdAt
+        expect(enablementBaselinesPreserved, "Self-edit skill preview edits preserve enablement baselines")
+        expect(editedPreview.manifest.skillPatches.first { $0.id == "review-buddy" }?.title == "Careful Reviewer", "Self-edit skill preview edits replace selected skill title")
+        expect(editedPreview.manifest.skillPatches.first { $0.id == "review-buddy" }?.markdown.contains("edge cases") == true, "Self-edit skill preview edits replace selected skill markdown")
+        expect(editedPreview.manifest.skillPatches.first { $0.id == "subagents" } == editableManifest.skillPatches[1], "Self-edit skill preview edits leave other skills unchanged")
+        do {
+            _ = try LatticeExtensionPreviewEditor.replacingSkillPatch(in: editablePreview, skillID: "missing", title: "Missing", summary: "", markdown: "# Missing")
+            expect(false, "Self-edit skill preview edit rejects missing skill")
+        } catch {
+            expect(true, "Self-edit skill preview edit rejects missing skill")
+        }
+        do {
+            _ = try LatticeExtensionPreviewEditor.replacingStylePatch(in: editablePreview, index: 9, tintHex: nil, accentHex: nil, cornerRadius: nil)
+            expect(false, "Self-edit style preview edit rejects missing style patch")
+        } catch {
+            expect(true, "Self-edit style preview edit rejects missing style patch")
+        }
+        do {
+            _ = try LatticeExtensionPreviewEditor.replacingLayoutPatch(in: editablePreview, index: 9, density: .comfortable)
+            expect(false, "Self-edit layout preview edit rejects missing layout patch")
+        } catch {
+            expect(true, "Self-edit layout preview edit rejects missing layout patch")
+        }
+        do {
+            _ = try LatticeExtensionPreviewEditor.replacingCopyPatch(in: editablePreview, target: .askButton, text: "Ask")
+            expect(false, "Self-edit copy preview edit rejects missing copy patch")
+        } catch {
+            expect(true, "Self-edit copy preview edit rejects missing copy patch")
+        }
+        do {
+            _ = try LatticeExtensionPreviewEditor.replacingPromptTemplate(in: editablePreview, originalInvocation: "/missing", invocation: "/missing", title: "Missing", detail: "", prompt: "Missing")
+            expect(false, "Self-edit template preview edit rejects missing template")
+        } catch {
+            expect(true, "Self-edit template preview edit rejects missing template")
+        }
+        do {
+            _ = try LatticeExtensionPreviewEditor.replacingOperationPreview(in: editablePreview, index: 9, summary: "Missing", detail: "")
+            expect(false, "Self-edit operation preview edit rejects missing operation")
+        } catch {
+            expect(true, "Self-edit operation preview edit rejects missing operation")
+        }
+        let enabledPreview = LatticeExtensionPreviewRecord(
+            sessionID: job.sessionID!,
+            harnessThreadID: job.harnessThreadID,
+            request: "Preview enabled warmer UI",
+            manifest: replacement,
+            previousManifestData: previousData,
+            previousDisabledSkillIDs: ["subagents"],
+            previousEnabled: true
+        )
+        let enabledPreviewData = try! JSONEncoder().encode(enabledPreview)
+        expect((try! JSONDecoder().decode(LatticeExtensionPreviewRecord.self, from: enabledPreviewData)).previousEnabled == true, "Self-edit preview persists previous enabled state")
+        expect((try! JSONDecoder().decode(LatticeExtensionPreviewRecord.self, from: enabledPreviewData)).previousDisabledSkillIDs == ["subagents"], "Self-edit preview persists prior skill enablement")
+        var legacyPreviewObject = try! JSONSerialization.jsonObject(with: enabledPreviewData) as! [String: Any]
+        legacyPreviewObject.removeValue(forKey: "previousEnabled")
+        legacyPreviewObject.removeValue(forKey: "previousSkillSnapshots")
+        legacyPreviewObject.removeValue(forKey: "previousDisabledSkillIDs")
+        let legacyPreviewData = try! JSONSerialization.data(withJSONObject: legacyPreviewObject)
+        expect((try! JSONDecoder().decode(LatticeExtensionPreviewRecord.self, from: legacyPreviewData)).previousEnabled == nil, "Legacy self-edit previews decode without previous enabled state")
+        expect((try! JSONDecoder().decode(LatticeExtensionPreviewRecord.self, from: legacyPreviewData)).previousSkillSnapshots.isEmpty, "Legacy self-edit previews decode without skill snapshots")
+        expect((try! JSONDecoder().decode(LatticeExtensionPreviewRecord.self, from: legacyPreviewData)).previousDisabledSkillIDs == nil, "Legacy self-edit previews decode without skill enablement snapshots")
+        let priorDisabledSkills = LatticeSkillEnablementRollbackPolicy.disabledSnapshot(affectedSkillIDs: ["subagents", "review"], disabledSkillIDs: ["subagents", "unrelated"])
+        expect(priorDisabledSkills == ["subagents"], "Self-edit captures only affected disabled skills")
+        let restoredDisabledSkills = LatticeSkillEnablementRollbackPolicy.restoredDisabledIDs(current: ["review", "unrelated"], affectedSkillIDs: ["subagents", "review"], previousDisabledSkillIDs: Set(priorDisabledSkills))
+        expect(restoredDisabledSkills == ["subagents", "unrelated"], "Self-edit rollback restores affected skill enablement without changing unrelated skills")
+        let clearedPreviews = try! previewStore.remove(preview.id, from: recordedPreviews)
+        expect(clearedPreviews.isEmpty, "Self-edit preview decision persisted")
+        let invalid = LatticeExtensionManifest(id: "../bad", name: "Bad", version: "1", summary: "", permissions: [.writeWorkspace], entrypoint: "../run.sh")
+        expect(!extensionStore.validate(invalid).isEmpty, "Unsafe extension rejected")
+        let emptyEntrypoint = LatticeExtensionManifest(id: "empty-entrypoint", name: "Empty Entrypoint", version: "1", summary: "", entrypoint: "")
+        expect(extensionStore.validate(emptyEntrypoint).isEmpty, "Empty extension entrypoint remains equivalent to unset")
+        let whitespaceEntrypoint = LatticeExtensionManifest(id: "whitespace-entrypoint", name: "Whitespace Entrypoint", version: "1", summary: "", entrypoint: " run.js ")
+        expect(extensionStore.validate(whitespaceEntrypoint).contains("Entrypoint must not have leading or trailing whitespace."), "Extension entrypoint rejects surrounding whitespace")
+        let multilineEntrypoint = LatticeExtensionManifest(id: "multiline-entrypoint", name: "Multiline Entrypoint", version: "1", summary: "", entrypoint: "run\n.js")
+        expect(extensionStore.validate(multilineEntrypoint).contains("Entrypoint must be one line."), "Extension entrypoint rejects newlines")
+        let escapingEntrypoint = LatticeExtensionManifest(id: "escaping-entrypoint", name: "Escaping Entrypoint", version: "1", summary: "", entrypoint: "scripts/../run.js")
+        expect(extensionStore.validate(escapingEntrypoint).contains("Entrypoint must stay inside the extension bundle."), "Extension entrypoint rejects path traversal")
+        let badStyle = LatticeExtensionManifest(id: "bad-style", name: "Bad Style", version: "1", summary: "", permissions: [], stylePatches: [.init(target: .composer, tintHex: "nope")])
+        expect(extensionStore.validate(badStyle).count >= 2, "Unsafe style rejected")
+        let badLayout = LatticeExtensionManifest(id: "bad-layout", name: "Bad Layout", version: "1", summary: "", layoutPatches: [.init(target: .composer, density: .compact)])
+        expect(extensionStore.validate(badLayout).contains("Layout patches require Edit UI permission."), "Layout patches require edit permission")
+        let badLayoutTarget = LatticeExtensionManifest(id: "bad-layout-target", name: "Bad Layout Target", version: "1", summary: "", permissions: [.editUI], uiTargets: ["overlay"], layoutPatches: [.init(target: .composer, density: .compact)])
+        expect(extensionStore.validate(badLayoutTarget).contains("Composer layout patches require composer in uiTargets."), "Layout patches require matching UI target")
+        let badCopy = LatticeExtensionManifest(id: "bad-copy", name: "Bad Copy", version: "1", summary: "", copyPatches: [.init(target: .promptPlaceholder, text: " Ask\n")])
+        expect(extensionStore.validate(badCopy).contains("Copy patches require Edit UI permission."), "Copy patches require edit permission")
+        expect(extensionStore.validate(badCopy).contains { $0.contains("must be one line") }, "Unsafe copy patch rejected")
+        let templateOnly = LatticeExtensionManifest(id: "template", name: "Template", version: "1", summary: "", permissions: [.editUI], promptTemplates: [.init(invocation: "/brief", title: "Brief", prompt: "Make this concise.")])
+        expect(templateOnly.hasRuntimePatches, "Prompt-template-only extension has runtime patches")
+        let badTemplate = LatticeExtensionManifest(id: "bad-template", name: "Bad Template", version: "1", summary: "", permissions: [.editUI], promptTemplates: [.init(invocation: "/self-edit", title: "", prompt: "")])
+        let badTemplateMessages = extensionStore.validate(badTemplate)
+        expect(badTemplateMessages.contains { $0.contains("cannot replace /self-edit") }, "Prompt template cannot replace self-edit")
+        expect(badTemplateMessages.contains { $0.contains("prompt is empty") }, "Prompt template prompt is required")
+        let collidingTemplateSkill = LatticeExtensionManifest(
+            id: "template-skill-collision",
+            name: "Template Skill Collision",
+            version: "1",
+            summary: "",
+            permissions: [.editUI],
+            promptTemplates: [.init(invocation: "/brief", title: "Brief", prompt: "Make this concise.")],
+            skillPatches: [.init(id: "brief", title: "Brief Skill", summary: "Use a skill.", markdown: "# Brief Skill\n\nUse a skill.")]
+        )
+        expect(extensionStore.validate(collidingTemplateSkill).contains { $0.contains("conflicts with prompt template /brief") }, "Extension rejects prompt template and skill slash-command collisions")
+        let messyTemplate = LatticeExtensionManifest(id: "messy-template", name: "Messy Template", version: "1", summary: "", permissions: [.editUI], promptTemplates: [.init(invocation: "/messy", title: " Messy\nTitle ", detail: " Detail\nmetadata ", prompt: "Line one\nLine two")])
+        let messyTemplateMessages = extensionStore.validate(messyTemplate)
+        expect(messyTemplateMessages.contains("Prompt template /messy title must not have leading or trailing whitespace."), "Prompt template title rejects surrounding whitespace")
+        expect(messyTemplateMessages.contains("Prompt template /messy title must be one line."), "Prompt template title rejects newlines")
+        expect(messyTemplateMessages.contains("Prompt template /messy detail must not have leading or trailing whitespace."), "Prompt template detail rejects surrounding whitespace")
+        expect(messyTemplateMessages.contains("Prompt template /messy detail must be one line."), "Prompt template detail rejects newlines")
+        let badOperation = LatticeExtensionManifest(id: "bad-operation", name: "Bad Operation", version: "1", summary: "", operationPreviews: [.init(targetSurfaceID: "models", operation: .addControl, summary: "Add a button where controls are unsupported.")])
+        expect(!badOperation.hasRuntimePatches, "Operation-preview-only extension has no runtime patches")
+        expect(extensionStore.validate(badOperation).contains { $0.contains("Add control is not supported on Models") }, "Unsupported operation preview rejected")
+        let missingOperationPermissions = LatticeExtensionManifest(
+            id: "missing-operation-permissions",
+            name: "Missing Operation Permissions",
+            version: "1",
+            summary: "Missing permissions.",
+            operationPreviews: [
+                .init(targetSurfaceID: "composer", operation: .relayout, summary: "Move composer."),
+                .init(targetSurfaceID: "extensions", operation: .addAutomation, summary: "Add morning brief.")
+            ]
+        )
+        let missingOperationPermissionMessages = extensionStore.validate(missingOperationPermissions)
+        expect(missingOperationPermissionMessages.contains("Relayout operation previews require Edit UI permission."), "Relayout preview requires edit permission")
+        expect(missingOperationPermissionMessages.contains("Add automation operation previews require Edit UI permission."), "Automation preview requires edit permission")
+        expect(missingOperationPermissionMessages.contains("Add automation operation previews require Automation permission."), "Automation preview requires automation permission")
+        let permittedOperation = LatticeExtensionManifest(id: "permitted-operation", name: "Permitted Operation", version: "1", summary: "Permitted.", permissions: [.editUI], operationPreviews: [.init(targetSurfaceID: "composer", operation: .relayout, summary: "Move composer.")])
+        expect(extensionStore.validate(permittedOperation).isEmpty, "Declared operation preview permission accepted")
+        expect(LatticeExtensionOperationRuntimePolicy.execution(for: permittedOperation.operationPreviews[0], in: permittedOperation) == .recordedOnly, "Unsupported operation preview remains recorded-only")
+        let executableRestyleOperation = LatticeExtensionManifest(
+            id: "executable-restyle",
+            name: "Executable Restyle",
+            version: "1",
+            summary: "",
+            permissions: [.editUI],
+            stylePatches: [.init(target: .composer, tintHex: "#88CCFF")],
+            operationPreviews: [.init(targetSurfaceID: "composer", operation: .restyle, summary: "Tint the composer.")]
+        )
+        expect(LatticeExtensionOperationRuntimePolicy.execution(for: executableRestyleOperation.operationPreviews[0], in: executableRestyleOperation) == .executable, "Restyle operation is executable when backed by a matching style patch")
+        let executableLayoutOperation = LatticeExtensionManifest(
+            id: "executable-layout",
+            name: "Executable Layout",
+            version: "1",
+            summary: "",
+            permissions: [.editUI],
+            uiTargets: ["composer"],
+            layoutPatches: [.init(target: .composer, density: .compact)],
+            operationPreviews: [.init(targetSurfaceID: "composer", operation: .relayout, summary: "Make the composer compact.")]
+        )
+        expect(LatticeExtensionOperationRuntimePolicy.execution(for: executableLayoutOperation.operationPreviews[0], in: executableLayoutOperation) == .executable, "Relayout operation is executable when backed by a composer layout patch")
+        let executableCopyOperation = LatticeExtensionManifest(
+            id: "executable-copy",
+            name: "Executable Copy",
+            version: "1",
+            summary: "",
+            permissions: [.editUI],
+            copyPatches: [.init(target: .askButton, text: "Ask softly")],
+            operationPreviews: [.init(targetSurfaceID: "overlay", operation: .rewriteCopy, summary: "Rename the ask button.")]
+        )
+        expect(LatticeExtensionOperationRuntimePolicy.execution(for: executableCopyOperation.operationPreviews[0], in: executableCopyOperation) == .executable, "Rewrite-copy operation is executable when backed by copy patches")
+        let executableControlOperation = LatticeExtensionManifest(
+            id: "executable-control",
+            name: "Executable Control",
+            version: "1",
+            summary: "",
+            permissions: [.editUI],
+            promptTemplates: [.init(invocation: "/calm", title: "Calm", prompt: "Make this calmer.")],
+            operationPreviews: [.init(targetSurfaceID: "composer", operation: .addControl, summary: "Add a calm prompt command.")]
+        )
+        expect(LatticeExtensionOperationRuntimePolicy.execution(for: executableControlOperation.operationPreviews[0], in: executableControlOperation) == .executable, "Add-control operation is executable when backed by a prompt template")
+        let executableSkillOperation = LatticeExtensionManifest(
+            id: "executable-skill",
+            name: "Executable Skill",
+            version: "1",
+            summary: "",
+            permissions: [.editUI],
+            skillPatches: [.init(id: "subagents", title: "Subagents", summary: "Use helper agents.", markdown: "# Subagents\n\nUse helper agents.")],
+            operationPreviews: [.init(targetSurfaceID: "extensions", operation: .addSkill, summary: "Add a subagents skill.")]
+        )
+        expect(LatticeExtensionOperationRuntimePolicy.execution(for: executableSkillOperation.operationPreviews[0], in: executableSkillOperation) == .executable, "Add-skill operation is executable when backed by a skill patch")
+        expect(LatticeExtensionOperationRuntimePolicy.executableOperationCount(in: executableControlOperation) == 1 && LatticeExtensionOperationRuntimePolicy.recordedOnlyOperationCount(in: executableControlOperation) == 0, "Operation runtime policy counts executable previews")
+        let badOperationTarget = LatticeExtensionManifest(id: "bad-operation-target", name: "Bad Operation Target", version: "1", summary: "", operationPreviews: [.init(targetSurfaceID: " composer\n", operation: .relayout, summary: "Move composer.")])
+        let badOperationTargetMessages = extensionStore.validate(badOperationTarget)
+        expect(badOperationTargetMessages.contains { $0.contains("must not have leading or trailing whitespace") }, "Operation preview target rejects surrounding whitespace")
+        expect(badOperationTargetMessages.contains("Operation preview target must be one line."), "Operation preview target rejects newlines")
+        let badOperationText = LatticeExtensionManifest(id: "bad-operation-text", name: "Bad Operation Text", version: "1", summary: "", operationPreviews: [.init(targetSurfaceID: "composer", operation: .relayout, summary: " Move\ncomposer ", detail: " Details\nhere ")])
+        let badOperationTextMessages = extensionStore.validate(badOperationText)
+        expect(badOperationTextMessages.contains("Operation preview summary for Composer must not have leading or trailing whitespace."), "Operation preview summary rejects surrounding whitespace")
+        expect(badOperationTextMessages.contains("Operation preview summary for Composer must be one line."), "Operation preview summary rejects newlines")
+        expect(badOperationTextMessages.contains("Operation preview detail for Composer must not have leading or trailing whitespace."), "Operation preview detail rejects surrounding whitespace")
+        expect(badOperationTextMessages.contains("Operation preview detail for Composer must be one line."), "Operation preview detail rejects newlines")
+        let duplicatePatchTargets = LatticeExtensionManifest(
+            id: "duplicate-patch-targets",
+            name: "Duplicate Patch Targets",
+            version: "1",
+            summary: "",
+            permissions: [.editUI],
+            stylePatches: [
+                .init(target: .composer, tintHex: "#223344"),
+                .init(target: .composer, accentHex: "#8899AA")
+            ],
+            layoutPatches: [
+                .init(target: .composer, density: .compact),
+                .init(target: .composer, density: .comfortable)
+            ],
+            copyPatches: [
+                .init(target: .askButton, text: "Ask"),
+                .init(target: .askButton, text: "Ask again")
+            ],
+            operationPreviews: [
+                .init(targetSurfaceID: "models", operation: .addModelRecommendation, summary: "Add recommendation one."),
+                .init(targetSurfaceID: "models", operation: .addModelRecommendation, summary: "Add recommendation two.")
+            ]
+        )
+        let duplicatePatchMessages = extensionStore.validate(duplicatePatchTargets)
+        expect(duplicatePatchMessages.contains("Duplicate style patch target: composer."), "Duplicate style patch targets are rejected before review")
+        expect(duplicatePatchMessages.contains("Duplicate layout patch target: composer."), "Duplicate layout patch targets are rejected before review")
+        expect(duplicatePatchMessages.contains("Duplicate copy patch target: askButton."), "Duplicate copy patch targets are rejected before review")
+        expect(duplicatePatchMessages.contains("Duplicate operation preview for models Add model recommendation."), "Duplicate operation preview keys are rejected before review")
+        let duplicateCurrentReview = LatticeExtensionManifest(
+            id: "duplicate-review-defensive",
+            name: "Duplicate Review Defensive",
+            version: "1",
+            summary: "",
+            permissions: [.editUI],
+            copyPatches: [
+                .init(target: .askButton, text: "Ask softly"),
+                .init(target: .askButton, text: "Ask calmer")
+            ]
+        )
+        expect(!LatticeExtensionChangeReviewBuilder.review(current: duplicateCurrentReview, previous: nil).changes.isEmpty, "Self-edit review diff remains defensive for malformed duplicate-key manifests")
+        let badTargets = LatticeExtensionManifest(id: "bad-targets", name: "Bad Targets", version: "1", summary: "", uiTargets: [" composer", "spaceship", "composer"])
+        let badTargetMessages = extensionStore.validate(badTargets)
+        expect(badTargetMessages.contains { $0.contains("must not have leading or trailing whitespace") }, "UI target rejects surrounding whitespace")
+        expect(badTargetMessages.contains("Unknown UI target: spaceship."), "Unknown UI target rejected")
+        expect(badTargetMessages.contains("Duplicate UI target: composer."), "Duplicate UI target rejected")
+        let runtimeRecord = LatticeExtensionRecord(
+            id: "runtime",
+            name: "Runtime",
+            version: "1",
+            summary: "Has runtime patches.",
+            permissions: [.editUI],
+            uiTargets: [],
+            stylePatches: [.init(target: .composer, tintHex: "#88CCFF")],
+            manifestURL: extensionRoot.appendingPathComponent("runtime"),
+            bundleURL: extensionRoot.appendingPathComponent("runtime"),
+            validationMessages: []
+        )
+        let layoutRuntimeRecord = LatticeExtensionRecord(
+            id: "layout-runtime",
+            name: "Layout Runtime",
+            version: "1",
+            summary: "Has layout runtime patches.",
+            permissions: [.editUI],
+            uiTargets: ["composer"],
+            layoutPatches: [.init(target: .composer, density: .compact)],
+            manifestURL: extensionRoot.appendingPathComponent("layout-runtime"),
+            bundleURL: extensionRoot.appendingPathComponent("layout-runtime"),
+            validationMessages: []
+        )
+        let previewOnlyRecord = LatticeExtensionRecord(
+            id: "preview",
+            name: "Preview",
+            version: "1",
+            summary: "Preview-only.",
+            permissions: [],
+            uiTargets: [],
+            operationPreviews: [.init(targetSurfaceID: "composer", operation: .relayout, summary: "Move composer.")],
+            manifestURL: extensionRoot.appendingPathComponent("preview"),
+            bundleURL: extensionRoot.appendingPathComponent("preview"),
+            validationMessages: []
+        )
+        let invalidRuntimeRecord = LatticeExtensionRecord(
+            id: "invalid",
+            name: "Invalid",
+            version: "1",
+            summary: "Invalid runtime.",
+            permissions: [.editUI],
+            uiTargets: [],
+            stylePatches: [.init(target: .composer, tintHex: "#88CCFF")],
+            manifestURL: extensionRoot.appendingPathComponent("invalid"),
+            bundleURL: extensionRoot.appendingPathComponent("invalid"),
+            validationMessages: ["Invalid"]
+        )
+        let enablement = LatticeExtensionEnablementPolicy.refresh(
+            records: [runtimeRecord, layoutRuntimeRecord, previewOnlyRecord, invalidRuntimeRecord],
+            storedEnabledIDs: ["preview", "invalid", "missing"],
+            knownIDs: []
+        )
+        expect(enablement.enabledIDs == ["layout-runtime", "runtime"], "Extension enablement only keeps valid runtime extensions")
+        expect(enablement.knownIDs == ["layout-runtime", "runtime"], "Extension known set only tracks auto-enabled runtime extensions")
+        let disabledKnownEnablement = LatticeExtensionEnablementPolicy.refresh(
+            records: [runtimeRecord],
+            storedEnabledIDs: [],
+            knownIDs: ["runtime", "formerly-invalid"]
+        )
+        expect(disabledKnownEnablement.enabledIDs.isEmpty, "Known disabled runtime extension stays disabled on refresh")
+        expect(disabledKnownEnablement.knownIDs == ["runtime", "formerly-invalid"], "Known extension IDs survive invalid or missing refreshes")
+        let selfMap = LatticeSelfMap()
+        expect(selfMap.surfaces.contains { $0.id == "overlay" && $0.operations.contains(.restyle) }, "Self map overlay")
+
+        // Conversation scroll + per-session new-content awareness / Jump to Latest.
+        let scrollNear = ConversationScrollMetrics(contentOffsetY: 900, containerHeight: 400, contentHeight: 1_300)
+        let scrollBrowse = ConversationScrollMetrics(contentOffsetY: 120, containerHeight: 400, contentHeight: 1_300)
+        expect(ConversationScrollPolicy.tailSentinelID == "lattice.conversation.scroll.tail", "Scroll tail sentinel id is stable")
+        let scrollMessageID = UUID()
+        let scrollInitial = ConversationScrollContentSnapshot(
+            messageCount: 2,
+            lastMessageID: scrollMessageID,
+            lastMessageCharacterCount: 10,
+            lastMessageRevision: 1,
+            lastMessageIsUser: false,
+            isStreaming: true
+        )
+        let scrollFirstEstablish = ConversationScrollPolicy.decideContentChange(
+            state: ConversationScrollSessionState(isFollowingTail: false, metrics: scrollBrowse),
+            content: scrollInitial,
+            measuredMetrics: scrollBrowse,
+            reduceMotion: false
+        )
+        expect(scrollFirstEstablish.command == .none && scrollFirstEstablish.state.pendingNewContentCount == 0, "Initial scroll snapshot does not invent pending new content")
+        let scrollDelta = ConversationScrollContentSnapshot(
+            messageCount: 2,
+            lastMessageID: scrollMessageID,
+            lastMessageCharacterCount: 80,
+            lastMessageRevision: 2,
+            lastMessageIsUser: false,
+            isStreaming: true
+        )
+        let scrollStreaming = ConversationScrollPolicy.decideContentChange(
+            state: ConversationScrollSessionState(
+                isFollowingTail: false,
+                metrics: scrollBrowse,
+                preservedOffsetY: scrollBrowse.contentOffsetY,
+                contentSnapshot: scrollInitial
+            ),
+            content: scrollDelta,
+            measuredMetrics: scrollBrowse,
+            reduceMotion: false
+        )
+        expect(scrollStreaming.command == .none, "Streaming while browsing does not move the viewport")
+        expect(scrollStreaming.state.pendingNewContentCount == 1, "Streaming while browsing increments one logical update")
+        expect(ConversationScrollPolicy.logicalNewContentIncrement(from: scrollInitial, to: scrollDelta, changeKind: .bottomTailGrowth) == 1, "Streamed delta is one logical update, not a character count")
+        let scrollFollowing = ConversationScrollPolicy.decideContentChange(
+            state: ConversationScrollSessionState(isFollowingTail: true, metrics: scrollNear, contentSnapshot: scrollInitial),
+            content: scrollDelta,
+            measuredMetrics: scrollNear,
+            reduceMotion: false
+        )
+        expect(scrollFollowing.command == .followTail(animated: false) && scrollFollowing.state.pendingNewContentCount == 0, "Streaming while following keeps zero pending and follows tail")
+        let scrollAssistant = ConversationScrollContentSnapshot(messageCount: 3, lastMessageID: UUID(), lastMessageCharacterCount: 12, lastMessageIsUser: false)
+        let scrollAssistantResult = ConversationScrollPolicy.decideContentChange(
+            state: ConversationScrollSessionState(isFollowingTail: false, metrics: scrollBrowse, contentSnapshot: ConversationScrollContentSnapshot(messageCount: 2, lastMessageIsUser: false)),
+            content: scrollAssistant,
+            measuredMetrics: scrollBrowse,
+            reduceMotion: false
+        )
+        expect(scrollAssistantResult.state.pendingNewContentCount == 1 && scrollAssistantResult.command == .none, "Assistant append while browsing increments pending without scrolling")
+        let scrollPermission = ConversationScrollContentSnapshot(messageCount: 2, lastMessageIsUser: false, hasPermissionNotice: true, permissionNoticeID: UUID())
+        expect(ConversationScrollPolicy.classifyContentChange(from: ConversationScrollContentSnapshot(messageCount: 2), to: scrollPermission) == .bottomTailGrowth, "Permission row is bottom-tail growth")
+        expect(ConversationScrollPolicy.decideContentChange(
+            state: ConversationScrollSessionState(isFollowingTail: false, metrics: scrollBrowse, contentSnapshot: ConversationScrollContentSnapshot(messageCount: 2)),
+            content: scrollPermission,
+            measuredMetrics: scrollBrowse,
+            reduceMotion: false
+        ).state.pendingNewContentCount == 1, "Permission row while browsing increments pending")
+        let scrollError = ConversationScrollContentSnapshot(messageCount: 2, lastMessageIsUser: false, hasVisibleError: true, visibleErrorRevision: 3)
+        expect(ConversationScrollPolicy.decideContentChange(
+            state: ConversationScrollSessionState(isFollowingTail: false, metrics: scrollBrowse, contentSnapshot: ConversationScrollContentSnapshot(messageCount: 2)),
+            content: scrollError,
+            measuredMetrics: scrollBrowse,
+            reduceMotion: false
+        ).state.pendingNewContentCount == 1, "Visible error row while browsing increments pending")
+        let scrollSelfEdit = ConversationScrollContentSnapshot(messageCount: 2, lastMessageIsUser: false, selfEditPreviewCount: 1, selfEditPreviewRevision: 1)
+        expect(ConversationScrollPolicy.decideContentChange(
+            state: ConversationScrollSessionState(isFollowingTail: false, metrics: scrollBrowse, contentSnapshot: ConversationScrollContentSnapshot(messageCount: 2)),
+            content: scrollSelfEdit,
+            measuredMetrics: scrollBrowse,
+            reduceMotion: false
+        ).state.pendingNewContentCount == 1, "Self-edit preview while browsing increments pending")
+        let scrollTailActivityPrevious = ConversationScrollContentSnapshot(
+            messageCount: 2,
+            lastMessageID: scrollMessageID,
+            activityCount: 1,
+            activityCharacterCount: 10,
+            activityRevision: 1,
+            tailActivityCount: 0,
+            aboveActivityCount: 1,
+            aboveActivityCharacterCount: 10,
+            aboveActivityRevision: 1
+        )
+        let scrollTailActivityNext = ConversationScrollContentSnapshot(
+            messageCount: 2,
+            lastMessageID: scrollMessageID,
+            activityCount: 2,
+            activityCharacterCount: 40,
+            activityRevision: 2,
+            tailActivityCount: 1,
+            tailActivityCharacterCount: 30,
+            tailActivityRevision: 2,
+            aboveActivityCount: 1,
+            aboveActivityCharacterCount: 10,
+            aboveActivityRevision: 1
+        )
+        expect(ConversationScrollPolicy.classifyContentChange(from: scrollTailActivityPrevious, to: scrollTailActivityNext) == .bottomTailGrowth, "Tail tool/action arrival is bottom-tail growth")
+        expect(ConversationScrollPolicy.decideContentChange(
+            state: ConversationScrollSessionState(isFollowingTail: false, metrics: scrollBrowse, contentSnapshot: scrollTailActivityPrevious),
+            content: scrollTailActivityNext,
+            measuredMetrics: scrollBrowse,
+            reduceMotion: false
+        ).state.pendingNewContentCount == 1, "Tail tool/action arrival while browsing increments pending")
+        let scrollAboveActivityNext = ConversationScrollContentSnapshot(
+            messageCount: 2,
+            lastMessageID: scrollMessageID,
+            activityCount: 1,
+            activityCharacterCount: 80,
+            activityRevision: 9,
+            tailActivityCount: 0,
+            aboveActivityCount: 1,
+            aboveActivityCharacterCount: 80,
+            aboveActivityRevision: 9
+        )
+        expect(ConversationScrollPolicy.classifyContentChange(from: scrollTailActivityPrevious, to: scrollAboveActivityNext) == .structuralOrAbove, "Above-transcript activity reflow is structural")
+        expect(ConversationScrollPolicy.decideContentChange(
+            state: ConversationScrollSessionState(isFollowingTail: false, metrics: scrollBrowse, contentSnapshot: scrollTailActivityPrevious, pendingNewContentCount: 2),
+            content: scrollAboveActivityNext,
+            measuredMetrics: scrollBrowse,
+            reduceMotion: false
+        ).state.pendingNewContentCount == 2, "Above-transcript activity reflow does not invent new pending content")
+        let scrollLegacyActivity = ConversationScrollPolicy.classifyContentChange(
+            from: ConversationScrollContentSnapshot(messageCount: 3, activityCount: 1, activityCharacterCount: 20),
+            to: ConversationScrollContentSnapshot(messageCount: 3, activityCount: 1, activityCharacterCount: 80)
+        )
+        expect(scrollLegacyActivity == .structuralOrAbove, "Unscoped activity reflow remains structural")
+        let scrollReflowState = ConversationScrollSessionState(
+            isFollowingTail: false,
+            metrics: scrollBrowse,
+            preservedOffsetY: scrollBrowse.contentOffsetY,
+            lastContentHeight: scrollBrowse.contentHeight,
+            pendingNewContentCount: 2
+        )
+        let scrollReflowMetrics = ConversationScrollMetrics(
+            contentOffsetY: scrollBrowse.contentOffsetY,
+            containerHeight: scrollBrowse.containerHeight,
+            contentHeight: scrollBrowse.contentHeight + 80
+        )
+        let scrollReflow = ConversationScrollPolicy.decideGeometryChange(scrollReflowMetrics, state: scrollReflowState)
+        expect(scrollReflow.state.pendingNewContentCount == 2, "Pure geometry reflow never increments pending new content")
+        expect({
+            if case .restoreOffset(let y, false) = scrollReflow.command { return abs(y - (scrollBrowse.contentOffsetY + 80)) < 0.01 }
+            return false
+        }(), "Pure geometry reflow compensates offset while browsing")
+        var scrollNearClear = ConversationScrollSessionState(
+            isFollowingTail: false,
+            metrics: scrollBrowse,
+            preservedOffsetY: scrollBrowse.contentOffsetY,
+            pendingNewContentCount: 4
+        )
+        scrollNearClear = ConversationScrollPolicy.ingestGeometry(scrollNear, state: scrollNearClear)
+        expect(scrollNearClear.isFollowingTail && scrollNearClear.pendingNewContentCount == 0, "Manual near-bottom clears pending new content")
+        let scrollJump = ConversationScrollPolicy.decideJumpToLatest(
+            state: ConversationScrollSessionState(isFollowingTail: false, metrics: scrollBrowse, pendingNewContentCount: 5),
+            reduceMotion: true
+        )
+        expect(scrollJump.command == .followTail(animated: false) && scrollJump.state.pendingNewContentCount == 0 && !scrollJump.state.pendingOutgoingFollow, "Jump to Latest follows exactly once and clears pending")
+        expect(!ConversationScrollPolicy.shouldShowJumpToLatest(state: scrollJump.state), "Jump affordance hides after Jump to Latest")
+        let scrollOutgoing = ConversationScrollPolicy.decideOutgoingUserAction(
+            state: ConversationScrollSessionState(isFollowingTail: false, metrics: scrollBrowse, pendingNewContentCount: 3),
+            reduceMotion: false
+        )
+        expect(scrollOutgoing.command == .followTail(animated: true) && scrollOutgoing.state.pendingNewContentCount == 0, "Outgoing action follows tail and clears pending")
+        let scrollSwitch = ConversationScrollPolicy.decideSessionActivation(
+            state: ConversationScrollSessionState(isFollowingTail: false, metrics: scrollBrowse, preservedOffsetY: 180, pendingNewContentCount: 7),
+            reduceMotion: false
+        )
+        expect(scrollSwitch.state.pendingNewContentCount == 7, "Session switch preserves pending new-content count")
+        expect({
+            if case .restoreOffset(let y, false) = scrollSwitch.command { return abs(y - 180) < 0.01 }
+            return false
+        }(), "Session switch restores preserved browse offset")
+        expect(ConversationScrollPolicy.freshBranchState().pendingNewContentCount == 0 && ConversationScrollPolicy.freshBranchState().isFollowingTail, "Branch state starts with zero pending and follows tail")
+        let scrollDelete = ConversationScrollPolicy.decideContentChange(
+            state: ConversationScrollSessionState(
+                isFollowingTail: false,
+                metrics: scrollBrowse,
+                contentSnapshot: ConversationScrollContentSnapshot(messageCount: 6, lastMessageIsUser: false),
+                pendingNewContentCount: 4
+            ),
+            content: ConversationScrollContentSnapshot(messageCount: 2, lastMessageIsUser: false),
+            measuredMetrics: scrollBrowse,
+            reduceMotion: false
+        )
+        expect(scrollDelete.state.pendingNewContentCount == 0 && scrollDelete.state.pendingGeometryChange == .structuralOrAbove, "Message deletion clears stale pending new content")
+        let scrollStopOnlyPrevious = ConversationScrollContentSnapshot(
+            messageCount: 2,
+            lastMessageID: scrollMessageID,
+            lastMessageCharacterCount: 40,
+            lastMessageRevision: 4,
+            lastMessageIsUser: false,
+            isStreaming: true
+        )
+        let scrollStopOnlyCurrent = ConversationScrollContentSnapshot(
+            messageCount: 2,
+            lastMessageID: scrollMessageID,
+            lastMessageCharacterCount: 40,
+            lastMessageRevision: 4,
+            lastMessageIsUser: false,
+            isStreaming: false
+        )
+        expect(ConversationScrollPolicy.classifyContentChange(from: scrollStopOnlyPrevious, to: scrollStopOnlyCurrent) == .none, "Stop-only streaming transition is not content growth")
+        expect(ConversationScrollPolicy.decideContentChange(
+            state: ConversationScrollSessionState(isFollowingTail: false, metrics: scrollBrowse, contentSnapshot: scrollStopOnlyPrevious, pendingNewContentCount: 2),
+            content: scrollStopOnlyCurrent,
+            measuredMetrics: scrollBrowse,
+            reduceMotion: false
+        ).state.pendingNewContentCount == 2, "Stop-only transition preserves truthful pending content")
+        expect(ConversationScrollPolicy.shouldShowJumpToLatest(state: ConversationScrollSessionState(isFollowingTail: false, pendingNewContentCount: 2)), "Jump affordance visible when browsing with pending content")
+        expect(!ConversationScrollPolicy.shouldShowJumpToLatest(state: ConversationScrollSessionState(isFollowingTail: true, pendingNewContentCount: 2)), "Jump affordance hidden while following tail")
+        expect(ConversationScrollPolicy.displayedPendingCount(1) == "1" && ConversationScrollPolicy.displayedPendingCount(100) == "99+", "Pending count display handles singular and large counts")
+        expect(ConversationScrollPolicy.jumpToLatestAccessibilityValue(count: 1) == "1 new update", "Jump accessibility value is singular")
+        expect(ConversationScrollPolicy.jumpToLatestAccessibilityValue(count: 4) == "4 new updates", "Jump accessibility value is plural")
+        expect(ConversationScrollPolicy.jumpToLatestAccessibilityLabel() == "Jump to Latest", "Jump accessibility label is stable")
+        let scrollQueued = ConversationScrollPolicy.decideContentChange(
+            state: ConversationScrollSessionState(
+                isFollowingTail: false,
+                metrics: scrollBrowse,
+                contentSnapshot: ConversationScrollContentSnapshot(messageCount: 2, queuedFollowUpCount: 0)
+            ),
+            content: ConversationScrollContentSnapshot(messageCount: 2, queuedFollowUpCount: 1),
+            measuredMetrics: scrollBrowse,
+            reduceMotion: false
+        )
+        expect(scrollQueued.command == .none && scrollQueued.state.pendingNewContentCount == 1 && !scrollQueued.state.isFollowingTail, "Queued content below increments pending without moving the browsing viewport")
+        let scrollMixedPrevious = ConversationScrollContentSnapshot(
+            messageCount: 2,
+            lastMessageID: scrollMessageID,
+            lastMessageCharacterCount: 20,
+            lastMessageRevision: 1,
+            activityCount: 1,
+            activityCharacterCount: 10,
+            activityRevision: 1,
+            aboveActivityCount: 1,
+            aboveActivityCharacterCount: 10,
+            aboveActivityRevision: 1,
+            isStreaming: true
+        )
+        let scrollMixedCurrent = ConversationScrollContentSnapshot(
+            messageCount: 2,
+            lastMessageID: scrollMessageID,
+            lastMessageCharacterCount: 60,
+            lastMessageRevision: 2,
+            activityCount: 1,
+            activityCharacterCount: 30,
+            activityRevision: 2,
+            aboveActivityCount: 1,
+            aboveActivityCharacterCount: 30,
+            aboveActivityRevision: 2,
+            isStreaming: true
+        )
+        let scrollMixed = ConversationScrollPolicy.decideContentChange(
+            state: ConversationScrollSessionState(isFollowingTail: false, metrics: scrollBrowse, contentSnapshot: scrollMixedPrevious),
+            content: scrollMixedCurrent,
+            measuredMetrics: scrollBrowse,
+            reduceMotion: false
+        )
+        expect(scrollMixed.command == .none && scrollMixed.state.pendingGeometryChange == .structuralOrAbove && scrollMixed.state.pendingNewContentCount == 1, "Simultaneous above reflow and tail streaming still counts only the real tail update")
+        let scrollRemovedNotice = ConversationScrollPolicy.decideContentChange(
+            state: ConversationScrollSessionState(
+                isFollowingTail: false,
+                metrics: scrollBrowse,
+                contentSnapshot: ConversationScrollContentSnapshot(messageCount: 2, hasPermissionNotice: true, permissionNoticeID: scrollMessageID),
+                pendingNewContentCount: 1
+            ),
+            content: ConversationScrollContentSnapshot(messageCount: 2),
+            measuredMetrics: scrollBrowse,
+            reduceMotion: false
+        )
+        expect(scrollRemovedNotice.state.pendingNewContentCount == 0, "Removing an unread tail accessory clears the stale pending claim")
+        expect(ConversationScrollPolicy.compensatedOffset(previousOffset: 150, previousContentHeight: 800, newContentHeight: 1_200, newContainerHeight: 400, changeKind: .bottomTailGrowth) == 150, "Bottom growth preserves browse offset")
+
+        // Session save coordinator: failure visibility, retry-latest, coalesce, flush, gate, storm suppression
+        final class Box<T>: @unchecked Sendable {
+            private let lock = NSLock()
+            private var storage: T
+            init(_ value: T) { storage = value }
+            var value: T {
+                get { lock.lock(); defer { lock.unlock() }; return storage }
+                set { lock.lock(); storage = newValue; lock.unlock() }
+            }
+        }
+        let diskFull = NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC), userInfo: [NSLocalizedDescriptionKey: "No space left on device"])
+        let permission = NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES), userInfo: [NSLocalizedDescriptionKey: "Permission denied"])
+        expect(SessionSaveFailureClassifier.kind(for: diskFull) == .diskFull, "Save classifier detects disk full")
+        expect(SessionSaveFailureClassifier.kind(for: permission) == .permissionDenied, "Save classifier detects permission denied")
+        expect(SessionSaveFailureClassifier.kind(for: NSError(domain: NSCocoaErrorDomain, code: NSFileWriteVolumeReadOnlyError, userInfo: nil)) == .permissionDenied, "Save classifier treats read-only volumes as permission failures")
+        expect(SessionSaveFailureClassifier.kind(for: NSError(domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError, userInfo: nil)) == .writeFailed, "Save classifier detects generic write failure")
+        expect(SessionSaveFailureClassifier.isWriteBlocked(DurableStoreRecoveryError.writeBlocked(storeName: "Chat sessions")), "Write-blocked is recognized and must not become save-failure UI")
+
+        let saveNotify = Box(0)
+        let failCoord = SessionSaveCoordinator(
+            storeID: SessionPersistence.storeID,
+            storeName: SessionPersistence.storeName,
+            filePath: "/tmp/lattice-verify-sessions.json",
+            writeGate: DurableStoreWriteGate(),
+            saveHandler: { _ in throw diskFull },
+            now: { Date(timeIntervalSince1970: 1_700_000_000) },
+            failureObserver: { _ in saveNotify.value += 1 }
+        )
+        if case .failed(let failure) = failCoord.saveNow([LatticeSession(title: "A", backend: .codex(model: "gpt-5.4"), draft: "keep")]) {
+            expect(failure.kind == .diskFull && failure.summary.contains("in memory"), "Save failure is visible and non-destructive")
+            expect(failure.kind.rawValue != DurableStoreIssueKind.corrupt.rawValue, "Save failure is classified separately from load recovery")
+        } else {
+            expect(false, "Save failure is visible and non-destructive")
+        }
+        expect(saveNotify.value == 1, "First save failure notifies once")
+        if case .coalescedFailure = failCoord.saveNow([LatticeSession(title: "A", backend: .codex(model: "gpt-5.4"), draft: "again")]) {
+            expect(saveNotify.value == 1, "Equivalent save failures coalesce without error storms")
+        } else {
+            expect(false, "Equivalent save failures coalesce without error storms")
+        }
+
+        let written = Box<[LatticeSession]?>(nil)
+        let shouldFail = Box(true)
+        let retryCoord = SessionSaveCoordinator(
+            storeID: SessionPersistence.storeID,
+            storeName: SessionPersistence.storeName,
+            filePath: "/tmp/lattice-verify-sessions.json",
+            writeGate: DurableStoreWriteGate(),
+            saveHandler: { sessions in
+                if shouldFail.value { throw permission }
+                written.value = sessions
+            },
+            now: { Date(timeIntervalSince1970: 1_700_000_000) }
+        )
+        _ = retryCoord.saveNow([LatticeSession(title: "Stale", backend: .codex(model: "gpt-5.4"), draft: "old")])
+        shouldFail.value = false
+        let retryResult = retryCoord.retry([LatticeSession(title: "Latest", backend: .codex(model: "gpt-5.4"), draft: "newest exact")])
+        expect(retryResult == .saved && retryCoord.currentFailure == nil, "Later success clears save failure status")
+        expect(written.value?.first?.draft == "newest exact" && written.value?.first?.title == "Latest", "Retry writes latest snapshot not the stale failed one")
+
+        let debouncedWrites = Box(0)
+        let debouncedDraft = Box<String?>(nil)
+        let debounceCoord = SessionSaveCoordinator(
+            storeID: SessionPersistence.storeID,
+            storeName: SessionPersistence.storeName,
+            filePath: "/tmp/lattice-verify-sessions.json",
+            writeGate: DurableStoreWriteGate(),
+            debounceNanoseconds: 5_000_000,
+            saveHandler: { sessions in
+                debouncedWrites.value += 1
+                debouncedDraft.value = sessions.first?.draft
+            },
+            now: { Date(timeIntervalSince1970: 1_700_000_000) }
+        )
+        debounceCoord.scheduleDebounced([LatticeSession(title: "D", backend: .codex(model: "gpt-5.4"), draft: "one")])
+        debounceCoord.scheduleDebounced([LatticeSession(title: "D", backend: .codex(model: "gpt-5.4"), draft: "two")])
+        debounceCoord.scheduleDebounced([LatticeSession(title: "D", backend: .codex(model: "gpt-5.4"), draft: "three exact")])
+        expect(debounceCoord.pendingDebouncedSnapshot?.first?.draft == "three exact", "Debounced drafts coalesce to latest pending snapshot")
+        try? await Task.sleep(nanoseconds: 40_000_000)
+        expect(debouncedWrites.value == 1 && debouncedDraft.value == "three exact", "Debounced save writes once with latest exact draft")
+
+        let stressWrites = Box(0)
+        let stressDraft = Box<String?>(nil)
+        let stressCoord = SessionSaveCoordinator(
+            storeID: SessionPersistence.storeID,
+            storeName: SessionPersistence.storeName,
+            filePath: "/tmp/lattice-verify-stress.json",
+            writeGate: DurableStoreWriteGate(),
+            debounceNanoseconds: 100_000_000,
+            saveHandler: { sessions in
+                stressWrites.value += 1
+                stressDraft.value = sessions.first?.draft
+            }
+        )
+        for index in 0..<2_000 {
+            stressCoord.scheduleDebounced([
+                LatticeSession(title: "Stress", backend: .codex(model: "gpt-5.4"), draft: "draft-\(index)")
+            ])
+        }
+        try? await Task.sleep(nanoseconds: 180_000_000)
+        expect(stressWrites.value == 1 && stressDraft.value == "draft-1999", "Rapid debounce cancellation keeps only the latest generation")
+
+        let boundaryWrites = Box<[String]>([])
+        let boundaryCoord = SessionSaveCoordinator(
+            storeID: SessionPersistence.storeID,
+            storeName: SessionPersistence.storeName,
+            filePath: "/tmp/lattice-verify-sessions.json",
+            writeGate: DurableStoreWriteGate(),
+            debounceNanoseconds: 200_000_000,
+            saveHandler: { sessions in boundaryWrites.value.append(sessions.first?.draft ?? "") },
+            now: { Date(timeIntervalSince1970: 1_700_000_000) }
+        )
+        boundaryCoord.scheduleDebounced([LatticeSession(title: "B", backend: .codex(model: "gpt-5.4"), draft: "pending")])
+        expect(boundaryCoord.saveNow([LatticeSession(title: "B", backend: .codex(model: "gpt-5.4"), draft: "immediate")]) == .saved, "Immediate safe-boundary save succeeds")
+        expect(!boundaryCoord.hasPendingDebouncedSave && boundaryWrites.value == ["immediate"], "Immediate save cancels/absorbs pending debounce")
+        let exactTermination = "typed before debounce\n  exact  "
+        expect(boundaryCoord.flush([LatticeSession(title: "Selected", backend: .codex(model: "gpt-5.4"), draft: exactTermination)]) == .saved, "Termination flush succeeds")
+        expect(boundaryWrites.value.last == exactTermination, "Termination flush writes exact latest draft snapshot")
+
+        let gateBlocked = DurableStoreWriteGate()
+        gateBlocked.block()
+        let gateWrites = Box(0)
+        let gateFailures = Box(0)
+        let gateCoord = SessionSaveCoordinator(
+            storeID: SessionPersistence.storeID,
+            storeName: SessionPersistence.storeName,
+            filePath: "/tmp/lattice-verify-sessions.json",
+            writeGate: gateBlocked,
+            saveHandler: { _ in gateWrites.value += 1 },
+            now: { Date(timeIntervalSince1970: 1_700_000_000) },
+            failureObserver: { _ in gateFailures.value += 1 }
+        )
+        expect(gateCoord.saveNow([LatticeSession(title: "G", backend: .codex(model: "gpt-5.4"))]) == .blockedByWriteGate, "Blocked gate save is not a write")
+        expect(gateCoord.flush([LatticeSession(title: "G", backend: .codex(model: "gpt-5.4"))]) == .blockedByWriteGate, "Blocked gate flush is not a write")
+        expect(gateCoord.retry([LatticeSession(title: "G", backend: .codex(model: "gpt-5.4"))]) == .blockedByWriteGate, "Blocked gate retry is not a write")
+        expect(gateWrites.value == 0 && gateCoord.currentFailure == nil && gateFailures.value == 0, "Blocked gate never becomes save-failure UI")
+
+        let saveRoot = FileManager.default.temporaryDirectory.appendingPathComponent("lattice-save-coord-\(UUID().uuidString)", isDirectory: true)
+        try! FileManager.default.createDirectory(at: saveRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: saveRoot) }
+        let saveURL = saveRoot.appendingPathComponent("sessions.json")
+        let liveGate = DurableStoreWriteGate()
+        let livePersistence = SessionPersistence(fileURL: saveURL, writeGate: liveGate)
+        let liveCoord = SessionSaveCoordinator(persistence: livePersistence)
+        liveGate.block()
+        expect(liveCoord.saveNow([LatticeSession(title: "Live", backend: .codex(model: "gpt-5.4"), draft: "blocked")]) == .blockedByWriteGate, "Persistence-backed coordinator respects write gate")
+        expect(!FileManager.default.fileExists(atPath: saveURL.path), "Blocked persistence-backed save leaves no file")
+        liveGate.unblock()
+        let liveDraft = "durable draft\nexact"
+        expect(liveCoord.flush([LatticeSession(title: "Live", backend: .codex(model: "gpt-5.4"), draft: liveDraft)]) == .saved, "Persistence-backed flush saves")
+        if case .loaded(let loaded) = livePersistence.loadResult() {
+            expect(loaded.first?.draft == liveDraft, "Persistence-backed flush preserves exact draft content")
+        } else {
+            expect(false, "Persistence-backed flush preserves exact draft content")
+        }
+
+        try? FileManager.default.removeItem(at: extensionRoot)
+
+        // MARK: Portable session archive safety invariants
+        let archiveDate = Date(timeIntervalSince1970: 1_700_000_100)
+        let archiveMessageID = UUID()
+        let archiveThread = "provider-thread-DO-NOT-EXPORT"
+        let archiveSession = LatticeSession(
+            title: "Archive safety",
+            messages: [
+                ChatMessage(id: archiveMessageID, role: .user, text: "Visible transcript", date: archiveDate, isPinned: true),
+                ChatMessage(role: .assistant, text: "Reply", date: archiveDate.addingTimeInterval(1))
+            ],
+            backend: .codex(model: "gpt-5.5"),
+            harnessID: "codex",
+            reasoningEffort: .low,
+            harnessThreadID: archiveThread,
+            workspacePath: "/Users/secret/workspace",
+            attachments: [ContextAttachment(path: "/Users/secret/file.txt")],
+            policy: .ask,
+            privacyMode: .localOnly,
+            actions: [
+                SessionAction(messageID: archiveMessageID, kind: .tool, toolKind: .read, title: "Read secret-token", detail: "provider-secret-value", status: .completed, createdAt: archiveDate, updatedAt: archiveDate),
+                SessionAction(messageID: archiveMessageID, kind: .tool, title: "Running", detail: "live", status: .running, createdAt: archiveDate, updatedAt: archiveDate),
+                SessionAction(messageID: archiveMessageID, kind: .approval, title: "Wait", detail: "approval", status: .waiting, createdAt: archiveDate, updatedAt: archiveDate),
+                SessionAction(messageID: archiveMessageID, kind: .reasoning, title: "Think", detail: "Visible reasoning summary", status: .completed, createdAt: archiveDate, updatedAt: archiveDate)
+            ],
+            queuedFollowUps: [QueuedFollowUp(text: "queued later", date: archiveDate)],
+            draft: "ordinary unsent draft",
+            isPinned: true,
+            isStreaming: true,
+            lastUpdated: archiveDate
+        )
+        let archiveJSON = try! SessionPortableArchiveExporter.exportData(
+            from: archiveSession,
+            options: .init(includeQueuedFollowUps: false, format: .jsonArchive, exportedAt: archiveDate)
+        )
+        let archiveText = String(data: archiveJSON, encoding: .utf8) ?? ""
+        expect(archiveText.contains(SessionPortableArchive.formatID), "JSON archive uses lattice.session.archive format id")
+        expect(!archiveText.contains(archiveThread), "JSON archive never includes provider thread IDs")
+        expect(!archiveText.contains("ordinary unsent draft"), "JSON archive never includes ordinary composer draft")
+        expect(!archiveText.contains("/Users/secret"), "JSON archive never includes absolute attachment/workspace paths")
+        expect(!archiveText.contains("queued later"), "Queued follow-ups are excluded by default")
+        expect(!archiveText.contains("\"running\""), "JSON archive never includes running action status")
+        expect(!archiveText.contains("\"waiting\""), "JSON archive never includes waiting action status")
+        expect(!archiveText.contains("secret-token") && !archiveText.contains("provider-secret-value"), "Action export uses typed summaries without provider free-form secrets")
+        expect(SessionPortableArchivePrivacy.assertExportPrivacy(in: archiveJSON).isEmpty, "JSON archive privacy forbidden substrings are absent")
+        let archiveWithQueued = try! SessionPortableArchiveExporter.exportData(
+            from: archiveSession,
+            options: .init(includeQueuedFollowUps: true, format: .jsonArchive, exportedAt: archiveDate)
+        )
+        expect(String(data: archiveWithQueued, encoding: .utf8)?.contains("queued later") == true, "Queued follow-ups export only when explicitly included")
+        let archiveMarkdown = SessionPortableArchiveExporter.exportMarkdown(
+            from: archiveSession,
+            options: .init(includeQueuedFollowUps: false, format: .markdown, exportedAt: archiveDate)
+        )
+        expect(archiveMarkdown.contains("Lattice Chat Export"), "Markdown export is labeled as Lattice Chat Export")
+        expect(archiveMarkdown.lowercased().contains("not") && archiveMarkdown.lowercased().contains("import"), "Markdown export states it is not importable")
+        expect(archiveMarkdown.contains("Visible transcript"), "Markdown export includes visible transcript")
+        expect(!archiveMarkdown.contains(archiveThread), "Markdown export never includes provider thread IDs")
+        expect(!archiveMarkdown.contains("ordinary unsent draft"), "Markdown export never includes ordinary composer draft")
+        expect(!archiveMarkdown.contains("Visible reasoning summary"), "Markdown export never includes provider free-form reasoning detail")
+        do {
+            _ = try SessionPortableArchiveImporter.prepareImport(data: Data(archiveMarkdown.utf8), existingSessions: [])
+            expect(false, "Markdown export must not be importable")
+        } catch SessionPortableArchive.ArchiveError.markdownNotImportable {
+            expect(true, "Markdown export is rejected on import")
+        } catch {
+            expect(false, "Markdown export is rejected on import")
+        }
+        let importPlan = try! SessionPortableArchiveImporter.prepareImport(data: archiveJSON, existingSessions: [])
+        expect(importPlan.session.id != archiveSession.id, "Import remaps session identity")
+        expect(importPlan.session.harnessThreadID == nil, "Import never restores provider thread IDs")
+        expect(importPlan.session.isStreaming == false, "Import never restores streaming state")
+        expect(importPlan.session.draft.isEmpty, "Import never restores ordinary draft")
+        expect(importPlan.session.attachments.allSatisfy(\.isMissing), "Imported attachments are missing metadata only")
+        expect(importPlan.session.attachments.allSatisfy { $0.path.hasPrefix(SessionPortableArchive.missingAttachmentScheme) }, "Imported attachment paths use non-resolvable missing scheme")
+        expect(importPlan.session.actions.allSatisfy { $0.status != .running && $0.status != .waiting }, "Imported actions are inert terminal summaries")
+        expect(importPlan.session.lastUpdated == archiveSession.lastUpdated, "Import preserves the exported chat timestamp")
+        expect(importPlan.session.queuedFollowUps.isEmpty, "Default export excludes queued follow-ups on import")
+        expect(importPlan.preview.messageCount == 2, "Import preview reports message count")
+        expect(importPlan.preview.attachmentCount == 1, "Import preview reports attachment count")
+        let existingForDup = importPlan.session
+        let sourceDupPlan = try! SessionPortableArchiveImporter.prepareImport(data: archiveJSON, existingSessions: [archiveSession])
+        expect(sourceDupPlan.preview.isDuplicate && sourceDupPlan.preview.duplicateSessionIDs == [archiveSession.id], "Duplicate detection recognizes the original exported session")
+        let dupPlan = try! SessionPortableArchiveImporter.prepareImport(data: archiveJSON, existingSessions: [existingForDup])
+        expect(dupPlan.preview.isDuplicate, "Duplicate portable fingerprint is detected")
+        expect(dupPlan.preview.duplicateSessionIDs == [existingForDup.id], "Duplicate warning points at matching local sessions")
+        let commit = SessionPortableArchiveImporter.commit(plan: importPlan, into: [archiveSession], selectedSessionID: archiveSession.id)
+        expect(commit.sessions.count == 2, "Import commit is additive")
+        expect(commit.sessions.contains(where: { $0.id == archiveSession.id }), "Import commit never overwrites the source session identity slot")
+        expect(commit.selectedSessionID == archiveSession.id, "Pure commit leaves selection unchanged")
+        let oversize = Data(repeating: 0x42, count: SessionPortableArchive.maxArchiveBytes + 1)
+        do {
+            _ = try SessionPortableArchiveImporter.prepareImport(data: oversize, existingSessions: [])
+            expect(false, "Oversize archives are rejected")
+        } catch SessionPortableArchive.ArchiveError.fileTooLarge {
+            expect(true, "Oversize archives are rejected before decode")
+        } catch {
+            expect(false, "Oversize archives are rejected before decode")
+        }
+        let futureArchive = """
+        {"format":"lattice.session.archive","version":9,"exportedAt":"2024-01-01T00:00:00Z","includeQueuedFollowUps":false,"chat":{"title":"x","backendRoute":"ollama","backendModel":"m","policy":"Ask","privacyMode":"cloudAllowed","messages":[],"attachments":[],"actions":[],"queuedFollowUps":[]}}
+        """
+        do {
+            _ = try SessionPortableArchiveImporter.prepareImport(data: Data(futureArchive.utf8), existingSessions: [])
+            expect(false, "Future archive versions are rejected")
+        } catch SessionPortableArchive.ArchiveError.unsupportedVersion(9) {
+            expect(true, "Future archive versions are rejected safely")
+        } catch {
+            expect(false, "Future archive versions are rejected safely")
+        }
+        let wrongTypedArchive = #"{"format":"lattice.session.archive","version":1,"exportedAt":"2024-01-01T00:00:00Z","includeQueuedFollowUps":"false","chat":{"title":"x","backendRoute":"ollama","backendModel":"m","policy":"Ask","privacyMode":"cloudAllowed"}}"#
+        do {
+            _ = try SessionPortableArchiveImporter.prepareImport(data: Data(wrongTypedArchive.utf8), existingSessions: [])
+            expect(false, "Wrong-typed archive fields are rejected")
+        } catch SessionPortableArchive.ArchiveError.invalidField("includeQueuedFollowUps") {
+            expect(true, "Wrong-typed archive fields are rejected instead of receiving legacy defaults")
+        } catch {
+            expect(false, "Wrong-typed archive fields are rejected instead of receiving legacy defaults")
+        }
+        let traversalArchive = """
+        {"format":"lattice.session.archive","version":1,"exportedAt":"2024-01-01T00:00:00Z","includeQueuedFollowUps":false,"chat":{"title":"x","backendRoute":"ollama","backendModel":"m","policy":"Ask","privacyMode":"cloudAllowed","messages":[],"attachments":[{"name":"../../etc/passwd","kind":"file","availability":"metadata-only"}],"actions":[],"queuedFollowUps":[]}}
+        """
+        let traversalPlan = try! SessionPortableArchiveImporter.prepareImport(data: Data(traversalArchive.utf8), existingSessions: [])
+        expect(traversalPlan.session.attachments.first?.isMissing == true, "Traversal attachment names import as missing")
+        expect(traversalPlan.session.attachments.first?.path.contains("..") != true, "Imported attachment tokens never retain path traversal")
+        expect(!FileManager.default.fileExists(atPath: traversalPlan.session.attachments.first?.path ?? "/"), "Import does not produce openable filesystem paths for attachments")
+        let legacyArchive = """
+        {"format":"lattice.session.archive","version":1,"exportedAt":"2024-01-01T00:00:00Z","chat":{"title":"Legacy","backendRoute":"appleIntelligence","policy":"Ask","privacyMode":"cloudAllowed"}}
+        """
+        let legacyPlan = try! SessionPortableArchiveImporter.prepareImport(data: Data(legacyArchive.utf8), existingSessions: [])
+        expect(legacyPlan.session.messages.isEmpty && legacyPlan.session.policy == .ask && legacyPlan.session.isStreaming == false, "Legacy-compatible omissions decode with safe defaults")
+        let fingerprintSession = LatticeSession(title: "fp", backend: .ollama(model: "m"), portableArchiveFingerprint: "abc")
+        let decodedFingerprintMissing = try! JSONDecoder().decode(
+            LatticeSession.self,
+            from: JSONSerialization.data(withJSONObject: [
+                "id": UUID().uuidString,
+                "title": "old",
+                "messages": [],
+                "backend": ["ollama": ["model": "m"]],
+                "attachments": [["id": UUID().uuidString, "path": "/tmp/a"]],
+                "policy": "Ask",
+                "privacyMode": "cloudAllowed",
+                "actions": [],
+                "queuedFollowUps": [],
+                "draft": "",
+                "isPinned": false,
+                "isStreaming": false,
+                "lastUpdated": 0
+            ])
+        )
+        expect(decodedFingerprintMissing.portableArchiveFingerprint == nil, "Missing portableArchiveFingerprint defaults to nil")
+        expect(decodedFingerprintMissing.attachments.first?.isMissing == false, "Missing attachment isMissing defaults to false")
+        expect(fingerprintSession.portableArchiveFingerprint == "abc", "Fingerprint can be stored on session metadata")
+
+        print("Core verification passed: \(checks) checks")
+    }
+}

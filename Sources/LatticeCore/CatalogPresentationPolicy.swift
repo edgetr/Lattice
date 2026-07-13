@@ -1,0 +1,302 @@
+import Foundation
+
+// MARK: - Extension / skill toggle accessibility
+
+/// Record-specific accessibility tokens for extension and skill enablement switches.
+/// Pure string policy — views apply labels/values/hints and surface disabled reasons.
+public enum CatalogToggleAccessibility: Sendable {
+    public struct Tokens: Equatable, Sendable {
+        public let label: String
+        public let value: String
+        public let hint: String
+        /// Spoken when the control is disabled; nil when enabled for interaction.
+        public let disabledReason: String?
+
+        public init(label: String, value: String, hint: String, disabledReason: String?) {
+            self.label = label
+            self.value = value
+            self.hint = hint
+            self.disabledReason = disabledReason
+        }
+    }
+
+    public static func extensionToggle(
+        name: String,
+        isEnabled: Bool,
+        isValid: Bool,
+        hasRuntimePatches: Bool,
+        validationMessages: [String]
+    ) -> Tokens {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayName = trimmed.isEmpty ? "Untitled extension" : trimmed
+        let label = "\(displayName) extension"
+        let value = isEnabled ? "On" : "Off"
+        let hint: String
+        if !isValid {
+            hint = "Extension failed validation and cannot be enabled."
+        } else if !hasRuntimePatches {
+            hint = "This extension has no runtime patches to enable."
+        } else {
+            hint = isEnabled
+                ? "Disable to stop applying this extension’s runtime patches."
+                : "Enable to apply this extension’s runtime patches."
+        }
+        let disabledReason: String?
+        if !isValid {
+            let detail = validationMessages
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+            disabledReason = detail.isEmpty
+                ? "Extension is invalid and cannot be toggled."
+                : "Extension is invalid: \(detail)"
+        } else if !hasRuntimePatches {
+            disabledReason = "No runtime patches to enable."
+        } else {
+            disabledReason = nil
+        }
+        return Tokens(label: label, value: value, hint: hint, disabledReason: disabledReason)
+    }
+
+    public static func skillToggle(
+        title: String,
+        isEnabled: Bool,
+        isValid: Bool,
+        canToggle: Bool,
+        ownerDisabledMessage: String?,
+        validationMessages: [String]
+    ) -> Tokens {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayName = trimmed.isEmpty ? "Untitled skill" : trimmed
+        let label = "\(displayName) skill"
+        let value = isEnabled ? "On" : "Off"
+        let hint: String
+        if let ownerDisabledMessage, !ownerDisabledMessage.isEmpty {
+            hint = ownerDisabledMessage
+        } else if !isValid {
+            hint = "Skill failed validation and cannot be enabled."
+        } else {
+            hint = isEnabled
+                ? "Disable to hide this skill from the command palette and composer."
+                : "Enable to make this skill available in the command palette and composer."
+        }
+        let disabledReason: String?
+        if canToggle {
+            disabledReason = nil
+        } else if let ownerDisabledMessage, !ownerDisabledMessage.isEmpty {
+            disabledReason = ownerDisabledMessage
+        } else if !isValid {
+            let detail = validationMessages
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+            disabledReason = detail.isEmpty
+                ? "Skill is invalid and cannot be toggled."
+                : "Skill is invalid: \(detail)"
+        } else {
+            disabledReason = "This skill cannot be toggled right now."
+        }
+        return Tokens(label: label, value: value, hint: hint, disabledReason: disabledReason)
+    }
+
+    /// Spoken accessibility value combining On/Off with an optional disabled reason.
+    public static func spokenValue(_ tokens: Tokens) -> String {
+        if let reason = tokens.disabledReason, !reason.isEmpty {
+            return "\(tokens.value). \(reason)"
+        }
+        return tokens.value
+    }
+}
+
+// MARK: - Progressive disclosure
+
+/// Density rules for catalog lists. Readiness and primary actions stay outside disclosure.
+public enum CatalogProgressiveDisclosure: Sendable {
+    /// Default visible provider models before “Show more”.
+    public static let collapsedProviderModelLimit = 3
+    /// Default visible model-visibility checkboxes before expanding the full list.
+    public static let collapsedModelVisibilityLimit = 4
+
+    public static func displayedCount(total: Int, expanded: Bool, collapsedLimit: Int) -> Int {
+        guard total > 0 else { return 0 }
+        if expanded { return total }
+        return min(total, max(0, collapsedLimit))
+    }
+
+    public static func remainingHiddenCount(total: Int, expanded: Bool, collapsedLimit: Int) -> Int {
+        max(0, total - displayedCount(total: total, expanded: expanded, collapsedLimit: collapsedLimit))
+    }
+
+    public static func showMoreTitle(hiddenCount: Int) -> String {
+        hiddenCount == 1 ? "Show 1 more" : "Show \(hiddenCount) more"
+    }
+
+    public static func showLessTitle() -> String { "Show less" }
+
+    public static func modelVisibilitySectionTitle(modelCount: Int) -> String {
+        modelCount == 1 ? "Model visibility (1)" : "Model visibility (\(modelCount))"
+    }
+
+    public static func providerDetailsTitle() -> String { "Details" }
+    public static func recommendationDetailsTitle() -> String { "Fit details" }
+}
+
+// MARK: - Empty states (existing actions only)
+
+public enum CatalogEmptyStateKind: String, Sendable, Equatable {
+    case extensions
+    case skills
+    case providerModelsHidden
+    case noConnectedProviderModels
+    case noInstalledLocalModels
+}
+
+public struct CatalogEmptyStateCopy: Equatable, Sendable {
+    public let title: String
+    public let message: String
+    public let primaryActionTitle: String?
+    public let secondaryActionTitle: String?
+
+    public init(title: String, message: String, primaryActionTitle: String?, secondaryActionTitle: String?) {
+        self.title = title
+        self.message = message
+        self.primaryActionTitle = primaryActionTitle
+        self.secondaryActionTitle = secondaryActionTitle
+    }
+}
+
+public enum CatalogEmptyStatePolicy: Sendable {
+    public static func copy(for kind: CatalogEmptyStateKind, providerName: String? = nil) -> CatalogEmptyStateCopy {
+        switch kind {
+        case .extensions:
+            return CatalogEmptyStateCopy(
+                title: "No extensions yet",
+                message: "Extensions are user-owned packages in Lattice’s extensions folder. Open the folder to add a package, then Refresh.",
+                primaryActionTitle: "Open Folder",
+                secondaryActionTitle: "Refresh"
+            )
+        case .skills:
+            return CatalogEmptyStateCopy(
+                title: "No skills imported",
+                message: "Lattice imports skills from ~/.codex/skills and ~/.agents/skills into its shared skills folder. Open the folder or Refresh after adding files. Generated /self-edit skills land here too.",
+                primaryActionTitle: "Open Folder",
+                secondaryActionTitle: "Refresh"
+            )
+        case .providerModelsHidden:
+            let name = providerName?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let subject = (name?.isEmpty == false) ? name! : "this provider"
+            return CatalogEmptyStateCopy(
+                title: "All \(subject) models are hidden",
+                message: "Model visibility is controlled in Connections. Turn models back on there, then return to Models.",
+                primaryActionTitle: "Open Connections",
+                secondaryActionTitle: nil
+            )
+        case .noConnectedProviderModels:
+            return CatalogEmptyStateCopy(
+                title: "No connected provider models",
+                message: "Connect a provider under Connections, or Refresh after signing in. Model installs never start automatically from this page.",
+                primaryActionTitle: "Open Connections",
+                secondaryActionTitle: "Refresh"
+            )
+        case .noInstalledLocalModels:
+            return CatalogEmptyStateCopy(
+                title: "No local chat models installed",
+                message: "Install a recommended model below when Ollama is running, or Refresh after pulling models outside Lattice.",
+                primaryActionTitle: "Refresh",
+                secondaryActionTitle: nil
+            )
+        }
+    }
+}
+
+// MARK: - Settings copy (truthful existing context only)
+
+public enum LatticeSettingsCopy: Sendable {
+    public static let overlayShortcutDisplay = "⌘⇧Space"
+    public static let overlayShortcutExplanation =
+        "Press ⌘⇧Space to show or hide the floating Lattice overlay while Lattice is running. The shortcut is registered by the app; this setting is informational."
+
+    public static let localUnloadExplanation =
+        "When idle unload is on, Lattice asks Ollama to unload the active local model after the chosen number of idle minutes. Set to Off to keep models loaded until Ollama’s own defaults apply."
+
+    public static let privacySecurityBody =
+        "Provider harnesses run with workspace write containment: tool writes are limited to the selected workspace. File reads and network access are not confidentiality-contained—models and CLIs may still read outside the workspace or contact remote services when a route allows it. Prefer Local Only privacy on a chat when you need cloud routes blocked."
+
+    public static let extensionsFolderHelp =
+        "Opens Lattice’s user extensions directory in Finder."
+    public static let skillsFolderHelp =
+        "Opens Lattice’s shared skills directory in Finder."
+    public static let refreshModelsHelp =
+        "Reloads locally discovered Ollama chat models without changing connections."
+    public static let showOnboardingTitle = "Show Onboarding…"
+    public static let showOnboardingHelp =
+        "Reopen the first-run onboarding guide. Does not install software or change preferences by itself."
+}
+
+// MARK: - Onboarding step machine
+
+public enum LatticeOnboardingStep: Int, CaseIterable, Sendable, Equatable, Comparable {
+    case welcome = 0
+    case chooseWorkspace = 1
+    case localVersusCloud = 2
+    case ready = 3
+
+    public static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
+
+    public var title: String {
+        switch self {
+        case .welcome: "Welcome to Lattice"
+        case .chooseWorkspace: "Choose a workspace"
+        case .localVersusCloud: "Local vs cloud"
+        case .ready: "You’re ready"
+        }
+    }
+
+    public var body: String {
+        switch self {
+        case .welcome:
+            return "Lattice is a macOS workspace for chatting with local and connected coding agents. This short guide explains the basics. Nothing is installed and no preferences change until you act."
+        case .chooseWorkspace:
+            return "Chats can bind to a folder so harness tools stay write-contained to that workspace. You can choose a folder now or skip and set one later from a chat’s inspector."
+        case .localVersusCloud:
+            return "Local routes use Apple Intelligence or Ollama on this Mac. Cloud routes use connected provider CLIs (for example Codex, Grok, OpenCode). Per-chat Model privacy can block cloud routes. Writes stay workspace-contained; reads and network are not confidentiality-contained."
+        case .ready:
+            return "Open Connections to sign in or install provider CLIs when you need them. Use Models to pick a route, and Extensions & Skills for user-owned customizations. You can reopen this guide later if Settings is wired to show it."
+        }
+    }
+
+    public var headingIdentifier: String { "lattice.onboarding.heading.\(rawValue)" }
+}
+
+public enum LatticeOnboardingNavigation: Sendable {
+    public static var first: LatticeOnboardingStep { .welcome }
+    public static var last: LatticeOnboardingStep { .ready }
+
+    public static func canGoBack(from step: LatticeOnboardingStep) -> Bool {
+        step > first
+    }
+
+    public static func canContinue(from step: LatticeOnboardingStep) -> Bool {
+        step < last
+    }
+
+    public static func isFinish(step: LatticeOnboardingStep) -> Bool {
+        step == last
+    }
+
+    public static func advancing(from step: LatticeOnboardingStep) -> LatticeOnboardingStep {
+        LatticeOnboardingStep(rawValue: min(step.rawValue + 1, last.rawValue)) ?? last
+    }
+
+    public static func retreating(from step: LatticeOnboardingStep) -> LatticeOnboardingStep {
+        LatticeOnboardingStep(rawValue: max(step.rawValue - 1, first.rawValue)) ?? first
+    }
+
+    public static func primaryActionTitle(for step: LatticeOnboardingStep) -> String {
+        isFinish(step: step) ? "Finish" : "Continue"
+    }
+
+    public static func showsSkip(for step: LatticeOnboardingStep) -> Bool {
+        !isFinish(step: step)
+    }
+}
