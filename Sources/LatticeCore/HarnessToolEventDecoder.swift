@@ -2,13 +2,17 @@ import Foundation
 
 public enum HarnessToolEventDecoder {
     public static func piEvent(from object: [String: Any], workspace: URL) -> AgentEvent? {
-        guard let type = object["type"] as? String,
-              let externalID = object["toolCallId"] as? String else { return nil }
+        guard let type = object["type"] as? String else { return diagnostic(provider: "Pi", object: object, reason: "Event is missing type.") }
+        guard ["tool_execution_start", "tool_execution_update", "tool_execution_end"].contains(type) else {
+            if ["message_update", "message_end", "agent_end", "extension_ui_request", "extension_error"].contains(type) { return nil }
+            return diagnostic(provider: "Pi", object: object, reason: "Unsupported event.")
+        }
+        guard let externalID = object["toolCallId"] as? String, !externalID.isEmpty else { return diagnostic(provider: "Pi", object: object, reason: "Tool event is missing toolCallId.") }
         let id = stableID(for: "pi:\(externalID)")
 
         switch type {
         case "tool_execution_start":
-            guard let toolName = object["toolName"] as? String else { return nil }
+            guard let toolName = object["toolName"] as? String, !toolName.isEmpty else { return diagnostic(provider: "Pi", object: object, reason: "Tool start is missing toolName.") }
             let input = object["args"] as? [String: Any] ?? [:]
             return .toolRequested(.init(
                 id: id,
@@ -31,11 +35,10 @@ public enum HarnessToolEventDecoder {
     }
 
     public static func hermesEvent(from object: [String: Any], workspace: URL) -> AgentEvent? {
-        guard object["method"] as? String == "session/update",
-              let params = object["params"] as? [String: Any],
-              let update = params["update"] as? [String: Any],
-              let type = update["sessionUpdate"] as? String,
-              let externalID = update["toolCallId"] as? String else { return nil }
+        guard object["method"] as? String == "session/update" else { return nil }
+        guard let params = object["params"] as? [String: Any], let update = params["update"] as? [String: Any], let type = update["sessionUpdate"] as? String else { return diagnostic(provider: "Hermes", object: object, reason: "Session update is malformed.") }
+        if type == "agent_message_chunk" { return nil }
+        guard let externalID = update["toolCallId"] as? String, !externalID.isEmpty else { return diagnostic(provider: "Hermes", object: update, reason: "Tool update is missing toolCallId.") }
         let id = stableID(for: "hermes:\(externalID)")
 
         switch type {
@@ -76,8 +79,14 @@ public enum HarnessToolEventDecoder {
             }
             return .toolProgress(id: id, fraction: fraction, detail: detail)
         default:
-            return nil
+            return diagnostic(provider: "Hermes", object: update, reason: "Unsupported session update.")
         }
+    }
+
+    public static func malformedEvent(provider: String, byteCount: Int) -> AgentEvent { .providerDiagnostic(.init(provider: provider, reason: "Malformed JSON event payload (\(max(0, byteCount)) bytes).")) }
+
+    public static func diagnostic(provider: String, object: [String: Any], reason: String) -> AgentEvent {
+        .providerDiagnostic(.init(provider: provider, eventType: (object["type"] as? String) ?? (object["method"] as? String) ?? (object["sessionUpdate"] as? String), reason: reason, fields: object.keys.sorted()))
     }
 
     private static func detail(input: [String: Any], fallback: String) -> String {

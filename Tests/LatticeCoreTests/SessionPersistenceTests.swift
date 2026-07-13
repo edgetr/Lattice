@@ -539,6 +539,61 @@ struct SessionPersistenceTests {
         }
     }
 
+    @Test func unknownAndMalformedProviderEventsBecomeSafeDiagnostics() {
+        let workspace = URL(fileURLWithPath: "/tmp/Lattice")
+        let unknownPi: [String: Any] = ["type": "future_provider_event", "secret": "must not be retained"]
+        if case .providerDiagnostic(let diagnostic)? = HarnessToolEventDecoder.piEvent(from: unknownPi, workspace: workspace) {
+            #expect(diagnostic.provider == "Pi")
+            #expect(diagnostic.eventType == "future_provider_event")
+            #expect(!diagnostic.detail.contains("must not be retained"))
+        } else { Issue.record("Unknown Pi event must remain observable as a diagnostic") }
+
+        let malformedPi: [String: Any] = ["type": "tool_execution_start", "toolName": "read"]
+        if case .providerDiagnostic(let diagnostic)? = HarnessToolEventDecoder.piEvent(from: malformedPi, workspace: workspace) {
+            #expect(diagnostic.reason.contains("toolCallId"))
+        } else { Issue.record("Malformed Pi event must remain observable as a diagnostic") }
+
+        let unknownHermes: [String: Any] = ["method": "session/update", "params": ["update": ["sessionUpdate": "future_update", "toolCallId": "tool-1"]]]
+        if case .providerDiagnostic(let diagnostic)? = HarnessToolEventDecoder.hermesEvent(from: unknownHermes, workspace: workspace) {
+            #expect(diagnostic.provider == "Hermes")
+            #expect(diagnostic.eventType == "future_update")
+        } else { Issue.record("Unknown Hermes event must remain observable as a diagnostic") }
+
+        let unknownCodex: [String: Any] = ["method": "item/started", "params": ["item": ["id": "item-1", "type": "future_item"]]]
+        if case .providerDiagnostic(let diagnostic) = CodexExecHarness.appServerEvent(from: unknownCodex, workspace: workspace) {
+            #expect(diagnostic.provider == "Codex")
+            #expect(diagnostic.eventType == "future_item")
+        } else { Issue.record("Unknown Codex event must remain observable as a diagnostic") }
+
+        if case .providerDiagnostic(let diagnostic) = HarnessToolEventDecoder.malformedEvent(provider: "Hermes", byteCount: 7) {
+            #expect(diagnostic.detail.contains("7 bytes"))
+        } else { Issue.record("Malformed JSON must remain observable as a diagnostic") }
+    }
+
+    @Test func providerDiagnosticPersistsAndReplayKeepsFailureStatus() throws {
+        let response = ChatMessage(role: .assistant, text: "Partial response")
+        let action = SessionAction(messageID: response.id, kind: .diagnostic, title: "Pi provider event not understood", detail: "Unsupported event", status: .failed)
+        let session = LatticeSession(title: "Diagnostic", messages: [response], backend: .codex(model: "gpt-5.4"), actions: [action])
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SessionPersistence(fileURL: root.appendingPathComponent("sessions.json"))
+        try store.save([session])
+        let restored = try #require(store.load().first)
+        #expect(restored.actions.first?.kind == .diagnostic)
+        #expect(restored.actions.first?.status == .failed)
+        var actions = restored.actions
+        #expect(SessionActionTrail.finishCompletedTurn(for: response.id, in: &actions) == 0)
+        #expect(actions.first?.status == .failed)
+
+        let archive = try SessionPortableArchiveExporter.exportData(from: session)
+        let imported = try SessionPortableArchiveImporter.prepareImport(data: archive, existingSessions: []).session
+        #expect(imported.actions.count == 1)
+        #expect(imported.actions.first?.kind == .diagnostic)
+        #expect(imported.actions.first?.status == .failed)
+        #expect(imported.actions.first?.title == "Provider event diagnostic")
+        #expect(imported.actions.first?.detail == "")
+    }
+
     @Test func deletingMessageTruncatesBranchAndProviderState() {
         let firstUser = ChatMessage(role: .user, text: "First")
         let firstAssistant = ChatMessage(role: .assistant, text: "First reply", isPinned: true)

@@ -141,8 +141,10 @@ public final class PiRPCHarness: @unchecked Sendable {
     }
 
     private func parse(_ data: Data, sessionID: UUID, workspace: URL, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) throws -> Bool {
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let type = object["type"] as? String else { return false }
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continuation.yield(HarnessToolEventDecoder.malformedEvent(provider: "Pi", byteCount: data.count)); return false }
+        guard let type = object["type"] as? String else { continuation.yield(HarnessToolEventDecoder.diagnostic(provider: "Pi", object: object, reason: "Event is missing type.")); return false }
         if type == "extension_ui_request" {
+            guard object["id"] as? String != nil else { continuation.yield(HarnessToolEventDecoder.diagnostic(provider: "Pi", object: object, reason: "Extension UI request is missing id.")); return false }
             try handleExtensionUIRequest(object, sessionID: sessionID, workspace: workspace, input: input, continuation: continuation)
             return false
         }
@@ -159,6 +161,8 @@ public final class PiRPCHarness: @unchecked Sendable {
            update["type"] as? String == "text_delta",
            let delta = update["delta"] as? String {
             continuation.yield(.assistantDelta(delta))
+        } else if type == "message_update" {
+            continuation.yield(HarnessToolEventDecoder.diagnostic(provider: "Pi", object: object, reason: "Message update is malformed."))
         }
         if type == "message_end",
            let message = object["message"] as? [String: Any],
@@ -166,6 +170,8 @@ public final class PiRPCHarness: @unchecked Sendable {
            let error = message["errorMessage"] as? String, !error.isEmpty {
             continuation.yield(.failed(error))
             return true
+        } else if type == "message_end" {
+            continuation.yield(HarnessToolEventDecoder.diagnostic(provider: "Pi", object: object, reason: "Message end is malformed."))
         }
         if type == "agent_end" {
             if !isCancelled(sessionID) { continuation.yield(.completed) }

@@ -4620,6 +4620,11 @@ Lattice self-edit rules:
                 reduceRunUI(.permissionRequested, for: id)
             }
         case .metric: break
+        case .providerDiagnostic(let diagnostic):
+            guard let messageID = sessions[index].messages.last(where: { $0.role == .assistant })?.id else { return }
+            upsertSessionAction(.init(id: diagnostic.id, messageID: messageID, kind: .diagnostic, title: diagnostic.title, detail: diagnostic.detail, status: .failed), at: index)
+            upsertActivity(.init(icon: "exclamationmark.triangle", title: diagnostic.title, detail: diagnostic.detail), sessionID: id)
+            persist()
         case .completed:
             activeRunIDs[id] = nil
             harnessPermissionNotices[id] = nil

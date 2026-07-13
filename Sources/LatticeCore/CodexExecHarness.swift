@@ -375,14 +375,19 @@ public final class CodexExecHarness: @unchecked Sendable {
     }
 
     public static func appServerEvent(from object: [String: Any], workspace: URL) -> AgentEvent? {
-        guard let method = object["method"] as? String,
-              let params = object["params"] as? [String: Any] else { return nil }
-        if method == "item/agentMessage/delta", let delta = params["delta"] as? String { return .assistantDelta(delta) }
+        guard let method = object["method"] as? String else { return HarnessToolEventDecoder.diagnostic(provider: "Codex", object: object, reason: "App-server event is missing method.") }
+        guard let params = object["params"] as? [String: Any] else { return method == "item/reasoning/textDelta" ? nil : HarnessToolEventDecoder.diagnostic(provider: "Codex", object: object, reason: "App-server event is missing params.") }
+        if method == "item/agentMessage/delta" {
+            guard let delta = params["delta"] as? String else { return HarnessToolEventDecoder.diagnostic(provider: "Codex", object: object, reason: "Agent message delta is malformed.") }
+            return .assistantDelta(delta)
+        }
         if method == "item/reasoning/summaryTextDelta",
            let externalID = params["itemId"] as? String,
            let delta = params["delta"] as? String, !delta.isEmpty {
             return .reasoningSummary(id: HarnessToolEventDecoder.stableID(for: "codex:reasoning:\(externalID)"), delta: delta)
         }
+        if method == "item/reasoning/summaryTextDelta" { return HarnessToolEventDecoder.diagnostic(provider: "Codex", object: object, reason: "Reasoning summary delta is malformed.") }
+        if method == "item/reasoning/textDelta" { return nil }
         if method == "turn/plan/updated",
            let turnID = params["turnId"] as? String,
            let rawSteps = params["plan"] as? [[String: Any]] {
@@ -401,9 +406,10 @@ public final class CodexExecHarness: @unchecked Sendable {
                 }
                 return "\(label) — \(step)"
             }
-            guard !steps.isEmpty else { return nil }
+            guard !steps.isEmpty else { return HarnessToolEventDecoder.diagnostic(provider: "Codex", object: object, reason: "Turn plan update has no usable steps.") }
             return .plan(id: HarnessToolEventDecoder.stableID(for: "codex:plan:\(turnID)"), title: "Plan", steps: steps)
         }
+        if method == "turn/plan/updated" { return HarnessToolEventDecoder.diagnostic(provider: "Codex", object: object, reason: "Turn plan update is malformed.") }
         if method == "error" {
             let error = params["error"] as? [String: Any]
             return .failed(error?["message"] as? String ?? params["message"] as? String ?? "Codex error")
@@ -411,7 +417,7 @@ public final class CodexExecHarness: @unchecked Sendable {
         guard ["item/started", "item/completed"].contains(method),
               let item = params["item"] as? [String: Any],
               let type = item["type"] as? String,
-              let externalID = item["id"] as? String else { return nil }
+              let externalID = item["id"] as? String else { return HarnessToolEventDecoder.diagnostic(provider: "Codex", object: object, reason: "Item event is malformed.") }
         let id = HarnessToolEventDecoder.stableID(for: "codex:\(externalID)")
         let completed = method == "item/completed"
         switch type {
@@ -432,7 +438,7 @@ public final class CodexExecHarness: @unchecked Sendable {
             if completed { return terminalToolProgress(id: id, status: item["status"]) }
             return .toolRequested(.init(id: id, kind: .network, title: "Search the web", detail: item["query"] as? String ?? "", workspaceScoped: false, reversible: true))
         default:
-            return nil
+            return HarnessToolEventDecoder.diagnostic(provider: "Codex", object: item, reason: "Unsupported item event.")
         }
     }
 
