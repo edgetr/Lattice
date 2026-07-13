@@ -563,7 +563,7 @@ struct SessionPersistenceTests {
 
     @Test func branchingCopiesVisibleTranscriptAndResetsProviderState() throws {
         let firstUser = ChatMessage(role: .user, text: "First")
-        let firstAssistant = ChatMessage(role: .assistant, text: "First reply")
+        let firstAssistant = ChatMessage(role: .assistant, text: "First reply", isPinned: true)
         let secondUser = ChatMessage(role: .user, text: "Second")
         let secondAssistant = ChatMessage(role: .assistant, text: "Second reply")
         let retainedAction = SessionAction(messageID: firstAssistant.id, kind: .tool, title: "Read", detail: "README.md", status: .completed)

@@ -122,9 +122,11 @@ public enum BoundedSubprocess {
         _ request: BoundedSubprocessRequest,
         isCancelled: @escaping @Sendable () -> Bool
     ) async -> BoundedSubprocessResult {
-        await Task.detached(priority: .userInitiated) {
-            runSync(request, isCancelled: isCancelled)
-        }.value
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: runSync(request, isCancelled: isCancelled))
+            }
+        }
     }
 
     /// Lock-backed cancellation probe shared between the caller's cancellation handler
