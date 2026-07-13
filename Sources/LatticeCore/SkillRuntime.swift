@@ -358,7 +358,9 @@ public struct LatticeSkillStore: Sendable {
             guard !id.isEmpty else { continue }
             guard "/\(id)" != LatticeSelfEditCommand.name else { continue }
             if deletedIDs.contains(id) { continue }
-            let sourceData = try Data(contentsOf: source)
+            guard let sourceData = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: source) else {
+                continue
+            }
             if let targetFolder = try LatticeStorePathSecurity.existingChildDirectory(named: id, under: canonicalRoot) {
                 if let targetSkill = try LatticeStorePathSecurity.existingEntry(
                     named: "SKILL.md",

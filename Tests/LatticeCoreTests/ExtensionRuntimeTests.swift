@@ -156,6 +156,24 @@ struct ExtensionRuntimeTests {
         try? FileManager.default.removeItem(at: global)
     }
 
+    @Test func globalSkillImportRejectsSymlinkedSourceFiles() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let global = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let globalSkill = global.appendingPathComponent("linked-skill", isDirectory: true)
+        let secret = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: globalSkill, withIntermediateDirectories: true)
+        try Data("must not be imported".utf8).write(to: secret)
+        try FileManager.default.createSymbolicLink(at: globalSkill.appendingPathComponent("SKILL.md"), withDestinationURL: secret)
+
+        let store = LatticeSkillStore(rootURL: root, globalRoots: [global])
+        try store.importGlobalSkills()
+        #expect(store.load().isEmpty)
+
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: global)
+        try? FileManager.default.removeItem(at: secret)
+    }
+
     @Test func importedSkillsMayContainFullWorkflowsBeyondGeneratedLimit() {
         let store = LatticeSkillStore(rootURL: URL(fileURLWithPath: "/tmp/unused"), globalRoots: [])
         let markdown = "# Hatch Pet\n\n" + String(repeating: "Detailed validation workflow.\n", count: 1_200)
