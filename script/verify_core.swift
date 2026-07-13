@@ -673,7 +673,14 @@ struct CoreVerification {
         expect(BackendAvailabilityPolicy.normalize(.codex(model: "gpt-5.4"), using: disconnectedCloud) == .ollama(model: "llama3.2:latest"), "Disconnected stale Codex model does not migrate to disconnected preferred model")
         expect(BackendAvailabilityPolicy.normalize(.openCode(model: "opencode/model"), using: disconnectedCloud) == .ollama(model: "llama3.2:latest"), "Disconnected OpenCode catalog is not treated as runnable")
         let localOnly = BackendAvailabilitySnapshot(ollamaModelNames: ["llama3.2:latest"])
-        expect(BackendAvailabilityPolicy.normalize(.ollama(model: ""), using: localOnly) == .ollama(model: "llama3.2:latest"), "Empty local backend normalizes to installed local model")
+        expect(BackendAvailabilityPolicy.normalize(.ollama(model: ""), using: localOnly) == .ollama(model: ""), "Empty local backend stays unresolved")
+        let modelLessArchive = """
+        {"format":"lattice.session.archive","version":1,"exportedAt":"2024-01-01T00:00:00Z","chat":{"title":"Model-less","backendRoute":"ollama","policy":"Ask","privacyMode":"cloudAllowed"}}
+        """
+        let modelLessImport = try! SessionPortableArchiveImporter.prepareImport(data: Data(modelLessArchive.utf8), existingSessions: [])
+        expect(modelLessImport.session.backend == .ollama(model: ""), "Model-less archive preserves empty Ollama provenance")
+        let discoveredOllama = BackendAvailabilitySnapshot(ollamaModelNames: ["qwen3:8b"])
+        expect(BackendAvailabilityPolicy.normalize(.ollama(model: "qwen3:8b"), using: discoveredOllama) == .ollama(model: "qwen3:8b"), "Discovered Ollama model recovers exact route")
         expect(ExecutionRoutePolicy.defaultHarnessID(for: "ollama") == "lattice", "Ollama defaults to Lattice harness")
         expect(ExecutionRoutePolicy.compatibleHarnessIDs(for: "ollama") == ["lattice"], "Ollama only exposes its implemented Lattice route")
         expect(ExecutionRoutePolicy.compatibleHarnessIDs(for: "codex").contains("pi"), "Codex can execute through Pi RPC")

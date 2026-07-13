@@ -343,6 +343,27 @@ struct SessionPortableArchiveTests {
         #expect(plan.session.harnessThreadID == nil)
     }
 
+    @Test func modelLessArchivesPreserveMissingAndEmptyModelForEveryModelRoute() throws {
+        let routes = ["codex", "grok", "opencode", "antigravity", "ollama"]
+        for model in [String?.none, ""] {
+            for route in routes {
+                let modelField = model.map { "\"backendModel\":\(jsonString($0))," } ?? ""
+                let archive = """
+                {"format":"lattice.session.archive","version":1,"exportedAt":"2024-01-01T00:00:00Z","chat":{"title":"Model-less","backendRoute":"\(route)",\(modelField)"policy":"Ask","privacyMode":"cloudAllowed"}}
+                """
+                let plan = try SessionPortableArchiveImporter.prepareImport(data: Data(archive.utf8), existingSessions: [])
+                switch route {
+                case "codex": #expect(plan.session.backend == .codex(model: ""))
+                case "grok": #expect(plan.session.backend == .grok(model: ""))
+                case "opencode": #expect(plan.session.backend == .openCode(model: ""))
+                case "antigravity": #expect(plan.session.backend == .antigravity(model: ""))
+                case "ollama": #expect(plan.session.backend == .ollama(model: ""))
+                default: Issue.record("Unexpected route \(route)")
+                }
+            }
+        }
+    }
+
     // 7. Collision-safe remapped IDs + no overwrite
     @Test func remapsIDsAndNeverOverwritesExistingSessions() throws {
         let existing = sampleSession()

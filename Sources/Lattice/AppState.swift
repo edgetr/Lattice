@@ -1682,7 +1682,9 @@ final class AppState: ObservableObject {
         case .appleIntelligence:
             return appleIntelligenceReady
         case .ollama(let model):
-            return ollamaReady && !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            return ollamaReady
+                && !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && ollamaModels.contains(where: { $0.name == model })
         case .antigravity(let model):
             return antigravityAuthenticated && visibleAntigravityModels.contains(where: { $0.id == model })
         }
@@ -1740,7 +1742,9 @@ final class AppState: ObservableObject {
         case .appleIntelligence:
             return appleIntelligenceReady
         case .ollama(let model):
-            return ollamaReady && !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            return ollamaReady
+                && !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && ollamaModels.contains(where: { $0.name == model })
         case .antigravity(let model):
             return antigravityAuthenticated && visibleAntigravityModels.contains(where: { $0.id == model })
         }
@@ -1781,7 +1785,11 @@ final class AppState: ObservableObject {
             return appleIntelligenceStatus
         case .ollama(let model):
             if model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Choose a local model." }
-            return ollamaInstalled ? "Start Ollama before this chat can continue." : "Ollama is not installed."
+            if !ollamaInstalled { return "Ollama is not installed." }
+            if !ollamaReady { return "Start Ollama before this chat can continue." }
+            if !ollamaModels.contains(where: { $0.name == model }) {
+                return "The local model \(model) is not installed."
+            }
         case .antigravity(let model):
             if !antigravityInstalled { return "Antigravity CLI is not installed." }
             if !antigravityAuthenticated { return "Sign in to Antigravity before this chat can continue." }

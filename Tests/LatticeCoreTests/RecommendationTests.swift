@@ -212,6 +212,32 @@ struct RecommendationTests {
         #expect(BackendAvailabilityPolicy.normalize(.antigravity(model: "Retired model"), using: snapshot) == .antigravity(model: models[0].id))
     }
 
+    @Test func emptyModelStaysUnavailableAcrossReadyProviderRoutes() {
+        let providerModel = ProviderModel(id: "runtime-model", name: "Runtime model", isDefault: true)
+        let snapshot = BackendAvailabilitySnapshot(
+            codexModels: [providerModel],
+            grokModels: [providerModel],
+            openCodeModels: [providerModel],
+            antigravityModels: [providerModel],
+            antigravityReady: true,
+            ollamaModelNames: ["runtime-model"]
+        )
+        #expect(BackendAvailabilityPolicy.normalize(.codex(model: ""), using: snapshot) == .codex(model: ""))
+        #expect(BackendAvailabilityPolicy.normalize(.grok(model: ""), using: snapshot) == .grok(model: ""))
+        #expect(BackendAvailabilityPolicy.normalize(.openCode(model: ""), using: snapshot) == .openCode(model: ""))
+        #expect(BackendAvailabilityPolicy.normalize(.antigravity(model: ""), using: snapshot) == .antigravity(model: ""))
+        #expect(BackendAvailabilityPolicy.normalize(.ollama(model: ""), using: snapshot) == .ollama(model: ""))
+    }
+
+    @Test func ollamaModelStaysUnavailableUntilRuntimeCatalogDiscoversIt() {
+        let backend = ChatBackend.ollama(model: "qwen3:8b")
+        let emptyCatalog = BackendAvailabilitySnapshot(ollamaModelNames: [])
+        let discoveredCatalog = BackendAvailabilitySnapshot(ollamaModelNames: ["qwen3:8b"])
+
+        #expect(BackendAvailabilityPolicy.normalize(backend, using: emptyCatalog) == backend)
+        #expect(BackendAvailabilityPolicy.normalize(backend, using: discoveredCatalog) == backend)
+    }
+
     @Test func hermesCompatibilityMatchesModelIdentityAcrossProviders() {
         let models = [HarnessModel(id: "nvidia:deepseek-ai/deepseek-v4-pro", name: "deepseek-ai/deepseek-v4-pro")]
         #expect(HermesACPHarness.bestMatch(for: "opencode-go/deepseek-v4-pro", in: models)?.id == "nvidia:deepseek-ai/deepseek-v4-pro")
