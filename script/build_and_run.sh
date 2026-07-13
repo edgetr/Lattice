@@ -23,6 +23,10 @@ INFO_PLIST="$APP_CONTENTS/Info.plist"
 ICON_NAME="AppIcon"
 ICON_SOURCE="$ROOT_DIR/Resources/$ICON_NAME.png"
 COMPANION_SOURCE="$ROOT_DIR/Resources/LatticeCompanion.png"
+PACKAGE_STAGING_ROOT=""
+PACKAGE_BACKUP_ROOT=""
+PACKAGE_FINAL_BUNDLE="$APP_BUNDLE"
+PACKAGE_PROMOTION_IN_PROGRESS=0
 LOCK_DIR="${TMPDIR:-/tmp}/lattice-build-and-run.lock"
 LOCK_PID_FILE="$LOCK_DIR/pid"
 MANUAL_BUILD="$ROOT_DIR/.build/manual"
@@ -34,6 +38,43 @@ SDK_CANDIDATES=(
   "/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk"
   "/Library/Developer/CommandLineTools/SDKs/MacOSX15.sdk"
 )
+
+set_bundle_paths() {
+  APP_BUNDLE="$1"
+  APP_CONTENTS="$APP_BUNDLE/Contents"
+  APP_MACOS="$APP_CONTENTS/MacOS"
+  APP_RESOURCES="$APP_CONTENTS/Resources"
+  APP_BINARY="$APP_MACOS/$APP_NAME"
+  INFO_PLIST="$APP_CONTENTS/Info.plist"
+}
+
+path_exists() {
+  [[ -e "$1" || -L "$1" ]]
+}
+
+cleanup_package_artifacts() {
+  if [[ -n "$PACKAGE_BACKUP_ROOT" ]]; then
+    local backup_bundle="$PACKAGE_BACKUP_ROOT/$APP_NAME.app"
+    if path_exists "$backup_bundle"; then
+      if [[ "$PACKAGE_PROMOTION_IN_PROGRESS" -eq 1 ]]; then
+        rm -rf "$PACKAGE_FINAL_BUNDLE"
+      fi
+      if ! path_exists "$PACKAGE_FINAL_BUNDLE"; then
+        mv "$backup_bundle" "$PACKAGE_FINAL_BUNDLE" || true
+      fi
+    fi
+    rm -rf "$PACKAGE_BACKUP_ROOT"
+    PACKAGE_BACKUP_ROOT=""
+    PACKAGE_PROMOTION_IN_PROGRESS=0
+  fi
+
+  if [[ -n "$PACKAGE_STAGING_ROOT" ]]; then
+    rm -rf "$PACKAGE_STAGING_ROOT"
+    PACKAGE_STAGING_ROOT=""
+  fi
+}
+
+set_bundle_paths "$APP_BUNDLE"
 
 usage() {
   cat >&2 <<'USAGE'
@@ -92,6 +133,7 @@ release_lock() {
 }
 
 on_exit() {
+  cleanup_package_artifacts
   release_lock
 }
 
@@ -240,8 +282,12 @@ build_binary() {
 }
 
 package_app() {
-  echo "==> Packaging $APP_BUNDLE"
-  rm -rf "$APP_BUNDLE"
+  local final_bundle="$APP_BUNDLE"
+  PACKAGE_FINAL_BUNDLE="$final_bundle"
+  mkdir -p "$DIST_DIR"
+  PACKAGE_STAGING_ROOT="$(mktemp -d "$DIST_DIR/.${APP_NAME}.app-staging.XXXXXX")"
+  set_bundle_paths "$PACKAGE_STAGING_ROOT/$APP_NAME.app"
+  echo "==> Packaging $final_bundle (staging: $APP_BUNDLE)"
   mkdir -p "$APP_MACOS" "$APP_RESOURCES"
   cp "$BUILD_BINARY" "$APP_BINARY"
   chmod +x "$APP_BINARY"
@@ -300,6 +346,38 @@ package_app() {
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
+
+  if ! verify_bundle; then
+    echo "FAIL: staged app bundle validation failed; preserving existing $final_bundle" >&2
+    set_bundle_paths "$final_bundle"
+    cleanup_package_artifacts
+    return 1
+  fi
+
+  local backup_root=""
+  if path_exists "$final_bundle"; then
+    backup_root="$(mktemp -d "$DIST_DIR/.${APP_NAME}.app-backup.XXXXXX")"
+    PACKAGE_BACKUP_ROOT="$backup_root"
+    PACKAGE_PROMOTION_IN_PROGRESS=1
+    if ! mv "$final_bundle" "$backup_root/$APP_NAME.app"; then
+      echo "FAIL: could not move existing app into transactional backup" >&2
+      set_bundle_paths "$final_bundle"
+      cleanup_package_artifacts
+      return 1
+    fi
+  fi
+
+  if ! mv "$APP_BUNDLE" "$final_bundle"; then
+    echo "FAIL: could not promote staged app; preserving existing $final_bundle" >&2
+    set_bundle_paths "$final_bundle"
+    cleanup_package_artifacts
+    return 1
+  fi
+
+  set_bundle_paths "$final_bundle"
+  PACKAGE_PROMOTION_IN_PROGRESS=0
+  cleanup_package_artifacts
+  echo "OK: packaged app promoted transactionally to $APP_BUNDLE"
 }
 
 plist_print() {
