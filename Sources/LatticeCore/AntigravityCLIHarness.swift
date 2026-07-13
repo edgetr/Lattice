@@ -7,6 +7,7 @@ public final class AntigravityCLIHarness: @unchecked Sendable {
     private let executableURL: URL?
     private let lock = NSLock()
     private var processes: [UUID: Process] = [:]
+    private var inputs: [UUID: FileHandle] = [:]
     private var cancelled: Set<UUID> = []
 
     public init(executableURL: URL? = ExecutableDiscovery.locate("agy")) {
@@ -49,10 +50,14 @@ public final class AntigravityCLIHarness: @unchecked Sendable {
                 }
 
                 let process = Process()
+                let input = Pipe()
                 let output = Pipe()
                 process.executableURL = executableURL
                 process.currentDirectoryURL = workspace
-                var arguments = ["--print", prompt, "--model", model, "--sandbox"]
+                // Antigravity print mode reads its prompt from stdin when no prompt
+                // argument is supplied. Keep transcript content out of argv, where
+                // it can be exposed by process inspection and system diagnostics.
+                var arguments = ["--print", "--model", model, "--sandbox"]
                 if policy == .yolo {
                     arguments += ["--mode", "accept-edits", "--dangerously-skip-permissions"]
                 } else {
@@ -61,12 +66,15 @@ public final class AntigravityCLIHarness: @unchecked Sendable {
                     arguments += ["--mode", "plan"]
                 }
                 process.arguments = arguments
+                process.standardInput = input
                 process.standardOutput = output
                 process.standardError = output
 
                 do {
                     try process.run()
-                    register(process, for: sessionID)
+                    register(process, input: input.fileHandleForWriting, for: sessionID)
+                    try input.fileHandleForWriting.write(contentsOf: Data(prompt.utf8))
+                    try input.fileHandleForWriting.close()
                     while process.isRunning {
                         let data = output.fileHandleForReading.availableData
                         if !data.isEmpty {
@@ -88,6 +96,7 @@ public final class AntigravityCLIHarness: @unchecked Sendable {
                     }
                 } catch {
                     let wasCancelled = unregister(sessionID)
+                    if process.isRunning { process.terminate() }
                     continuation.yield(wasCancelled ? .cancelled : .failed(error.localizedDescription))
                 }
                 continuation.finish()
@@ -104,22 +113,27 @@ public final class AntigravityCLIHarness: @unchecked Sendable {
         lock.lock()
         cancelled.insert(sessionID)
         let process = processes[sessionID]
+        let input = inputs[sessionID]
         lock.unlock()
+        try? input?.close()
         if process?.isRunning == true { process?.terminate() }
     }
 
-    private func register(_ process: Process, for sessionID: UUID) {
+    private func register(_ process: Process, input: FileHandle, for sessionID: UUID) {
         lock.lock()
         cancelled.remove(sessionID)
         processes[sessionID] = process
+        inputs[sessionID] = input
         lock.unlock()
     }
 
     private func unregister(_ sessionID: UUID) -> Bool {
         lock.lock()
         processes[sessionID] = nil
+        let input = inputs.removeValue(forKey: sessionID)
         let wasCancelled = cancelled.remove(sessionID) != nil
         lock.unlock()
+        try? input?.close()
         return wasCancelled
     }
 
