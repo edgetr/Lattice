@@ -849,19 +849,11 @@ struct ProjectsView: View {
                                 .accessibilityLabel("Streaming")
                         }
                     }
-                    HStack(spacing: 6) {
-                        Text("\(session.messages.count) messages")
-                        Text("·")
-                        Text(relativeUpdated(session.lastUpdated))
-                        if !session.actions.isEmpty {
-                            Text("·")
-                            Text("\(session.actions.count) actions")
-                        }
-                    }
+                    Text(workspaceSessionMetadata(for: session))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
-                    .lineLimit(1)
+                    .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 8)
                 Image(systemName: "chevron.right")
@@ -878,6 +870,14 @@ struct ProjectsView: View {
         .accessibilityLabel(session.title)
         .accessibilityHint("Opens this existing chat")
         .accessibilityValue(workspaceSessionAccessibilityValue(session))
+    }
+
+    private func workspaceSessionMetadata(for session: LatticeSession) -> String {
+        var parts = ["\(session.messages.count) messages", relativeUpdated(session.lastUpdated)]
+        if !session.actions.isEmpty {
+            parts.append("\(session.actions.count) actions")
+        }
+        return parts.joined(separator: " · ")
     }
 
     private func workspaceSessionAccessibilityValue(_ session: LatticeSession) -> String {
