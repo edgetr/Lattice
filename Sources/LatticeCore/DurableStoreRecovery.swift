@@ -574,9 +574,7 @@ public enum DurableStoreRecovery: Sendable {
         _ lhs: (modificationDate: Date?, fileSize: Int?, fingerprint: String?),
         _ rhs: (modificationDate: Date?, fileSize: Int?, fingerprint: String?)
     ) -> Bool {
-        lhs.fileSize == rhs.fileSize &&
-            lhs.fingerprint == rhs.fingerprint &&
-            lhs.modificationDate.map { date in rhs.modificationDate.map { abs(date.timeIntervalSince($0)) <= 0.001 } ?? false } ?? rhs.modificationDate == nil
+        lhs.fileSize == rhs.fileSize && lhs.fingerprint == rhs.fingerprint
     }
 
     private static func oversizedIssue(
