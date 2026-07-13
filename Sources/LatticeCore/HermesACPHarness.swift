@@ -11,33 +11,6 @@ public struct HarnessModel: Hashable, Sendable {
 }
 
 public final class ACPHarness: @unchecked Sendable {
-    private final class JSONLineReader {
-        private let handle: FileHandle
-        private var buffer = Data()
-
-        init(_ handle: FileHandle) {
-            self.handle = handle
-        }
-
-        func next() throws -> [String: Any]? {
-            while true {
-                if let newline = buffer.firstIndex(of: 0x0A) {
-                    let line = Data(buffer[..<newline])
-                    buffer.removeSubrange(...newline)
-                    if line.isEmpty { continue }
-                    return try JSONSerialization.jsonObject(with: line) as? [String: Any]
-                }
-                let chunk = handle.availableData
-                if chunk.isEmpty {
-                    guard !buffer.isEmpty else { return nil }
-                    defer { buffer.removeAll(keepingCapacity: true) }
-                    return try JSONSerialization.jsonObject(with: buffer) as? [String: Any]
-                }
-                buffer.append(chunk)
-            }
-        }
-    }
-
     public enum Profile: String, Sendable {
         case hermes
         case grok
@@ -198,7 +171,7 @@ public final class ACPHarness: @unchecked Sendable {
                     process.environment = environment
                     try process.run()
                     register(process: process, input: input.fileHandleForWriting, for: sessionID)
-                    let reader = JSONLineReader(output.fileHandleForReading)
+                    let reader = BoundedJSONLineReader(output.fileHandleForReading)
                     try Self.write(Self.initializeRequest(id: 1), to: input.fileHandleForWriting)
                     _ = try Self.readResponse(id: 1, from: reader, input: input.fileHandleForWriting)
 
@@ -440,7 +413,7 @@ public final class ACPHarness: @unchecked Sendable {
         return ["jsonrpc": "2.0", "id": id, "method": method, "params": params]
     }
 
-    private static func readResponse(id: Int, from reader: JSONLineReader, input: FileHandle) throws -> [String: Any] {
+    private static func readResponse(id: Int, from reader: BoundedJSONLineReader, input: FileHandle) throws -> [String: Any] {
         while let object = try reader.next() {
             if object["method"] != nil { try answerNoninteractiveServerRequest(object, to: input); continue }
             if (object["id"] as? NSNumber)?.intValue == id { return object }
@@ -457,7 +430,7 @@ public final class ACPHarness: @unchecked Sendable {
         }
     }
 
-    private func readPromptResponse(id: Int, sessionID: UUID, workspace: URL, from reader: JSONLineReader, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) throws {
+    private func readPromptResponse(id: Int, sessionID: UUID, workspace: URL, from reader: BoundedJSONLineReader, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) throws {
         while let object = try reader.next() {
             if object["method"] as? String == "session/update" {
                 let update = ((object["params"] as? [String: Any])?["update"] as? [String: Any])

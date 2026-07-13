@@ -135,8 +135,9 @@ public final class CodexExecHarness: @unchecked Sendable {
                 do {
                     try process.run()
                     register(process: process, input: input.fileHandleForWriting, for: sessionID)
+                    let reader = BoundedJSONLineReader(output.fileHandleForReading)
                     try Self.write(Self.initializeRequest(id: 1), to: input.fileHandleForWriting)
-                    _ = try readResponse(id: 1, sessionID: sessionID, from: output.fileHandleForReading, input: input.fileHandleForWriting, continuation: continuation)
+                    _ = try readResponse(id: 1, sessionID: sessionID, from: reader, input: input.fileHandleForWriting, continuation: continuation)
                     try Self.write(["method": "initialized", "params": [:]], to: input.fileHandleForWriting)
 
                     let route = Self.executionRoute(policy: policy, workspaceWrite: workspaceWrite)
@@ -152,7 +153,7 @@ public final class CodexExecHarness: @unchecked Sendable {
                     ]
                     if let threadID { threadParams["threadId"] = threadID }
                     try Self.write(["method": method, "id": 2, "params": threadParams], to: input.fileHandleForWriting)
-                    let threadResponse = try readResponse(id: 2, sessionID: sessionID, from: output.fileHandleForReading, input: input.fileHandleForWriting, continuation: continuation)
+                    let threadResponse = try readResponse(id: 2, sessionID: sessionID, from: reader, input: input.fileHandleForWriting, continuation: continuation)
                     guard let result = threadResponse["result"] as? [String: Any],
                           let thread = result["thread"] as? [String: Any],
                           let activeThreadID = thread["id"] as? String else {
@@ -175,14 +176,14 @@ public final class CodexExecHarness: @unchecked Sendable {
                         turnParams["summary"] = "auto"
                     }
                     try Self.write(["method": "turn/start", "id": 3, "params": turnParams], to: input.fileHandleForWriting)
-                    let turnResponse = try readResponse(id: 3, sessionID: sessionID, from: output.fileHandleForReading, input: input.fileHandleForWriting, continuation: continuation)
+                    let turnResponse = try readResponse(id: 3, sessionID: sessionID, from: reader, input: input.fileHandleForWriting, continuation: continuation)
                     guard let turnResult = turnResponse["result"] as? [String: Any],
                           let turn = turnResult["turn"] as? [String: Any],
                           let turnID = turn["id"] as? String else {
                         throw CodexHarnessError.message(Self.responseError(turnResponse, fallback: "Codex did not start the turn."))
                     }
                     setTurnID(turnID, for: sessionID)
-                    let turnReportedCancellation = try readTurn(sessionID: sessionID, workspace: workspace, from: output.fileHandleForReading, input: input.fileHandleForWriting, continuation: continuation)
+                    let turnReportedCancellation = try readTurn(sessionID: sessionID, workspace: workspace, from: reader, input: input.fileHandleForWriting, continuation: continuation)
                     if process.isRunning { process.terminate() }
                     process.waitUntilExit()
                     let didCancel = unregister(sessionID)
@@ -267,11 +268,11 @@ public final class CodexExecHarness: @unchecked Sendable {
     private func readResponse(
         id: Int,
         sessionID: UUID,
-        from output: FileHandle,
+        from reader: BoundedJSONLineReader,
         input: FileHandle,
         continuation: AsyncStream<AgentEvent>.Continuation
     ) throws -> [String: Any] {
-        while let object = try Self.readObject(from: output) {
+        while let object = try reader.next() {
             if object["method"] != nil {
                 if object["id"] != nil {
                     try handleServerRequest(object, sessionID: sessionID, workspace: nil, input: input, continuation: continuation)
@@ -289,11 +290,11 @@ public final class CodexExecHarness: @unchecked Sendable {
     private func readTurn(
         sessionID: UUID,
         workspace: URL,
-        from output: FileHandle,
+        from reader: BoundedJSONLineReader,
         input: FileHandle,
         continuation: AsyncStream<AgentEvent>.Continuation
     ) throws -> Bool {
-        while let object = try Self.readObject(from: output) {
+        while let object = try reader.next() {
             if object["id"] != nil, object["method"] != nil {
                 try handleServerRequest(object, sessionID: sessionID, workspace: workspace, input: input, continuation: continuation)
                 continue
@@ -493,17 +494,6 @@ public final class CodexExecHarness: @unchecked Sendable {
         try handle.write(contentsOf: data)
     }
 
-    private static func readObject(from handle: FileHandle) throws -> [String: Any]? {
-        var data = Data()
-        while true {
-            let byte = try handle.read(upToCount: 1) ?? Data()
-            if byte.isEmpty { return data.isEmpty ? nil : (try JSONSerialization.jsonObject(with: data) as? [String: Any]) }
-            if byte[byte.startIndex] == 0x0A { break }
-            data.append(byte)
-        }
-        return try JSONSerialization.jsonObject(with: data) as? [String: Any]
-    }
-
     fileprivate static func parseModels(_ response: [String: Any]) -> [ProviderModel] {
         guard let result = response["result"] as? [String: Any], let values = result["data"] as? [[String: Any]] else { return [] }
         return values.compactMap { value in
@@ -544,23 +534,32 @@ public final class CodexExecHarness: @unchecked Sendable {
 
 private final class AppServerAccumulator: @unchecked Sendable {
     private let lock = NSLock()
-    private var buffer = Data()
+    private var frameBuffer = BoundedJSONLineBuffer()
+    private var processedInputBytes = 0
     private var models: [ProviderModel] = []
     private var usage: ProviderUsage?
     private var received: Set<Int> = []
+    private var failed = false
 
-    var isComplete: Bool { lock.withLock { received.isSuperset(of: [1, 2]) } }
-    var snapshot: CodexProviderSnapshot { lock.withLock { CodexProviderSnapshot(models: models, usage: usage) } }
+    var isComplete: Bool { lock.withLock { failed || received.isSuperset(of: [1, 2]) } }
+    var snapshot: CodexProviderSnapshot { lock.withLock { failed ? .empty : CodexProviderSnapshot(models: models, usage: usage) } }
 
     func append(_ chunk: Data) {
         lock.withLock {
-            buffer.append(chunk)
-            while let newline = buffer.firstIndex(of: 0x0A) {
-                let line = Data(buffer[..<newline])
-                buffer.removeSubrange(...newline)
-                guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any], let id = object["id"] as? Int else { continue }
-                if id == 1 { models = CodexExecHarness.parseModels(object); received.insert(id) }
-                if id == 2 { usage = CodexExecHarness.parseUsage(object); received.insert(id) }
+            guard !failed, chunk.count >= processedInputBytes else { return }
+            let delta = chunk.dropFirst(processedInputBytes)
+            processedInputBytes = chunk.count
+            do {
+                for object in try frameBuffer.append(Data(delta)) {
+                    guard let id = object["id"] as? Int else { continue }
+                    if id == 1 { models = CodexExecHarness.parseModels(object); received.insert(id) }
+                    if id == 2 { usage = CodexExecHarness.parseUsage(object); received.insert(id) }
+                }
+            } catch {
+                failed = true
+                models.removeAll(keepingCapacity: false)
+                usage = nil
+                received.removeAll(keepingCapacity: false)
             }
         }
     }

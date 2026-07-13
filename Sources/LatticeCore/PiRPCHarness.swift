@@ -100,10 +100,11 @@ public final class PiRPCHarness: @unchecked Sendable {
                     register(process: process, input: input.fileHandleForWriting, for: sessionID)
                     continuation.yield(.harnessSessionStarted("pi:\(piThreadID)"))
                     try Self.write(["id": "prompt", "type": "prompt", "message": prompt], to: input.fileHandleForWriting)
+                    let reader = BoundedJSONLineReader(output.fileHandleForReading)
                     var finished = false
                     while !finished {
-                        guard let line = try Self.readLine(from: output.fileHandleForReading) else { break }
-                        finished = try parse(line, sessionID: sessionID, workspace: canonicalWorkspace, input: input.fileHandleForWriting, continuation: continuation)
+                        guard let object = try reader.next() else { break }
+                        finished = try parse(object, sessionID: sessionID, workspace: canonicalWorkspace, input: input.fileHandleForWriting, continuation: continuation)
                     }
                     if process.isRunning { process.terminate() }
                     process.waitUntilExit()
@@ -140,9 +141,11 @@ public final class PiRPCHarness: @unchecked Sendable {
         return pending?.resolve(optionID: optionID) == true
     }
 
-    private func parse(_ data: Data, sessionID: UUID, workspace: URL, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) throws -> Bool {
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continuation.yield(HarnessToolEventDecoder.malformedEvent(provider: "Pi", byteCount: data.count)); return false }
-        guard let type = object["type"] as? String else { continuation.yield(HarnessToolEventDecoder.diagnostic(provider: "Pi", object: object, reason: "Event is missing type.")); return false }
+    private func parse(_ object: [String: Any], sessionID: UUID, workspace: URL, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) throws -> Bool {
+        guard let type = object["type"] as? String else {
+            continuation.yield(HarnessToolEventDecoder.diagnostic(provider: "Pi", object: object, reason: "Event is missing type."))
+            return false
+        }
         if type == "extension_ui_request" {
             guard object["id"] as? String != nil else { continuation.yield(HarnessToolEventDecoder.diagnostic(provider: "Pi", object: object, reason: "Extension UI request is missing id.")); return false }
             try handleExtensionUIRequest(object, sessionID: sessionID, workspace: workspace, input: input, continuation: continuation)
@@ -294,16 +297,6 @@ public final class PiRPCHarness: @unchecked Sendable {
         var data = try JSONSerialization.data(withJSONObject: object)
         data.append(0x0A)
         try handle.write(contentsOf: data)
-    }
-
-    private static func readLine(from handle: FileHandle) throws -> Data? {
-        var data = Data()
-        while true {
-            let byte = try handle.read(upToCount: 1) ?? Data()
-            if byte.isEmpty { return data.isEmpty ? nil : data }
-            if byte[byte.startIndex] == 0x0A { return data }
-            data.append(byte)
-        }
     }
 
     private static func piThinkingLevel(_ effort: ReasoningEffort) -> String {
