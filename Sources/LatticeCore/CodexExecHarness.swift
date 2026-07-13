@@ -318,15 +318,9 @@ public final class CodexExecHarness: @unchecked Sendable {
             }
             guard let method = object["method"] as? String else { continue }
             if method == "turn/completed" {
-                let turn = (object["params"] as? [String: Any])?["turn"] as? [String: Any]
-                switch turn?["status"] as? String {
-                case "interrupted": continuation.yield(.cancelled)
-                case "failed":
-                    let error = turn?["error"] as? [String: Any]
-                    continuation.yield(.failed(error?["message"] as? String ?? "Codex could not complete the turn."))
-                default: continuation.yield(.completed)
-                }
-                return turn?["status"] as? String == "interrupted"
+                let event = Self.turnCompletionEvent(from: object)
+                continuation.yield(event)
+                return event == .cancelled
             }
             if let event = Self.appServerEvent(from: object, workspace: workspace) { continuation.yield(event) }
         }
@@ -441,23 +435,46 @@ public final class CodexExecHarness: @unchecked Sendable {
         switch type {
         case "commandExecution":
             if completed {
-                return .toolProgress(id: id, fraction: 1, detail: item["status"] as? String == "completed" ? "Completed" : "Failed")
+                return terminalToolProgress(id: id, status: item["status"])
             }
             let command = item["command"] as? String ?? "Command"
             let cwd = item["cwd"] as? String
             return .toolRequested(.init(id: id, kind: .command, title: "Run command", detail: "$ \(command)", workspaceScoped: cwd.map { Self.isWorkspaceScoped($0, workspace: workspace) } ?? false, reversible: false))
         case "fileChange":
             if completed {
-                return .toolProgress(id: id, fraction: 1, detail: item["status"] as? String == "completed" ? "Completed" : "Failed")
+                return terminalToolProgress(id: id, status: item["status"])
             }
             let paths = (item["changes"] as? [[String: Any]] ?? []).compactMap { $0["path"] as? String }
             return .toolRequested(.init(id: id, kind: .write, title: "Change files", detail: paths.isEmpty ? "Workspace files" : paths.joined(separator: ", "), workspaceScoped: paths.allSatisfy { Self.isWorkspaceScoped($0, workspace: workspace) }, reversible: true))
         case "webSearch":
-            if completed { return .toolProgress(id: id, fraction: 1, detail: "Completed") }
+            if completed { return terminalToolProgress(id: id, status: item["status"]) }
             return .toolRequested(.init(id: id, kind: .network, title: "Search the web", detail: item["query"] as? String ?? "", workspaceScoped: false, reversible: true))
         default:
             return nil
         }
+    }
+
+    static func turnCompletionEvent(from object: [String: Any]) -> AgentEvent {
+        let turn = (object["params"] as? [String: Any])?["turn"] as? [String: Any]
+        switch turn?["status"] as? String {
+        case "completed": return .completed
+        case "interrupted": return .cancelled
+        case "failed":
+            let error = turn?["error"] as? [String: Any]
+            return .failed(error?["message"] as? String ?? "Codex could not complete the turn.")
+        default: return .failed("Codex returned malformed turn status.")
+        }
+    }
+
+    private static func terminalToolProgress(id: UUID, status: Any?) -> AgentEvent {
+        let detail: String
+        switch status as? String {
+        case "completed": detail = "Completed"
+        case "failed": detail = "Failed"
+        case "cancelled", "canceled", "interrupted", "declined": detail = "Cancelled"
+        default: detail = "Failed"
+        }
+        return .toolProgress(id: id, fraction: 1, detail: detail)
     }
 
     private static func approvalOptions(_ decisions: [String]) -> [ApprovalOption] {

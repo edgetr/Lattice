@@ -4587,7 +4587,7 @@ Lattice self-edit rules:
                 workspaceScoped: request.workspaceScoped
             ), at: index)
         case .toolProgress(let toolID, _, let detail):
-            updateSessionAction(id: toolID, status: detail == "Failed" ? .failed : (detail == "Completed" ? .completed : .running), at: index)
+            updateSessionAction(id: toolID, status: detail == "Failed" ? .failed : (detail == "Cancelled" ? .cancelled : (detail == "Completed" ? .completed : .running)), at: index)
         case .permissionRequested(let request):
             let harnessID = effectiveHarnessID(for: sessions[index])
             let notice = HarnessPermissionNotice(

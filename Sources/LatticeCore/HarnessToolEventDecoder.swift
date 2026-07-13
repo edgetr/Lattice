@@ -21,8 +21,10 @@ public enum HarnessToolEventDecoder {
         case "tool_execution_update":
             return .toolProgress(id: id, fraction: 0.5, detail: "Running")
         case "tool_execution_end":
-            let failed = object["isError"] as? Bool == true
-            return .toolProgress(id: id, fraction: 1, detail: failed ? "Failed" : "Completed")
+            guard let isError = object["isError"] as? Bool else {
+                return .toolProgress(id: id, fraction: 1, detail: "Failed")
+            }
+            return .toolProgress(id: id, fraction: 1, detail: isError ? "Failed" : "Completed")
         default:
             return nil
         }
@@ -63,8 +65,16 @@ public enum HarnessToolEventDecoder {
                 reversible: false
             ))
         case "tool_call_update":
-            let failed = update["status"] as? String == "failed"
-            return .toolProgress(id: id, fraction: 1, detail: failed ? "Failed" : "Completed")
+            let fraction: Double
+            let detail: String
+            switch update["status"] as? String {
+            case "pending", "in_progress": (fraction, detail) = (0.5, "Running")
+            case "completed": (fraction, detail) = (1, "Completed")
+            case "failed": (fraction, detail) = (1, "Failed")
+            case "cancelled", "canceled": (fraction, detail) = (1, "Cancelled")
+            default: (fraction, detail) = (1, "Failed")
+            }
+            return .toolProgress(id: id, fraction: fraction, detail: detail)
         default:
             return nil
         }
