@@ -124,21 +124,15 @@ public final class AntigravityCLIHarness: @unchecked Sendable {
     }
 
     private static func run(_ executableURL: URL, arguments: [String]) async -> (status: Int32, output: Data) {
-        await Task.detached {
-            let process = Process()
-            let pipe = Pipe()
-            process.executableURL = executableURL
-            process.arguments = arguments
-            process.standardOutput = pipe
-            process.standardError = pipe
-            do {
-                try process.run()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                return (process.terminationStatus, data)
-            } catch {
-                return (-1, Data(error.localizedDescription.utf8))
-            }
-        }.value
+        let result = await BoundedSubprocess.run(.init(
+            executableURL: executableURL,
+            arguments: arguments,
+            deadline: 30,
+            maximumOutputBytes: BoundedSubprocessRequest.defaultMaximumOutputBytes
+        ))
+        let output = result.combinedOutput.isEmpty
+            ? Data((result.launchErrorDescription ?? "").utf8)
+            : result.combinedOutput
+        return (result.isSuccess ? 0 : (result.exitStatus ?? -1), output)
     }
 }

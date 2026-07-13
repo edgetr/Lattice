@@ -60,7 +60,9 @@ struct ConversationView: View {
                                                 .id(notice.id)
                                         }
                                         if let error = state.visibleErrorMessage(for: session.id) {
-                                            ErrorRow(message: error)
+                                            ErrorRow(message: error, canRetry: state.canRetrySelectedSession) {
+                                                state.retrySelectedSession()
+                                            }
                                                 .id("lattice.conversation.error.\(session.id.uuidString)")
                                         }
                                         // Stable bottom sentinel for every tail row type (messages, follow-ups, previews, permission, error).
@@ -478,6 +480,9 @@ struct ComposerView: View {
         VStack(spacing: state.composerSpacing()) {
             HStack(spacing: 10) {
                 BackendMenu(state: state)
+                if state.availableExecutionRoutes.count > 1 {
+                    HarnessMenu(state: state)
+                }
                 if let routeStatus = state.activeRouteStatusText {
                     Label(routeStatus, systemImage: "exclamationmark.triangle.fill")
                         .font(.caption)
@@ -705,6 +710,41 @@ struct ReasoningMenu: View {
             Label(state.activeReasoningEffort?.displayName ?? "Reasoning", systemImage: "brain")
         }
         .menuStyle(.borderlessButton).fixedSize().help("Reasoning effort")
+    }
+}
+
+struct HarnessMenu: View {
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        Group {
+            if state.isSelectedSessionRouteLocked {
+                Label(state.activeHarnessID.capitalized, systemImage: "lock.fill")
+                    .foregroundStyle(.secondary)
+                    .help("Start a new chat to switch execution harness")
+            } else {
+                Menu {
+                    ForEach(state.availableExecutionRoutes) { route in
+                        Button {
+                            state.setExecutionRoute(engineID: route.engineID, harnessID: route.harnessID)
+                        } label: {
+                            if state.activeHarnessID == route.harnessID {
+                                Label(route.title, systemImage: "checkmark")
+                            } else {
+                                Text(route.title)
+                            }
+                        }
+                    }
+                } label: {
+                    Label(state.activeHarnessID.capitalized, systemImage: "arrow.triangle.branch")
+                }
+                .menuStyle(.borderlessButton)
+                .help("Choose the execution harness for this model")
+                .accessibilityLabel("Execution harness")
+                .accessibilityValue(state.activeHarnessID)
+            }
+        }
+        .fixedSize()
     }
 }
 
@@ -1160,6 +1200,8 @@ struct HarnessPermissionNoticeRow: View {
 
 struct ErrorRow: View {
     let message: String
+    let canRetry: Bool
+    let onRetry: () -> Void
 
     private var presentation: ConversationErrorPresentation {
         ConversationErrorPresentationPolicy.presentation(for: message)
@@ -1185,12 +1227,17 @@ struct ErrorRow: View {
                 }
             }
             Spacer(minLength: 0)
+            if canRetry {
+                Button("Retry", action: onRetry)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .accessibilityLabel("Retry request")
+            }
         }
         .padding(12)
         .latticeGlass(cornerRadius: 12, tint: .red.opacity(0.08))
         .accessibilityElement(children: .combine)
         .accessibilityLabel(presentation.accessibilityLabel)
         .accessibilityValue(presentation.accessibilityValue ?? presentation.headline)
-        // No retry — errors remain informational; recovery stays with existing session/composer flows.
     }
 }

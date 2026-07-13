@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 private enum CodexHarnessError: LocalizedError {
     case message(String)
@@ -59,22 +60,12 @@ public final class CodexExecHarness: @unchecked Sendable {
 
     public func isAuthenticated() async -> Bool {
         guard let executableURL else { return false }
-        return await Task.detached {
-            let process = Process(); process.executableURL = executableURL
-            process.arguments = ["login", "-c", "service_tier=\"flex\"", "status"]
-            process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
-            do { try process.run(); process.waitUntilExit(); return process.terminationStatus == 0 } catch { return false }
-        }.value
+        return (await Self.run(executableURL, arguments: ["login", "-c", "service_tier=\"flex\"", "status"], discardOutput: true)).status == 0
     }
 
     public func login() async -> Bool {
         guard let executableURL else { return false }
-        return await Task.detached {
-            let process = Process(); process.executableURL = executableURL
-            process.arguments = ["login", "-c", "service_tier=\"flex\""]
-            process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
-            do { try process.run(); process.waitUntilExit(); return process.terminationStatus == 0 } catch { return false }
-        }.value
+        return (await Self.run(executableURL, arguments: ["login", "-c", "service_tier=\"flex\""], discardOutput: true)).status == 0
     }
 
     public func updateCLI() async -> Bool {
@@ -116,16 +107,20 @@ public final class CodexExecHarness: @unchecked Sendable {
                     data.append(0x0A)
                     try input.fileHandleForWriting.write(contentsOf: data)
                 }
-                let accumulator = AppServerAccumulator()
+                let accumulator = AppServerAccumulator(maximumBytes: BoundedSubprocessRequest.defaultMaximumOutputBytes)
                 output.fileHandleForReading.readabilityHandler = { handle in
                     let chunk = handle.availableData
                     if chunk.isEmpty { return }
                     accumulator.append(chunk)
                 }
                 let deadline = Date().addingTimeInterval(6)
-                while !accumulator.isComplete && Date() < deadline { try? await Task.sleep(nanoseconds: 50_000_000) }
+                while !accumulator.isComplete && !accumulator.isOverLimit && Date() < deadline { try? await Task.sleep(nanoseconds: 50_000_000) }
                 output.fileHandleForReading.readabilityHandler = nil
-                if process.isRunning { process.terminate() }
+                if process.isRunning {
+                    process.terminate()
+                    if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+                }
+                process.waitUntilExit()
                 try? input.fileHandleForWriting.close()
                 return accumulator.snapshot
             } catch {
@@ -528,37 +523,34 @@ public final class CodexExecHarness: @unchecked Sendable {
     }
 
     private static func run(_ executable: URL, arguments: [String], discardOutput: Bool = false) async -> (status: Int32, output: Data) {
-        await Task.detached {
-            let process = Process()
-            let pipe = Pipe()
-            process.executableURL = executable
-            process.arguments = arguments
-            process.standardOutput = discardOutput ? FileHandle.nullDevice : pipe
-            process.standardError = discardOutput ? FileHandle.nullDevice : pipe
-            do {
-                try process.run()
-                let data = discardOutput ? Data() : pipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                return (process.terminationStatus, data)
-            } catch {
-                return (-1, Data())
-            }
-        }.value
+        let result = await BoundedSubprocess.run(.init(
+            executableURL: executable,
+            arguments: arguments,
+            deadline: 30,
+            maximumOutputBytes: BoundedSubprocessRequest.defaultMaximumOutputBytes
+        ))
+        return (result.isSuccess ? 0 : (result.exitStatus ?? -1), discardOutput ? Data() : result.combinedOutput)
     }
 }
 
 private final class AppServerAccumulator: @unchecked Sendable {
     private let lock = NSLock()
+    private let maximumBytes: Int
     private var buffer = Data()
+    private var observedBytes = 0
     private var models: [ProviderModel] = []
     private var usage: ProviderUsage?
     private var received: Set<Int> = []
 
+    init(maximumBytes: Int) { self.maximumBytes = maximumBytes }
     var isComplete: Bool { lock.withLock { received.isSuperset(of: [1, 2]) } }
+    var isOverLimit: Bool { lock.withLock { observedBytes > maximumBytes } }
     var snapshot: CodexProviderSnapshot { lock.withLock { CodexProviderSnapshot(models: models, usage: usage) } }
 
     func append(_ chunk: Data) {
         lock.withLock {
+            observedBytes += chunk.count
+            guard observedBytes <= maximumBytes else { return }
             buffer.append(chunk)
             while let newline = buffer.firstIndex(of: 0x0A) {
                 let line = Data(buffer[..<newline])

@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 public struct HarnessModel: Hashable, Sendable {
     public let id: String
@@ -13,6 +14,7 @@ public struct HarnessModel: Hashable, Sendable {
 public final class ACPHarness: @unchecked Sendable {
     private final class JSONLineReader {
         private let handle: FileHandle
+        private let maximumBufferedBytes = BoundedSubprocessRequest.defaultMaximumOutputBytes
         private var buffer = Data()
 
         init(_ handle: FileHandle) {
@@ -32,6 +34,9 @@ public final class ACPHarness: @unchecked Sendable {
                     guard !buffer.isEmpty else { return nil }
                     defer { buffer.removeAll(keepingCapacity: true) }
                     return try JSONSerialization.jsonObject(with: buffer) as? [String: Any]
+                }
+                guard buffer.count + chunk.count <= maximumBufferedBytes else {
+                    throw HarnessError.message("\(self) protocol output exceeded the safety limit.")
                 }
                 buffer.append(chunk)
             }
@@ -157,6 +162,16 @@ public final class ACPHarness: @unchecked Sendable {
                 var environment = ProcessInfo.processInfo.environment
                 environment["TMPDIR"] = scratchDirectory.path + "/"
                 process.environment = environment
+                let timeout = DispatchSource.makeTimerSource(queue: .global(qos: .userInitiated))
+                timeout.schedule(deadline: .now() + 30)
+                timeout.setEventHandler { [weak process] in
+                    if let process, process.isRunning {
+                        process.terminate()
+                        if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+                    }
+                }
+                timeout.resume()
+                defer { timeout.cancel() }
                 try process.run()
                 let reader = JSONLineReader(output.fileHandleForReading)
                 try Self.write(Self.initializeRequest(id: 1), to: input.fileHandleForWriting)

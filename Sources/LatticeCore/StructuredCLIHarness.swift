@@ -84,18 +84,13 @@ public final class StructuredCLIHarness: @unchecked Sendable {
     }
 
     private static func run(_ executable: URL, arguments: [String], discardOutput: Bool = false) async -> (status: Int32, output: Data) {
-        await Task.detached {
-            let process = Process(); let pipe = Pipe()
-            process.executableURL = executable; process.arguments = arguments
-            process.standardOutput = discardOutput ? FileHandle.nullDevice : pipe
-            process.standardError = discardOutput ? FileHandle.nullDevice : pipe
-            do {
-                try process.run()
-                let data = discardOutput ? Data() : pipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                return (process.terminationStatus, data)
-            } catch { return (-1, Data()) }
-        }.value
+        let result = await BoundedSubprocess.run(.init(
+            executableURL: executable,
+            arguments: arguments,
+            deadline: 30,
+            maximumOutputBytes: BoundedSubprocessRequest.defaultMaximumOutputBytes
+        ))
+        return (result.isSuccess ? 0 : (result.exitStatus ?? -1), discardOutput ? Data() : result.combinedOutput)
     }
 
     private static func parseGrokModels(_ data: Data) -> [ProviderModel] {

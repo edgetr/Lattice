@@ -516,6 +516,13 @@ struct SessionPortableArchiveTests {
         #expect(decoded[0].attachments.allSatisfy { $0.isMissing == false })
     }
 
+    @Test func importerRejectsHarnessRouteMismatch() throws {
+        let archive = #"{"format":"lattice.session.archive","version":1,"exportedAt":"2024-01-01T00:00:00Z","includeQueuedFollowUps":false,"chat":{"title":"Mismatch","backendRoute":"codex","backendModel":"gpt-5.5","harnessID":"hermes","policy":"Ask","privacyMode":"cloudAllowed","messages":[],"attachments":[],"actions":[],"queuedFollowUps":[]}}"#.data(using: .utf8)!
+        #expect(throws: SessionPortableArchive.ArchiveError.invalidEnum(field: "chat.harnessID", value: "hermes")) {
+            _ = try SessionPortableArchiveImporter.prepareImport(data: archive, existingSessions: [])
+        }
+    }
+
     private func jsonString(_ value: String) -> String {
         let data = try! JSONSerialization.data(withJSONObject: value, options: .fragmentsAllowed)
         return String(data: data, encoding: .utf8)!

@@ -87,6 +87,13 @@ struct HarnessPermissionNotice: Identifiable {
     let request: ApprovalRequest
 }
 
+struct ExecutionRouteOption: Identifiable, Equatable {
+    let engineID: String
+    let harnessID: String
+    let title: String
+    var id: String { "\(engineID):\(harnessID)" }
+}
+
 private struct PreparedSubmission {
     let userText: String
     let runText: String
@@ -163,8 +170,8 @@ final class AppState: ObservableObject {
     @Published var defaultBackend: ChatBackend
     @Published var ollamaModels: [OllamaModel] = []
     @Published var composerState: MorphingControlState = .expanded
-    @Published var activeComposerState: MorphingControlState?
-    @Published var activeComposerStateSessionID: UUID?
+    /// Run-specific composer state. A background chat must not overwrite the selected chat's controls.
+    @Published private var activeComposerStates: [UUID: MorphingControlState] = [:]
     @Published var overlayControlState: MorphingControlState = .expanded
     @Published var columnVisibility: NavigationSplitViewVisibility = .all
     /// Last measured conversations workspace width; used only for split-column adaptation.
@@ -278,6 +285,7 @@ final class AppState: ObservableObject {
     private var extensionDirectoryFileDescriptor: CInt = -1
     private var cancellables: Set<AnyCancellable> = []
     private var submittedRequests: [UUID: String] = [:]
+    private var retryableRequests: [UUID: String] = [:]
     private var selfEditRunIDs: Set<UUID> = []
     private var activeRunIDs: [UUID: UUID] = [:]
     /// Suppresses draft→session write-back while loading a session's draft into the composer.
@@ -474,6 +482,25 @@ final class AppState: ObservableObject {
     var activeBackend: ChatBackend { selectedSession?.backend ?? defaultBackend }
     var activePrivacyMode: SessionPrivacyMode { selectedSession?.privacyMode ?? privacyMode }
     var activeHarnessID: String { selectedSession.map(effectiveHarnessID(for:)) ?? selectedRouteHarnessID }
+    var availableExecutionRoutes: [ExecutionRouteOption] {
+        let engineID = selectedSession.map { Self.engineID(for: $0.backend) } ?? selectedRouteEngineID
+        return ExecutionRoutePolicy.compatibleHarnessIDs(for: engineID)
+            .sorted()
+            .filter { isRouteHarnessCompatible(engineID: engineID, harnessID: $0) }
+            .compactMap { harnessID in
+                let title: String
+                switch harnessID {
+                case "codex": title = "Codex"
+                case "opencode": title = "OpenCode"
+                case "grok": title = "Grok"
+                case "antigravity": title = "Antigravity"
+                case "pi": title = "Pi"
+                case "hermes": title = "Hermes"
+                default: title = "Lattice"
+                }
+                return ExecutionRouteOption(engineID: engineID, harnessID: harnessID, title: title)
+            }
+    }
     var activeReasoningOptions: [ReasoningOption] { reasoningOptions(for: activeBackend, harnessID: activeHarnessID) }
     var activeReasoningEffort: ReasoningEffort? { selectedSession?.reasoningEffort ?? defaultReasoning(for: activeBackend, harnessID: activeHarnessID) }
     var isSelectedSessionRouteLocked: Bool {
@@ -487,6 +514,8 @@ final class AppState: ObservableObject {
     var visibleGrokModels: [ProviderModel] { grokModels.filter { isModelEnabled("grok:\($0.id)") } }
     var visibleOpenCodeModels: [ProviderModel] { openCodeModels.filter { isModelEnabled("opencode:\($0.id)") } }
     var visibleAntigravityModels: [ProviderModel] { antigravityModels.filter { isModelEnabled("antigravity:\($0.id)") } }
+    var codexCatalogReady: Bool { codexReady && !codexModels.isEmpty }
+    var antigravityCatalogReady: Bool { antigravityAuthenticated && !visibleAntigravityModels.isEmpty }
 
     func setProviderModelsExpanded(_ providerID: String, expanded: Bool) {
         if expanded { expandedProviderModelIDs.insert(providerID) }
@@ -540,6 +569,24 @@ final class AppState: ObservableObject {
               LatticeContinuationPolicy.canContinue(session) else { return false }
         return canRunSession(session)
     }
+    var canRetrySelectedSession: Bool {
+        guard let session = selectedSession, !session.isStreaming, retryableRequests[session.id] != nil else { return false }
+        return canRunSession(session)
+    }
+    func retrySelectedSession() {
+        guard let id = selectedSessionID,
+              let index = sessions.firstIndex(where: { $0.id == id }),
+              !sessions[index].isStreaming,
+              let request = retryableRequests[id] else { return }
+        guard canRunSession(sessions[index]) else {
+            setError(routeUnavailableMessage(for: sessions[index]) ?? "Choose a connected model.", sessionID: id)
+            return
+        }
+        sessions[index].messages.append(.init(role: .assistant, text: ""))
+        submittedRequests[id] = request
+        retryableRequests[id] = nil
+        startRun(for: id, at: index, submittedText: request)
+    }
     var canDeleteSelectedSession: Bool {
         guard let session = selectedSession else { return false }
         return !session.isStreaming
@@ -557,17 +604,11 @@ final class AppState: ObservableObject {
         activitySessionID == sessionID ? activity : []
     }
     func visibleComposerState(for sessionID: UUID) -> MorphingControlState {
-        if activeComposerStateSessionID == sessionID, let activeComposerState {
-            return activeComposerState
-        }
-        return composerState
+        activeComposerStates[sessionID] ?? (selectedSessionID == sessionID ? composerState : .expanded)
     }
     func setVisibleComposerState(_ state: MorphingControlState, for sessionID: UUID?) {
-        if let sessionID, activeComposerStateSessionID == sessionID {
-            activeComposerState = state
-        } else {
-            composerState = state
-        }
+        if let sessionID { activeComposerStates[sessionID] = state }
+        else { composerState = state }
     }
 
     func contextBudgetEstimate(for session: LatticeSession) -> LatticeContextBudgetEstimate {
@@ -906,6 +947,34 @@ final class AppState: ObservableObject {
         persist()
     }
 
+    var canStartLocalOnlyChat: Bool {
+        appleIntelligenceReady || (ollamaReady && !ollamaModels.isEmpty)
+    }
+
+    func startLocalOnlyChatFromSelected() {
+        guard canStartLocalOnlyChat else {
+            setError("Local-only mode needs Apple Intelligence or a running Ollama model. Open Connections to make one available.", sessionID: selectedSessionID)
+            return
+        }
+        let backend = localBackendFallback()
+        let harnessID = Self.defaultHarnessID(for: backend)
+        let source = selectedSession
+        let session = LatticeSession(
+            title: "New local chat",
+            backend: backend,
+            harnessID: harnessID,
+            reasoningEffort: defaultReasoning(for: backend, harnessID: harnessID),
+            workspacePath: source?.workspacePath ?? selectedWorkspacePath,
+            policy: source?.policy ?? policy,
+            privacyMode: .localOnly
+        )
+        sessions.insert(session, at: 0)
+        selectedSessionID = session.id
+        selectedSection = .conversations
+        clearError()
+        persist()
+    }
+
     func useBackendInChat(_ backend: ChatBackend) {
         guard canUseBackendInNewChat(backend) else {
             let message = backendUnavailableMessage(for: backend) ?? "Choose a connected model."
@@ -944,6 +1013,8 @@ final class AppState: ObservableObject {
             selfEditPreviews = updated
         }
         sessions.removeAll { $0.id == id }
+        submittedRequests[id] = nil
+        retryableRequests[id] = nil
         clearConversationScrollState(for: id)
         selectedSessionID = LatticeSessionListOrdering.sorted(sessions).first?.id
         persist()
@@ -1424,6 +1495,7 @@ final class AppState: ObservableObject {
         sessions[index].messages.append(.init(role: .user, text: submission.userText))
         sessions[index].messages.append(.init(role: .assistant, text: ""))
         submittedRequests[id] = submission.runText
+        retryableRequests[id] = nil
         startRun(for: id, at: index, submittedText: submission.runText)
         return true
     }
@@ -1465,6 +1537,7 @@ final class AppState: ObservableObject {
         preservedComposerDraftBeforeEdit = ""
         draft = MessageEditDraftState.complete(existing)
         submittedRequests[id] = submission.runText
+        retryableRequests[id] = nil
         startRun(for: id, at: index, submittedText: submission.runText)
     }
 
@@ -1536,11 +1609,13 @@ final class AppState: ObservableObject {
     private func startRun(for id: UUID, at index: Int, submittedText: String) {
         sessions[index].isStreaming = true
         sessions[index].lastUpdated = .now
-        clearError()
-        clearActivity()
-        overlayMode = .running
+        if selectedSessionID == id {
+            clearError()
+            clearActivity()
+            overlayMode = .running
+        }
         setActiveComposerState(.progress(0.1), sessionID: id)
-        overlayControlState = .progress(0.1)
+        if selectedSessionID == id { overlayControlState = .progress(0.1) }
         persist()
 
         let session = sessions[index]
@@ -1649,7 +1724,7 @@ final class AppState: ObservableObject {
         if harnessID == "hermes" { return hermesInstalled && hermesMatch(for: backend) != nil }
         switch backend {
         case .codex(let model):
-            return codexReady && (codexModels.isEmpty || codexModels.contains(where: { $0.id == model }))
+            return codexReady && codexModels.contains(where: { $0.id == model })
         case .grok(let model):
             return grokReady && ACPHarness.bestMatch(for: model, in: grokACPModels) != nil
         case .openCode(let model):
@@ -1707,7 +1782,7 @@ final class AppState: ObservableObject {
         if harnessID == "hermes" { return hermesInstalled && hermesMatch(for: backend) != nil }
         switch backend {
         case .codex(let model):
-            return codexReady && (codexModels.isEmpty || codexModels.contains(where: { $0.id == model }))
+            return codexReady && codexModels.contains(where: { $0.id == model })
         case .grok(let model):
             return grokReady && ACPHarness.bestMatch(for: model, in: grokACPModels) != nil
         case .openCode(let model):
@@ -1737,7 +1812,8 @@ final class AppState: ObservableObject {
         case .codex(let model):
             if !codex.isInstalled { return "Codex is not installed." }
             if !codexReady { return "Codex sign-in is required before this chat can continue." }
-            if !codexModels.isEmpty, !codexModels.contains(where: { $0.id == model }) {
+            if codexModels.isEmpty { return "Codex has not reported a model catalog. Refresh Connections before continuing." }
+            if !codexModels.contains(where: { $0.id == model }) {
                 return "Codex no longer exposes \(model). Start a new chat to choose another model."
             }
         case .grok(let model):
@@ -1760,6 +1836,7 @@ final class AppState: ObservableObject {
         case .antigravity(let model):
             if !antigravityInstalled { return "Antigravity CLI is not installed." }
             if !antigravityAuthenticated { return "Sign in to Antigravity before this chat can continue." }
+            if visibleAntigravityModels.isEmpty { return "Antigravity has not reported a model catalog. Refresh Connections before continuing." }
             if !visibleAntigravityModels.contains(where: { $0.id == model }) {
                 return "Antigravity no longer exposes \(model). Start a new chat to choose another model."
             }
@@ -1776,6 +1853,7 @@ final class AppState: ObservableObject {
     func stop(sessionID id: UUID) {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
         let session = sessions[index]
+        if let request = submittedRequests[id] { retryableRequests[id] = request }
         activeRunIDs[id] = nil
         finishPendingActions(status: .cancelled, at: index)
         sessions[index].isStreaming = false
@@ -1785,7 +1863,7 @@ final class AppState: ObservableObject {
         if selectedSessionID == id {
             clearActivity()
             overlayMode = .result
-            clearActiveComposerState()
+            clearActiveComposerState(for: id)
             composerState = .expanded
             overlayControlState = .expanded
         }
@@ -4630,12 +4708,18 @@ Lattice self-edit rules:
             activeRunIDs[id] = nil
             harnessPermissionNotices[id] = nil
             finishCompletedTurnActions(at: index)
-            sessions[index].isStreaming = false; clearActivity(); clearActiveComposerState(); overlayMode = .result; composerState = .expanded; overlayControlState = .expanded
+            sessions[index].isStreaming = false
+            if selectedSessionID == id {
+                clearActivity(); clearActiveComposerState(for: id); overlayMode = .result; composerState = .expanded; overlayControlState = .expanded
+            } else {
+                clearActiveComposerState(for: id)
+            }
             let request = submittedRequests[id]
             if selfEditRunIDs.remove(id) != nil {
                 _ = prepareGeneratedExtensionPreview(at: index, request: request)
             }
             submittedRequests[id] = nil
+            retryableRequests[id] = nil
             if runNextQueuedFollowUpIfPossible(for: id) { return }
             persist()
             scheduleIdleUnloadIfNeeded(for: backend)
@@ -4644,17 +4728,30 @@ Lattice self-edit rules:
             harnessPermissionNotices[id] = nil
             selfEditRunIDs.remove(id)
             finishPendingActions(status: .cancelled, at: index)
-            sessions[index].isStreaming = false; clearActivity(); clearActiveComposerState(); overlayMode = .result; composerState = .expanded; overlayControlState = .expanded; persist()
+            sessions[index].isStreaming = false
+            if selectedSessionID == id {
+                clearActivity(); clearActiveComposerState(for: id); overlayMode = .result; composerState = .expanded; overlayControlState = .expanded
+            } else {
+                clearActiveComposerState(for: id)
+            }
+            if let request = submittedRequests[id] { retryableRequests[id] = request }
+            submittedRequests[id] = nil
+            persist()
             scheduleIdleUnloadIfNeeded(for: backend)
         case .failed(let message):
             activeRunIDs[id] = nil
             harnessPermissionNotices[id] = nil
             selfEditRunIDs.remove(id)
+            if let request = submittedRequests[id] { retryableRequests[id] = request }
             submittedRequests[id] = nil
             finishPendingActions(status: .failed, at: index)
-            sessions[index].isStreaming = false; clearActivity(); clearActiveComposerState(); setError(message, sessionID: id)
+            sessions[index].isStreaming = false
+            clearActiveComposerState(for: id)
+            if selectedSessionID == id { clearActivity() }
+            setError(message, sessionID: id)
             if sessions[index].messages.last?.text.isEmpty == true { sessions[index].messages.removeLast() }
-            overlayMode = .prompt; composerState = .expanded; overlayControlState = .expanded; persist()
+            if selectedSessionID == id { overlayMode = .prompt; composerState = .expanded; overlayControlState = .expanded }
+            persist()
             scheduleIdleUnloadIfNeeded(for: backend)
         }
     }
@@ -4971,6 +5068,7 @@ Lattice self-edit rules:
     }
 
     private func setActivity(_ items: [ActivityItem], sessionID: UUID) {
+        guard selectedSessionID == sessionID else { return }
         activity = items
         activitySessionID = sessionID
     }
@@ -4988,13 +5086,12 @@ Lattice self-edit rules:
     }
 
     private func setActiveComposerState(_ state: MorphingControlState, sessionID: UUID) {
-        activeComposerState = state
-        activeComposerStateSessionID = sessionID
+        activeComposerStates[sessionID] = state
     }
 
-    private func clearActiveComposerState() {
-        activeComposerState = nil
-        activeComposerStateSessionID = nil
+    private func clearActiveComposerState(for sessionID: UUID? = nil) {
+        if let sessionID { activeComposerStates[sessionID] = nil }
+        else { activeComposerStates.removeAll() }
     }
 
     private func setError(_ message: String, sessionID: UUID? = nil) {
