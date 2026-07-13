@@ -744,11 +744,13 @@ struct ProjectsView: View {
                             .accessibilityLabel("Streaming")
                     }
                     Spacer(minLength: 4)
-                    Text(session.backend.displayName)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
                 }
+
+                Text(session.backend.displayName)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
                 Text(activityDetail(for: session))
                     .font(.caption)
@@ -760,7 +762,7 @@ struct ProjectsView: View {
             .background(Color.primary.opacity(colorScheme == .dark ? 0.08 : 0.04), in: RoundedRectangle(cornerRadius: LatticeMetrics.compactRadius, style: .continuous))
             .accessibilityElement(children: .combine)
             .accessibilityLabel("Current activity for \(session.title)")
-            .accessibilityValue(activityDetail(for: session))
+            .accessibilityValue("\(session.backend.displayName) · \(activityDetail(for: session))")
         }
     }
 
