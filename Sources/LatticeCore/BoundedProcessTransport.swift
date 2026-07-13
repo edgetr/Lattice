@@ -269,20 +269,19 @@ public final class BoundedProcessTransport: @unchecked Sendable {
     }
 
     private func readChunkFromPipe(maxLength: Int) throws -> Data? {
-        do {
-            // `read(upToCount:)` may wait for the requested byte count while an
-            // interactive child remains alive. `availableData` returns as soon as
-            // the pipe has bytes, which is required for request/response protocols.
-            // A pipe read is kernel-bounded; the aggregate cap is enforced below.
-            _ = maxLength
-            let data = output.availableData
-            if data.isEmpty { return nil }
-            try recordOutput(data.count)
-            return data
-        } catch let error as BoundedProcessTransportError {
-            throw error
-        } catch {
-            throw BoundedProcessTransportError.readFailed(error.localizedDescription)
+        var buffer = Data(count: max(1, maxLength))
+        while true {
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.read(output.fileDescriptor, bytes.baseAddress, bytes.count)
+            }
+            if count > 0 {
+                buffer.removeSubrange(count..<buffer.count)
+                try recordOutput(count)
+                return buffer
+            }
+            if count == 0 { return nil }
+            if errno == EINTR { continue }
+            throw BoundedProcessTransportError.readFailed(String(cString: strerror(errno)))
         }
     }
 

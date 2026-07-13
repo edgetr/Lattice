@@ -14,7 +14,7 @@ public enum AutomaticPermissionResolutionPolicy {
     ) -> AutomaticPermissionResolution {
         switch decision {
         case .deny(let reason):
-            guard let option = options.first(where: \.isReject) else {
+            guard let option = options.first(where: { $0.kind == "reject_once" }) else {
                 return .denyFailClosed(reason: reason)
             }
             return .forward(optionID: option.id, allowed: false)

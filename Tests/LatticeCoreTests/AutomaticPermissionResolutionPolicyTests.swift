@@ -21,6 +21,14 @@ import Testing
         ) == .forward(optionID: "reject", allowed: false))
     }
 
+    @Test func automaticDenialNeverChoosesPersistentReject() {
+        #expect(AutomaticPermissionResolutionPolicy.resolve(
+            decision: .deny(reason: "Credentials stay blocked."),
+            policy: .smart,
+            options: [ApprovalOption(id: "always", name: "Always deny", kind: "reject_always")]
+        ) == .denyFailClosed(reason: "Credentials stay blocked."))
+    }
+
     @Test func automaticAllowRequiresAllowOnce() {
         #expect(AutomaticPermissionResolutionPolicy.resolve(
             decision: .allow(reason: "Safe workspace read."),

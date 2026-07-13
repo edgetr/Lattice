@@ -161,6 +161,7 @@ public final class ACPHarness: @unchecked Sendable {
             let start = processRegistry.beginStart(for: sessionID)
             let task = Task.detached(priority: .userInitiated) { [self] in
                 guard let executableURL else {
+                    _ = processRegistry.abandonStart(start, sessionID: sessionID)
                     continuation.yield(.failed("\(profile.displayName) is not installed.")); continuation.finish(); return
                 }
                 let scratchDirectory = scratchDirectory(for: sessionID)
@@ -270,6 +271,10 @@ public final class ACPHarness: @unchecked Sendable {
                         }
                     }
 
+                    // Registry-only metadata enables graceful protocol cancellation.
+                    // Durable AppState persistence remains gated on the started event below.
+                    setACPSessionID(acpID, owner: registeredOwner, for: sessionID)
+
                     sessionRequestID += 1
                     let promptText: String
                     if didRecover {
@@ -282,7 +287,6 @@ public final class ACPHarness: @unchecked Sendable {
                     }
                     try Self.write(["jsonrpc": "2.0", "id": sessionRequestID, "method": "session/prompt", "params": ["sessionId": acpID, "prompt": [["type": "text", "text": promptText]]]], to: runningTransport)
                     try await readPromptResponse(id: sessionRequestID, sessionID: sessionID, owner: registeredOwner, workspace: canonicalWorkspace, allowFileModification: allowFileModification, from: reader, transport: runningTransport, continuation: continuation)
-                    setACPSessionID(acpID, owner: registeredOwner, for: sessionID)
                     continuation.yield(.harnessSessionStarted("\(profile.sessionPrefix)\(acpID)"))
                     runningTransport.finish()
                     let didCancel = unregister(registeredOwner, start: start, sessionID: sessionID)

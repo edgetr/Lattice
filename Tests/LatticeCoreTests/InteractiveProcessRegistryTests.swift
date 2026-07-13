@@ -38,6 +38,27 @@ struct InteractiveProcessRegistryTests {
         #expect(registry.abandonStart(start, sessionID: sessionID) == false)
     }
 
+    @Test func abandonedStartDoesNotLeakIntoLaterCancellation() {
+        let registry = InteractiveProcessRegistry()
+        let sessionID = UUID()
+        let abandoned = registry.beginStart(for: sessionID)
+        #expect(!registry.abandonStart(abandoned, sessionID: sessionID))
+        _ = registry.cancel(sessionID: sessionID)
+
+        let next = registry.beginStart(for: sessionID)
+        let result = registry.register(
+            process: BoundedProcessTransport(request: request),
+            input: nil,
+            for: sessionID,
+            start: next
+        )
+        guard case .accepted(let owner) = result else {
+            Issue.record("A later start must not inherit cancellation from an abandoned run")
+            return
+        }
+        #expect(!registry.unregister(owner, sessionID: sessionID).wasCancelled)
+    }
+
     @Test func cancelOldThenImmediateReplacementIsAccepted() {
         let registry = InteractiveProcessRegistry()
         let sessionID = UUID()

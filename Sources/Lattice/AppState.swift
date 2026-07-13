@@ -1740,7 +1740,7 @@ final class AppState: ObservableObject {
             existingHarnessThreadID: usesPromptDrivenBackend ? session.harnessThreadID : "structured-message-list",
             managementMode: usesPromptDrivenBackend ? .providerManagedSession : .latticeManagedVisibleTranscript
         )
-        let supportsACPRecovery = ["grok", "openCode", "hermes"].contains(harnessID)
+        let supportsACPRecovery = ["grok", "opencode", "hermes"].contains(harnessID)
         let hasPersistedACPSession = supportsACPRecovery && session.harnessThreadID != nil
         let recoveryPlan = hasPersistedACPSession
             ? LatticeContextHandoffPlanner.plan(
@@ -1859,6 +1859,13 @@ final class AppState: ObservableObject {
         if let message = SessionPrivacyPolicy.blockedMessage(for: backend, in: activePrivacyMode) {
             return message
         }
+        if case .ollama(let model) = backend {
+            if model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Choose a local model." }
+            if !ollamaInstalled { return "Ollama is not installed." }
+            if !ollamaReady { return "Start Ollama before using this local model." }
+            if ollamaCatalogStatus == .loading { return "Ollama is refreshing its local model catalog." }
+            if ollamaCatalogStatus == .failed { return "Ollama's local model catalog is unavailable. Refresh Connections before continuing." }
+        }
         if validBackend(backend, privacyMode: activePrivacyMode) != backend {
             switch backend {
             case .codex(let model):
@@ -1874,7 +1881,6 @@ final class AppState: ObservableObject {
                     ? "OpenCode cannot run \(model) through its current ACP connection."
                     : "OpenCode no longer exposes \(model), or it is hidden in Connections."
             case .ollama(let model):
-                if model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Choose a local model." }
                 return "The local model \(model) is not installed."
             case .appleIntelligence:
                 return appleIntelligenceStatus
@@ -2304,7 +2310,15 @@ final class AppState: ObservableObject {
 
     func refreshLocalModels(normalizeAfterRefresh: Bool = true) async {
         let generation = localModelRefreshGeneration.begin()
+        let previousCatalogStatus = ollamaCatalogStatus
         ollamaCatalogStatus = .loading
+        defer {
+            if Task.isCancelled,
+               localModelRefreshGeneration.isCurrent(generation),
+               ollamaCatalogStatus == .loading {
+                ollamaCatalogStatus = previousCatalogStatus
+            }
+        }
         let catalog = await ollama.modelsResult()
         guard !Task.isCancelled, localModelRefreshGeneration.isCurrent(generation) else { return }
         ollamaCatalogStatus = catalog.status
@@ -2318,9 +2332,26 @@ final class AppState: ObservableObject {
     func refreshConnections(refreshProviderCatalogs: Bool = false) async {
         let generation = connectionRefreshGeneration.begin()
         let localGeneration = localModelRefreshGeneration.begin()
+        let previousCatalogStatuses = (
+            codex: codexCatalogStatus,
+            grok: grokCatalogStatus,
+            openCode: openCodeCatalogStatus,
+            hermes: hermesCatalogStatus,
+            ollama: ollamaCatalogStatus
+        )
         isRefreshingConnections = true
         defer {
             if connectionRefreshGeneration.isCurrent(generation) {
+                if Task.isCancelled {
+                    if codexCatalogStatus == .loading { codexCatalogStatus = previousCatalogStatuses.codex }
+                    if grokCatalogStatus == .loading { grokCatalogStatus = previousCatalogStatuses.grok }
+                    if openCodeCatalogStatus == .loading { openCodeCatalogStatus = previousCatalogStatuses.openCode }
+                    if hermesCatalogStatus == .loading { hermesCatalogStatus = previousCatalogStatuses.hermes }
+                    if ollamaCatalogStatus == .loading,
+                       localModelRefreshGeneration.isCurrent(localGeneration) {
+                        ollamaCatalogStatus = previousCatalogStatuses.ollama
+                    }
+                }
                 isRefreshingConnections = false
             }
         }

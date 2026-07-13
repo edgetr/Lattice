@@ -127,6 +127,7 @@ public final class CodexExecHarness: @unchecked Sendable {
             let start = processRegistry.beginStart(for: sessionID)
             let task = Task.detached(priority: .userInitiated) { [self] in
                 guard let executableURL else {
+                    _ = processRegistry.abandonStart(start, sessionID: sessionID)
                     continuation.yield(.failed("Codex is not installed.")); continuation.finish(); return
                 }
                 let transport = BoundedProcessTransport(request: .init(

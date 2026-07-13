@@ -155,6 +155,27 @@ struct BoundedProcessTransportTests {
         #expect(line == "ack:request")
     }
 
+    @Test func readChunkHonorsRequestedMaximum() async {
+        let chunk = await BoundedSubprocess.performOffCooperativeExecutor { () -> Data? in
+            let transport = BoundedProcessTransport(request: .init(
+                executableURL: self.shell,
+                arguments: ["-c", "printf 'abc'; IFS= read -r remaining"],
+                deadline: 2,
+                maximumOutputBytes: 1024
+            ))
+            do {
+                try transport.start()
+                let data = try transport.readChunk(maxLength: 1)
+                transport.cancel()
+                return data
+            } catch {
+                transport.cancel()
+                return nil
+            }
+        }
+        #expect(chunk == Data("a".utf8))
+    }
+
     @Test func fastExitRetainsBufferedOutputWithoutFalseLaunchFailure() async {
         let result = await BoundedSubprocess.performOffCooperativeExecutor { () -> (String?, Int32?) in
             let transport = BoundedProcessTransport(request: .init(
