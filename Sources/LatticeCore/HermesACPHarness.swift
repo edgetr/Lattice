@@ -188,7 +188,7 @@ public final class ACPHarness: @unchecked Sendable {
         }.value
     }
 
-    public func stream(prompt: String, sessionID: UUID, threadID: String?, workspace: URL, requestedModel: String) -> AsyncStream<AgentEvent> {
+    public func stream(prompt: String, sessionID: UUID, threadID: String?, workspace: URL, requestedModel: String, allowFileModification: Bool = true) -> AsyncStream<AgentEvent> {
         AsyncStream { continuation in
             let task = Task.detached(priority: .userInitiated) { [self] in
                 guard let executableURL else {
@@ -204,7 +204,8 @@ public final class ACPHarness: @unchecked Sendable {
                         executableURL: executableURL,
                         sandboxExecutableURL: sandboxExecutableURL,
                         workspace: canonicalWorkspace,
-                        scratchDirectory: scratchDirectory
+                        scratchDirectory: scratchDirectory,
+                        allowFileModification: allowFileModification
                     )
                     process.executableURL = launch.executableURL; process.arguments = launch.arguments
                     process.currentDirectoryURL = canonicalWorkspace
@@ -268,7 +269,7 @@ public final class ACPHarness: @unchecked Sendable {
 
                     sessionRequestID += 1
                     try Self.write(["jsonrpc": "2.0", "id": sessionRequestID, "method": "session/prompt", "params": ["sessionId": acpID, "prompt": [["type": "text", "text": prompt]]]], to: input.fileHandleForWriting)
-                    try readPromptResponse(id: sessionRequestID, sessionID: sessionID, workspace: canonicalWorkspace, from: reader, input: input.fileHandleForWriting, continuation: continuation)
+                    try readPromptResponse(id: sessionRequestID, sessionID: sessionID, workspace: canonicalWorkspace, allowFileModification: allowFileModification, from: reader, input: input.fileHandleForWriting, continuation: continuation)
                     if process.isRunning { process.terminate() }
                     process.waitUntilExit()
                     let didCancel = unregister(sessionID)
@@ -329,7 +330,8 @@ public final class ACPHarness: @unchecked Sendable {
         executableURL: URL,
         sandboxExecutableURL: URL?,
         workspace: URL,
-        scratchDirectory: URL
+        scratchDirectory: URL,
+        allowFileModification: Bool = true
     ) throws -> HarnessSandbox.LaunchConfiguration {
         let runtimeDirectories = runtimeDirectoryCandidates().filter {
             var isDirectory: ObjCBool = false
@@ -338,7 +340,7 @@ public final class ACPHarness: @unchecked Sendable {
         return try HarnessSandbox.writeRestrictedLaunch(
             command: executableURL,
             arguments: profile.arguments(workspace: workspace),
-            writableDirectories: [workspace, scratchDirectory] + runtimeDirectories,
+            writableDirectories: (allowFileModification ? [workspace] : []) + [scratchDirectory] + runtimeDirectories,
             writablePaths: runtimeFileCandidates(),
             sandboxExecutableURL: sandboxExecutableURL
         )
@@ -472,7 +474,7 @@ public final class ACPHarness: @unchecked Sendable {
         }
     }
 
-    private func readPromptResponse(id: Int, sessionID: UUID, workspace: URL, from reader: JSONLineReader, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) throws {
+    private func readPromptResponse(id: Int, sessionID: UUID, workspace: URL, allowFileModification: Bool, from reader: JSONLineReader, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) throws {
         while let object = try reader.next() {
             if object["method"] as? String == "session/update" {
                 let update = ((object["params"] as? [String: Any])?["update"] as? [String: Any])
@@ -485,7 +487,7 @@ public final class ACPHarness: @unchecked Sendable {
                 }
                 continue
             }
-            if object["method"] != nil { try answerServerRequest(object, sessionID: sessionID, workspace: workspace, to: input, continuation: continuation); continue }
+            if object["method"] != nil { try answerServerRequest(object, sessionID: sessionID, workspace: workspace, allowFileModification: allowFileModification, to: input, continuation: continuation); continue }
             if (object["id"] as? NSNumber)?.intValue == id {
                 if let error = object["error"] as? [String: Any] { throw HarnessError.message(error["message"] as? String ?? "Hermes prompt failed.") }
                 return
@@ -494,11 +496,15 @@ public final class ACPHarness: @unchecked Sendable {
         throw HarnessError.message("ACP agent ended before completing the response.")
     }
 
-    private func answerServerRequest(_ object: [String: Any], sessionID: UUID, workspace: URL, to input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) throws {
+    private func answerServerRequest(_ object: [String: Any], sessionID: UUID, workspace: URL, allowFileModification: Bool, to input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) throws {
         guard let id = object["id"], let method = object["method"] as? String else { return }
         guard method == "session/request_permission", let request = Self.permissionRequest(from: object, workspace: workspace) else {
             try Self.write(["jsonrpc": "2.0", "id": id, "error": ["code": -32601, "message": "Unsupported client request: \(method)"]], to: input)
             return
+        }
+        if !allowFileModification, let kind = request.toolRequest?.kind, [.write, .command, .destructive].contains(kind) {
+            try Self.write(["jsonrpc": "2.0", "id": id, "result": ["outcome": ["outcome": "cancelled"]]], to: input)
+            throw HarnessError.message("Provider file writes and commands are disabled during Lattice self-edit.")
         }
         let pending = PendingPermission(sessionID: sessionID, requestID: request.id, optionIDs: Set(request.options.map(\.id)))
         register(pending)

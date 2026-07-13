@@ -2268,8 +2268,14 @@ struct CoreVerification {
             storedEnabledIDs: ["preview", "invalid", "missing"],
             knownIDs: []
         )
-        expect(enablement.enabledIDs == ["layout-runtime", "runtime"], "Extension enablement only keeps valid runtime extensions")
-        expect(enablement.knownIDs == ["layout-runtime", "runtime"], "Extension known set only tracks auto-enabled runtime extensions")
+        expect(enablement.enabledIDs.isEmpty, "First-seen runtime extensions stay disabled until explicitly applied")
+        expect(enablement.knownIDs == ["layout-runtime", "runtime"], "Extension known set tracks valid runtime extensions")
+        let explicitlyAppliedEnablement = LatticeExtensionEnablementPolicy.refresh(
+            records: [runtimeRecord],
+            storedEnabledIDs: ["runtime"],
+            knownIDs: []
+        )
+        expect(explicitlyAppliedEnablement.enabledIDs == ["runtime"], "Explicitly applied runtime extension remains enabled")
         let disabledKnownEnablement = LatticeExtensionEnablementPolicy.refresh(
             records: [runtimeRecord],
             storedEnabledIDs: [],

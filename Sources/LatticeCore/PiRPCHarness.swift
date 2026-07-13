@@ -83,7 +83,7 @@ public final class PiRPCHarness: @unchecked Sendable {
                     let launch = try HarnessSandbox.writeRestrictedLaunch(
                         command: executableURL,
                         arguments: arguments,
-                        writableDirectories: [canonicalWorkspace, sessionDirectory, scratchDirectory],
+                        writableDirectories: (allowFileModification ? [canonicalWorkspace] : []) + [sessionDirectory, scratchDirectory],
                         writablePaths: [Self.piSettingsLockURL()],
                         sandboxExecutableURL: sandboxExecutableURL
                     )

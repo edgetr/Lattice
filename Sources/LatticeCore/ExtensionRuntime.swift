@@ -611,11 +611,9 @@ public enum LatticeExtensionEnablementPolicy {
         knownIDs: Set<String>
     ) -> (enabledIDs: Set<String>, knownIDs: Set<String>) {
         let runtimeIDs = Set(records.filter { $0.isValid && $0.hasRuntimePatches }.map(\.id))
-        let firstSeenRuntimeIDs = runtimeIDs.subtracting(knownIDs)
         let enabledIDs = storedEnabledIDs
             .intersection(runtimeIDs)
-            .union(firstSeenRuntimeIDs)
-        let refreshedKnownIDs = knownIDs.union(firstSeenRuntimeIDs)
+        let refreshedKnownIDs = knownIDs.union(runtimeIDs)
         return (enabledIDs, refreshedKnownIDs)
     }
 }

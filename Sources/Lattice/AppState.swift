@@ -1617,21 +1617,21 @@ final class AppState: ObservableObject {
             return
         }
         if harnessID == "pi", let piRoute = piRoute(for: session.backend) {
-            stream = pi.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, provider: piRoute.provider, model: piRoute.model, reasoningEffort: reasoningEffort, allowFileModification: true)
+            stream = pi.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, provider: piRoute.provider, model: piRoute.model, reasoningEffort: reasoningEffort, allowFileModification: !isExtensionSelfEdit)
         } else if harnessID == "hermes" {
-            stream = hermes.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: session.backend.displayName)
+            stream = hermes.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: session.backend.displayName, allowFileModification: !isExtensionSelfEdit)
         } else { switch session.backend {
         case .codex(let model):
             stream = codex.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, model: model, reasoningEffort: reasoningEffort, policy: session.policy)
         case .grok(let model):
-            stream = grokACP.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: model)
+            stream = grokACP.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: model, allowFileModification: !isExtensionSelfEdit)
         case .openCode(let model):
-            stream = openCodeACP.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: model)
+            stream = openCodeACP.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: model, allowFileModification: !isExtensionSelfEdit)
         case .appleIntelligence:
             let transcript = LatticeBackendMessageBuilder.transcript(session: session, submittedText: submittedText, additionalContext: additionalContext, contextPlan: contextPlan)
             stream = appleIntelligence.stream(prompt: transcript, sessionID: id)
         case .antigravity(let model):
-            stream = antigravity.stream(prompt: prompt, sessionID: id, workspace: workspace, model: model, policy: session.policy)
+            stream = antigravity.stream(prompt: prompt, sessionID: id, workspace: workspace, model: model, policy: isExtensionSelfEdit ? .ask : session.policy)
         case .ollama(let model):
             cancelLocalModelIdleUnload()
             localModelStatus = "Loaded \(model)"

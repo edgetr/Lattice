@@ -394,8 +394,15 @@ struct ExtensionRuntimeTests {
             storedEnabledIDs: ["preview", "invalid", "missing"],
             knownIDs: []
         )
-        #expect(result.enabledIDs == ["layout-runtime", "runtime"])
+        #expect(result.enabledIDs.isEmpty)
         #expect(result.knownIDs == ["layout-runtime", "runtime"])
+
+        let explicitlyApplied = LatticeExtensionEnablementPolicy.refresh(
+            records: [runtime],
+            storedEnabledIDs: ["runtime"],
+            knownIDs: []
+        )
+        #expect(explicitlyApplied.enabledIDs == ["runtime"])
 
         let disabledKnown = LatticeExtensionEnablementPolicy.refresh(
             records: [runtime],
