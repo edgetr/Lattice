@@ -740,7 +740,8 @@ struct MessageRow: View {
         .accessibilityLabel(
             MessageTimestampPresentationPolicy.accessibilityMetadata(
                 role: message.role,
-                date: message.date
+                date: message.date,
+                isGenerating: message.role == .assistant && message.text.isEmpty
             )
         )
     }
@@ -781,7 +782,10 @@ struct MessageRow: View {
         HStack(alignment: .top, spacing: 8) {
             Group {
                 if message.text.isEmpty {
-                    ProgressView().controlSize(.small).padding(.vertical, 5)
+                    ProgressView()
+                        .controlSize(.small)
+                        .padding(.vertical, 5)
+                        .accessibilityHidden(true)
                 } else {
                     VStack(alignment: .leading, spacing: 6) {
                         if message.isPinned { PinnedMessageBadge() }

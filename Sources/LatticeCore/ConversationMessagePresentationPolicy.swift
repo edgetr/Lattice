@@ -31,11 +31,15 @@ public enum MessageTimestampPresentationPolicy: Sendable {
     public static func accessibilityMetadata(
         role: ChatMessage.Role,
         date: Date,
+        isGenerating: Bool = false,
         locale: Locale = .current,
         timeZone: TimeZone = .current
     ) -> String {
         let rolePart = roleLabel(for: role)
         let timePart = formattedTimestamp(date, locale: locale, timeZone: timeZone)
+        if isGenerating {
+            return "\(rolePart), Generating response, \(timePart)"
+        }
         return "\(rolePart), \(timePart)"
     }
 }
