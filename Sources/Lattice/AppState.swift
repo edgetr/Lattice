@@ -163,7 +163,8 @@ final class AppState: ObservableObject {
     @Published var columnVisibility: NavigationSplitViewVisibility = .all
     /// Last measured conversations workspace width; used only for split-column adaptation.
     private var lastMeasuredWorkspaceWidth: CGFloat = 0
-    private var activeConnectionRefreshes = 0
+    private let connectionRefreshGeneration = RefreshGenerationController()
+    private let localModelRefreshGeneration = RefreshGenerationController()
     /// Visibility last written by adaptive layout; used to distinguish user-driven toggles.
     private var lastAutoAppliedColumnVisibility: NavigationSplitViewVisibility?
     /// When true, do not auto-change columns until the window is comfortably wide again.
@@ -2282,7 +2283,10 @@ final class AppState: ObservableObject {
     }
 
     func refreshLocalModels(normalizeAfterRefresh: Bool = true) async {
-        ollamaModels = await ollama.models()
+        let generation = localModelRefreshGeneration.begin()
+        let models = await ollama.models()
+        guard !Task.isCancelled, localModelRefreshGeneration.isCurrent(generation) else { return }
+        ollamaModels = models
         if normalizeAfterRefresh {
             normalizeBackendsAfterCatalogRefresh()
             normalizeExecutionRouteAfterCatalogRefresh()
@@ -2290,26 +2294,34 @@ final class AppState: ObservableObject {
     }
 
     func refreshConnections(refreshProviderCatalogs: Bool = false) async {
-        activeConnectionRefreshes += 1
+        let generation = connectionRefreshGeneration.begin()
+        let localGeneration = localModelRefreshGeneration.begin()
         isRefreshingConnections = true
         defer {
-            activeConnectionRefreshes -= 1
-            isRefreshingConnections = activeConnectionRefreshes > 0
+            if connectionRefreshGeneration.isCurrent(generation) {
+                isRefreshingConnections = false
+            }
         }
-        async let codexRefresh: Void = refreshCodexConnection()
-        async let grokRefresh: Void = refreshGrokConnection()
-        async let openCodeRefresh: Void = refreshOpenCodeConnection(refreshCatalog: refreshProviderCatalogs)
-        async let antigravityRefresh: Void = refreshAntigravityConnection()
-        async let piRefresh: Void = refreshPiConnection()
-        async let hermesRefresh: Void = refreshHermesConnection()
-        async let localRefresh: Void = refreshLocalConnection()
+        async let codexRefresh: Void = refreshCodexConnection(generation: generation)
+        async let grokRefresh: Void = refreshGrokConnection(generation: generation)
+        async let openCodeRefresh: Void = refreshOpenCodeConnection(refreshCatalog: refreshProviderCatalogs, generation: generation)
+        async let antigravityRefresh: Void = refreshAntigravityConnection(generation: generation)
+        async let piRefresh: Void = refreshPiConnection(generation: generation)
+        async let hermesRefresh: Void = refreshHermesConnection(generation: generation)
+        async let localRefresh: Void = refreshLocalConnection(generation: generation, localGeneration: localGeneration)
         _ = await (codexRefresh, grokRefresh, openCodeRefresh, antigravityRefresh, piRefresh, hermesRefresh, localRefresh)
+        guard canApplyCatalogRefresh(generation) else { return }
         normalizeBackendsAfterCatalogRefresh()
         normalizeExecutionRouteAfterCatalogRefresh()
     }
 
-    private func refreshCodexConnection() async {
+    private func canApplyCatalogRefresh(_ generation: UInt64) -> Bool {
+        !Task.isCancelled && connectionRefreshGeneration.isCurrent(generation)
+    }
+
+    private func refreshCodexConnection(generation: UInt64) async {
         let executable = ExecutableDiscovery.locate("codex")
+        guard canApplyCatalogRefresh(generation) else { return }
         if codex.isInstalled != (executable != nil) { codex = CodexExecHarness(executableURL: executable) }
         codexCatalogStatus = .loading
         async let codexAuth = codex.isAuthenticated()
@@ -2318,17 +2330,21 @@ final class AppState: ObservableObject {
         async let codexLatest = Self.latestCLIVersion(executableName: "codex", homebrewFormula: "codex", homebrewCask: "codex", npmPackage: "@openai/codex", pnpmPackage: "@openai/codex", directPackage: "@openai/codex")
         let auth = await codexAuth
         let snapshot = await codexData
+        let version = await codexVersion
+        let latest = await codexLatest
+        guard canApplyCatalogRefresh(generation) else { return }
         codexAuthenticated = auth
         codexCatalogStatus = snapshot.catalogStatus
         codexModels = snapshot.models
         codexReady = ProviderReadinessSnapshot(installed: codex.isInstalled, authenticated: auth, catalogStatus: snapshot.catalogStatus, runnableModelCount: visibleCodexModels.count).isRunnable
         codexUsage = snapshot.usage
-        codexCLIVersion = await codexVersion
-        codexLatestCLIVersion = await codexLatest
+        codexCLIVersion = version
+        codexLatestCLIVersion = latest
     }
 
-    private func refreshGrokConnection() async {
+    private func refreshGrokConnection(generation: UInt64) async {
         let executable = ExecutableDiscovery.locate("grok")
+        guard canApplyCatalogRefresh(generation) else { return }
         if grok.isInstalled != (executable != nil) { grok = StructuredCLIHarness(kind: .grok, executableURL: executable) }
         if grokACP.isInstalled != (executable != nil) { grokACP = ACPHarness(profile: .grok, executableURL: executable) }
         grokCatalogStatus = .loading
@@ -2339,17 +2355,20 @@ final class AppState: ObservableObject {
         let auth = await grokAuth
         let cliCatalog = await grokCatalog
         let acpCatalog = await grokACPCatalog
+        let update = await grokUpdate
+        guard canApplyCatalogRefresh(generation) else { return }
         grokAuthenticated = auth
         grokACPModels = acpCatalog.models
         grokCatalogStatus = ProviderCatalogStatus.combined(cliCatalog.status, acpCatalog.status)
         grokModels = cliCatalog.models.isEmpty ? acpCatalog.models.map { ProviderModel(id: $0.id, name: $0.name) } : cliCatalog.models
         grokReady = ProviderReadinessSnapshot(installed: grok.isInstalled, authenticated: auth, catalogStatus: grokCatalogStatus, runnableModelCount: runnableGrokModels.count).isRunnable
-        grokCLIInfo = await grokUpdate
+        grokCLIInfo = update
         grokUpdateStatus = grokCLIInfo.statusText
     }
 
-    private func refreshOpenCodeConnection(refreshCatalog: Bool = false) async {
+    private func refreshOpenCodeConnection(refreshCatalog: Bool = false, generation: UInt64) async {
         let executable = ExecutableDiscovery.locate("opencode")
+        guard canApplyCatalogRefresh(generation) else { return }
         if openCode.isInstalled != (executable != nil) { openCode = StructuredCLIHarness(kind: .openCode, executableURL: executable) }
         if openCodeACP.isInstalled != (executable != nil) { openCodeACP = ACPHarness(profile: .openCode, executableURL: executable) }
         openCodeCatalogStatus = .loading
@@ -2364,63 +2383,88 @@ final class AppState: ObservableObject {
         let acpCatalog = await openCodeACPCatalog
         let detectedVersion = await openCodeVersion
         let installedVersion = await openCodeInstalledVersion
-        openCodeAPIKeySaved = OpenCodeAuthBridge.hasGoCredential()
-        openCodeAuthenticated = auth || openCodeAPIKeySaved
+        let latest = await openCodeLatest
+        let apiKeySaved = OpenCodeAuthBridge.hasGoCredential()
+        guard canApplyCatalogRefresh(generation) else { return }
+        openCodeAPIKeySaved = apiKeySaved
+        openCodeAuthenticated = auth || apiKeySaved
         openCodeACPModels = acpCatalog.models
         openCodeCatalogStatus = ProviderCatalogStatus.combined(catalog.status, acpCatalog.status)
         openCodeModels = catalog.models
         openCodeReady = ProviderReadinessSnapshot(installed: openCode.isInstalled, authenticated: openCodeAuthenticated, catalogStatus: openCodeCatalogStatus, runnableModelCount: runnableOpenCodeModels.count).isRunnable
         openCodeCLIVersion = detectedVersion ?? installedVersion
-        openCodeLatestCLIVersion = await openCodeLatest
+        openCodeLatestCLIVersion = latest
     }
 
-    private func refreshAntigravityConnection() async {
+    private func refreshAntigravityConnection(generation: UInt64) async {
         let executable = ExecutableDiscovery.locate("agy")
+        guard canApplyCatalogRefresh(generation) else { return }
         if antigravity.isInstalled != (executable != nil) {
             antigravity = AntigravityCLIHarness(executableURL: executable)
         }
         async let antigravityVersion = Self.commandOutput("agy", ["--version"])
         async let antigravityLatest = Self.latestCLIVersion(executableName: "agy", homebrewFormula: nil, homebrewCask: "antigravity-cli", npmPackage: nil, pnpmPackage: nil, directPackage: "@google/antigravity-cli")
         async let antigravityCatalog = antigravity.models()
+        let version = await antigravityVersion
+        let latest = await antigravityLatest
+        let models = await antigravityCatalog
+        let authenticated = executable != nil && Self.antigravityCredentialsExist()
+        guard canApplyCatalogRefresh(generation) else { return }
         antigravityInstalled = executable != nil
-        antigravityAuthenticated = antigravityInstalled && Self.antigravityCredentialsExist()
-        antigravityModels = await antigravityCatalog
-        antigravityCLIVersion = CLIVersionDisplayPolicy.normalizedVersion(await antigravityVersion)
-        antigravityLatestCLIVersion = await antigravityLatest
+        antigravityAuthenticated = authenticated
+        antigravityModels = models
+        antigravityCLIVersion = CLIVersionDisplayPolicy.normalizedVersion(version)
+        antigravityLatestCLIVersion = latest
     }
 
-    private func refreshPiConnection() async {
+    private func refreshPiConnection(generation: UInt64) async {
         let executable = ExecutableDiscovery.locate("pi")
+        guard canApplyCatalogRefresh(generation) else { return }
         if pi.isInstalled != (executable != nil) { pi = PiRPCHarness(executableURL: executable) }
         async let piVersion = Self.commandOutput("pi", ["--version"])
         async let piCatalog = Self.piModelCatalog()
         async let piLatest = Self.latestCLIVersion(executableName: "pi", homebrewFormula: "pi", homebrewCask: nil, npmPackage: "@earendil-works/pi-coding-agent", pnpmPackage: "@earendil-works/pi-coding-agent", directPackage: "@earendil-works/pi-coding-agent")
+        let version = await piVersion
+        let catalog = await piCatalog
+        let latest = await piLatest
+        guard canApplyCatalogRefresh(generation) else { return }
         piInstalled = executable != nil
-        piCLIVersion = await piVersion
-        piModelIDs = await piCatalog
-        piLatestCLIVersion = await piLatest
+        piCLIVersion = version
+        piModelIDs = catalog
+        piLatestCLIVersion = latest
     }
 
-    private func refreshHermesConnection() async {
+    private func refreshHermesConnection(generation: UInt64) async {
         let executable = ExecutableDiscovery.locate("hermes")
+        guard canApplyCatalogRefresh(generation) else { return }
         if hermes.isInstalled != (executable != nil) { hermes = ACPHarness(executableURL: executable) }
         hermesCatalogStatus = .loading
         async let hermesInfo = Self.hermesUpdateInfo()
         async let hermesCatalog = hermes.modelsResult(workspace: URL(fileURLWithPath: selectedWorkspacePath))
-        hermesInstalled = executable != nil
         let catalog = await hermesCatalog
+        let info = await hermesInfo
+        guard canApplyCatalogRefresh(generation) else { return }
+        hermesInstalled = executable != nil
         hermesCatalogStatus = catalog.status
         hermesModels = catalog.models
-        hermesCLIInfo = await hermesInfo
+        hermesCLIInfo = info
     }
 
-    private func refreshLocalConnection() async {
+    private func refreshLocalConnection(generation: UInt64, localGeneration: UInt64) async {
         async let local = ollama.isAvailable()
-        appleIntelligenceReady = appleIntelligence.isAvailable
-        appleIntelligenceStatus = appleIntelligence.statusDescription
-        ollamaInstalled = ExecutableDiscovery.locate("ollama") != nil || Self.ollamaAppURL() != nil
-        ollamaReady = await local
-        await refreshLocalModels(normalizeAfterRefresh: false)
+        async let models = ollama.models()
+        let localReady = await local
+        let localModels = await models
+        let localInstalled = ExecutableDiscovery.locate("ollama") != nil || Self.ollamaAppURL() != nil
+        let intelligenceReady = appleIntelligence.isAvailable
+        let intelligenceStatus = appleIntelligence.statusDescription
+        guard canApplyCatalogRefresh(generation),
+              localModelRefreshGeneration.isCurrent(localGeneration) else { return }
+        appleIntelligenceReady = intelligenceReady
+        appleIntelligenceStatus = intelligenceStatus
+        ollamaInstalled = localInstalled
+        ollamaReady = localReady
+        ollamaModels = localModels
     }
 
     func connectCodex() {
@@ -2606,7 +2650,7 @@ final class AppState: ObservableObject {
         guard beginCLIAction(provider: "hermes", progress: "Finish Hermes setup in your browser…") else { return }
         Task {
             let result = await Self.runCommand("hermes", ["setup", "--portal", "--non-interactive"])
-            await refreshHermesConnection()
+            await refreshConnections()
             if hermesReady {
                 cliActionMessages["hermes"] = ""
             } else {
