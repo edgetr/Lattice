@@ -136,7 +136,11 @@ struct ModelsView: View {
     @ObservedObject var state: AppState
     @AppStorage("lattice.models.showOnlyFittingLocalRecommendations") private var showOnlyFittingLocalRecommendations = true
     var installedTags: Set<String> {
-        state.ollamaCatalogStatus == .loaded ? Set(state.ollamaModels.map(\.name)) : []
+        isOllamaCatalogAuthoritative ? Set(state.ollamaModels.map(\.name)) : []
+    }
+
+    private var isOllamaCatalogAuthoritative: Bool {
+        state.ollamaCatalogStatus == .loaded || state.ollamaCatalogStatus == .empty
     }
 
     var body: some View {
@@ -295,7 +299,7 @@ struct ModelsView: View {
                                     RecommendationRow(
                                         model: model,
                                         installed: installedTags.contains(model.ollamaTag),
-                                        catalogAuthoritative: state.ollamaCatalogStatus == .loaded,
+                                        catalogAuthoritative: isOllamaCatalogAuthoritative,
                                         state: state
                                     )
                                 }
