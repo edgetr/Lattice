@@ -19,7 +19,7 @@ public enum HarnessToolEventDecoder {
                 kind: kind(for: toolName),
                 title: "Pi is using \(displayName(toolName))",
                 detail: detail(input: input, fallback: toolName),
-                workspaceScoped: isWorkspaceScoped(input["path"] as? String, workspace: workspace),
+                workspaceScoped: WorkspacePathScope.isWorkspaceScoped(input["path"] as? String, workspace: workspace),
                 reversible: false
             ))
         case "tool_execution_update":
