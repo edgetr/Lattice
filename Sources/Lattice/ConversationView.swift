@@ -454,6 +454,7 @@ struct EmptyConversationView: View {
                 Text(state.copyText(for: .emptyChatTitle, fallback: "What can I help with?"))
                     .font(.title2)
                     .fontWeight(.semibold)
+                    .accessibilityAddTraits(.isHeader)
                 Text(state.activeBackend.displayName).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
