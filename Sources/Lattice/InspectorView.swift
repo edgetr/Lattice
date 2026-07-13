@@ -1315,7 +1315,7 @@ struct SettingsView: View {
                 Button("Open Skills Folder") { state.openSkillsFolder() }
             }
             Section("Privacy & Security") {
-                Text("Provider harnesses are contained for workspace writes. They may still read files outside the workspace and use the network, so this is not a confidentiality boundary.")
+                Text(LatticeSettingsCopy.privacySecurityBody)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
