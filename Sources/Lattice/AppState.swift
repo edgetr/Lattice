@@ -4180,28 +4180,31 @@ Lattice self-edit rules:
         guard let executable = ExecutableDiscovery.locate("agy") else {
             return (-1, Data("Antigravity CLI is not installed.".utf8))
         }
-        return await Task.detached {
-            let process = Process()
-            let pipe = Pipe()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/script")
-            process.arguments = ["-q", "/dev/null", executable.path]
-            process.standardOutput = pipe
-            process.standardError = pipe
-            do {
-                try process.run()
-                let deadline = Date().addingTimeInterval(180)
-                while process.isRunning && Date() < deadline && !antigravityCredentialsExist() {
-                    try? await Task.sleep(nanoseconds: 400_000_000)
-                }
-                if process.isRunning { process.terminate() }
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                if antigravityCredentialsExist() { return (0, data) }
-                return (process.terminationStatus, data)
-            } catch {
-                return (-1, Data(error.localizedDescription.utf8))
-            }
-        }.value
+        let result = await BoundedSubprocess.run(
+            .init(
+                executableURL: URL(fileURLWithPath: "/usr/bin/script"),
+                arguments: ["-q", "/dev/null", executable.path],
+                deadline: 180
+            ),
+            isCancelled: { Self.antigravityCredentialsExist() }
+        )
+        if Self.antigravityCredentialsExist() {
+            return (0, result.combinedOutput)
+        }
+        switch result.outcome {
+        case .exited:
+            return (result.exitStatus ?? -1, result.combinedOutput)
+        case .timedOut:
+            return (-1, Data("Antigravity login timed out after 180 seconds.".utf8))
+        case .cancelled:
+            return (-1, Data("Antigravity login was cancelled.".utf8))
+        case .launchFailed:
+            return (-1, Data((result.launchErrorDescription ?? "Antigravity login failed to launch.").utf8))
+        case .outputLimitExceeded:
+            return (-1, Data("Antigravity login output exceeded Lattice's safety limit.".utf8))
+        case .completed:
+            return (-1, Data("Antigravity login ended before credentials were available.".utf8))
+        }
     }
 
     private static func runCommand(
@@ -4218,8 +4221,8 @@ Lattice self-edit rules:
             maximumOutputBytes: discardOutput ? 0 : 2_000_000
         ))
         switch result.outcome {
-        case .exited:
-            return (result.exitStatus ?? -1, discardOutput ? Data() : result.combinedOutput)
+        case .exited, .completed:
+            return (result.exitStatus ?? 0, discardOutput ? Data() : result.combinedOutput)
         case .timedOut:
             return (-1, Data("Command timed out after \(Int(deadline)) seconds.".utf8))
         case .cancelled:

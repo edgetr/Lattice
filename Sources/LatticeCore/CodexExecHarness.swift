@@ -59,34 +59,24 @@ public final class CodexExecHarness: @unchecked Sendable {
 
     public func isAuthenticated() async -> Bool {
         guard let executableURL else { return false }
-        return await Task.detached {
-            let process = Process(); process.executableURL = executableURL
-            process.arguments = ["login", "-c", "service_tier=\"flex\"", "status"]
-            process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
-            do { try process.run(); process.waitUntilExit(); return process.terminationStatus == 0 } catch { return false }
-        }.value
+        return await Self.run(executableURL, arguments: ["login", "-c", "service_tier=\"flex\"", "status"]).isSuccess
     }
 
     public func login() async -> Bool {
         guard let executableURL else { return false }
-        return await Task.detached {
-            let process = Process(); process.executableURL = executableURL
-            process.arguments = ["login", "-c", "service_tier=\"flex\""]
-            process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
-            do { try process.run(); process.waitUntilExit(); return process.terminationStatus == 0 } catch { return false }
-        }.value
+        return await Self.run(executableURL, arguments: ["login", "-c", "service_tier=\"flex\""]).isSuccess
     }
 
     public func updateCLI() async -> Bool {
         guard let executableURL else { return false }
-        return await Self.run(executableURL, arguments: ["update"], discardOutput: true).status == 0
+        return await Self.run(executableURL, arguments: ["update"]).isSuccess
     }
 
     public func cliVersion() async -> String? {
         guard let executableURL else { return nil }
         let result = await Self.run(executableURL, arguments: ["--version"])
-        guard result.status == 0 else { return nil }
-        let value = String(decoding: result.output, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard result.isSuccess else { return nil }
+        let value = String(decoding: result.combinedOutput, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return nil }
         if let version = value.split(separator: " ").last { return String(version) }
         return value
@@ -94,45 +84,37 @@ public final class CodexExecHarness: @unchecked Sendable {
 
     public func providerSnapshot() async -> CodexProviderSnapshot {
         guard let executableURL else { return .empty }
-        return await Task.detached {
-            let process = Process()
-            let input = Pipe()
-            let output = Pipe()
-            process.executableURL = executableURL
-            process.arguments = ["app-server", "-c", "service_tier=\"flex\""]
-            process.standardInput = input
-            process.standardOutput = output
-            process.standardError = FileHandle.nullDevice
-            do {
-                try process.run()
-                let messages: [[String: Any]] = [
-                    ["method": "initialize", "id": 0, "params": ["clientInfo": ["name": "lattice", "title": "Lattice", "version": "0.1.0"], "capabilities": ["experimentalApi": true]]],
-                    ["method": "initialized", "params": [:]],
-                    ["method": "model/list", "id": 1, "params": ["includeHidden": false, "limit": 100]],
-                    ["method": "account/rateLimits/read", "id": 2]
-                ]
-                for message in messages {
-                    var data = try JSONSerialization.data(withJSONObject: message)
-                    data.append(0x0A)
-                    try input.fileHandleForWriting.write(contentsOf: data)
-                }
-                let accumulator = AppServerAccumulator()
-                output.fileHandleForReading.readabilityHandler = { handle in
-                    let chunk = handle.availableData
-                    if chunk.isEmpty { return }
-                    accumulator.append(chunk)
-                }
-                let deadline = Date().addingTimeInterval(6)
-                while !accumulator.isComplete && Date() < deadline { try? await Task.sleep(nanoseconds: 50_000_000) }
-                output.fileHandleForReading.readabilityHandler = nil
-                if process.isRunning { process.terminate() }
-                try? input.fileHandleForWriting.close()
-                return accumulator.snapshot
-            } catch {
-                if process.isRunning { process.terminate() }
-                return .empty
+        let messages: [[String: Any]] = [
+            ["method": "initialize", "id": 0, "params": ["clientInfo": ["name": "lattice", "title": "Lattice", "version": "0.1.0"], "capabilities": ["experimentalApi": true]]],
+            ["method": "initialized", "params": [:]],
+            ["method": "model/list", "id": 1, "params": ["includeHidden": false, "limit": 100]],
+            ["method": "account/rateLimits/read", "id": 2]
+        ]
+        let stdinData: Data
+        do {
+            stdinData = try messages.reduce(into: Data()) { data, message in
+                data.append(contentsOf: try JSONSerialization.data(withJSONObject: message))
+                data.append(0x0A)
             }
-        }.value
+        } catch {
+            return .empty
+        }
+        let accumulator = AppServerAccumulator()
+        let result = await BoundedSubprocess.run(
+            .init(
+                executableURL: executableURL,
+                arguments: ["app-server", "-c", "service_tier=\"flex\""],
+                stdinData: stdinData,
+                deadline: 6
+            ),
+            stopWhen: { stdout, _ in
+                accumulator.append(stdout)
+                return accumulator.isComplete
+            }
+        )
+        guard result.outcome == .completed || result.outcome == .exited else { return .empty }
+        accumulator.append(result.stdout)
+        return accumulator.snapshot
     }
 
     public func stream(prompt: String, sessionID: UUID, threadID: String?, workspace: URL, model: String, reasoningEffort: ReasoningEffort? = nil, policy: ExecutionPolicy = .ask, workspaceWrite: Bool = false) -> AsyncStream<AgentEvent> {
@@ -544,24 +526,14 @@ public final class CodexExecHarness: @unchecked Sendable {
         return windows.isEmpty && credits == nil ? nil : ProviderUsage(windows: windows, creditsBalance: credits)
     }
 
-    private static func run(_ executable: URL, arguments: [String], discardOutput: Bool = false) async -> (status: Int32, output: Data) {
-        await Task.detached {
-            let process = Process()
-            let pipe = Pipe()
-            process.executableURL = executable
-            process.arguments = arguments
-            process.standardOutput = discardOutput ? FileHandle.nullDevice : pipe
-            process.standardError = discardOutput ? FileHandle.nullDevice : pipe
-            do {
-                try process.run()
-                let data = discardOutput ? Data() : pipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                return (process.terminationStatus, data)
-            } catch {
-                return (-1, Data())
-            }
-        }.value
+    private static func run(_ executable: URL, arguments: [String]) async -> BoundedSubprocessResult {
+        await BoundedSubprocess.run(.init(
+            executableURL: executable,
+            arguments: arguments
+        ))
     }
+
+
 }
 
 private final class AppServerAccumulator: @unchecked Sendable {

@@ -8,6 +8,8 @@ import Foundation
 public struct BoundedSubprocessRequest: Sendable, Equatable {
     public var executableURL: URL
     public var arguments: [String]
+    /// Bytes written to stdin before it is closed. `nil` keeps the existing EOF-only behavior.
+    public var stdinData: Data?
     public var currentDirectoryURL: URL?
     /// When non-nil, replaces the child environment entirely.
     public var environment: [String: String]?
@@ -24,6 +26,7 @@ public struct BoundedSubprocessRequest: Sendable, Equatable {
     public init(
         executableURL: URL,
         arguments: [String] = [],
+        stdinData: Data? = nil,
         currentDirectoryURL: URL? = nil,
         environment: [String: String]? = nil,
         deadline: TimeInterval? = 60,
@@ -32,6 +35,7 @@ public struct BoundedSubprocessRequest: Sendable, Equatable {
     ) {
         self.executableURL = executableURL
         self.arguments = arguments
+        self.stdinData = stdinData
         self.currentDirectoryURL = currentDirectoryURL
         self.environment = environment
         self.deadline = deadline
@@ -44,6 +48,8 @@ public struct BoundedSubprocessRequest: Sendable, Equatable {
 
 public enum BoundedSubprocessOutcome: String, Sendable, Equatable, Codable {
     case exited
+    /// Supervisor stopped process after caller-provided finite-protocol completion condition.
+    case completed
     case timedOut
     case cancelled
     case launchFailed
@@ -84,7 +90,11 @@ public struct BoundedSubprocessResult: Sendable, Equatable {
     }
 
     public var isSuccess: Bool {
-        outcome == .exited && exitStatus == 0
+        switch outcome {
+        case .exited: return exitStatus == 0
+        case .completed: return true
+        case .timedOut, .cancelled, .launchFailed, .outputLimitExceeded: return false
+        }
     }
 }
 
@@ -104,7 +114,22 @@ public enum BoundedSubprocess {
         let flag = CancellationFlag()
         return await withTaskCancellationHandler {
             if Task.isCancelled { flag.cancel() }
-            return await runUninterruptibly(request, isCancelled: { flag.isCancelled })
+            return await runUninterruptibly(request, isCancelled: { flag.isCancelled }, stopWhen: nil)
+        } onCancel: {
+            flag.cancel()
+        }
+    }
+
+    /// Runs finite protocols that can declare completion before child naturally exits.
+    /// Output remains bounded and timeout/cap/cancel outcomes stay typed.
+    public static func run(
+        _ request: BoundedSubprocessRequest,
+        stopWhen: @escaping @Sendable (_ stdout: Data, _ stderr: Data) -> Bool
+    ) async -> BoundedSubprocessResult {
+        let flag = CancellationFlag()
+        return await withTaskCancellationHandler {
+            if Task.isCancelled { flag.cancel() }
+            return await runUninterruptibly(request, isCancelled: { flag.isCancelled }, stopWhen: stopWhen)
         } onCancel: {
             flag.cancel()
         }
@@ -115,16 +140,17 @@ public enum BoundedSubprocess {
         _ request: BoundedSubprocessRequest,
         isCancelled: @escaping @Sendable () -> Bool
     ) async -> BoundedSubprocessResult {
-        await runUninterruptibly(request, isCancelled: isCancelled)
+        await runUninterruptibly(request, isCancelled: isCancelled, stopWhen: nil)
     }
 
     private static func runUninterruptibly(
         _ request: BoundedSubprocessRequest,
-        isCancelled: @escaping @Sendable () -> Bool
+        isCancelled: @escaping @Sendable () -> Bool,
+        stopWhen: (@Sendable (_ stdout: Data, _ stderr: Data) -> Bool)?
     ) async -> BoundedSubprocessResult {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                continuation.resume(returning: runSync(request, isCancelled: isCancelled))
+                continuation.resume(returning: runSync(request, isCancelled: isCancelled, stopWhen: stopWhen))
             }
         }
     }
@@ -147,7 +173,8 @@ public enum BoundedSubprocess {
 
     private static func runSync(
         _ request: BoundedSubprocessRequest,
-        isCancelled: @escaping @Sendable () -> Bool
+        isCancelled: @escaping @Sendable () -> Bool,
+        stopWhen: (@Sendable (_ stdout: Data, _ stderr: Data) -> Bool)?
     ) -> BoundedSubprocessResult {
         let process = Process()
         process.executableURL = request.executableURL
@@ -166,7 +193,7 @@ public enum BoundedSubprocess {
         process.standardError = stderrPipe
         process.standardInput = stdinPipe
 
-        let capture = OutputCapture(maximumOutputBytes: request.maximumOutputBytes)
+        let capture = OutputCapture(maximumOutputBytes: request.maximumOutputBytes, stopWhen: stopWhen)
 
         do {
             try process.run()
@@ -178,11 +205,15 @@ public enum BoundedSubprocess {
             )
         }
 
-        // Close our write end of stdin immediately so the child sees EOF.
-        try? stdinPipe.fileHandleForWriting.close()
-
         attachDrain(stdoutPipe.fileHandleForReading, stream: .stdout, capture: capture)
         attachDrain(stderrPipe.fileHandleForReading, stream: .stderr, capture: capture)
+
+        if let stdinData = request.stdinData, !stdinData.isEmpty {
+            try? stdinPipe.fileHandleForWriting.write(contentsOf: stdinData)
+        }
+
+        // Close our write end of stdin immediately so the child sees EOF.
+        try? stdinPipe.fileHandleForWriting.close()
 
         let deadlineDate: Date? = request.deadline.map { Date().addingTimeInterval($0) }
         var stopReason: StopReason = .waitForExit
@@ -196,6 +227,10 @@ public enum BoundedSubprocess {
                 stopReason = .outputLimit
                 break
             }
+            if capture.isComplete {
+                stopReason = .completed
+                break
+            }
             if let deadlineDate, Date() >= deadlineDate {
                 stopReason = .timedOut
                 break
@@ -206,7 +241,7 @@ public enum BoundedSubprocess {
         switch stopReason {
         case .waitForExit:
             break
-        case .timedOut, .cancelled, .outputLimit:
+        case .completed, .timedOut, .cancelled, .outputLimit:
             forceStop(process, grace: request.terminateGraceInterval)
         }
 
@@ -227,6 +262,14 @@ public enum BoundedSubprocess {
 
         let snapshot = capture.snapshot()
         switch stopReason {
+        case .completed:
+            return BoundedSubprocessResult(
+                outcome: .completed,
+                exitStatus: process.terminationStatus,
+                stdout: snapshot.stdout,
+                stderr: snapshot.stderr,
+                observedOutputBytes: snapshot.observed
+            )
         case .timedOut:
             return BoundedSubprocessResult(
                 outcome: .timedOut,
@@ -273,6 +316,7 @@ public enum BoundedSubprocess {
 
     private enum StopReason {
         case waitForExit
+        case completed
         case timedOut
         case cancelled
         case outputLimit
@@ -326,18 +370,29 @@ public enum BoundedSubprocess {
     private final class OutputCapture: @unchecked Sendable {
         private let lock = NSLock()
         private let maximumOutputBytes: Int
+        private let stopWhen: (@Sendable (_ stdout: Data, _ stderr: Data) -> Bool)?
         private var stdout = Data()
         private var stderr = Data()
         private var observed = 0
         private var overLimit = false
+        private var complete = false
 
-        init(maximumOutputBytes: Int) {
+        init(
+            maximumOutputBytes: Int,
+            stopWhen: (@Sendable (_ stdout: Data, _ stderr: Data) -> Bool)?
+        ) {
             self.maximumOutputBytes = maximumOutputBytes
+            self.stopWhen = stopWhen
         }
 
         var isOverLimit: Bool {
             lock.lock(); defer { lock.unlock() }
             return overLimit
+        }
+
+        var isComplete: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return complete
         }
 
         func append(_ chunk: Data, stream: Stream) {
@@ -358,6 +413,9 @@ public enum BoundedSubprocess {
             }
             if chunk.count > remaining {
                 overLimit = true
+            }
+            if !overLimit, stopWhen?(stdout, stderr) == true {
+                complete = true
             }
         }
 

@@ -138,54 +138,39 @@ public final class ACPHarness: @unchecked Sendable {
 
     public func models(workspace: URL) async -> [HarnessModel] {
         guard let executableURL else { return [] }
-        let sandboxExecutableURL = sandboxExecutableURL
-        return await Task.detached {
-            let process = Process(); let input = Pipe(); let output = Pipe()
-            let scratchDirectory = self.scratchDirectory(for: UUID())
-            process.standardInput = input; process.standardOutput = output; process.standardError = FileHandle.nullDevice
-            do {
-                try FileManager.default.createDirectory(at: scratchDirectory, withIntermediateDirectories: true)
-                let canonicalWorkspace = try HarnessSandbox.canonicalDirectory(workspace)
-                let launch = try self.sandboxedLaunch(
-                    executableURL: executableURL,
-                    sandboxExecutableURL: sandboxExecutableURL,
-                    workspace: canonicalWorkspace,
-                    scratchDirectory: scratchDirectory
-                )
-                process.executableURL = launch.executableURL; process.arguments = launch.arguments
-                process.currentDirectoryURL = canonicalWorkspace
-                var environment = ProcessInfo.processInfo.environment
-                environment["TMPDIR"] = scratchDirectory.path + "/"
-                process.environment = environment
-                try process.run()
-                let reader = JSONLineReader(output.fileHandleForReading)
-                try Self.write(Self.initializeRequest(id: 1), to: input.fileHandleForWriting)
-                let initializeResponse = try Self.readResponse(id: 1, from: reader, input: input.fileHandleForWriting)
-                let initializedModels = Self.models(from: initializeResponse)
-                if !initializedModels.isEmpty {
-                    if process.isRunning { process.terminate() }
-                    process.waitUntilExit()
-                    try? FileManager.default.removeItem(at: scratchDirectory)
-                    return initializedModels
-                }
-                try Self.write(Self.sessionRequest(id: 2, method: "session/new", workspace: canonicalWorkspace, threadID: nil), to: input.fileHandleForWriting)
-                let response = try Self.readResponse(id: 2, from: reader, input: input.fileHandleForWriting)
-                if self.profile == .openCode,
-                   let sessionID = Self.result(from: response)?["sessionId"] as? String {
-                    try? Self.write(["jsonrpc": "2.0", "id": 3, "method": "session/close", "params": ["sessionId": sessionID]], to: input.fileHandleForWriting)
-                    _ = try? Self.readResponse(id: 3, from: reader, input: input.fileHandleForWriting)
-                }
-                if process.isRunning { process.terminate() }
-                process.waitUntilExit()
-                try? FileManager.default.removeItem(at: scratchDirectory)
-                return Self.models(from: response)
-            } catch {
-                if process.isRunning { process.terminate() }
-                if process.isRunning { process.waitUntilExit() }
-                try? FileManager.default.removeItem(at: scratchDirectory)
-                return []
-            }
-        }.value
+        let scratchDirectory = scratchDirectory(for: UUID())
+        defer { try? FileManager.default.removeItem(at: scratchDirectory) }
+        do {
+            try FileManager.default.createDirectory(at: scratchDirectory, withIntermediateDirectories: true)
+            let canonicalWorkspace = try HarnessSandbox.canonicalDirectory(workspace)
+            let launch = try sandboxedLaunch(
+                executableURL: executableURL,
+                sandboxExecutableURL: sandboxExecutableURL,
+                workspace: canonicalWorkspace,
+                scratchDirectory: scratchDirectory
+            )
+            var environment = ProcessInfo.processInfo.environment
+            environment["TMPDIR"] = scratchDirectory.path + "/"
+            var stdinData = Data()
+            stdinData.append(contentsOf: try Self.serialized(Self.initializeRequest(id: 1)))
+            stdinData.append(contentsOf: try Self.serialized(Self.sessionRequest(id: 2, method: "session/new", workspace: canonicalWorkspace, threadID: nil)))
+            let result = await BoundedSubprocess.run(
+                .init(
+                    executableURL: launch.executableURL,
+                    arguments: launch.arguments,
+                    stdinData: stdinData,
+                    currentDirectoryURL: canonicalWorkspace,
+                    environment: environment,
+                    deadline: 10,
+                    maximumOutputBytes: 1_000_000
+                ),
+                stopWhen: { stdout, _ in !Self.modelsFromOutput(stdout).isEmpty }
+            )
+            guard result.outcome == .completed || result.outcome == .exited else { return [] }
+            return Self.modelsFromOutput(result.stdout)
+        } catch {
+            return []
+        }
     }
 
     public func stream(prompt: String, sessionID: UUID, threadID: String?, workspace: URL, requestedModel: String) -> AsyncStream<AgentEvent> {
@@ -592,6 +577,21 @@ public final class ACPHarness: @unchecked Sendable {
             }
         }
         return nil
+    }
+
+    private static func serialized(_ object: [String: Any]) throws -> Data {
+        var data = try JSONSerialization.data(withJSONObject: object, options: [.withoutEscapingSlashes])
+        data.append(0x0A)
+        return data
+    }
+
+    private static func modelsFromOutput(_ data: Data) -> [HarnessModel] {
+        for line in data.split(separator: 0x0A) where !line.isEmpty {
+            guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
+            let values = models(from: object)
+            if !values.isEmpty { return values }
+        }
+        return []
     }
 
     private static func write(_ object: [String: Any], to handle: FileHandle?) throws {

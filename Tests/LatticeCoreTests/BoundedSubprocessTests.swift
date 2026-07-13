@@ -130,6 +130,35 @@ struct BoundedSubprocessTests {
         #expect(result.outcome == .exited)
         #expect(result.exitStatus == 0)
     }
+
+    @Test func writesBoundedFiniteStdinBeforeClosingPipe() async {
+        let request = BoundedSubprocessRequest(
+            executableURL: URL(fileURLWithPath: "/bin/cat"),
+            stdinData: Data("finite-input".utf8),
+            deadline: 3,
+            maximumOutputBytes: 128
+        )
+        let result = await BoundedSubprocess.run(request)
+        #expect(result.outcome == .exited)
+        #expect(result.isSuccess)
+        #expect(result.stdout == Data("finite-input".utf8))
+    }
+
+    @Test func stopsFiniteProtocolWhenCompletionArrives() async {
+        let request = BoundedSubprocessRequest(
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "printf ready; while :; do :; done"],
+            deadline: 3,
+            maximumOutputBytes: 128,
+            terminateGraceInterval: 0.05
+        )
+        let result = await BoundedSubprocess.run(request) { stdout, _ in
+            stdout == Data("ready".utf8)
+        }
+        #expect(result.outcome == .completed)
+        #expect(result.isSuccess)
+        #expect(result.stdout == Data("ready".utf8))
+    }
 }
 
 /// Simple lock-backed cancellation probe for tests (avoids relying solely on Task tree).

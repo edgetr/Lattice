@@ -18,8 +18,8 @@ public final class AntigravityCLIHarness: @unchecked Sendable {
     public func models() async -> [ProviderModel] {
         guard let executableURL else { return [] }
         let result = await Self.run(executableURL, arguments: ["models"])
-        guard result.status == 0 else { return [] }
-        let names = String(decoding: result.output, as: UTF8.self)
+        guard result.isSuccess else { return [] }
+        let names = String(decoding: result.combinedOutput, as: UTF8.self)
             .split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
@@ -123,22 +123,10 @@ public final class AntigravityCLIHarness: @unchecked Sendable {
         return wasCancelled
     }
 
-    private static func run(_ executableURL: URL, arguments: [String]) async -> (status: Int32, output: Data) {
-        await Task.detached {
-            let process = Process()
-            let pipe = Pipe()
-            process.executableURL = executableURL
-            process.arguments = arguments
-            process.standardOutput = pipe
-            process.standardError = pipe
-            do {
-                try process.run()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                return (process.terminationStatus, data)
-            } catch {
-                return (-1, Data(error.localizedDescription.utf8))
-            }
-        }.value
+    private static func run(_ executableURL: URL, arguments: [String]) async -> BoundedSubprocessResult {
+        await BoundedSubprocess.run(.init(
+            executableURL: executableURL,
+            arguments: arguments
+        ))
     }
 }
