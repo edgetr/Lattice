@@ -16,13 +16,15 @@ public final class CodexExecHarness: @unchecked Sendable {
         }
 
         let sessionID: UUID
+        let owner: InteractiveProcessRegistry.Owner
         let requestID: UUID
         let serverRequestID: Any
         let allowedDecisions: Set<String>
         private let waiter = PermissionWaiter<Decision>()
 
-        init(sessionID: UUID, requestID: UUID, serverRequestID: Any, allowedDecisions: Set<String>) {
+        init(sessionID: UUID, owner: InteractiveProcessRegistry.Owner, requestID: UUID, serverRequestID: Any, allowedDecisions: Set<String>) {
             self.sessionID = sessionID
+            self.owner = owner
             self.requestID = requestID
             self.serverRequestID = serverRequestID
             self.allowedDecisions = allowedDecisions
@@ -48,12 +50,8 @@ public final class CodexExecHarness: @unchecked Sendable {
     private let executableURL: URL?
     private let permissionTimeoutNanoseconds: UInt64
     private let lock = NSLock()
-    private var processes: [UUID: Process] = [:]
-    private var inputs: [UUID: FileHandle] = [:]
-    private var threadIDs: [UUID: String] = [:]
-    private var turnIDs: [UUID: String] = [:]
+    private let processRegistry = InteractiveProcessRegistry()
     private var pendingPermissions: [UUID: PendingPermission] = [:]
-    private var cancelled: Set<UUID> = []
 
     public init(executableURL: URL? = ExecutableDiscovery.locate("codex"), permissionTimeout: TimeInterval = 120) {
         self.executableURL = executableURL
@@ -130,22 +128,25 @@ public final class CodexExecHarness: @unchecked Sendable {
                 guard let executableURL else {
                     continuation.yield(.failed("Codex is not installed.")); continuation.finish(); return
                 }
-                let process = Process()
-                let input = Pipe()
-                let output = Pipe()
-                process.executableURL = executableURL
-                process.arguments = ["app-server", "-c", "service_tier=\"flex\""]
-                process.currentDirectoryURL = workspace
-                process.standardInput = input
-                process.standardOutput = output
-                process.standardError = FileHandle.nullDevice
+                let transport = BoundedProcessTransport(request: .init(
+                    executableURL: executableURL,
+                    arguments: ["app-server", "-c", "service_tier=\"flex\""],
+                    currentDirectoryURL: workspace,
+                    deadline: 30 * 60,
+                    maximumOutputBytes: 8_000_000
+                ))
+                var owner: InteractiveProcessRegistry.Owner?
+                let start = processRegistry.beginStart(for: sessionID)
                 do {
-                    try process.run()
-                    register(process: process, input: input.fileHandleForWriting, for: sessionID)
-                    let reader = BoundedJSONLineReader(output.fileHandleForReading)
-                    try Self.write(Self.initializeRequest(id: 1), to: input.fileHandleForWriting)
-                    _ = try await readResponse(id: 1, sessionID: sessionID, from: reader, input: input.fileHandleForWriting, continuation: continuation)
-                    try Self.write(["method": "initialized", "params": [:]], to: input.fileHandleForWriting)
+                    try transport.start()
+                    guard let registeredOwner = register(process: transport, input: transport.input, for: sessionID, start: start) else {
+                        throw CodexHarnessError.message("Codex request cancelled before process registration.")
+                    }
+                    owner = registeredOwner
+                    let reader = BoundedJSONLineReader(transport.output)
+                    try Self.write(Self.initializeRequest(id: 1), to: transport.input)
+                    _ = try await readResponse(id: 1, sessionID: sessionID, owner: registeredOwner, from: reader, input: transport.input, continuation: continuation)
+                    try Self.write(["method": "initialized", "params": [:]], to: transport.input)
 
                     let route = Self.executionRoute(policy: policy, workspaceWrite: workspaceWrite)
                     let method = threadID == nil ? "thread/start" : "thread/resume"
@@ -159,14 +160,14 @@ public final class CodexExecHarness: @unchecked Sendable {
                         "sandbox": route.sandbox
                     ]
                     if let threadID { threadParams["threadId"] = threadID }
-                    try Self.write(["method": method, "id": 2, "params": threadParams], to: input.fileHandleForWriting)
-                    let threadResponse = try await readResponse(id: 2, sessionID: sessionID, from: reader, input: input.fileHandleForWriting, continuation: continuation)
+                    try Self.write(["method": method, "id": 2, "params": threadParams], to: transport.input)
+                    let threadResponse = try await readResponse(id: 2, sessionID: sessionID, owner: registeredOwner, from: reader, input: transport.input, continuation: continuation)
                     guard let result = threadResponse["result"] as? [String: Any],
                           let thread = result["thread"] as? [String: Any],
                           let activeThreadID = thread["id"] as? String else {
                         throw CodexHarnessError.message(Self.responseError(threadResponse, fallback: "Codex did not return a thread ID."))
                     }
-                    setThreadID(activeThreadID, for: sessionID)
+                    setThreadID(activeThreadID, owner: registeredOwner, for: sessionID)
                     continuation.yield(.harnessSessionStarted(activeThreadID))
 
                     var turnParams: [String: Any] = [
@@ -182,23 +183,24 @@ public final class CodexExecHarness: @unchecked Sendable {
                         turnParams["effort"] = reasoningEffort.rawValue
                         turnParams["summary"] = "auto"
                     }
-                    try Self.write(["method": "turn/start", "id": 3, "params": turnParams], to: input.fileHandleForWriting)
-                    let turnResponse = try await readResponse(id: 3, sessionID: sessionID, from: reader, input: input.fileHandleForWriting, continuation: continuation)
+                    try Self.write(["method": "turn/start", "id": 3, "params": turnParams], to: transport.input)
+                    let turnResponse = try await readResponse(id: 3, sessionID: sessionID, owner: registeredOwner, from: reader, input: transport.input, continuation: continuation)
                     guard let turnResult = turnResponse["result"] as? [String: Any],
                           let turn = turnResult["turn"] as? [String: Any],
                           let turnID = turn["id"] as? String else {
                         throw CodexHarnessError.message(Self.responseError(turnResponse, fallback: "Codex did not start the turn."))
                     }
-                    setTurnID(turnID, for: sessionID)
-                    let turnReportedCancellation = try await readTurn(sessionID: sessionID, workspace: workspace, from: reader, input: input.fileHandleForWriting, continuation: continuation)
-                    if process.isRunning { process.terminate() }
-                    process.waitUntilExit()
-                    let didCancel = unregister(sessionID)
+                    setTurnID(turnID, owner: registeredOwner, for: sessionID)
+                    let turnReportedCancellation = try await readTurn(sessionID: sessionID, owner: registeredOwner, workspace: workspace, from: reader, input: transport.input, continuation: continuation)
+                    transport.finish()
+                    let didCancel = unregister(registeredOwner, start: start, sessionID: sessionID)
                     if didCancel && !turnReportedCancellation { continuation.yield(.cancelled) }
                 } catch {
-                    let didCancel = unregister(sessionID)
-                    if process.isRunning { process.terminate() }
-                    if didCancel { continuation.yield(.cancelled) }
+                    let didCancel = unregister(owner, start: start, sessionID: sessionID)
+                    transport.cancel()
+                    if didCancel || transport.terminationReason == .cancelled { continuation.yield(.cancelled) }
+                    else if transport.terminationReason == .timedOut { continuation.yield(.failed("Codex timed out.")) }
+                    else if transport.terminationReason == .outputLimitExceeded { continuation.yield(.failed("Codex output exceeded its limit.")) }
                     else { continuation.yield(.failed(error.localizedDescription)) }
                 }
                 continuation.finish()
@@ -212,23 +214,18 @@ public final class CodexExecHarness: @unchecked Sendable {
     }
 
     public func cancel(sessionID: UUID) {
+        let target = processRegistry.cancel(sessionID: sessionID)
+        let input = target.input
+        let threadID = target.metadata.threadID
+        let turnID = target.metadata.turnID
         lock.lock()
-        cancelled.insert(sessionID)
-        let process = processes[sessionID]
-        let input = inputs[sessionID]
-        let threadID = threadIDs[sessionID]
-        let turnID = turnIDs[sessionID]
-        let pending = pendingPermissions.values.filter { $0.sessionID == sessionID }
+        let pending = target.metadata.pendingPermissionIDs.compactMap { pendingPermissions[$0] }
         lock.unlock()
         pending.forEach { _ = $0.resolve(nil) }
         if let input, let threadID, let turnID {
             try? Self.write(["method": "turn/interrupt", "id": 99, "params": ["threadId": threadID, "turnId": turnID]], to: input)
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.35) {
-                if process?.isRunning == true { process?.terminate() }
-            }
-        } else if process?.isRunning == true {
-            process?.terminate()
-        }
+            target.process?.cancel(after: 0.35)
+        } else { target.process?.cancel() }
     }
 
     @discardableResult
@@ -238,35 +235,50 @@ public final class CodexExecHarness: @unchecked Sendable {
         return pending?.resolve(optionID) == true
     }
 
-    private func register(process: Process, input: FileHandle, for id: UUID) {
-        lock.lock(); processes[id] = process; inputs[id] = input; lock.unlock()
+    private func register(process: BoundedProcessTransport, input: FileHandle, for id: UUID, start: InteractiveProcessRegistry.StartToken) -> InteractiveProcessRegistry.Owner? {
+        guard case .accepted(let owner) = processRegistry.register(process: process, input: input, for: id, start: start) else { return nil }
+        lock.lock()
+        let stale = pendingPermissions.values.filter { $0.sessionID == id }
+        pendingPermissions = pendingPermissions.filter { $0.value.sessionID != id }
+        lock.unlock()
+        stale.forEach { _ = $0.resolve(nil) }
+        return owner
     }
 
-    private func setThreadID(_ threadID: String, for id: UUID) {
-        lock.lock(); threadIDs[id] = threadID; lock.unlock()
+    private func setThreadID(_ threadID: String, owner: InteractiveProcessRegistry.Owner, for id: UUID) {
+        processRegistry.updateMetadata(owner, sessionID: id) { $0.threadID = threadID }
     }
 
-    private func setTurnID(_ turnID: String, for id: UUID) {
-        lock.lock(); turnIDs[id] = turnID; lock.unlock()
+    private func setTurnID(_ turnID: String, owner: InteractiveProcessRegistry.Owner, for id: UUID) {
+        processRegistry.updateMetadata(owner, sessionID: id) { $0.turnID = turnID }
     }
 
     private func register(_ pending: PendingPermission) {
+        guard processRegistry.updateMetadata(pending.owner, sessionID: pending.sessionID, {
+            $0.pendingPermissionIDs.insert(pending.requestID)
+        }) else {
+            _ = pending.resolve(nil)
+            return
+        }
         lock.lock(); pendingPermissions[pending.requestID] = pending; lock.unlock()
     }
 
-    private func removePendingPermission(_ requestID: UUID) {
+    private func removePendingPermission(_ requestID: UUID, owner: InteractiveProcessRegistry.Owner, sessionID: UUID) {
+        processRegistry.updateMetadata(owner, sessionID: sessionID) {
+            $0.pendingPermissionIDs.remove(requestID)
+        }
         lock.lock(); pendingPermissions[requestID] = nil; lock.unlock()
     }
 
-    private func unregister(_ id: UUID) -> Bool {
+    private func unregister(_ owner: InteractiveProcessRegistry.Owner?, start: InteractiveProcessRegistry.StartToken, sessionID id: UUID) -> Bool {
+        guard let owner else { return processRegistry.abandonStart(start, sessionID: id) }
+        let result = processRegistry.unregister(owner, sessionID: id)
+        guard result.removedCurrentOwner else { return result.wasCancelled }
         lock.lock()
-        let pending = pendingPermissions.values.filter { $0.sessionID == id }
-        processes[id] = nil; inputs[id] = nil; threadIDs[id] = nil; turnIDs[id] = nil
-        pendingPermissions = pendingPermissions.filter { $0.value.sessionID != id }
-        let didCancel = cancelled.remove(id) != nil
+        let pending = result.metadata.pendingPermissionIDs.compactMap { pendingPermissions.removeValue(forKey: $0) }
         lock.unlock()
         pending.forEach { _ = $0.resolve(nil) }
-        return didCancel
+        return result.wasCancelled
     }
 
     private static func initializeRequest(id: Int) -> [String: Any] {
@@ -287,6 +299,7 @@ public final class CodexExecHarness: @unchecked Sendable {
     private func readResponse(
         id: Int,
         sessionID: UUID,
+        owner: InteractiveProcessRegistry.Owner,
         from reader: BoundedJSONLineReader,
         input: FileHandle,
         continuation: AsyncStream<AgentEvent>.Continuation
@@ -294,7 +307,7 @@ public final class CodexExecHarness: @unchecked Sendable {
         while let object = try reader.next() {
             if object["method"] != nil {
                 if object["id"] != nil {
-                    try await handleServerRequest(object, sessionID: sessionID, workspace: nil, input: input, continuation: continuation)
+                    try await handleServerRequest(object, sessionID: sessionID, owner: owner, workspace: nil, input: input, continuation: continuation)
                 }
                 continue
             }
@@ -308,6 +321,7 @@ public final class CodexExecHarness: @unchecked Sendable {
 
     private func readTurn(
         sessionID: UUID,
+        owner: InteractiveProcessRegistry.Owner,
         workspace: URL,
         from reader: BoundedJSONLineReader,
         input: FileHandle,
@@ -315,7 +329,7 @@ public final class CodexExecHarness: @unchecked Sendable {
     ) async throws -> Bool {
         while let object = try reader.next() {
             if object["id"] != nil, object["method"] != nil {
-                try await handleServerRequest(object, sessionID: sessionID, workspace: workspace, input: input, continuation: continuation)
+                try await handleServerRequest(object, sessionID: sessionID, owner: owner, workspace: workspace, input: input, continuation: continuation)
                 continue
             }
             guard let method = object["method"] as? String else { continue }
@@ -332,6 +346,7 @@ public final class CodexExecHarness: @unchecked Sendable {
     private func handleServerRequest(
         _ object: [String: Any],
         sessionID: UUID,
+        owner: InteractiveProcessRegistry.Owner,
         workspace: URL?,
         input: FileHandle,
         continuation: AsyncStream<AgentEvent>.Continuation
@@ -344,11 +359,11 @@ public final class CodexExecHarness: @unchecked Sendable {
             return
         }
         let decisions = Set(request.options.map(\.id)).union(["cancel"])
-        let pending = PendingPermission(sessionID: sessionID, requestID: request.id, serverRequestID: serverID, allowedDecisions: decisions)
+        let pending = PendingPermission(sessionID: sessionID, owner: owner, requestID: request.id, serverRequestID: serverID, allowedDecisions: decisions)
         register(pending)
         continuation.yield(.permissionRequested(request))
         let result = await pending.wait(timeoutNanoseconds: permissionTimeoutNanoseconds)
-        removePendingPermission(request.id)
+        removePendingPermission(request.id, owner: owner, sessionID: sessionID)
         switch result {
         case .resolved(.selected(let decision)):
             try Self.write(["id": pending.serverRequestID, "result": ["decision": decision]], to: input)

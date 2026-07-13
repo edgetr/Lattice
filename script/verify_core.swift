@@ -12,6 +12,45 @@ struct CoreVerification {
             checks += 1
         }
 
+        let transportRoundTrip = await BoundedSubprocess.performOffCooperativeExecutor {
+            let transport = BoundedProcessTransport(request: .init(
+                executableURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", "IFS= read -r value; printf '%s\\n' \"$value\""],
+                deadline: 2,
+                maximumOutputBytes: 1024
+            ))
+            do {
+                try transport.start()
+                try transport.write(Data("transport-ok\n".utf8))
+                let value = try transport.readLine().map { String(decoding: $0, as: UTF8.self) }
+                transport.finish()
+                return value
+            } catch {
+                transport.cancel()
+                return nil
+            }
+        }
+        expect(transportRoundTrip == "transport-ok", "Interactive transport preserves parent writer and reader")
+
+        let fastExitOutput = await BoundedSubprocess.performOffCooperativeExecutor {
+            let transport = BoundedProcessTransport(request: .init(
+                executableURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", "printf 'buffered-fast-exit\\n'"],
+                deadline: 2,
+                maximumOutputBytes: 1024
+            ))
+            do {
+                try transport.start()
+                let value = try transport.readLine().map { String(decoding: $0, as: UTF8.self) }
+                transport.finish()
+                return value
+            } catch {
+                transport.cancel()
+                return nil
+            }
+        }
+        expect(fastExitOutput == "buffered-fast-exit", "Fast exit retains buffered interactive output")
+
         let editChat = UUID()
         let otherChat = UUID()
         let editContext = MessageEditContext(sessionID: editChat, messageID: UUID())
@@ -96,7 +135,9 @@ struct CoreVerification {
         } else {
             expect(false, "Smart gates material file changes without reversible evidence")
         }
-        let f05CodexWorkspace = URL(fileURLWithPath: "/tmp/Lattice")
+        // WorkspacePathScope intentionally fails closed when the workspace root
+        // itself does not exist; use a real root for this positive-path fixture.
+        let f05CodexWorkspace = FileManager.default.temporaryDirectory
         let f05CodexApprovalObject: [String: Any] = [
             "method": "item/fileChange/requestApproval",
             "params": ["grantRoot": f05CodexWorkspace.path, "reason": "Update Sources/App.swift"]

@@ -5,11 +5,13 @@ public final class PiRPCHarness: @unchecked Sendable {
         enum Decision: Sendable { case selected(String), cancelled }
 
         let sessionID: UUID
+        let owner: InteractiveProcessRegistry.Owner
         let requestID: UUID
         private let waiter = PermissionWaiter<Decision>()
 
-        init(sessionID: UUID, requestID: UUID) {
+        init(sessionID: UUID, owner: InteractiveProcessRegistry.Owner, requestID: UUID) {
             self.sessionID = sessionID
+            self.owner = owner
             self.requestID = requestID
         }
 
@@ -33,9 +35,7 @@ public final class PiRPCHarness: @unchecked Sendable {
     private let applicationSupportDirectory: URL?
     private let permissionTimeoutNanoseconds: UInt64
     private let lock = NSLock()
-    private var processes: [UUID: Process] = [:]
-    private var inputs: [UUID: FileHandle] = [:]
-    private var cancelled: Set<UUID> = []
+    private let processRegistry = InteractiveProcessRegistry()
     private var pendingPermissions: [UUID: PendingPermission] = [:]
 
     public init(
@@ -60,16 +60,13 @@ public final class PiRPCHarness: @unchecked Sendable {
                 guard let executableURL else {
                     continuation.yield(.failed("Pi is not installed.")); continuation.finish(); return
                 }
-                let process = Process()
-                let input = Pipe()
-                let output = Pipe()
-                process.standardInput = input
-                process.standardOutput = output
-                process.standardError = FileHandle.nullDevice
                 let tools = allowFileModification ? "read,grep,find,ls,write,edit,bash" : "read,grep,find,ls"
                 let piThreadID = Self.piThreadID(from: threadID) ?? UUID().uuidString.lowercased()
                 let sessionDirectory = sessionDirectory()
                 let scratchDirectory = scratchDirectory(for: sessionID)
+                var transport: BoundedProcessTransport?
+                var owner: InteractiveProcessRegistry.Owner?
+                let start = processRegistry.beginStart(for: sessionID)
                 do {
                     try FileManager.default.createDirectory(at: sessionDirectory, withIntermediateDirectories: true)
                     try FileManager.default.createDirectory(at: scratchDirectory, withIntermediateDirectories: true)
@@ -89,34 +86,44 @@ public final class PiRPCHarness: @unchecked Sendable {
                         writablePaths: [Self.piSettingsLockURL()],
                         sandboxExecutableURL: sandboxExecutableURL
                     )
-                    process.executableURL = launch.executableURL
-                    process.arguments = launch.arguments
-                    process.currentDirectoryURL = canonicalWorkspace
                     var environment = ProcessInfo.processInfo.environment
                     environment["LATTICE_PI_WORKSPACE"] = canonicalWorkspace.path
                     // Keep legacy env for older Pi helper tooling that still reads NISA_*.
                     environment["NISA_PI_WORKSPACE"] = canonicalWorkspace.path
                     environment["TMPDIR"] = scratchDirectory.path + "/"
-                    process.environment = environment
-                    try process.run()
-                    register(process: process, input: input.fileHandleForWriting, for: sessionID)
+                    let runningTransport = BoundedProcessTransport(request: .init(
+                        executableURL: launch.executableURL,
+                        arguments: launch.arguments,
+                        currentDirectoryURL: canonicalWorkspace,
+                        environment: environment,
+                        deadline: 30 * 60,
+                        maximumOutputBytes: 8_000_000
+                    ))
+                    transport = runningTransport
+                    try runningTransport.start()
+                    guard let registeredOwner = register(process: runningTransport, input: runningTransport.input, for: sessionID, start: start) else {
+                        throw NSError(domain: "PiRPCHarness", code: 1, userInfo: [NSLocalizedDescriptionKey: "Pi request cancelled before process registration."])
+                    }
+                    owner = registeredOwner
                     continuation.yield(.harnessSessionStarted("pi:\(piThreadID)"))
-                    try Self.write(["id": "prompt", "type": "prompt", "message": prompt], to: input.fileHandleForWriting)
-                    let reader = BoundedJSONLineReader(output.fileHandleForReading)
+                    try Self.write(["id": "prompt", "type": "prompt", "message": prompt], to: runningTransport.input)
+                    let reader = BoundedJSONLineReader(runningTransport.output)
                     var finished = false
                     while !finished {
                         guard let object = try reader.next() else { break }
-                        finished = try await parse(object, sessionID: sessionID, workspace: canonicalWorkspace, input: input.fileHandleForWriting, continuation: continuation)
+                        finished = try await parse(object, sessionID: sessionID, owner: registeredOwner, workspace: canonicalWorkspace, input: runningTransport.input, continuation: continuation)
                     }
-                    if process.isRunning { process.terminate() }
-                    process.waitUntilExit()
-                    let didCancel = unregister(sessionID)
+                    runningTransport.finish()
+                    let didCancel = unregister(registeredOwner, start: start, sessionID: sessionID)
                     if didCancel { continuation.yield(.cancelled) }
                     else if !finished { continuation.yield(.failed("Pi ended before completing the response.")) }
                 } catch {
-                    if process.isRunning { process.terminate() }
-                    _ = unregister(sessionID)
-                    continuation.yield(.failed((error as? PiHarnessError)?.text ?? error.localizedDescription))
+                    let didCancel = unregister(owner, start: start, sessionID: sessionID)
+                    transport?.cancel()
+                    if didCancel || transport?.terminationReason == .cancelled { continuation.yield(.cancelled) }
+                    else if transport?.terminationReason == .timedOut { continuation.yield(.failed("Pi timed out.")) }
+                    else if transport?.terminationReason == .outputLimitExceeded { continuation.yield(.failed("Pi output exceeded its limit.")) }
+                    else { continuation.yield(.failed((error as? PiHarnessError)?.text ?? error.localizedDescription)) }
                 }
                 try? FileManager.default.removeItem(at: scratchDirectory)
                 continuation.finish()
@@ -126,11 +133,11 @@ public final class PiRPCHarness: @unchecked Sendable {
     }
 
     public func cancel(sessionID: UUID) {
-        lock.lock(); cancelled.insert(sessionID); let process = processes[sessionID]; let input = inputs[sessionID]; lock.unlock()
-        let hadPermission = cancelPendingPermissions(for: sessionID)
+        let target = processRegistry.cancel(sessionID: sessionID)
+        let hadPermission = cancelPendingPermissions(target.metadata.pendingPermissionIDs)
         let stop = {
-            try? Self.write(["type": "abort"], to: input)
-            if process?.isRunning == true { process?.terminate() }
+            try? Self.write(["type": "abort"], to: target.input)
+            target.process?.cancel()
         }
         if hadPermission { DispatchQueue.global().asyncAfter(deadline: .now() + 0.1, execute: stop) }
         else { stop() }
@@ -144,14 +151,14 @@ public final class PiRPCHarness: @unchecked Sendable {
         return pending?.resolve(optionID: optionID) == true
     }
 
-    private func parse(_ object: [String: Any], sessionID: UUID, workspace: URL, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) async throws -> Bool {
+    private func parse(_ object: [String: Any], sessionID: UUID, owner: InteractiveProcessRegistry.Owner, workspace: URL, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) async throws -> Bool {
         guard let type = object["type"] as? String else {
             continuation.yield(HarnessToolEventDecoder.diagnostic(provider: "Pi", object: object, reason: "Event is missing type."))
             return false
         }
         if type == "extension_ui_request" {
             guard object["id"] as? String != nil else { continuation.yield(HarnessToolEventDecoder.diagnostic(provider: "Pi", object: object, reason: "Extension UI request is missing id.")); return false }
-            try await handleExtensionUIRequest(object, sessionID: sessionID, workspace: workspace, input: input, continuation: continuation)
+            try await handleExtensionUIRequest(object, sessionID: sessionID, owner: owner, workspace: workspace, input: input, continuation: continuation)
             return false
         }
         if type == "extension_error" {
@@ -180,52 +187,62 @@ public final class PiRPCHarness: @unchecked Sendable {
             continuation.yield(HarnessToolEventDecoder.diagnostic(provider: "Pi", object: object, reason: "Message end is malformed."))
         }
         if type == "agent_end" {
-            if !isCancelled(sessionID) { continuation.yield(.completed) }
+            if !processRegistry.isCancelled(owner, sessionID: sessionID) { continuation.yield(.completed) }
             return true
         }
         return false
     }
 
-    private func isCancelled(_ sessionID: UUID) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return cancelled.contains(sessionID)
-    }
-
-    private func register(process: Process, input: FileHandle, for id: UUID) {
-        lock.lock(); processes[id] = process; inputs[id] = input; lock.unlock()
+    private func register(process: BoundedProcessTransport, input: FileHandle, for id: UUID, start: InteractiveProcessRegistry.StartToken) -> InteractiveProcessRegistry.Owner? {
+        guard case .accepted(let owner) = processRegistry.register(process: process, input: input, for: id, start: start) else { return nil }
+        lock.lock()
+        let stale = pendingPermissions.values.filter { $0.sessionID == id }
+        pendingPermissions = pendingPermissions.filter { $0.value.sessionID != id }
+        lock.unlock()
+        stale.forEach { _ = $0.resolve(optionID: nil) }
+        return owner
     }
 
     private func register(_ pending: PendingPermission) {
+        guard processRegistry.updateMetadata(pending.owner, sessionID: pending.sessionID, {
+            $0.pendingPermissionIDs.insert(pending.requestID)
+        }) else {
+            _ = pending.resolve(optionID: nil)
+            return
+        }
         lock.lock(); pendingPermissions[pending.requestID] = pending; lock.unlock()
     }
 
-    private func removePendingPermission(_ requestID: UUID) {
+    private func removePendingPermission(_ requestID: UUID, owner: InteractiveProcessRegistry.Owner, sessionID: UUID) {
+        processRegistry.updateMetadata(owner, sessionID: sessionID) {
+            $0.pendingPermissionIDs.remove(requestID)
+        }
         lock.lock(); pendingPermissions[requestID] = nil; lock.unlock()
     }
 
-    private func unregister(_ id: UUID) -> Bool {
+    private func unregister(_ owner: InteractiveProcessRegistry.Owner?, start: InteractiveProcessRegistry.StartToken, sessionID id: UUID) -> Bool {
+        guard let owner else { return processRegistry.abandonStart(start, sessionID: id) }
+        let result = processRegistry.unregister(owner, sessionID: id)
+        guard result.removedCurrentOwner else { return result.wasCancelled }
         lock.lock()
-        let pending = pendingPermissions.values.filter { $0.sessionID == id }
-        processes[id] = nil; inputs[id] = nil
-        pendingPermissions = pendingPermissions.filter { $0.value.sessionID != id }
-        let didCancel = cancelled.remove(id) != nil
+        let pending = result.metadata.pendingPermissionIDs.compactMap { pendingPermissions.removeValue(forKey: $0) }
         lock.unlock()
         pending.forEach { _ = $0.resolve(optionID: nil) }
-        return didCancel
+        return result.wasCancelled
     }
 
-    private func handleExtensionUIRequest(_ object: [String: Any], sessionID: UUID, workspace: URL, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) async throws {
+    private func handleExtensionUIRequest(_ object: [String: Any], sessionID: UUID, owner: InteractiveProcessRegistry.Owner, workspace: URL, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) async throws {
         guard let externalID = object["id"] as? String else { return }
         guard object["method"] as? String == "confirm",
               let request = Self.permissionRequest(from: object, workspace: workspace) else {
             try Self.write(["type": "extension_ui_response", "id": externalID, "cancelled": true], to: input)
             return
         }
-        let pending = PendingPermission(sessionID: sessionID, requestID: request.id)
+        let pending = PendingPermission(sessionID: sessionID, owner: owner, requestID: request.id)
         register(pending)
         continuation.yield(.permissionRequested(request))
         let result = await pending.wait(timeoutNanoseconds: permissionTimeoutNanoseconds)
-        removePendingPermission(request.id)
+        removePendingPermission(request.id, owner: owner, sessionID: sessionID)
         switch result {
         case .resolved(.selected("allow_once")):
             try Self.write(["type": "extension_ui_response", "id": externalID, "confirmed": true], to: input)
@@ -239,8 +256,8 @@ public final class PiRPCHarness: @unchecked Sendable {
         }
     }
 
-    private func cancelPendingPermissions(for sessionID: UUID) -> Bool {
-        lock.lock(); let pending = pendingPermissions.values.filter { $0.sessionID == sessionID }; lock.unlock()
+    private func cancelPendingPermissions(_ requestIDs: Set<UUID>) -> Bool {
+        lock.lock(); let pending = requestIDs.compactMap { pendingPermissions[$0] }; lock.unlock()
         pending.forEach { $0.resolve(optionID: nil) }
         return !pending.isEmpty
     }

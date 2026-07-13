@@ -111,6 +111,18 @@ public struct BoundedSubprocessResult: Sendable, Equatable {
 /// - Parent-task cancellation is bridged explicitly because `Task.detached` does not
 ///   inherit cancellation from the caller.
 public enum BoundedSubprocess {
+    /// Runs blocking interactive protocol work on a dispatch worker rather than
+    /// occupying Swift's cooperative executor. The operation owns bounded cleanup.
+    public static func performOffCooperativeExecutor<T: Sendable>(
+        _ operation: @escaping @Sendable () -> T
+    ) async -> T {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: operation())
+            }
+        }
+    }
+
     public static func run(_ request: BoundedSubprocessRequest) async -> BoundedSubprocessResult {
         let flag = CancellationFlag()
         return await withTaskCancellationHandler {

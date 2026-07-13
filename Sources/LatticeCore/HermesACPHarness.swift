@@ -53,12 +53,14 @@ public final class ACPHarness: @unchecked Sendable {
         enum Decision: Sendable { case selected(String), cancelled }
 
         let sessionID: UUID
+        let owner: InteractiveProcessRegistry.Owner
         let requestID: UUID
         let optionIDs: Set<String>
         private let waiter = PermissionWaiter<Decision>()
 
-        init(sessionID: UUID, requestID: UUID, optionIDs: Set<String>) {
+        init(sessionID: UUID, owner: InteractiveProcessRegistry.Owner, requestID: UUID, optionIDs: Set<String>) {
             self.sessionID = sessionID
+            self.owner = owner
             self.requestID = requestID
             self.optionIDs = optionIDs
         }
@@ -86,11 +88,8 @@ public final class ACPHarness: @unchecked Sendable {
     private let profile: Profile
     private let permissionTimeoutNanoseconds: UInt64
     private let lock = NSLock()
-    private var processes: [UUID: Process] = [:]
-    private var inputs: [UUID: FileHandle] = [:]
-    private var acpSessionIDs: [UUID: String] = [:]
+    private let processRegistry = InteractiveProcessRegistry()
     private var pendingPermissions: [UUID: PendingPermission] = [:]
-    private var cancelled: Set<UUID> = []
 
     public init(
         profile: Profile = .hermes,
@@ -153,9 +152,10 @@ public final class ACPHarness: @unchecked Sendable {
                 guard let executableURL else {
                     continuation.yield(.failed("\(profile.displayName) is not installed.")); continuation.finish(); return
                 }
-                let process = Process(); let input = Pipe(); let output = Pipe()
                 let scratchDirectory = scratchDirectory(for: sessionID)
-                process.standardInput = input; process.standardOutput = output; process.standardError = FileHandle.nullDevice
+                var transport: BoundedProcessTransport?
+                var owner: InteractiveProcessRegistry.Owner?
+                let start = processRegistry.beginStart(for: sessionID)
                 do {
                     try FileManager.default.createDirectory(at: scratchDirectory, withIntermediateDirectories: true)
                     let canonicalWorkspace = try HarnessSandbox.canonicalDirectory(workspace)
@@ -166,16 +166,25 @@ public final class ACPHarness: @unchecked Sendable {
                         scratchDirectory: scratchDirectory,
                         allowFileModification: allowFileModification
                     )
-                    process.executableURL = launch.executableURL; process.arguments = launch.arguments
-                    process.currentDirectoryURL = canonicalWorkspace
                     var environment = ProcessInfo.processInfo.environment
                     environment["TMPDIR"] = scratchDirectory.path + "/"
-                    process.environment = environment
-                    try process.run()
-                    register(process: process, input: input.fileHandleForWriting, for: sessionID)
-                    let reader = BoundedJSONLineReader(output.fileHandleForReading)
-                    try Self.write(Self.initializeRequest(id: 1), to: input.fileHandleForWriting)
-                    _ = try Self.readResponse(id: 1, from: reader, input: input.fileHandleForWriting)
+                    let runningTransport = BoundedProcessTransport(request: .init(
+                        executableURL: launch.executableURL,
+                        arguments: launch.arguments,
+                        currentDirectoryURL: canonicalWorkspace,
+                        environment: environment,
+                        deadline: 30 * 60,
+                        maximumOutputBytes: 8_000_000
+                    ))
+                    transport = runningTransport
+                    try runningTransport.start()
+                    guard let registeredOwner = register(process: runningTransport, input: runningTransport.input, for: sessionID, start: start) else {
+                        throw HarnessError.message("\(profile.displayName) request cancelled before process registration.")
+                    }
+                    owner = registeredOwner
+                    let reader = BoundedJSONLineReader(runningTransport.output)
+                    try Self.write(Self.initializeRequest(id: 1), to: runningTransport.input)
+                    _ = try Self.readResponse(id: 1, from: reader, input: runningTransport.input)
 
                     var sessionRequestID = 2
 
@@ -185,28 +194,28 @@ public final class ACPHarness: @unchecked Sendable {
                         return profile == .grok || profile == .openCode ? threadID : nil
                     }()
                     let method = storedID == nil ? "session/new" : "session/load"
-                    try Self.write(Self.sessionRequest(id: sessionRequestID, method: method, workspace: canonicalWorkspace, threadID: storedID), to: input.fileHandleForWriting)
-                    var sessionResponse = try Self.readResponse(id: sessionRequestID, from: reader, input: input.fileHandleForWriting)
+                    try Self.write(Self.sessionRequest(id: sessionRequestID, method: method, workspace: canonicalWorkspace, threadID: storedID), to: runningTransport.input)
+                    var sessionResponse = try Self.readResponse(id: sessionRequestID, from: reader, input: runningTransport.input)
                     if profile == .grok, Self.isAuthenticationRequired(sessionResponse) {
                         sessionRequestID += 1
-                        try Self.write(["jsonrpc": "2.0", "id": sessionRequestID, "method": "authenticate", "params": ["methodId": "cached_token"]], to: input.fileHandleForWriting)
-                        let authResponse = try Self.readResponse(id: sessionRequestID, from: reader, input: input.fileHandleForWriting)
+                        try Self.write(["jsonrpc": "2.0", "id": sessionRequestID, "method": "authenticate", "params": ["methodId": "cached_token"]], to: runningTransport.input)
+                        let authResponse = try Self.readResponse(id: sessionRequestID, from: reader, input: runningTransport.input)
                         if let error = authResponse["error"] as? [String: Any] {
                             throw HarnessError.message(error["message"] as? String ?? "Grok authentication failed.")
                         }
                         sessionRequestID += 1
-                        try Self.write(Self.sessionRequest(id: sessionRequestID, method: method, workspace: canonicalWorkspace, threadID: storedID), to: input.fileHandleForWriting)
-                        sessionResponse = try Self.readResponse(id: sessionRequestID, from: reader, input: input.fileHandleForWriting)
+                        try Self.write(Self.sessionRequest(id: sessionRequestID, method: method, workspace: canonicalWorkspace, threadID: storedID), to: runningTransport.input)
+                        sessionResponse = try Self.readResponse(id: sessionRequestID, from: reader, input: runningTransport.input)
                     }
                     if Self.result(from: sessionResponse) == nil, storedID != nil {
                         sessionRequestID += 1
-                        try Self.write(Self.sessionRequest(id: sessionRequestID, method: "session/new", workspace: canonicalWorkspace, threadID: nil), to: input.fileHandleForWriting)
-                        sessionResponse = try Self.readResponse(id: sessionRequestID, from: reader, input: input.fileHandleForWriting)
+                        try Self.write(Self.sessionRequest(id: sessionRequestID, method: "session/new", workspace: canonicalWorkspace, threadID: nil), to: runningTransport.input)
+                        sessionResponse = try Self.readResponse(id: sessionRequestID, from: reader, input: runningTransport.input)
                     }
                     guard let result = Self.result(from: sessionResponse), let acpID = (result["sessionId"] as? String) ?? storedID else {
                         throw HarnessError.message("\(profile.displayName) could not create a session.")
                     }
-                    setACPSessionID(acpID, for: sessionID)
+                    setACPSessionID(acpID, owner: registeredOwner, for: sessionID)
                     continuation.yield(.harnessSessionStarted("\(profile.sessionPrefix)\(acpID)"))
 
                     let models = Self.models(from: sessionResponse)
@@ -222,22 +231,22 @@ public final class ACPHarness: @unchecked Sendable {
                         } else {
                             request = ["jsonrpc": "2.0", "id": sessionRequestID, "method": "session/set_model", "params": ["sessionId": acpID, "modelId": matched.id]]
                         }
-                        try Self.write(request, to: input.fileHandleForWriting)
-                        _ = try Self.readResponse(id: sessionRequestID, from: reader, input: input.fileHandleForWriting)
+                        try Self.write(request, to: runningTransport.input)
+                        _ = try Self.readResponse(id: sessionRequestID, from: reader, input: runningTransport.input)
                     }
 
                     sessionRequestID += 1
-                    try Self.write(["jsonrpc": "2.0", "id": sessionRequestID, "method": "session/prompt", "params": ["sessionId": acpID, "prompt": [["type": "text", "text": prompt]]]], to: input.fileHandleForWriting)
-                    try await readPromptResponse(id: sessionRequestID, sessionID: sessionID, workspace: canonicalWorkspace, allowFileModification: allowFileModification, from: reader, input: input.fileHandleForWriting, continuation: continuation)
-                    if process.isRunning { process.terminate() }
-                    process.waitUntilExit()
-                    let didCancel = unregister(sessionID)
+                    try Self.write(["jsonrpc": "2.0", "id": sessionRequestID, "method": "session/prompt", "params": ["sessionId": acpID, "prompt": [["type": "text", "text": prompt]]]], to: runningTransport.input)
+                    try await readPromptResponse(id: sessionRequestID, sessionID: sessionID, owner: registeredOwner, workspace: canonicalWorkspace, allowFileModification: allowFileModification, from: reader, input: runningTransport.input, continuation: continuation)
+                    runningTransport.finish()
+                    let didCancel = unregister(registeredOwner, start: start, sessionID: sessionID)
                     continuation.yield(didCancel ? .cancelled : .completed)
                 } catch {
-                    let didCancel = unregister(sessionID)
-                    if process.isRunning { process.terminate() }
-                    if process.isRunning { process.waitUntilExit() }
-                    if didCancel { continuation.yield(.cancelled) }
+                    let didCancel = unregister(owner, start: start, sessionID: sessionID)
+                    transport?.cancel()
+                    if didCancel || transport?.terminationReason == .cancelled { continuation.yield(.cancelled) }
+                    else if transport?.terminationReason == .timedOut { continuation.yield(.failed("\(profile.displayName) timed out.")) }
+                    else if transport?.terminationReason == .outputLimitExceeded { continuation.yield(.failed("\(profile.displayName) output exceeded its limit.")) }
                     else { continuation.yield(.failed((error as? HarnessError)?.text ?? error.localizedDescription)) }
                 }
                 try? FileManager.default.removeItem(at: scratchDirectory)
@@ -252,14 +261,12 @@ public final class ACPHarness: @unchecked Sendable {
     }
 
     public func cancel(sessionID: UUID) {
-        lock.lock(); cancelled.insert(sessionID); let process = processes[sessionID]; let input = inputs[sessionID]; let acpID = acpSessionIDs[sessionID]; lock.unlock()
-        cancelPendingPermissions(for: sessionID)
-        if let acpID { try? Self.write(["jsonrpc": "2.0", "method": "session/cancel", "params": ["sessionId": acpID]], to: input) }
-        if let process, process.isRunning {
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) {
-                if process.isRunning { process.terminate() }
-            }
+        let target = processRegistry.cancel(sessionID: sessionID)
+        cancelPendingPermissions(target.metadata.pendingPermissionIDs)
+        if let acpID = target.metadata.providerSessionID {
+            try? Self.write(["jsonrpc": "2.0", "method": "session/cancel", "params": ["sessionId": acpID]], to: target.input)
         }
+        target.process?.cancel(after: 0.25)
     }
 
     @discardableResult
@@ -372,36 +379,51 @@ public final class ACPHarness: @unchecked Sendable {
         return LatticeApplicationSupport.productRootURL().appendingPathComponent("HarnessScratch/\(profile.displayName)/\(sessionID.uuidString.lowercased())", isDirectory: true)
     }
 
-    private func register(process: Process, input: FileHandle, for id: UUID) {
-        lock.lock(); processes[id] = process; inputs[id] = input; lock.unlock()
-    }
-
-    private func setACPSessionID(_ acpID: String, for id: UUID) {
-        lock.lock(); acpSessionIDs[id] = acpID; lock.unlock()
-    }
-
-    private func unregister(_ id: UUID) -> Bool {
+    private func register(process: BoundedProcessTransport, input: FileHandle, for id: UUID, start: InteractiveProcessRegistry.StartToken) -> InteractiveProcessRegistry.Owner? {
+        guard case .accepted(let owner) = processRegistry.register(process: process, input: input, for: id, start: start) else { return nil }
         lock.lock()
-        let pending = pendingPermissions.values.filter { $0.sessionID == id }
-        processes[id] = nil; inputs[id] = nil; acpSessionIDs[id] = nil
+        let stale = pendingPermissions.values.filter { $0.sessionID == id }
         pendingPermissions = pendingPermissions.filter { $0.value.sessionID != id }
-        let didCancel = cancelled.remove(id) != nil
+        lock.unlock()
+        stale.forEach { _ = $0.resolve(optionID: nil) }
+        return owner
+    }
+
+    private func setACPSessionID(_ acpID: String, owner: InteractiveProcessRegistry.Owner, for id: UUID) {
+        processRegistry.updateMetadata(owner, sessionID: id) { $0.providerSessionID = acpID }
+    }
+
+    private func unregister(_ owner: InteractiveProcessRegistry.Owner?, start: InteractiveProcessRegistry.StartToken, sessionID id: UUID) -> Bool {
+        guard let owner else { return processRegistry.abandonStart(start, sessionID: id) }
+        let result = processRegistry.unregister(owner, sessionID: id)
+        guard result.removedCurrentOwner else { return result.wasCancelled }
+        lock.lock()
+        let pending = result.metadata.pendingPermissionIDs.compactMap { pendingPermissions.removeValue(forKey: $0) }
         lock.unlock()
         pending.forEach { _ = $0.resolve(optionID: nil) }
-        return didCancel
+        return result.wasCancelled
     }
 
     private func register(_ pending: PendingPermission) {
+        guard processRegistry.updateMetadata(pending.owner, sessionID: pending.sessionID, {
+            $0.pendingPermissionIDs.insert(pending.requestID)
+        }) else {
+            _ = pending.resolve(optionID: nil)
+            return
+        }
         lock.lock(); pendingPermissions[pending.requestID] = pending; lock.unlock()
     }
 
-    private func removePendingPermission(_ requestID: UUID) {
+    private func removePendingPermission(_ requestID: UUID, owner: InteractiveProcessRegistry.Owner, sessionID: UUID) {
+        processRegistry.updateMetadata(owner, sessionID: sessionID) {
+            $0.pendingPermissionIDs.remove(requestID)
+        }
         lock.lock(); pendingPermissions[requestID] = nil; lock.unlock()
     }
 
-    private func cancelPendingPermissions(for sessionID: UUID) {
+    private func cancelPendingPermissions(_ requestIDs: Set<UUID>) {
         lock.lock()
-        let pending = pendingPermissions.values.filter { $0.sessionID == sessionID }
+        let pending = requestIDs.compactMap { pendingPermissions[$0] }
         lock.unlock()
         pending.forEach { $0.resolve(optionID: nil) }
     }
@@ -437,7 +459,7 @@ public final class ACPHarness: @unchecked Sendable {
         }
     }
 
-    private func readPromptResponse(id: Int, sessionID: UUID, workspace: URL, allowFileModification: Bool, from reader: BoundedJSONLineReader, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) async throws {
+    private func readPromptResponse(id: Int, sessionID: UUID, owner: InteractiveProcessRegistry.Owner, workspace: URL, allowFileModification: Bool, from reader: BoundedJSONLineReader, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) async throws {
         while let object = try reader.next() {
             if object["method"] as? String == "session/update" {
                 let update = ((object["params"] as? [String: Any])?["update"] as? [String: Any])
@@ -450,7 +472,7 @@ public final class ACPHarness: @unchecked Sendable {
                 }
                 continue
             }
-            if object["method"] != nil { try await answerServerRequest(object, sessionID: sessionID, workspace: workspace, allowFileModification: allowFileModification, to: input, continuation: continuation); continue }
+            if object["method"] != nil { try await answerServerRequest(object, sessionID: sessionID, owner: owner, workspace: workspace, allowFileModification: allowFileModification, to: input, continuation: continuation); continue }
             if (object["id"] as? NSNumber)?.intValue == id {
                 if let error = object["error"] as? [String: Any] { throw HarnessError.message(error["message"] as? String ?? "Hermes prompt failed.") }
                 return
@@ -459,7 +481,7 @@ public final class ACPHarness: @unchecked Sendable {
         throw HarnessError.message("ACP agent ended before completing the response.")
     }
 
-    private func answerServerRequest(_ object: [String: Any], sessionID: UUID, workspace: URL, allowFileModification: Bool, to input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) async throws {
+    private func answerServerRequest(_ object: [String: Any], sessionID: UUID, owner: InteractiveProcessRegistry.Owner, workspace: URL, allowFileModification: Bool, to input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) async throws {
         guard let id = object["id"], let method = object["method"] as? String else { return }
         guard method == "session/request_permission", let request = Self.permissionRequest(from: object, workspace: workspace) else {
             try Self.write(["jsonrpc": "2.0", "id": id, "error": ["code": -32601, "message": "Unsupported client request: \(method)"]], to: input)
@@ -469,11 +491,11 @@ public final class ACPHarness: @unchecked Sendable {
             try Self.write(["jsonrpc": "2.0", "id": id, "result": ["outcome": ["outcome": "cancelled"]]], to: input)
             throw HarnessError.message("Provider file writes and commands are disabled during Lattice self-edit.")
         }
-        let pending = PendingPermission(sessionID: sessionID, requestID: request.id, optionIDs: Set(request.options.map(\.id)))
+        let pending = PendingPermission(sessionID: sessionID, owner: owner, requestID: request.id, optionIDs: Set(request.options.map(\.id)))
         register(pending)
         continuation.yield(.permissionRequested(request))
         let result = await pending.wait(timeoutNanoseconds: permissionTimeoutNanoseconds)
-        removePendingPermission(request.id)
+        removePendingPermission(request.id, owner: owner, sessionID: sessionID)
         let outcome: [String: Any]
         switch result {
         case .resolved(.selected(let optionID)):
