@@ -27,8 +27,11 @@ PACKAGE_STAGING_ROOT=""
 PACKAGE_BACKUP_ROOT=""
 PACKAGE_FINAL_BUNDLE="$APP_BUNDLE"
 PACKAGE_PROMOTION_IN_PROGRESS=0
-LOCK_DIR="${TMPDIR:-/tmp}/lattice-build-and-run.lock"
-LOCK_PID_FILE="$LOCK_DIR/pid"
+LOCK_FILE="${LATTICE_LOCK_FILE:-${TMPDIR:-/tmp}/lattice-build-and-run.lock}"
+LOCK_PID_FILE="$LOCK_FILE"
+LOCK_TOOL="${LATTICE_LOCK_TOOL:-/usr/bin/shlock}"
+LOCK_WAIT_SECONDS="${LATTICE_LOCK_WAIT_SECONDS:-0.2}"
+LOCK_WAIT_LIMIT="${LATTICE_LOCK_WAIT_LIMIT:-600}"
 MANUAL_BUILD="$ROOT_DIR/.build/manual"
 SDK_CANDIDATES=(
   "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
@@ -100,35 +103,28 @@ USAGE
 }
 
 acquire_lock() {
+  if [[ ! -x "$LOCK_TOOL" ]]; then
+    echo "Cannot acquire build lock: shlock unavailable at $LOCK_TOOL." >&2
+    return 1
+  fi
+
   local waited=0
-  while ! mkdir "$LOCK_DIR" >/dev/null 2>&1; do
-    if [[ -f "$LOCK_PID_FILE" ]]; then
-      local owner
-      owner="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
-      if [[ -n "$owner" ]] && ! kill -0 "$owner" >/dev/null 2>&1; then
-        rm -rf "$LOCK_DIR"
-        continue
-      fi
-    else
-      sleep 1
-      if [[ ! -f "$LOCK_PID_FILE" ]]; then
-        rm -rf "$LOCK_DIR"
-        continue
-      fi
-    fi
-    sleep 0.2
+  # shlock prepares PID record and publishes it with atomic link(2).
+  # Stale-PID check/removal stays inside same protocol; shell never splits
+  # lock acquisition from PID creation.
+  while ! "$LOCK_TOOL" -f "$LOCK_FILE" -p "$$" >/dev/null 2>&1; do
+    sleep "$LOCK_WAIT_SECONDS"
     waited=$((waited + 1))
-    if [[ "$waited" -ge 600 ]]; then
+    if [[ "$waited" -ge "$LOCK_WAIT_LIMIT" ]]; then
       echo "Timed out waiting for another Lattice build/run task to finish." >&2
-      exit 1
+      return 1
     fi
   done
-  printf '%s\n' "$$" >"$LOCK_PID_FILE"
 }
 
 release_lock() {
   if [[ -f "$LOCK_PID_FILE" ]] && [[ "$(cat "$LOCK_PID_FILE" 2>/dev/null || true)" == "$$" ]]; then
-    rm -rf "$LOCK_DIR"
+    rm -f "$LOCK_FILE"
   fi
 }
 
