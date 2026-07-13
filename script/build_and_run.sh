@@ -27,8 +27,10 @@ LOCK_DIR="${TMPDIR:-/tmp}/lattice-build-and-run.lock"
 LOCK_PID_FILE="$LOCK_DIR/pid"
 MANUAL_BUILD="$ROOT_DIR/.build/manual"
 SDK_CANDIDATES=(
-  "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+  "/Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk"
   "/Library/Developer/CommandLineTools/SDKs/MacOSX27.sdk"
+  "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk"
+  "/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk"
   "/Library/Developer/CommandLineTools/SDKs/MacOSX15.sdk"
 )
 
@@ -120,7 +122,7 @@ build_with_swiftpm() {
   BUILD_BINARY="$(swift build --show-bin-path)/$APP_NAME"
 }
 
-build_manual() {
+build_manual_core() {
   local sdk
   if ! sdk="$(resolve_manual_sdk)"; then
     echo "Lattice requires full Xcode or a complete macOS SDK. Swift Package Manager is unavailable." >&2
@@ -130,11 +132,20 @@ build_manual() {
   rm -rf "$MANUAL_BUILD"
   mkdir -p "$MANUAL_BUILD"
   # shellcheck disable=SC2086
-  swiftc -sdk "$sdk" -target arm64-apple-macosx15.0 -parse-as-library -emit-module -emit-library -static \
+  swiftc -sdk "$sdk" -target arm64-apple-macosx15.0 -parse-as-library -enable-testing \
+    -module-cache-path "$MANUAL_BUILD/module-cache" -emit-module -emit-library -static \
     -module-name LatticeCore "$ROOT_DIR"/Sources/LatticeCore/*.swift \
     -emit-module-path "$MANUAL_BUILD/LatticeCore.swiftmodule" -o "$MANUAL_BUILD/libLatticeCore.a"
+  CORE_BIN_PATH="$MANUAL_BUILD"
+}
+
+build_manual() {
+  build_manual_core
+  local sdk
+  sdk="$(resolve_manual_sdk)"
   # shellcheck disable=SC2086
-  swiftc -sdk "$sdk" -target arm64-apple-macosx15.0 -I "$MANUAL_BUILD" "$MANUAL_BUILD/libLatticeCore.a" -framework Security \
+  swiftc -sdk "$sdk" -target arm64-apple-macosx15.0 -module-cache-path "$MANUAL_BUILD/module-cache" \
+    -I "$MANUAL_BUILD" "$MANUAL_BUILD/libLatticeCore.a" -framework Security \
     "$ROOT_DIR"/Sources/Lattice/*.swift -o "$MANUAL_BUILD/Lattice"
   BUILD_BINARY="$MANUAL_BUILD/Lattice"
 }
@@ -145,17 +156,68 @@ ensure_core_library() {
     CORE_BIN_PATH="$(swift build --show-bin-path)"
     return 0
   fi
-  if [[ ! -f "$MANUAL_BUILD/libLatticeCore.a" || ! -f "$MANUAL_BUILD/LatticeCore.swiftmodule" ]]; then
-    build_manual
+  # Never trust manual artifacts from an earlier source or toolchain state.
+  build_manual_core
+}
+
+verify_fallback_test_inventory() {
+  local expected_test_files=(
+    AtomicJSONFileTransactionTests.swift
+    BoundedSubprocessTests.swift
+    CatalogPresentationPolicyTests.swift
+    ConversationMessagePresentationPolicyTests.swift
+    ConversationScrollPolicyTests.swift
+    DurableStoreRecoveryTests.swift
+    ExtensionRuntimeTests.swift
+    PolicyEngineTests.swift
+    RecommendationTests.swift
+    RemoteInstallerScriptPolicyTests.swift
+    SessionPersistenceTests.swift
+    SessionPortableArchiveTests.swift
+    SessionSaveCoordinatorTests.swift
+  )
+  local expected_files="${#expected_test_files[@]}"
+  local expected_tests=231
+  local test_sources=("$ROOT_DIR"/Tests/LatticeCoreTests/*.swift)
+  if [[ ! -e "${test_sources[0]}" ]]; then
+    echo "FAIL: fallback test inventory missing Tests/LatticeCoreTests/*.swift" >&2
+    return 1
   fi
-  CORE_BIN_PATH="$MANUAL_BUILD"
+  if [[ "${#test_sources[@]}" -ne "$expected_files" ]]; then
+    echo "FAIL: fallback/native test-file parity changed (expected $expected_files, found ${#test_sources[@]})" >&2
+    return 1
+  fi
+
+  local test_file test_count total_tests=0 index=0
+  for test_file in "${test_sources[@]}"; do
+    if [[ "$(basename "$test_file")" != "${expected_test_files[$index]}" ]]; then
+      echo "FAIL: fallback/native test-file parity changed at index $index" >&2
+      return 1
+    fi
+    if ! /usr/bin/grep -q '^import Testing$' "$test_file"; then
+      echo "FAIL: fallback test inventory found non-Swift-Testing file: $test_file" >&2
+      return 1
+    fi
+    test_count="$(/usr/bin/grep -Ec '^[[:space:]]*@Test(\(|[[:space:]]|$)' "$test_file")"
+    total_tests=$((total_tests + test_count))
+    index=$((index + 1))
+  done
+  if [[ "$total_tests" -ne "$expected_tests" ]]; then
+    echo "FAIL: fallback/native test-declaration parity changed (expected $expected_tests, found $total_tests)" >&2
+    return 1
+  fi
+  if [[ ! -s "$ROOT_DIR/script/verify_core.swift" ]]; then
+    echo "FAIL: fallback verifier missing or empty: script/verify_core.swift" >&2
+    return 1
+  fi
+  echo "Fallback inventory: ${#test_sources[@]} native test files / $total_tests native Swift Testing declarations; native declarations are not executed in fallback mode."
 }
 
 run_tests() {
-  echo "==> Running tests (non-destructive)"
   if have_swiftpm; then
+    echo "==> Running native Swift Testing suite (non-destructive)"
     swift test
-    echo "OK: swift test passed"
+    echo "OK: native Swift Testing suite passed"
     return 0
   fi
 
@@ -165,14 +227,23 @@ run_tests() {
     exit 1
   fi
 
-  echo "==> SwiftPM unavailable; building LatticeCore and running script/verify_core.swift"
+  echo "==> SwiftPM unavailable; running deterministic fallback core verification"
+  echo "    Native Swift Testing suite is not run in fallback mode."
+  verify_fallback_test_inventory
   ensure_core_library
   # shellcheck disable=SC2086
-  swiftc -parse-as-library -sdk "$sdk" -target arm64-apple-macosx15.0 \
+  if ! swiftc -parse-as-library -sdk "$sdk" -target arm64-apple-macosx15.0 \
+    -module-cache-path "$MANUAL_BUILD/module-cache" \
     -I "$CORE_BIN_PATH" "$CORE_BIN_PATH/libLatticeCore.a" \
-    "$ROOT_DIR/script/verify_core.swift" -o "$MANUAL_BUILD/verify_core"
-  "$MANUAL_BUILD/verify_core"
-  echo "OK: verify_core passed (manual core verification path)"
+    "$ROOT_DIR/script/verify_core.swift" -o "$MANUAL_BUILD/verify_core"; then
+    echo "FAIL: fallback verifier compilation failed" >&2
+    return 1
+  fi
+  if ! "$MANUAL_BUILD/verify_core"; then
+    echo "FAIL: fallback core verification failed" >&2
+    return 1
+  fi
+  echo "OK: fallback core verification passed (native Swift Testing suite not run)"
 }
 
 build_binary() {
