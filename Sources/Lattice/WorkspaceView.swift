@@ -109,7 +109,7 @@ struct WorkspaceView: View {
                     }
                     .padding(12)
                     .latticeGlass(cornerRadius: 14, tint: Color.green.opacity(0.08))
-                    .accessibilityElement(children: .combine)
+                    .accessibilityElement(children: .contain)
                     .accessibilityLabel("Export or import status")
                     .accessibilityValue(status)
                     .accessibilityIdentifier("export-import-status")
