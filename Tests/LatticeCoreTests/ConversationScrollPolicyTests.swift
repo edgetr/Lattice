@@ -194,6 +194,11 @@ struct ConversationScrollPolicyTests {
     }
 
     @Test func structuralHeightChangeCompensatesOffsetWhileBrowsing() {
+        let beforeDelete = ConversationScrollMetrics(
+            contentOffsetY: 200,
+            containerHeight: 400,
+            contentHeight: 1_000
+        )
         let previous = ConversationScrollContentSnapshot(
             messageCount: 5,
             lastMessageID: UUID(),
@@ -202,7 +207,7 @@ struct ConversationScrollPolicyTests {
         )
         let state = ConversationScrollSessionState(
             isFollowingTail: false,
-            metrics: browsing,
+            metrics: beforeDelete,
             preservedOffsetY: 200,
             lastContentHeight: 1_000,
             contentSnapshot: previous
@@ -221,7 +226,7 @@ struct ConversationScrollPolicyTests {
         let contentResult = ConversationScrollPolicy.decideContentChange(
             state: state,
             content: current,
-            measuredMetrics: browsing,
+            measuredMetrics: beforeDelete,
             reduceMotion: false
         )
         #expect(contentResult.command == .none)

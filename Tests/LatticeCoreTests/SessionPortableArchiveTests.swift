@@ -517,7 +517,7 @@ struct SessionPortableArchiveTests {
     }
 
     private func jsonString(_ value: String) -> String {
-        let data = try! JSONSerialization.data(withJSONObject: value)
+        let data = try! JSONSerialization.data(withJSONObject: value, options: .fragmentsAllowed)
         return String(data: data, encoding: .utf8)!
     }
 }
