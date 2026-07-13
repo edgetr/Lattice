@@ -34,6 +34,16 @@ struct InspectorView: View {
                         Text("Cloud provider routes are blocked for this chat.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                        if !session.backend.isLocal && session.messages.contains(where: { $0.role == .user }) {
+                            Text("This chat is locked to its cloud route. Start a separate local chat to continue without sending cloud requests.")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                            Button("Start New Local Chat") {
+                                state.startLocalOnlyChatFromSelected()
+                            }
+                            .disabled(!state.canStartLocalOnlyChat)
+                            .help(state.canStartLocalOnlyChat ? "Create a fresh chat with a local backend" : "Make Apple Intelligence or Ollama available in Connections first")
+                        }
                     }
                 }
                 if case .codex = session.backend, let usage = state.codexUsage {
@@ -593,7 +603,7 @@ struct ConnectionsView: View {
                         }
                     }
 
-                    ConnectionCard(identity: .systemImage("paperplane"), name: "Antigravity", detail: state.antigravityAuthenticated ? "Ready · CLI" : (state.antigravityInstalled ? "Sign in required" : "Not installed"), ready: state.antigravityAuthenticated) {
+                    ConnectionCard(identity: .systemImage("paperplane"), name: "Antigravity", detail: state.antigravityCatalogReady ? "Ready · CLI" : (state.antigravityAuthenticated ? "Connected · no models reported" : (state.antigravityInstalled ? "Sign in required" : "Not installed")), ready: state.antigravityCatalogReady) {
                         if state.antigravityInstalled {
                             if !state.antigravityAuthenticated { CLIActionButton(title: "Sign In", provider: "antigravity", state: state) { state.connectAntigravity() } }
                             if CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: state.antigravityCLIVersion, latestVersion: state.antigravityLatestCLIVersion) {

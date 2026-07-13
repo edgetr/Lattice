@@ -82,6 +82,13 @@ struct UnsafeProviderRouteAcknowledgement: Identifiable {
     let detail: String
 }
 
+struct ExecutionRouteOption: Identifiable, Equatable {
+    let engineID: String
+    let harnessID: String
+    let title: String
+    var id: String { "\(engineID):\(harnessID)" }
+}
+
 private struct PreparedSubmission {
     let userText: String
     let runText: String
@@ -272,6 +279,7 @@ final class AppState: ObservableObject {
     private var extensionDirectoryFileDescriptor: CInt = -1
     private var cancellables: Set<AnyCancellable> = []
     private var submittedRequests: [UUID: String] = [:]
+    private var retryableRequests: [UUID: String] = [:]
     private var selfEditRunIDs: Set<UUID> = []
     private var activeRunIDs: [UUID: UUID] = [:]
     @Published private var runUIStates: [UUID: RunUIState] = [:]
@@ -486,6 +494,25 @@ final class AppState: ObservableObject {
         get { selectedRunUIState?.overlayControlState ?? .expanded }
         set { updateSelectedRunUI { $0.overlayControlState = newValue } }
     }
+    var availableExecutionRoutes: [ExecutionRouteOption] {
+        let engineID = selectedSession.map { Self.engineID(for: $0.backend) } ?? selectedRouteEngineID
+        return ExecutionRoutePolicy.compatibleHarnessIDs(for: engineID)
+            .sorted()
+            .filter { isRouteHarnessCompatible(engineID: engineID, harnessID: $0) }
+            .compactMap { harnessID in
+                let title: String
+                switch harnessID {
+                case "codex": title = "Codex"
+                case "opencode": title = "OpenCode"
+                case "grok": title = "Grok"
+                case "antigravity": title = "Antigravity"
+                case "pi": title = "Pi"
+                case "hermes": title = "Hermes"
+                default: title = "Lattice"
+                }
+                return ExecutionRouteOption(engineID: engineID, harnessID: harnessID, title: title)
+            }
+    }
     var activeReasoningOptions: [ReasoningOption] { reasoningOptions(for: activeBackend, harnessID: activeHarnessID) }
     var activeReasoningEffort: ReasoningEffort? { selectedSession?.reasoningEffort ?? defaultReasoning(for: activeBackend, harnessID: activeHarnessID) }
     var isSelectedSessionRouteLocked: Bool {
@@ -499,6 +526,8 @@ final class AppState: ObservableObject {
     var visibleGrokModels: [ProviderModel] { grokModels.filter { isModelEnabled("grok:\($0.id)") } }
     var visibleOpenCodeModels: [ProviderModel] { openCodeModels.filter { isModelEnabled("opencode:\($0.id)") } }
     var visibleAntigravityModels: [ProviderModel] { antigravityModels.filter { isModelEnabled("antigravity:\($0.id)") } }
+    var codexCatalogReady: Bool { codexReady && !codexModels.isEmpty }
+    var antigravityCatalogReady: Bool { antigravityAuthenticated && !visibleAntigravityModels.isEmpty }
 
     func setProviderModelsExpanded(_ providerID: String, expanded: Bool) {
         if expanded { expandedProviderModelIDs.insert(providerID) }
@@ -578,6 +607,24 @@ final class AppState: ObservableObject {
               let session = selectedSession,
               LatticeContinuationPolicy.canContinue(session) else { return false }
         return canRunSession(session)
+    }
+    var canRetrySelectedSession: Bool {
+        guard let session = selectedSession, !session.isStreaming, retryableRequests[session.id] != nil else { return false }
+        return canRunSession(session)
+    }
+    func retrySelectedSession() {
+        guard let id = selectedSessionID,
+              let index = sessions.firstIndex(where: { $0.id == id }),
+              !sessions[index].isStreaming,
+              let request = retryableRequests[id] else { return }
+        guard canRunSession(sessions[index]) else {
+            setError(routeUnavailableMessage(for: sessions[index]) ?? "Choose a connected model.", sessionID: id)
+            return
+        }
+        sessions[index].messages.append(.init(role: .assistant, text: ""))
+        submittedRequests[id] = request
+        retryableRequests[id] = nil
+        startRun(for: id, at: index, submittedText: request)
     }
     var canDeleteSelectedSession: Bool {
         guard let session = selectedSession else { return false }
@@ -945,8 +992,39 @@ final class AppState: ObservableObject {
         let sessionPrivacy = activePrivacyMode
         privacyMode = sessionPrivacy
         let backend = validBackend(defaultBackend, privacyMode: sessionPrivacy)
-        let harnessID = Self.defaultHarnessID(for: backend)
+        let engineID = Self.engineID(for: backend)
+        let harnessID = selectedRouteEngineID == engineID && isRouteHarnessCompatible(engineID: engineID, harnessID: selectedRouteHarnessID)
+            ? selectedRouteHarnessID
+            : Self.defaultHarnessID(for: backend)
         let session = LatticeSession(title: "New chat", backend: backend, harnessID: harnessID, reasoningEffort: defaultReasoning(for: backend, harnessID: harnessID), workspacePath: selectedWorkspacePath, policy: policy, privacyMode: sessionPrivacy)
+        sessions.insert(session, at: 0)
+        selectedSessionID = session.id
+        selectedSection = .conversations
+        clearError()
+        persist()
+    }
+
+    var canStartLocalOnlyChat: Bool {
+        appleIntelligenceReady || (ollamaReady && !ollamaModels.isEmpty)
+    }
+
+    func startLocalOnlyChatFromSelected() {
+        guard canStartLocalOnlyChat else {
+            setError("Local-only mode needs Apple Intelligence or a running Ollama model. Open Connections to make one available.", sessionID: selectedSessionID)
+            return
+        }
+        let backend = localBackendFallback()
+        let harnessID = Self.defaultHarnessID(for: backend)
+        let source = selectedSession
+        let session = LatticeSession(
+            title: "New local chat",
+            backend: backend,
+            harnessID: harnessID,
+            reasoningEffort: defaultReasoning(for: backend, harnessID: harnessID),
+            workspacePath: source?.workspacePath ?? selectedWorkspacePath,
+            policy: source?.policy ?? policy,
+            privacyMode: .localOnly
+        )
         sessions.insert(session, at: 0)
         selectedSessionID = session.id
         selectedSection = .conversations
@@ -992,6 +1070,8 @@ final class AppState: ObservableObject {
             selfEditPreviews = updated
         }
         sessions.removeAll { $0.id == id }
+        submittedRequests[id] = nil
+        retryableRequests[id] = nil
         clearConversationScrollState(for: id)
         selectedSessionID = LatticeSessionListOrdering.sorted(sessions).first?.id
         persist()
@@ -1480,6 +1560,7 @@ final class AppState: ObservableObject {
         sessions[index].messages.append(.init(role: .user, text: submission.userText))
         sessions[index].messages.append(.init(role: .assistant, text: ""))
         submittedRequests[id] = submission.runText
+        retryableRequests[id] = nil
         startRun(for: id, at: index, submittedText: submission.runText)
         return true
     }
@@ -1522,6 +1603,7 @@ final class AppState: ObservableObject {
         preservedComposerDraftBeforeEdit = ""
         draft = MessageEditDraftState.complete(existing)
         submittedRequests[id] = submission.runText
+        retryableRequests[id] = nil
         startRun(for: id, at: index, submittedText: submission.runText)
     }
 
@@ -1710,7 +1792,7 @@ final class AppState: ObservableObject {
         if harnessID == "hermes" { return hermesInstalled && hermesMatch(for: backend) != nil }
         switch backend {
         case .codex(let model):
-            return codexReady && (codexModels.isEmpty || codexModels.contains(where: { $0.id == model }))
+            return codexReady && codexModels.contains(where: { $0.id == model })
         case .grok(let model):
             return grokReady && ACPHarness.bestMatch(for: model, in: grokACPModels) != nil
         case .openCode(let model):
@@ -1770,7 +1852,7 @@ final class AppState: ObservableObject {
         if harnessID == "hermes" { return hermesInstalled && hermesMatch(for: backend) != nil }
         switch backend {
         case .codex(let model):
-            return codexReady && (codexModels.isEmpty || codexModels.contains(where: { $0.id == model }))
+            return codexReady && codexModels.contains(where: { $0.id == model })
         case .grok(let model):
             return grokReady && ACPHarness.bestMatch(for: model, in: grokACPModels) != nil
         case .openCode(let model):
@@ -1802,7 +1884,8 @@ final class AppState: ObservableObject {
         case .codex(let model):
             if !codex.isInstalled { return "Codex is not installed." }
             if !codexReady { return "Codex sign-in is required before this chat can continue." }
-            if !codexModels.isEmpty, !codexModels.contains(where: { $0.id == model }) {
+            if codexModels.isEmpty { return "Codex has not reported a model catalog. Refresh Connections before continuing." }
+            if !codexModels.contains(where: { $0.id == model }) {
                 return "Codex no longer exposes \(model). Start a new chat to choose another model."
             }
         case .grok(let model):
@@ -1829,6 +1912,7 @@ final class AppState: ObservableObject {
         case .antigravity(let model):
             if !antigravityInstalled { return "Antigravity CLI is not installed." }
             if !antigravityAuthenticated { return "Sign in to Antigravity before this chat can continue." }
+            if visibleAntigravityModels.isEmpty { return "Antigravity has not reported a model catalog. Refresh Connections before continuing." }
             if !visibleAntigravityModels.contains(where: { $0.id == model }) {
                 return "Antigravity no longer exposes \(model). Start a new chat to choose another model."
             }
@@ -1880,6 +1964,7 @@ final class AppState: ObservableObject {
     func stop(sessionID id: UUID) {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
         let session = sessions[index]
+        if let request = submittedRequests[id] { retryableRequests[id] = request }
         activeRunIDs[id] = nil
         finishPendingActions(status: .cancelled, at: index)
         sessions[index].isStreaming = false
@@ -4862,6 +4947,7 @@ Lattice self-edit rules:
                 _ = prepareGeneratedExtensionPreview(at: index, request: request)
             }
             submittedRequests[id] = nil
+            retryableRequests[id] = nil
             if runNextQueuedFollowUpIfPossible(for: id) { return }
             persist()
             scheduleIdleUnloadIfNeeded(for: backend)
@@ -4871,6 +4957,8 @@ Lattice self-edit rules:
             selfEditRunIDs.remove(id)
             finishPendingActions(status: .cancelled, at: index)
             sessions[index].isStreaming = false
+            if let request = submittedRequests[id] { retryableRequests[id] = request }
+            submittedRequests[id] = nil
             reduceRunUI(.cancelled, for: id)
             persist()
             scheduleIdleUnloadIfNeeded(for: backend)
@@ -4878,6 +4966,7 @@ Lattice self-edit rules:
             activeRunIDs[id] = nil
             harnessPermissionNotices[id] = nil
             selfEditRunIDs.remove(id)
+            if let request = submittedRequests[id] { retryableRequests[id] = request }
             submittedRequests[id] = nil
             let timedOut = message == "Permission request timed out."
             finishPendingActions(

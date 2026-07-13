@@ -245,6 +245,7 @@ public final class OllamaClient: @unchecked Sendable {
                     guard try isSuccessStatus(response) else {
                         throw URLError(.badServerResponse)
                     }
+                    var receivedDone = false
                     for try await line in lines {
                         try Task.checkCancellation()
                         guard let data = line.data(using: .utf8),
@@ -255,10 +256,14 @@ public final class OllamaClient: @unchecked Sendable {
                             continuation.yield(.assistantDelta(content))
                         }
                         if json["done"] as? Bool == true {
+                            receivedDone = true
                             continuation.yield(.completed)
                         }
                     }
                     try Task.checkCancellation()
+                    if !receivedDone {
+                        continuation.yield(.failed("The local model stream ended before Ollama reported completion."))
+                    }
                 } catch {
                     if Self.isCancellation(error) {
                         continuation.yield(.cancelled)

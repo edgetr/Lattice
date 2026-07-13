@@ -1076,6 +1076,7 @@ public enum SessionPortableArchiveImporter {
         try validateBackendRoute(backendRoute)
         let backendModel = try optionalString(object["backendModel"], field: "chat.backendModel", limit: SessionPortableArchive.maxModelLength)
         let harnessID = try optionalString(object["harnessID"], field: "chat.harnessID", limit: SessionPortableArchive.maxHarnessIDLength)
+        try validateHarnessID(harnessID, forBackendRoute: backendRoute)
         let harnessLabel = try optionalString(object["harnessLabel"], field: "chat.harnessLabel", limit: 100)
         let reasoningEffort = try optionalString(object["reasoningEffort"], field: "chat.reasoningEffort", limit: 32)
         if let reasoningEffort {
@@ -1429,6 +1430,22 @@ public enum SessionPortableArchiveImporter {
         let allowed = ["codex", "grok", "opencode", "antigravity", "appleIntelligence", "ollama"]
         guard allowed.contains(route) else {
             throw SessionPortableArchive.ArchiveError.invalidEnum(field: "chat.backendRoute", value: route)
+        }
+    }
+
+    private static func validateHarnessID(_ harnessID: String?, forBackendRoute route: String) throws {
+        guard let harnessID else { return }
+        let allowed: Set<String>
+        switch route {
+        case "codex": allowed = ["codex", "pi"]
+        case "grok": allowed = ["grok"]
+        case "opencode": allowed = ["opencode", "pi", "hermes"]
+        case "antigravity": allowed = ["antigravity"]
+        case "appleIntelligence", "ollama": allowed = ["lattice"]
+        default: allowed = []
+        }
+        guard allowed.contains(harnessID) else {
+            throw SessionPortableArchive.ArchiveError.invalidEnum(field: "chat.harnessID", value: harnessID)
         }
     }
 
