@@ -169,7 +169,7 @@ struct ModelsView: View {
                                     Spacer(minLength: 8)
                                     Button("Use") { state.useBackendInChat(backend) }
                                         .disabled(!runnable)
-                                        .accessibilityHint(runnable ? "Use \(model.name\) in a chat." : "Start Ollama before using this local model.")
+                                        .accessibilityHint(runnable ? "Use \(model.name) in a chat." : "Start Ollama before using this local model.")
                                         .help(runnable ? "Use \(model.name) in a chat." : "Start Ollama before using this local model.")
                                 }
                                 .padding(LatticeMetrics.cardPadding)
@@ -511,7 +511,7 @@ struct RecommendationRow: View {
                 Button("Use") { state.useBackendInChat(backend) }
                     .fixedSize(horizontal: true, vertical: false)
                     .disabled(!runnable)
-                    .accessibilityHint(runnable ? "Use \(model.name\) in a chat." : "Start Ollama before using this local model.")
+                    .accessibilityHint(runnable ? "Use \(model.name) in a chat." : "Start Ollama before using this local model.")
                     .help(runnable ? "Use \(model.name) in a chat." : "Start Ollama before using this local model.")
             } else if !state.ollamaInstalled {
                 Button("Get Ollama") { state.installOllama() }.fixedSize(horizontal: true, vertical: false)

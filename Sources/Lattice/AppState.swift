@@ -169,6 +169,7 @@ final class AppState: ObservableObject {
     @Published var columnVisibility: NavigationSplitViewVisibility = .all
     /// Last measured conversations workspace width; used only for split-column adaptation.
     private var lastMeasuredWorkspaceWidth: CGFloat = 0
+    private var activeConnectionRefreshes = 0
     /// Visibility last written by adaptive layout; used to distinguish user-driven toggles.
     private var lastAutoAppliedColumnVisibility: NavigationSplitViewVisibility?
     /// When true, do not auto-change columns until the window is comfortably wide again.
@@ -2061,8 +2062,12 @@ final class AppState: ObservableObject {
     }
 
     func refreshConnections(refreshProviderCatalogs: Bool = false) async {
+        activeConnectionRefreshes += 1
         isRefreshingConnections = true
-        defer { isRefreshingConnections = false }
+        defer {
+            activeConnectionRefreshes -= 1
+            isRefreshingConnections = activeConnectionRefreshes > 0
+        }
         async let codexRefresh: Void = refreshCodexConnection()
         async let grokRefresh: Void = refreshGrokConnection()
         async let openCodeRefresh: Void = refreshOpenCodeConnection(refreshCatalog: refreshProviderCatalogs)
