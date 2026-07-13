@@ -6,36 +6,7 @@ struct WorkspaceView: View {
     @ObservedObject var state: AppState
 
     var body: some View {
-        Group {
-            if state.selectedSection == .conversations {
-                NavigationSplitView(columnVisibility: $state.columnVisibility) {
-                    SidebarView(state: state)
-                        // Section sidebar can shrink aggressively; chat list + transcript keep priority.
-                        .navigationSplitViewColumnWidth(min: 160, ideal: 200, max: 230)
-                } content: {
-                    SessionListView(state: state)
-                        .navigationSplitViewColumnWidth(min: 220, ideal: 280, max: 340)
-                } detail: {
-                    if state.isOverlayVisible {
-                        Color.clear
-                    } else {
-                        ConversationView(state: state)
-                            .inspector(isPresented: $state.showInspector) {
-                                InspectorView(state: state).inspectorColumnWidth(min: 240, ideal: 280, max: 330)
-                            }
-                    }
-                }
-                // Prefer a usable transcript over keeping every column open at narrow widths.
-                .navigationSplitViewStyle(.prominentDetail)
-            } else {
-                NavigationSplitView {
-                    SidebarView(state: state)
-                        .navigationSplitViewColumnWidth(min: 168, ideal: 200, max: 230)
-                } detail: {
-                    sectionDetail
-                }
-            }
-        }
+        workspaceLayout
         .background {
             GeometryReader { proxy in
                 Color.clear
@@ -190,6 +161,14 @@ struct WorkspaceView: View {
         }
     }
 
+    @ViewBuilder private var workspaceLayout: some View {
+        if state.selectedSection == .conversations {
+            ConversationWorkspaceLayout(state: state)
+        } else {
+            SectionWorkspaceLayout(state: state, detail: sectionDetail)
+        }
+    }
+
     private static func cliDisplayName(_ provider: String) -> String {
         switch provider {
         case "codex": "Codex CLI"
@@ -209,6 +188,47 @@ struct WorkspaceView: View {
         case .models: ModelsView(state: state)
         case .connections: ConnectionsView(state: state)
         case .extensions: ExtensionsView(state: state)
+        }
+    }
+}
+
+private struct ConversationWorkspaceLayout: View {
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        NavigationSplitView(columnVisibility: $state.columnVisibility) {
+            SidebarView(state: state)
+                // Section sidebar can shrink aggressively; chat list + transcript keep priority.
+                .navigationSplitViewColumnWidth(min: 160, ideal: 200, max: 230)
+        } content: {
+            SessionListView(state: state)
+                .navigationSplitViewColumnWidth(min: 220, ideal: 280, max: 340)
+        } detail: {
+            if state.isOverlayVisible {
+                Color.clear
+            } else {
+                ConversationView(state: state)
+                    .inspector(isPresented: $state.showInspector) {
+                        InspectorView(state: state)
+                            .inspectorColumnWidth(min: 240, ideal: 280, max: 330)
+                    }
+            }
+        }
+        // Prefer a usable transcript over keeping every column open at narrow widths.
+        .navigationSplitViewStyle(.prominentDetail)
+    }
+}
+
+private struct SectionWorkspaceLayout<Detail: View>: View {
+    @ObservedObject var state: AppState
+    let detail: Detail
+
+    var body: some View {
+        NavigationSplitView {
+            SidebarView(state: state)
+                .navigationSplitViewColumnWidth(min: 168, ideal: 200, max: 230)
+        } detail: {
+            detail
         }
     }
 }
