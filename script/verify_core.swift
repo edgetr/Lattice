@@ -90,6 +90,64 @@ struct CoreVerification {
         let write = ToolRequest(kind: .write, title: "Write", detail: "file", workspaceScoped: true, reversible: true)
         if case .allow = policy.evaluate(read, under: .ask) { expect(true, "Ask read") } else { expect(false, "Ask read") }
         if case .requireApproval = policy.evaluate(write, under: .ask) { expect(true, "Ask write") } else { expect(false, "Ask write") }
+        let materialFileChange = ToolRequest(kind: .write, title: "Change files", detail: "Sources/App.swift", workspaceScoped: true, reversible: false)
+        if case .requireApproval = policy.evaluate(materialFileChange, under: .smart) {
+            expect(true, "Smart gates material file changes without reversible evidence")
+        } else {
+            expect(false, "Smart gates material file changes without reversible evidence")
+        }
+        let f05CodexWorkspace = URL(fileURLWithPath: "/tmp/Lattice")
+        let f05CodexApprovalObject: [String: Any] = [
+            "method": "item/fileChange/requestApproval",
+            "params": ["grantRoot": f05CodexWorkspace.path, "reason": "Update Sources/App.swift"]
+        ]
+        if let approval = CodexExecHarness.appServerPermissionRequest(from: f05CodexApprovalObject, workspace: f05CodexWorkspace),
+           let request = approval.toolRequest {
+            expect(request.workspaceScoped && !request.reversible, "Codex file-change request defaults non-reversible without undo evidence")
+            if case .requireApproval = policy.evaluate(request, under: .smart) {
+                expect(true, "Smart gates scoped Codex file-change request")
+            } else {
+                expect(false, "Smart gates scoped Codex file-change request")
+            }
+        } else {
+            expect(false, "Codex file-change request defaults non-reversible without undo evidence")
+        }
+        let f05CodexEventObject: [String: Any] = [
+            "method": "item/started",
+            "params": ["item": [
+                "id": "file-change-1",
+                "type": "fileChange",
+                "changes": [["path": "Sources/App.swift"]]
+            ]]
+        ]
+        if case .toolRequested(let request)? = CodexExecHarness.appServerEvent(from: f05CodexEventObject, workspace: f05CodexWorkspace) {
+            expect(request.workspaceScoped && !request.reversible, "Codex file-change event defaults non-reversible without undo evidence")
+            if case .requireApproval = policy.evaluate(request, under: .smart) {
+                expect(true, "Smart gates scoped Codex file-change event")
+            } else {
+                expect(false, "Smart gates scoped Codex file-change event")
+            }
+        } else {
+            expect(false, "Codex file-change event defaults non-reversible without undo evidence")
+        }
+        let f05CodexOutsideObject: [String: Any] = [
+            "method": "item/started",
+            "params": ["item": [
+                "id": "file-change-outside",
+                "type": "fileChange",
+                "changes": [["path": "/tmp/Other/App.swift"]]
+            ]]
+        ]
+        if case .toolRequested(let request)? = CodexExecHarness.appServerEvent(from: f05CodexOutsideObject, workspace: f05CodexWorkspace) {
+            expect(!request.workspaceScoped && !request.reversible, "Codex file-change scope remains fail-closed")
+            if case .requireApproval = policy.evaluate(request, under: .smart) {
+                expect(true, "Smart gates out-of-workspace Codex file-change event")
+            } else {
+                expect(false, "Smart gates out-of-workspace Codex file-change event")
+            }
+        } else {
+            expect(false, "Codex file-change scope remains fail-closed")
+        }
         let broker = LocalToolBroker(handlers: [
             .write: { request in .toolProgress(id: request.id, fraction: 1, detail: "patched") }
         ])
