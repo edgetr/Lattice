@@ -6,23 +6,23 @@ struct WorkspaceView: View {
     @ObservedObject var state: AppState
 
     var body: some View {
-        workspaceLayout
-        .background {
-            GeometryReader { proxy in
-                Color.clear
-                    .preference(key: WorkspaceWidthPreferenceKey.self, value: proxy.size.width)
+        AnyView(
+            workspaceLayout
+            .background {
+                GeometryReader { proxy in
+                    Color.clear
+                        .preference(key: WorkspaceWidthPreferenceKey.self, value: proxy.size.width)
+                }
             }
-        }
-        .onPreferenceChange(WorkspaceWidthPreferenceKey.self) { width in
-            state.noteWorkspaceWidth(width)
-        }
-        .onChange(of: state.columnVisibility) { _, newValue in
-            state.noteColumnVisibilityChanged(to: newValue)
-        }
+            .onPreferenceChange(WorkspaceWidthPreferenceKey.self) { width in
+                state.noteWorkspaceWidth(width)
+            }
+            .onChange(of: state.columnVisibility) { _, newValue in
+                state.noteColumnVisibilityChanged(to: newValue)
+            }
+        )
         .onChange(of: state.selectedSection) { _, section in
-            if section == .conversations {
-                state.applyAdaptiveColumnVisibilityIfNeeded()
-            }
+            noteSelectedSectionChanged(section)
         }
         .accessibilityIdentifier(LatticeAccessibilityID.workspaceRoot)
         .toolbar {
@@ -159,6 +159,11 @@ struct WorkspaceView: View {
         } message: {
             Text(state.importChatErrorMessage ?? "Something went wrong. Existing chats were not changed.")
         }
+    }
+
+    private func noteSelectedSectionChanged(_ section: WorkspaceSection) {
+        guard section == .conversations else { return }
+        state.applyAdaptiveColumnVisibilityIfNeeded()
     }
 
     @ViewBuilder private var workspaceLayout: some View {
