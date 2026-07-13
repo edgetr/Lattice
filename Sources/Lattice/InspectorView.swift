@@ -453,11 +453,12 @@ struct ConnectionsView: View {
                     ConnectionCard(
                         identity: .provider(.codex),
                         name: "Codex",
-                        detail: state.codexReady ? "Connected" : (state.codex.isInstalled ? "Sign in required" : "Not installed"),
+                        detail: state.codexReadinessCopy.detail,
                         ready: state.codexReady
                     ) {
                         if state.codex.isInstalled {
-                            if !state.codexReady {
+                            CatalogRefreshButton(status: state.codexCatalogStatus, state: state)
+                            if !state.codexAuthenticated {
                                 CLIActionButton(title: "Sign In", provider: "codex", state: state) { state.connectCodex() }
                             }
                             if CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: state.codexCLIVersion, latestVersion: state.codexLatestCLIVersion) {
@@ -477,11 +478,12 @@ struct ConnectionsView: View {
                     ConnectionCard(
                         identity: .provider(.grok),
                         name: "Grok",
-                        detail: state.grokReady ? "Ready · ACP" : (state.grok.isInstalled ? "Sign in or ACP unavailable" : "Not installed"),
+                        detail: state.grokReadinessCopy.detail,
                         ready: state.grokReady
                     ) {
                         if state.grok.isInstalled {
-                            if !state.grokReady {
+                            CatalogRefreshButton(status: state.grokCatalogStatus, state: state)
+                            if !state.grokAuthenticated {
                                 CLIActionButton(title: "Sign In", provider: "grok", state: state) { state.connectGrok() }
                             }
                             CLIActionButton(title: CLIVersionDisplayPolicy.updateActionTitle(state.grokCLIInfo.updateAvailable == true ? "Update CLI" : "Check Update", currentVersion: state.grokCLIInfo.currentVersion, latestVersion: state.grokCLIInfo.updateAvailable == true ? state.grokCLIInfo.latestVersion : nil), provider: "grok", state: state) {
@@ -506,11 +508,12 @@ struct ConnectionsView: View {
                     ConnectionCard(
                         identity: .provider(.opencode),
                         name: "OpenCode",
-                        detail: state.openCodeReady ? "Ready · ACP" : (state.openCode.isInstalled ? "Sign in or ACP unavailable" : "Not installed"),
+                        detail: state.openCodeReadinessCopy.detail,
                         ready: state.openCodeReady
                     ) {
                         if state.openCode.isInstalled {
-                            if !state.openCodeReady {
+                            CatalogRefreshButton(status: state.openCodeCatalogStatus, state: state)
+                            if !state.openCodeAuthenticated {
                                 CLIActionButton(title: "Sign In", provider: "opencode", state: state) { state.connectOpenCode() }
                             }
                             if CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: state.openCodeCLIVersion, latestVersion: state.openCodeLatestCLIVersion) {
@@ -609,11 +612,12 @@ struct ConnectionsView: View {
                     ConnectionCard(
                         identity: .systemImage("shippingbox"),
                         name: "Hermes",
-                        detail: state.hermesInstalled ? (state.hermesReady ? "Ready · \(state.hermesModels.count) models" : "Setup required") : "Not installed",
+                        detail: state.hermesReadinessCopy.detail,
                         ready: state.hermesReady
                     ) {
                         if state.hermesInstalled {
-                            if !state.hermesReady {
+                            CatalogRefreshButton(status: state.hermesCatalogStatus, state: state)
+                            if state.hermesCatalogStatus == .unknown {
                                 CLIActionButton(title: "Set Up", provider: "hermes", state: state) { state.connectHermes() }
                             }
                             CLIActionButton(title: CLIVersionDisplayPolicy.updateActionTitle(state.hermesCLIInfo.updateAvailable == true ? "Update CLI" : "Check Update", currentVersion: state.hermesCLIInfo.currentVersion, latestVersion: state.hermesCLIInfo.updateAvailable == true ? state.hermesCLIInfo.latestVersion : nil), provider: "hermes", state: state) {
@@ -668,6 +672,19 @@ struct SectionHeader: View {
         Text(title)
             .font(.headline)
             .padding(.top, 8)
+    }
+}
+
+struct CatalogRefreshButton: View {
+    let status: ProviderCatalogStatus
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        if status.isRefreshable {
+            Button(status == .failed ? "Retry catalog" : "Refresh catalog") {
+                Task { await state.refreshConnections(refreshProviderCatalogs: true) }
+            }
+        }
     }
 }
 

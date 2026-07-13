@@ -156,15 +156,21 @@ final class AppState: ObservableObject {
     @Published var localModelIdleUnloadMinutes: Int
     @Published var localModelStatus: String?
     @Published var codexReady = false
+    @Published var codexAuthenticated = false
+    @Published var codexCatalogStatus: ProviderCatalogStatus = .unknown
     @Published var codexModels: [ProviderModel] = []
     @Published var codexUsage: ProviderUsage?
     @Published var codexCLIVersion: String?
     @Published var codexLatestCLIVersion: String?
     @Published var grokReady = false
+    @Published var grokAuthenticated = false
+    @Published var grokCatalogStatus: ProviderCatalogStatus = .unknown
     @Published var grokModels: [ProviderModel] = []
     var grokACPModels: [HarnessModel] = []
     @Published var grokCLIInfo = CLIUpdateInfo()
     @Published var openCodeReady = false
+    @Published var openCodeAuthenticated = false
+    @Published var openCodeCatalogStatus: ProviderCatalogStatus = .unknown
     @Published var openCodeModels: [ProviderModel] = []
     var openCodeACPModels: [HarnessModel] = []
     @Published var openCodeCLIVersion: String?
@@ -188,6 +194,7 @@ final class AppState: ObservableObject {
     @Published var piLatestCLIVersion: String?
     @Published var piModelIDs: Set<String> = []
     @Published var hermesInstalled = false
+    @Published var hermesCatalogStatus: ProviderCatalogStatus = .unknown
     @Published var hermesCLIInfo = CLIUpdateInfo()
     @Published var hermesModels: [HarnessModel] = []
     @Published var appleIntelligenceReady = false
@@ -488,7 +495,34 @@ final class AppState: ObservableObject {
     var runnableGrokModels: [ProviderModel] { visibleGrokModels.filter { ACPHarness.bestMatch(for: $0.id, in: grokACPModels) != nil } }
     var runnableOpenCodeModels: [ProviderModel] { visibleOpenCodeModels.filter { ACPHarness.bestMatch(for: $0.id, in: openCodeACPModels) != nil } }
     var localModelIdleUnloadLabel: String { localModelIdleUnloadMinutes == 0 ? "Off" : "\(localModelIdleUnloadMinutes)m" }
-    var hermesReady: Bool { hermesInstalled && !hermesModels.isEmpty }
+    var codexReadinessCopy: ProviderReadinessCopy {
+        ProviderReadinessPresentationPolicy.copy(
+            providerName: "Codex",
+            readiness: ProviderReadinessSnapshot(installed: codex.isInstalled, authenticated: codexAuthenticated, catalogStatus: codexCatalogStatus, runnableModelCount: visibleCodexModels.count)
+        )
+    }
+    var grokReadinessCopy: ProviderReadinessCopy {
+        ProviderReadinessPresentationPolicy.copy(
+            providerName: "Grok",
+            readiness: ProviderReadinessSnapshot(installed: grok.isInstalled, authenticated: grokAuthenticated, catalogStatus: grokCatalogStatus, runnableModelCount: runnableGrokModels.count),
+            readyDetail: "Ready · ACP"
+        )
+    }
+    var openCodeReadinessCopy: ProviderReadinessCopy {
+        ProviderReadinessPresentationPolicy.copy(
+            providerName: "OpenCode",
+            readiness: ProviderReadinessSnapshot(installed: openCode.isInstalled, authenticated: openCodeAuthenticated, catalogStatus: openCodeCatalogStatus, runnableModelCount: runnableOpenCodeModels.count),
+            readyDetail: "Ready · ACP"
+        )
+    }
+    var hermesReadinessCopy: ProviderReadinessCopy {
+        ProviderReadinessPresentationPolicy.copy(
+            providerName: "Hermes",
+            readiness: ProviderReadinessSnapshot(installed: hermesInstalled, authenticated: hermesInstalled, catalogStatus: hermesCatalogStatus, runnableModelCount: hermesModels.count),
+            readyDetail: "Ready · \(hermesModels.count) models"
+        )
+    }
+    var hermesReady: Bool { hermesReadinessCopy.isReady }
     var piCLIInfo: CLIUpdateInfo {
         CLIUpdateInfo(
             currentVersion: piCLIVersion,
@@ -2056,14 +2090,17 @@ final class AppState: ObservableObject {
     private func refreshCodexConnection() async {
         let executable = ExecutableDiscovery.locate("codex")
         if codex.isInstalled != (executable != nil) { codex = CodexExecHarness(executableURL: executable) }
+        codexCatalogStatus = .loading
         async let codexAuth = codex.isAuthenticated()
         async let codexData = codex.providerSnapshot()
         async let codexVersion = codex.cliVersion()
         async let codexLatest = Self.latestCLIVersion(executableName: "codex", homebrewFormula: "codex", homebrewCask: "codex", npmPackage: "@openai/codex", pnpmPackage: "@openai/codex", directPackage: "@openai/codex")
         let auth = await codexAuth
         let snapshot = await codexData
-        codexReady = auth
+        codexAuthenticated = auth
+        codexCatalogStatus = snapshot.catalogStatus
         codexModels = snapshot.models
+        codexReady = ProviderReadinessSnapshot(installed: codex.isInstalled, authenticated: auth, catalogStatus: snapshot.catalogStatus, runnableModelCount: visibleCodexModels.count).isRunnable
         codexUsage = snapshot.usage
         codexCLIVersion = await codexVersion
         codexLatestCLIVersion = await codexLatest
@@ -2073,16 +2110,19 @@ final class AppState: ObservableObject {
         let executable = ExecutableDiscovery.locate("grok")
         if grok.isInstalled != (executable != nil) { grok = StructuredCLIHarness(kind: .grok, executableURL: executable) }
         if grokACP.isInstalled != (executable != nil) { grokACP = ACPHarness(profile: .grok, executableURL: executable) }
+        grokCatalogStatus = .loading
         async let grokAuth = grok.isAuthenticated()
-        async let grokCatalog = grok.models()
-        async let grokACPCatalog = grokACP.models(workspace: URL(fileURLWithPath: selectedWorkspacePath))
+        async let grokCatalog = grok.modelsResult()
+        async let grokACPCatalog = grokACP.modelsResult(workspace: URL(fileURLWithPath: selectedWorkspacePath))
         async let grokUpdate = grok.updateStatus()
         let auth = await grokAuth
         let cliCatalog = await grokCatalog
         let acpCatalog = await grokACPCatalog
-        grokACPModels = acpCatalog
-        grokReady = auth && !acpCatalog.isEmpty
-        grokModels = cliCatalog.isEmpty ? acpCatalog.map { ProviderModel(id: $0.id, name: $0.name) } : cliCatalog
+        grokAuthenticated = auth
+        grokACPModels = acpCatalog.models
+        grokCatalogStatus = ProviderCatalogStatus.combined(cliCatalog.status, acpCatalog.status)
+        grokModels = cliCatalog.models.isEmpty ? acpCatalog.models.map { ProviderModel(id: $0.id, name: $0.name) } : cliCatalog.models
+        grokReady = ProviderReadinessSnapshot(installed: grok.isInstalled, authenticated: auth, catalogStatus: grokCatalogStatus, runnableModelCount: runnableGrokModels.count).isRunnable
         grokCLIInfo = await grokUpdate
         grokUpdateStatus = grokCLIInfo.statusText
     }
@@ -2091,9 +2131,10 @@ final class AppState: ObservableObject {
         let executable = ExecutableDiscovery.locate("opencode")
         if openCode.isInstalled != (executable != nil) { openCode = StructuredCLIHarness(kind: .openCode, executableURL: executable) }
         if openCodeACP.isInstalled != (executable != nil) { openCodeACP = ACPHarness(profile: .openCode, executableURL: executable) }
+        openCodeCatalogStatus = .loading
         async let openCodeAuth = openCode.isAuthenticated()
-        async let openCodeCatalog = openCode.models(refreshCache: refreshCatalog)
-        async let openCodeACPCatalog = openCodeACP.models(workspace: URL(fileURLWithPath: selectedWorkspacePath))
+        async let openCodeCatalog = openCode.modelsResult(refreshCache: refreshCatalog)
+        async let openCodeACPCatalog = openCodeACP.modelsResult(workspace: URL(fileURLWithPath: selectedWorkspacePath))
         async let openCodeVersion = openCode.cliVersion()
         async let openCodeInstalledVersion = Self.homebrewInstalledFormulaVersion("opencode")
         async let openCodeLatest = Self.latestCLIVersion(executableName: "opencode", homebrewFormula: "opencode", homebrewCask: nil, npmPackage: "opencode-ai", pnpmPackage: "opencode-ai", directPackage: "opencode-ai")
@@ -2103,9 +2144,11 @@ final class AppState: ObservableObject {
         let detectedVersion = await openCodeVersion
         let installedVersion = await openCodeInstalledVersion
         openCodeAPIKeySaved = OpenCodeAuthBridge.hasGoCredential()
-        openCodeACPModels = acpCatalog
-        openCodeReady = (auth || openCodeAPIKeySaved) && catalog.contains { ACPHarness.bestMatch(for: $0.id, in: acpCatalog) != nil }
-        openCodeModels = catalog
+        openCodeAuthenticated = auth || openCodeAPIKeySaved
+        openCodeACPModels = acpCatalog.models
+        openCodeCatalogStatus = ProviderCatalogStatus.combined(catalog.status, acpCatalog.status)
+        openCodeModels = catalog.models
+        openCodeReady = ProviderReadinessSnapshot(installed: openCode.isInstalled, authenticated: openCodeAuthenticated, catalogStatus: openCodeCatalogStatus, runnableModelCount: runnableOpenCodeModels.count).isRunnable
         openCodeCLIVersion = detectedVersion ?? installedVersion
         openCodeLatestCLIVersion = await openCodeLatest
     }
@@ -2140,10 +2183,13 @@ final class AppState: ObservableObject {
     private func refreshHermesConnection() async {
         let executable = ExecutableDiscovery.locate("hermes")
         if hermes.isInstalled != (executable != nil) { hermes = ACPHarness(executableURL: executable) }
+        hermesCatalogStatus = .loading
         async let hermesInfo = Self.hermesUpdateInfo()
-        async let hermesCatalog = hermes.models(workspace: URL(fileURLWithPath: selectedWorkspacePath))
+        async let hermesCatalog = hermes.modelsResult(workspace: URL(fileURLWithPath: selectedWorkspacePath))
         hermesInstalled = executable != nil
-        hermesModels = await hermesCatalog
+        let catalog = await hermesCatalog
+        hermesCatalogStatus = catalog.status
+        hermesModels = catalog.models
         hermesCLIInfo = await hermesInfo
     }
 
@@ -4296,9 +4342,9 @@ Lattice self-edit rules:
             grokReady: grokReady,
             openCodeReady: openCodeReady,
             antigravityReady: antigravityAuthenticated && !visibleAntigravityModels.isEmpty,
-            codexCatalogKnown: !codexModels.isEmpty,
-            grokCatalogKnown: !grokModels.isEmpty,
-            openCodeCatalogKnown: !openCodeModels.isEmpty,
+            codexCatalogKnown: codexCatalogStatus.isResolved,
+            grokCatalogKnown: grokCatalogStatus.isResolved,
+            openCodeCatalogKnown: openCodeCatalogStatus.isResolved,
             appleIntelligenceReady: appleIntelligenceReady,
             ollamaModelNames: ollamaModels.map(\.name),
             codexInstalled: codex.isInstalled

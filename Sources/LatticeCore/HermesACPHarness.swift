@@ -110,7 +110,11 @@ public final class ACPHarness: @unchecked Sendable {
     public var isInstalled: Bool { executableURL != nil }
 
     public func models(workspace: URL) async -> [HarnessModel] {
-        guard let executableURL else { return [] }
+        await modelsResult(workspace: workspace).models
+    }
+
+    public func modelsResult(workspace: URL) async -> ProviderCatalogResult<HarnessModel> {
+        guard let executableURL else { return .unknown() }
         let scratchDirectory = scratchDirectory(for: UUID())
         defer { try? FileManager.default.removeItem(at: scratchDirectory) }
         do {
@@ -139,10 +143,10 @@ public final class ACPHarness: @unchecked Sendable {
                 ),
                 stopWhen: { stdout, _ in !Self.modelsFromOutput(stdout).isEmpty }
             )
-            guard result.outcome == .completed || result.outcome == .exited else { return [] }
-            return Self.modelsFromOutput(result.stdout)
+            let models = Self.modelsFromOutput(result.stdout)
+            return ProviderCatalogResult(models: models, succeeded: result.isSuccess)
         } catch {
-            return []
+            return ProviderCatalogResult(models: [], status: .failed)
         }
     }
 

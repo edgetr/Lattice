@@ -60,7 +60,11 @@ public final class StructuredCLIHarness: @unchecked Sendable {
     }
 
     public func models(refreshCache: Bool = false) async -> [ProviderModel] {
-        guard let executableURL else { return [] }
+        await modelsResult(refreshCache: refreshCache).models
+    }
+
+    public func modelsResult(refreshCache: Bool = false) async -> ProviderCatalogResult<ProviderModel> {
+        guard let executableURL else { return .unknown() }
         if kind == .openCode {
             if refreshCache {
                 _ = await Self.run(executableURL, arguments: ["models", "--refresh"])
@@ -69,11 +73,20 @@ public final class StructuredCLIHarness: @unchecked Sendable {
             async let go = Self.run(executableURL, arguments: ["models", "opencode-go", "--verbose"])
             let (freeResult, goResult) = await (free, go)
             let results = [freeResult, goResult]
-            return results.filter { $0.isSuccess }.flatMap { Self.parseOpenCodeModels($0.combinedOutput) }
+            let successful = results.filter(\.isSuccess)
+            let models = successful.flatMap { Self.parseOpenCodeModels($0.combinedOutput) }
+            let status: ProviderCatalogStatus = if !models.isEmpty {
+                .loaded
+            } else if successful.count == results.count {
+                .empty
+            } else {
+                .failed
+            }
+            return ProviderCatalogResult(models: models, status: status)
         }
         let result = await Self.run(executableURL, arguments: ["models"])
-        guard result.isSuccess else { return [] }
-        return Self.parseModels(result.combinedOutput, kind: kind)
+        guard result.isSuccess else { return ProviderCatalogResult(models: [], status: .failed) }
+        return ProviderCatalogResult(models: Self.parseModels(result.combinedOutput, kind: kind), succeeded: true)
     }
 
     public static func parseModels(_ data: Data, kind: Kind) -> [ProviderModel] {

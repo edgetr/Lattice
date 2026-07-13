@@ -97,7 +97,7 @@ public final class CodexExecHarness: @unchecked Sendable {
                 data.append(0x0A)
             }
         } catch {
-            return .empty
+            return CodexProviderSnapshot(models: [], usage: nil, catalogStatus: .failed)
         }
         let accumulator = AppServerAccumulator()
         let result = await BoundedSubprocess.run(
@@ -112,7 +112,9 @@ public final class CodexExecHarness: @unchecked Sendable {
                 return accumulator.isComplete
             }
         )
-        guard result.outcome == .completed || result.outcome == .exited else { return .empty }
+        guard result.outcome == .completed || result.outcome == .exited else {
+            return CodexProviderSnapshot(models: [], usage: nil, catalogStatus: .failed)
+        }
         accumulator.append(result.stdout)
         return accumulator.snapshot
     }
@@ -540,9 +542,18 @@ private final class AppServerAccumulator: @unchecked Sendable {
     private var usage: ProviderUsage?
     private var received: Set<Int> = []
     private var failed = false
+    private var modelCatalogSucceeded = false
 
     var isComplete: Bool { lock.withLock { failed || received.isSuperset(of: [1, 2]) } }
-    var snapshot: CodexProviderSnapshot { lock.withLock { failed ? .empty : CodexProviderSnapshot(models: models, usage: usage) } }
+    var snapshot: CodexProviderSnapshot {
+        lock.withLock {
+            if failed { return CodexProviderSnapshot(models: [], usage: nil, catalogStatus: .failed) }
+            let status = received.contains(1)
+                ? ProviderCatalogStatus.resolved(modelCount: models.count, succeeded: modelCatalogSucceeded)
+                : .failed
+            return CodexProviderSnapshot(models: models, usage: usage, catalogStatus: status)
+        }
+    }
 
     func append(_ chunk: Data) {
         lock.withLock {
@@ -552,7 +563,11 @@ private final class AppServerAccumulator: @unchecked Sendable {
             do {
                 for object in try frameBuffer.append(Data(delta)) {
                     guard let id = object["id"] as? Int else { continue }
-                    if id == 1 { models = CodexExecHarness.parseModels(object); received.insert(id) }
+                    if id == 1 {
+                        modelCatalogSucceeded = object["error"] == nil
+                        models = CodexExecHarness.parseModels(object)
+                        received.insert(id)
+                    }
                     if id == 2 { usage = CodexExecHarness.parseUsage(object); received.insert(id) }
                 }
             } catch {
@@ -568,6 +583,9 @@ private final class AppServerAccumulator: @unchecked Sendable {
 public struct CodexProviderSnapshot: Sendable {
     public let models: [ProviderModel]
     public let usage: ProviderUsage?
-    public init(models: [ProviderModel], usage: ProviderUsage?) { self.models = models; self.usage = usage }
-    public static let empty = CodexProviderSnapshot(models: [], usage: nil)
+    public let catalogStatus: ProviderCatalogStatus
+    public init(models: [ProviderModel], usage: ProviderUsage?, catalogStatus: ProviderCatalogStatus = .unknown) {
+        self.models = models; self.usage = usage; self.catalogStatus = catalogStatus
+    }
+    public static let empty = CodexProviderSnapshot(models: [], usage: nil, catalogStatus: .unknown)
 }
