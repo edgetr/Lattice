@@ -5,8 +5,7 @@ import Testing
 @Suite("Bounded protocol frames")
 struct BoundedProtocolReaderTests {
     @Test func preservesValidFramesAndEOFPartialFrame() throws {
-        let reader = try makeReader(Data(#"{"id":1}
-{"id":2}"#.utf8))
+        let reader = try makeReader(Data("{\"id\":1}\n{\"id\":2}".utf8))
 
         let first = try #require(reader.next())
         #expect(first["id"] as? Int == 1)
@@ -16,8 +15,7 @@ struct BoundedProtocolReaderTests {
     }
 
     @Test func rejectsOversizedFrame() throws {
-        let reader = try makeReader(Data(#"{"value":"123456789"}
-"#.utf8), maximumFrameBytes: 8)
+        let reader = try makeReader(Data("{\"value\":\"123456789\"}\n".utf8), maximumFrameBytes: 8)
 
         do {
             _ = try reader.next()
@@ -28,8 +26,7 @@ struct BoundedProtocolReaderTests {
     }
 
     @Test func rejectsMalformedFrame() throws {
-        let reader = try makeReader(Data(#"{"id":}
-"#.utf8))
+        let reader = try makeReader(Data("{\"id\":}\n".utf8))
 
         do {
             _ = try reader.next()
