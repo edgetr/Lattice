@@ -41,6 +41,7 @@ final class InteractiveProcessRegistry: @unchecked Sendable {
 
     private struct Entry {
         let owner: Owner
+        let start: StartToken
         let process: BoundedProcessTransport
         let input: FileHandle?
         var metadata: Metadata
@@ -49,16 +50,14 @@ final class InteractiveProcessRegistry: @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [UUID: Entry] = [:]
     private var cancelledOwners: Set<Owner> = []
-    private var starts: [UUID: StartToken] = [:]
+    private var starts: [UUID: Set<StartToken>] = [:]
     private var cancelledStarts: Set<StartToken> = []
 
     func beginStart(for sessionID: UUID) -> StartToken {
         lock.lock()
         defer { lock.unlock() }
         let token = StartToken(token: UUID())
-        if let stale = starts.updateValue(token, forKey: sessionID) {
-            cancelledStarts.remove(stale)
-        }
+        starts[sessionID, default: []].insert(token)
         return token
     }
 
@@ -66,7 +65,8 @@ final class InteractiveProcessRegistry: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let wasCancelled = cancelledStarts.remove(token) != nil
-        if starts[sessionID] == token { starts[sessionID] = nil }
+        starts[sessionID]?.remove(token)
+        if starts[sessionID]?.isEmpty == true { starts[sessionID] = nil }
         return wasCancelled
     }
 
@@ -77,19 +77,21 @@ final class InteractiveProcessRegistry: @unchecked Sendable {
         start: StartToken
     ) -> RegistrationResult {
         lock.lock()
-        guard starts[sessionID] == start else {
+        guard starts[sessionID]?.remove(start) != nil else {
             lock.unlock()
             return .cancelled
         }
-        starts[sessionID] = nil
+        if starts[sessionID]?.isEmpty == true { starts[sessionID] = nil }
         if cancelledStarts.remove(start) != nil {
             lock.unlock()
             return .cancelled
         }
         let previous = entries[sessionID]
         let owner = Owner(token: UUID())
+        if let previous { cancelledOwners.insert(previous.owner) }
         entries[sessionID] = Entry(
             owner: owner,
+            start: start,
             process: process,
             input: input,
             metadata: Metadata()
@@ -107,10 +109,8 @@ final class InteractiveProcessRegistry: @unchecked Sendable {
         let entry = entries[sessionID]
         if let entry {
             cancelledOwners.insert(entry.owner)
-        } else if let start = starts[sessionID] {
-            // Token scoping prevents this from cancelling a later unrelated run.
-            cancelledStarts.insert(start)
         }
+        if let pending = starts[sessionID] { cancelledStarts.formUnion(pending) }
         lock.unlock()
         return CancellationTarget(
             owner: entry?.owner,
@@ -120,12 +120,33 @@ final class InteractiveProcessRegistry: @unchecked Sendable {
         )
     }
 
+    /// Cancel only the run represented by `start`. A stale stream's termination
+    /// cannot cancel a replacement that now owns the same Lattice session.
+    func cancel(sessionID: UUID, start: StartToken) -> CancellationTarget {
+        lock.lock()
+        if let entry = entries[sessionID], entry.start == start {
+            cancelledOwners.insert(entry.owner)
+            lock.unlock()
+            return CancellationTarget(
+                owner: entry.owner,
+                process: entry.process,
+                input: entry.input,
+                metadata: entry.metadata
+            )
+        }
+        if starts[sessionID]?.contains(start) == true {
+            cancelledStarts.insert(start)
+        }
+        lock.unlock()
+        return CancellationTarget(owner: nil, process: nil, input: nil, metadata: Metadata())
+    }
+
     func isCancelled(_ owner: Owner?, sessionID: UUID) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         if let owner { return cancelledOwners.contains(owner) }
-        guard entries[sessionID] == nil, let start = starts[sessionID] else { return false }
-        return cancelledStarts.contains(start)
+        guard entries[sessionID] == nil, let pending = starts[sessionID] else { return false }
+        return !pending.isDisjoint(with: cancelledStarts)
     }
 
     @discardableResult

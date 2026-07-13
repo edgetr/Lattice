@@ -39,6 +39,7 @@ public final class AntigravityCLIHarness: @unchecked Sendable {
         policy: ExecutionPolicy
     ) -> AsyncStream<AgentEvent> {
         AsyncStream<AgentEvent>(bufferingPolicy: .unbounded) { continuation in
+            let start = processRegistry.beginStart(for: sessionID)
             let task = Task.detached(priority: .userInitiated) { [self] in
                 guard let executableURL else {
                     continuation.yield(.failed("Antigravity CLI is not installed."))
@@ -70,8 +71,6 @@ public final class AntigravityCLIHarness: @unchecked Sendable {
                     mergeStandardError: true
                 )
                 var owner: InteractiveProcessRegistry.Owner?
-                let start = processRegistry.beginStart(for: sessionID)
-
                 do {
                     try transport.start()
                     guard case .accepted(let registeredOwner) = processRegistry.register(process: transport, input: nil, for: sessionID, start: start) else {
@@ -112,7 +111,7 @@ public final class AntigravityCLIHarness: @unchecked Sendable {
             }
             continuation.onTermination = { [weak self] termination in
                 guard case .cancelled = termination else { return }
-                self?.cancel(sessionID: sessionID)
+                self?.cancel(sessionID: sessionID, start: start)
                 task.cancel()
             }
         }
@@ -120,6 +119,10 @@ public final class AntigravityCLIHarness: @unchecked Sendable {
 
     public func cancel(sessionID: UUID) {
         processRegistry.cancel(sessionID: sessionID).process?.cancel()
+    }
+
+    private func cancel(sessionID: UUID, start: InteractiveProcessRegistry.StartToken) {
+        processRegistry.cancel(sessionID: sessionID, start: start).process?.cancel()
     }
 
     private static func run(_ executableURL: URL, arguments: [String]) async -> BoundedSubprocessResult {

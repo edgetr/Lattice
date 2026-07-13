@@ -56,6 +56,7 @@ public final class PiRPCHarness: @unchecked Sendable {
 
     public func stream(prompt: String, sessionID: UUID, threadID: String?, workspace: URL, provider: String, model: String, reasoningEffort: ReasoningEffort?, allowFileModification: Bool = false) -> AsyncStream<AgentEvent> {
         AsyncStream { continuation in
+            let start = processRegistry.beginStart(for: sessionID)
             let task = Task.detached(priority: .userInitiated) { [self] in
                 guard let executableURL else {
                     continuation.yield(.failed("Pi is not installed.")); continuation.finish(); return
@@ -66,7 +67,6 @@ public final class PiRPCHarness: @unchecked Sendable {
                 let scratchDirectory = scratchDirectory(for: sessionID)
                 var transport: BoundedProcessTransport?
                 var owner: InteractiveProcessRegistry.Owner?
-                let start = processRegistry.beginStart(for: sessionID)
                 do {
                     try FileManager.default.createDirectory(at: sessionDirectory, withIntermediateDirectories: true)
                     try FileManager.default.createDirectory(at: scratchDirectory, withIntermediateDirectories: true)
@@ -128,12 +128,23 @@ public final class PiRPCHarness: @unchecked Sendable {
                 try? FileManager.default.removeItem(at: scratchDirectory)
                 continuation.finish()
             }
-            continuation.onTermination = { [weak self] _ in self?.cancel(sessionID: sessionID); task.cancel() }
+            continuation.onTermination = { [weak self] termination in
+                guard case .cancelled = termination else { return }
+                self?.cancel(sessionID: sessionID, start: start)
+                task.cancel()
+            }
         }
     }
 
     public func cancel(sessionID: UUID) {
-        let target = processRegistry.cancel(sessionID: sessionID)
+        cancel(processRegistry.cancel(sessionID: sessionID))
+    }
+
+    private func cancel(sessionID: UUID, start: InteractiveProcessRegistry.StartToken) {
+        cancel(processRegistry.cancel(sessionID: sessionID, start: start))
+    }
+
+    private func cancel(_ target: InteractiveProcessRegistry.CancellationTarget) {
         let hadPermission = cancelPendingPermissions(target.metadata.pendingPermissionIDs)
         let stop = {
             try? Self.write(["type": "abort"], to: target.process)

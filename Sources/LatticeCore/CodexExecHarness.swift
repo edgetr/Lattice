@@ -124,6 +124,7 @@ public final class CodexExecHarness: @unchecked Sendable {
 
     public func stream(prompt: String, sessionID: UUID, threadID: String?, workspace: URL, model: String, reasoningEffort: ReasoningEffort? = nil, policy: ExecutionPolicy = .ask, workspaceWrite: Bool = false) -> AsyncStream<AgentEvent> {
         AsyncStream<AgentEvent>(bufferingPolicy: .unbounded) { continuation in
+            let start = processRegistry.beginStart(for: sessionID)
             let task = Task.detached(priority: .userInitiated) { [self] in
                 guard let executableURL else {
                     continuation.yield(.failed("Codex is not installed.")); continuation.finish(); return
@@ -136,7 +137,6 @@ public final class CodexExecHarness: @unchecked Sendable {
                     maximumOutputBytes: 8_000_000
                 ))
                 var owner: InteractiveProcessRegistry.Owner?
-                let start = processRegistry.beginStart(for: sessionID)
                 do {
                     try transport.start()
                     guard let registeredOwner = register(process: transport, input: transport.input, for: sessionID, start: start) else {
@@ -207,14 +207,21 @@ public final class CodexExecHarness: @unchecked Sendable {
             }
             continuation.onTermination = { [weak self] termination in
                 guard case .cancelled = termination else { return }
-                self?.cancel(sessionID: sessionID)
+                self?.cancel(sessionID: sessionID, start: start)
                 task.cancel()
             }
         }
     }
 
     public func cancel(sessionID: UUID) {
-        let target = processRegistry.cancel(sessionID: sessionID)
+        cancel(processRegistry.cancel(sessionID: sessionID))
+    }
+
+    private func cancel(sessionID: UUID, start: InteractiveProcessRegistry.StartToken) {
+        cancel(processRegistry.cancel(sessionID: sessionID, start: start))
+    }
+
+    private func cancel(_ target: InteractiveProcessRegistry.CancellationTarget) {
         let threadID = target.metadata.threadID
         let turnID = target.metadata.turnID
         lock.lock()

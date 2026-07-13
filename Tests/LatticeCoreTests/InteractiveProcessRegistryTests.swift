@@ -129,4 +129,93 @@ struct InteractiveProcessRegistryTests {
         #expect(target.metadata.pendingPermissionIDs.contains(requestID))
         #expect(!registry.isPendingPermissionActive(requestID, owner: owner, sessionID: sessionID))
     }
+
+    @Test func unscopedCancelMarksActiveOwnerAndAlreadyReservedReplacement() {
+        let registry = InteractiveProcessRegistry()
+        let sessionID = UUID()
+        let activeStart = registry.beginStart(for: sessionID)
+        guard case .accepted(let activeOwner) = registry.register(
+            process: BoundedProcessTransport(request: request),
+            input: nil,
+            for: sessionID,
+            start: activeStart
+        ) else {
+            Issue.record("Active run should register")
+            return
+        }
+        let replacementStart = registry.beginStart(for: sessionID)
+
+        _ = registry.cancel(sessionID: sessionID)
+
+        #expect(registry.unregister(activeOwner, sessionID: sessionID).wasCancelled)
+        guard case .cancelled = registry.register(
+            process: BoundedProcessTransport(request: request),
+            input: nil,
+            for: sessionID,
+            start: replacementStart
+        ) else {
+            Issue.record("Already-reserved replacement must observe cancellation")
+            return
+        }
+    }
+
+    @Test func staleTokenCancellationCannotCancelReplacementOwner() {
+        let registry = InteractiveProcessRegistry()
+        let sessionID = UUID()
+        let staleStart = registry.beginStart(for: sessionID)
+        guard case .accepted(let staleOwner) = registry.register(
+            process: BoundedProcessTransport(request: request),
+            input: nil,
+            for: sessionID,
+            start: staleStart
+        ) else {
+            Issue.record("Stale run should register")
+            return
+        }
+        let replacementStart = registry.beginStart(for: sessionID)
+        guard case .accepted(let replacementOwner) = registry.register(
+            process: BoundedProcessTransport(request: request),
+            input: nil,
+            for: sessionID,
+            start: replacementStart
+        ) else {
+            Issue.record("Replacement should register")
+            return
+        }
+
+        let staleTarget = registry.cancel(sessionID: sessionID, start: staleStart)
+        #expect(staleTarget.process == nil)
+        #expect(registry.unregister(staleOwner, sessionID: sessionID).wasCancelled)
+        let replacementResult = registry.unregister(replacementOwner, sessionID: sessionID)
+        #expect(replacementResult.removedCurrentOwner)
+        #expect(!replacementResult.wasCancelled)
+    }
+
+    @Test func scopedCancellationRejectsOnlyMatchingPendingStart() {
+        let registry = InteractiveProcessRegistry()
+        let sessionID = UUID()
+        let cancelledStart = registry.beginStart(for: sessionID)
+        let survivingStart = registry.beginStart(for: sessionID)
+        _ = registry.cancel(sessionID: sessionID, start: cancelledStart)
+
+        guard case .cancelled = registry.register(
+            process: BoundedProcessTransport(request: request),
+            input: nil,
+            for: sessionID,
+            start: cancelledStart
+        ) else {
+            Issue.record("Matching pending start must be cancelled")
+            return
+        }
+        guard case .accepted(let owner) = registry.register(
+            process: BoundedProcessTransport(request: request),
+            input: nil,
+            for: sessionID,
+            start: survivingStart
+        ) else {
+            Issue.record("Unrelated pending start must survive scoped cancellation")
+            return
+        }
+        #expect(registry.unregister(owner, sessionID: sessionID).removedCurrentOwner)
+    }
 }

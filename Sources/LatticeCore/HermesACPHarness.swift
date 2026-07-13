@@ -148,6 +148,7 @@ public final class ACPHarness: @unchecked Sendable {
 
     public func stream(prompt: String, sessionID: UUID, threadID: String?, workspace: URL, requestedModel: String, allowFileModification: Bool = true) -> AsyncStream<AgentEvent> {
         AsyncStream { continuation in
+            let start = processRegistry.beginStart(for: sessionID)
             let task = Task.detached(priority: .userInitiated) { [self] in
                 guard let executableURL else {
                     continuation.yield(.failed("\(profile.displayName) is not installed.")); continuation.finish(); return
@@ -155,7 +156,6 @@ public final class ACPHarness: @unchecked Sendable {
                 let scratchDirectory = scratchDirectory(for: sessionID)
                 var transport: BoundedProcessTransport?
                 var owner: InteractiveProcessRegistry.Owner?
-                let start = processRegistry.beginStart(for: sessionID)
                 do {
                     try FileManager.default.createDirectory(at: scratchDirectory, withIntermediateDirectories: true)
                     let canonicalWorkspace = try HarnessSandbox.canonicalDirectory(workspace)
@@ -254,14 +254,21 @@ public final class ACPHarness: @unchecked Sendable {
             }
             continuation.onTermination = { [weak self] termination in
                 guard case .cancelled = termination else { return }
-                self?.cancel(sessionID: sessionID)
+                self?.cancel(sessionID: sessionID, start: start)
                 task.cancel()
             }
         }
     }
 
     public func cancel(sessionID: UUID) {
-        let target = processRegistry.cancel(sessionID: sessionID)
+        cancel(processRegistry.cancel(sessionID: sessionID))
+    }
+
+    private func cancel(sessionID: UUID, start: InteractiveProcessRegistry.StartToken) {
+        cancel(processRegistry.cancel(sessionID: sessionID, start: start))
+    }
+
+    private func cancel(_ target: InteractiveProcessRegistry.CancellationTarget) {
         cancelPendingPermissions(target.metadata.pendingPermissionIDs)
         if let acpID = target.metadata.providerSessionID {
             try? Self.write(["jsonrpc": "2.0", "method": "session/cancel", "params": ["sessionId": acpID]], to: target.process)
