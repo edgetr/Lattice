@@ -4208,10 +4208,18 @@ Lattice self-edit rules:
 
     nonisolated private static func antigravityCredentialsExist() -> Bool {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        return [".gemini/oauth_creds.json", ".gemini/google_accounts.json"].contains {
-            let url = home.appendingPathComponent($0)
-            return (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) ?? 0 > 2
+        let oauthURL = home.appendingPathComponent(".gemini/oauth_creds.json")
+        guard let oauthData = try? Data(contentsOf: oauthURL),
+              CredentialPresencePolicy.hasAntigravityOAuthCredential(in: oauthData) else {
+            return false
         }
+
+        // google_accounts.json is only an account-selection cache. It can
+        // refine a valid OAuth state, but must not establish authentication.
+        let accountsURL = home.appendingPathComponent(".gemini/google_accounts.json")
+        guard FileManager.default.fileExists(atPath: accountsURL.path) else { return true }
+        guard let accountsData = try? Data(contentsOf: accountsURL) else { return false }
+        return CredentialPresencePolicy.hasAntigravityAccountMarker(in: accountsData)
     }
 
     private static func runAntigravityLogin() async -> (status: Int32, output: Data) {
