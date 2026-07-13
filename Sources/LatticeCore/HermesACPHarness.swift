@@ -539,7 +539,11 @@ public final class ACPHarness: @unchecked Sendable {
     private static func toolRequest(from toolCall: [String: Any], title: String, detail: String, workspace: URL?) -> ToolRequest {
         let rawInput = toolCall["rawInput"] as? [String: Any] ?? [:]
         return ToolRequest(
-            kind: toolKind(for: [toolCall["kind"] as? String, title, rawInput["command"] as? String].compactMap { $0 }.joined(separator: " ")),
+            kind: toolKind(
+                explicitKind: toolCall["kind"] as? String,
+                title: title,
+                command: rawInput["command"] as? String
+            ),
             title: title,
             detail: detail,
             workspaceScoped: ACPPathScope.isWorkspaceScoped(toolCall: toolCall, workspace: workspace),
@@ -547,14 +551,24 @@ public final class ACPHarness: @unchecked Sendable {
         )
     }
 
-    private static func toolKind(for value: String) -> ToolRequest.Kind {
-        let name = value.lowercased()
+    private static func toolKind(explicitKind: String?, title: String, command: String?) -> ToolRequest.Kind {
+        let explicitName = explicitKind?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let name = [explicitName, title, command]
+            .compactMap { $0 }
+            .joined(separator: " ")
+            .lowercased()
         if name.contains("delete") || name.contains("remove") { return .destructive }
         if name.contains("write") || name.contains("edit") || name.contains("patch") || name.contains("move") { return .write }
-        if name.contains("bash") || name.contains("terminal") || name.contains("execute") || name.contains("command") || name.contains("run ") { return .command }
+        if name.contains("bash") || name.contains("terminal") || name.contains("execute") || name.contains("command") || name.contains("run") { return .command }
         if name.contains("web") || name.contains("fetch") || name.contains("network") { return .network }
         if name.contains("browser") || name.contains("automation") { return .automation }
-        return .read
+        if ["read", "read_file", "list", "list_files", "search", "grep", "glob", "find", "stat", "inspect", "view"].contains(explicitName) {
+            return .read
+        }
+        if let command, !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return .command
+        }
+        return .unknown
     }
 
     private static func permissionDetail(toolCall: [String: Any]) -> String {

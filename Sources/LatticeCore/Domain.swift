@@ -520,7 +520,7 @@ public struct EngineHarnessSelection: Hashable, Codable, Sendable {
 }
 
 public struct ToolRequest: Identifiable, Hashable, Sendable {
-    public enum Kind: String, Codable, Sendable { case read, write, command, network, automation, credential, destructive }
+    public enum Kind: String, Codable, Sendable { case read, write, command, network, automation, credential, destructive, unknown }
     public let id: UUID
     public let kind: Kind
     public let title: String

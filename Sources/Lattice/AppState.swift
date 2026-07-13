@@ -5076,6 +5076,7 @@ Lattice self-edit rules:
         case .automation: "cursorarrow.motionlines"
         case .credential: "key"
         case .destructive: "exclamationmark.triangle"
+        case .unknown: "questionmark.circle"
         }
     }
 

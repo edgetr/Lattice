@@ -34,6 +34,9 @@ public struct DeterministicPolicyEngine: PolicyEngine {
         if policy == .yolo {
             return .allow(reason: "Explicit YOLO mode; operating-system boundaries still apply.")
         }
+        if request.kind == .unknown {
+            return .requireApproval(reason: "Unknown tool capabilities require confirmation.")
+        }
         if !request.workspaceScoped {
             return .requireApproval(reason: "The action crosses the selected workspace boundary.")
         }

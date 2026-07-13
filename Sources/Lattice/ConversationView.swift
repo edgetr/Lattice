@@ -1038,6 +1038,7 @@ private struct SessionActionDetailRow: View {
         case .automation: return "cursorarrow.motionlines"
         case .credential: return "key"
         case .destructive: return "exclamationmark.triangle"
+        case .unknown: return "questionmark.circle"
         case .read, .none: return "doc.text.magnifyingglass"
         }
     }
