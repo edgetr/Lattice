@@ -538,13 +538,11 @@ public final class ACPHarness: @unchecked Sendable {
 
     private static func toolRequest(from toolCall: [String: Any], title: String, detail: String, workspace: URL?) -> ToolRequest {
         let rawInput = toolCall["rawInput"] as? [String: Any] ?? [:]
-        let locations = (toolCall["locations"] as? [[String: Any]] ?? []).compactMap { $0["path"] as? String }
-        let path = (rawInput["path"] as? String) ?? locations.first
         return ToolRequest(
             kind: toolKind(for: [toolCall["kind"] as? String, title, rawInput["command"] as? String].compactMap { $0 }.joined(separator: " ")),
             title: title,
             detail: detail,
-            workspaceScoped: workspace.map { isWorkspaceScoped(path, workspace: $0) } ?? false,
+            workspaceScoped: ACPPathScope.isWorkspaceScoped(toolCall: toolCall, workspace: workspace),
             reversible: false
         )
     }
@@ -557,16 +555,6 @@ public final class ACPHarness: @unchecked Sendable {
         if name.contains("web") || name.contains("fetch") || name.contains("network") { return .network }
         if name.contains("browser") || name.contains("automation") { return .automation }
         return .read
-    }
-
-    private static func isWorkspaceScoped(_ path: String?, workspace: URL) -> Bool {
-        guard let path, !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
-        let root = workspace.standardizedFileURL.resolvingSymlinksInPath().path
-        let candidate = (path.hasPrefix("/") ? URL(fileURLWithPath: path) : workspace.appendingPathComponent(path))
-            .standardizedFileURL
-            .resolvingSymlinksInPath()
-            .path
-        return candidate == root || candidate.hasPrefix(root + "/")
     }
 
     private static func permissionDetail(toolCall: [String: Any]) -> String {

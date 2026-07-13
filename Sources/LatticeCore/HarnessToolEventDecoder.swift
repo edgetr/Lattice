@@ -15,7 +15,7 @@ public enum HarnessToolEventDecoder {
                 kind: kind(for: toolName),
                 title: "Pi is using \(displayName(toolName))",
                 detail: detail(input: input, fallback: toolName),
-                workspaceScoped: isWorkspaceScoped(input["path"] as? String, workspace: workspace),
+                workspaceScoped: ACPPathScope.isWorkspaceScoped(input["path"] as? String, workspace: workspace),
                 reversible: false
             ))
         case "tool_execution_update":
@@ -50,9 +50,11 @@ public enum HarnessToolEventDecoder {
                 kind: kind(for: kindName),
                 title: title,
                 detail: detail,
-                workspaceScoped: locations.isEmpty
-                    ? isWorkspaceScoped(rawInput["path"] as? String, workspace: workspace)
-                    : locations.allSatisfy { isWorkspaceScoped($0, workspace: workspace) },
+                workspaceScoped: ACPPathScope.isWorkspaceScoped(
+                    rawInput: update["rawInput"],
+                    locations: update["locations"],
+                    workspace: workspace
+                ),
                 reversible: false
             ))
         case "tool_call_update":
@@ -93,14 +95,6 @@ public enum HarnessToolEventDecoder {
 
     private static func displayName(_ rawName: String) -> String {
         rawName.replacingOccurrences(of: "_", with: " ")
-    }
-
-    private static func isWorkspaceScoped(_ path: String?, workspace: URL) -> Bool {
-        guard let path, !path.isEmpty else { return false }
-        let root = workspace.standardizedFileURL.resolvingSymlinksInPath().path
-        let candidate = (path.hasPrefix("/") ? URL(fileURLWithPath: path) : workspace.appendingPathComponent(path))
-            .standardizedFileURL.resolvingSymlinksInPath().path
-        return candidate == root || candidate.hasPrefix(root + "/")
     }
 
     static func stableID(for value: String) -> UUID {
