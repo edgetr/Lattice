@@ -249,6 +249,8 @@ public enum BoundedSubprocess {
         }
 
         switch stopReason {
+        case .completed:
+            break
         case .waitForExit:
             // The child can exit while a descendant keeps writing to the pipe. Treat
             // output observed after that race as a stop condition so the descendant's
