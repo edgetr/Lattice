@@ -1887,14 +1887,49 @@ final class AppState: ObservableObject {
             setError("That permission choice is not available in \(policy.rawValue) mode.", sessionID: notice.sessionID)
             return
         }
-        guard sessions.contains(where: { $0.id == notice.sessionID && $0.isStreaming }),
-              forwardHarnessPermission(notice, optionID: option.id) else {
+        guard sessions.contains(where: { $0.id == notice.sessionID && $0.isStreaming }) else {
             setError("This permission request is no longer active.", sessionID: notice.sessionID)
             harnessPermissionNotices[notice.sessionID] = nil
+            if let sessionIndex = sessions.firstIndex(where: { $0.id == notice.sessionID }) {
+                updateApprovalProvenance(
+                    id: notice.request.id,
+                    sessionIndex: sessionIndex,
+                    actor: .user,
+                    selectedOptionKind: option.kind,
+                    outcome: .stale,
+                    providerAcknowledgement: .rejectedByHarness
+                )
+            }
+            updateSessionAction(id: notice.request.id, status: .cancelled, sessionID: notice.sessionID)
+            return
+        }
+        guard forwardHarnessPermission(notice, optionID: option.id) else {
+            setError("This permission request is no longer active.", sessionID: notice.sessionID)
+            harnessPermissionNotices[notice.sessionID] = nil
+            if let sessionIndex = sessions.firstIndex(where: { $0.id == notice.sessionID }) {
+                updateApprovalProvenance(
+                    id: notice.request.id,
+                    sessionIndex: sessionIndex,
+                    actor: .user,
+                    selectedOptionKind: option.kind,
+                    outcome: .stale,
+                    providerAcknowledgement: .rejectedByHarness
+                )
+            }
             updateSessionAction(id: notice.request.id, status: .cancelled, sessionID: notice.sessionID)
             return
         }
         harnessPermissionNotices[notice.sessionID] = nil
+        if let sessionIndex = sessions.firstIndex(where: { $0.id == notice.sessionID }) {
+            updateApprovalProvenance(
+                id: notice.request.id,
+                sessionIndex: sessionIndex,
+                actor: .user,
+                selectedOptionKind: option.kind,
+                outcome: .forwarded,
+                providerAcknowledgement: .acceptedByHarness
+            )
+        }
         updateSessionAction(id: notice.request.id, status: option.isAllow ? .allowed : .denied, sessionID: notice.sessionID)
         setActivity([
             .init(
@@ -4664,6 +4699,13 @@ Lattice self-edit rules:
                 providerName: harnessID == "codex" ? "Codex" : (harnessID == "grok" ? "Grok" : (harnessID == "opencode" ? "OpenCode" : (harnessID == "pi" ? "Pi" : "Hermes"))),
                 request: request
             )
+            let automaticDecision = request.toolRequest.map { policyEngine.evaluate($0, under: sessions[index].policy) }
+            let policyReason: String = {
+                switch automaticDecision {
+                case .allow(let reason), .requireApproval(let reason), .deny(let reason): return reason
+                case nil: return "The provider requested an explicit permission decision."
+                }
+            }()
             if let messageID = sessions[index].messages.last(where: { $0.role == .assistant })?.id {
                 upsertSessionAction(.init(
                     id: request.id,
@@ -4673,10 +4715,20 @@ Lattice self-edit rules:
                     title: request.title,
                     detail: request.detail,
                     status: .waiting,
-                    workspaceScoped: request.toolRequest?.workspaceScoped ?? false
+                    workspaceScoped: request.toolRequest?.workspaceScoped ?? false,
+                    approvalProvenance: .init(
+                        harnessID: harnessID,
+                        providerName: notice.providerName,
+                        requestID: request.id,
+                        requestedOptionKinds: request.options.map(\.kind),
+                        toolKind: request.toolRequest?.kind,
+                        workspaceScoped: request.toolRequest?.workspaceScoped ?? false,
+                        policy: sessions[index].policy,
+                        policyReason: policyReason,
+                        actor: .user
+                    )
                 ), at: index)
             }
-            let automaticDecision = request.toolRequest.map { policyEngine.evaluate($0, under: sessions[index].policy) }
             let automaticOptionID: String? = {
                 if case .some(.allow) = automaticDecision { return request.options.first(where: { $0.kind == "allow_once" })?.id }
                 if case .some(.deny) = automaticDecision { return request.options.first(where: \.isReject)?.id }
@@ -4685,6 +4737,14 @@ Lattice self-edit rules:
             }()
             if let automaticOptionID, forwardHarnessPermission(notice, optionID: automaticOptionID) {
                 let allowed = request.options.first(where: { $0.id == automaticOptionID })?.isAllow == true
+                updateApprovalProvenance(
+                    id: request.id,
+                    sessionIndex: index,
+                    actor: .automatic,
+                    selectedOptionKind: request.options.first(where: { $0.id == automaticOptionID })?.kind,
+                    outcome: .forwarded,
+                    providerAcknowledgement: .acceptedByHarness
+                )
                 updateSessionAction(id: request.id, status: allowed ? .allowed : .denied, at: index)
                 setActivity([.init(icon: allowed ? "checkmark.shield" : "xmark.shield", title: allowed ? "Allowed by \(sessions[index].policy.rawValue.capitalized) mode" : "Blocked by policy", detail: request.title)], sessionID: id)
             } else {
@@ -4719,12 +4779,37 @@ Lattice self-edit rules:
             harnessPermissionNotices[id] = nil
             selfEditRunIDs.remove(id)
             submittedRequests[id] = nil
-            finishPendingActions(status: .failed, at: index)
+            let timedOut = message == "Permission request timed out."
+            finishPendingActions(
+                status: .failed,
+                at: index,
+                approvalOutcome: timedOut ? .timedOut : .failed,
+                providerAcknowledgement: timedOut ? .timedOut : .unavailable
+            )
             sessions[index].isStreaming = false; clearActivity(); clearActiveComposerState(); setError(message, sessionID: id)
             if sessions[index].messages.last?.text.isEmpty == true { sessions[index].messages.removeLast() }
             overlayMode = .prompt; composerState = .expanded; overlayControlState = .expanded; persist()
             scheduleIdleUnloadIfNeeded(for: backend)
         }
+    }
+
+    private func updateApprovalProvenance(
+        id: UUID,
+        sessionIndex: Int,
+        actor: ApprovalProvenance.Actor? = nil,
+        selectedOptionKind: String? = nil,
+        outcome: ApprovalProvenance.Outcome? = nil,
+        providerAcknowledgement: ApprovalProvenance.ProviderAcknowledgement? = nil
+    ) {
+        guard let actionIndex = sessions[sessionIndex].actions.firstIndex(where: { $0.id == id }),
+              var provenance = sessions[sessionIndex].actions[actionIndex].approvalProvenance else { return }
+        if let actor { provenance.actor = actor }
+        if let selectedOptionKind { provenance.selectedOptionKind = selectedOptionKind }
+        if let outcome { provenance.outcome = outcome }
+        if let providerAcknowledgement { provenance.providerAcknowledgement = providerAcknowledgement }
+        provenance.updatedAt = .now
+        sessions[sessionIndex].actions[actionIndex].approvalProvenance = provenance
+        sessions[sessionIndex].lastUpdated = .now
     }
 
     // MARK: - Persistence recovery
@@ -5028,14 +5113,47 @@ Lattice self-edit rules:
         updateSessionAction(id: actionID, status: status, at: sessionIndex)
     }
 
-    private func finishPendingActions(status: SessionAction.Status, at sessionIndex: Int) {
+    private func finishPendingActions(
+        status: SessionAction.Status,
+        at sessionIndex: Int,
+        approvalOutcome: ApprovalProvenance.Outcome? = nil,
+        providerAcknowledgement: ApprovalProvenance.ProviderAcknowledgement? = nil
+    ) {
         guard let messageID = sessions[sessionIndex].messages.last(where: { $0.role == .assistant })?.id else { return }
+        let outcome = approvalOutcome ?? (status == .failed ? .failed : .cancelled)
+        let acknowledgement = providerAcknowledgement ?? (status == .failed ? .unavailable : .cancelled)
+        finalizePendingApprovalProvenance(
+            at: sessionIndex,
+            outcome: outcome,
+            providerAcknowledgement: acknowledgement
+        )
         if SessionActionTrail.finishPending(for: messageID, as: status, in: &sessions[sessionIndex].actions) > 0 { persist() }
     }
 
     private func finishCompletedTurnActions(at sessionIndex: Int) {
         guard let messageID = sessions[sessionIndex].messages.last(where: { $0.role == .assistant })?.id else { return }
+        finalizePendingApprovalProvenance(
+            at: sessionIndex,
+            outcome: .cancelled,
+            providerAcknowledgement: .cancelled
+        )
         if SessionActionTrail.finishCompletedTurn(for: messageID, in: &sessions[sessionIndex].actions) > 0 { persist() }
+    }
+
+    private func finalizePendingApprovalProvenance(
+        at sessionIndex: Int,
+        outcome: ApprovalProvenance.Outcome,
+        providerAcknowledgement: ApprovalProvenance.ProviderAcknowledgement
+    ) {
+        for actionIndex in sessions[sessionIndex].actions.indices {
+            guard sessions[sessionIndex].actions[actionIndex].kind == .approval,
+                  [.running, .waiting].contains(sessions[sessionIndex].actions[actionIndex].status),
+                  var provenance = sessions[sessionIndex].actions[actionIndex].approvalProvenance else { continue }
+            provenance.outcome = outcome
+            provenance.providerAcknowledgement = providerAcknowledgement
+            provenance.updatedAt = .now
+            sessions[sessionIndex].actions[actionIndex].approvalProvenance = provenance
+        }
     }
 
     private func setActivity(_ items: [ActivityItem], sessionID: UUID) {

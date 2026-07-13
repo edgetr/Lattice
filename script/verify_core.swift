@@ -2934,6 +2934,41 @@ struct CoreVerification {
         expect(decodedFingerprintMissing.attachments.first?.isMissing == false, "Missing attachment isMissing defaults to false")
         expect(fingerprintSession.portableArchiveFingerprint == "abc", "Fingerprint can be stored on session metadata")
 
+        let provenanceRequestID = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
+        let provenance = ApprovalProvenance(
+            harnessID: "hermes",
+            providerName: "Hermes",
+            requestID: provenanceRequestID,
+            requestedOptionKinds: ["allow_once", "reject_once"],
+            toolKind: .write,
+            workspaceScoped: true,
+            policy: .smart,
+            policyReason: "Material changes require confirmation.",
+            actor: .user,
+            selectedOptionKind: "allow_once",
+            outcome: .forwarded,
+            providerAcknowledgement: .acceptedByHarness
+        )
+        let provenanceAction = SessionAction(
+            messageID: UUID(),
+            kind: .approval,
+            toolKind: .write,
+            title: "Approval",
+            detail: "bounded summary",
+            status: .allowed,
+            workspaceScoped: true,
+            approvalProvenance: provenance
+        )
+        let provenanceData = try! JSONEncoder().encode(provenanceAction)
+        let decodedProvenanceAction = try! JSONDecoder().decode(SessionAction.self, from: provenanceData)
+        expect(decodedProvenanceAction.approvalProvenance == provenance, "Approval provenance survives durable session JSON")
+        let redactedCLIMessage = CLIActionStatusPolicy.failureMessage(
+            prefix: "Install failed",
+            output: Data("authorization: Bearer abcdefghijklmnop sk-proj-abcdefghijklmnop\n".utf8)
+        )
+        expect(redactedCLIMessage.contains("[REDACTED]"), "CLI failure summaries redact credential-shaped output")
+        expect(!redactedCLIMessage.contains("abcdefghijklmnop"), "CLI failure summaries do not expose token material")
+
         print("Core verification passed: \(checks) checks")
     }
 }

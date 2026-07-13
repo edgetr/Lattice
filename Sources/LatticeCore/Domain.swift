@@ -564,6 +564,68 @@ public struct ApprovalRequest: Identifiable, Hashable, Sendable {
     }
 }
 
+/// Durable, privacy-bounded evidence for a permission decision.
+/// Provider payloads, prompts, tokens, and raw option IDs are intentionally excluded.
+public struct ApprovalProvenance: Hashable, Codable, Sendable {
+    public enum Actor: String, Codable, Sendable { case user, automatic }
+    public enum Outcome: String, Codable, Sendable { case pending, forwarded, stale, timedOut, cancelled, failed }
+    public enum ProviderAcknowledgement: String, Codable, Sendable {
+        case pending, acceptedByHarness, rejectedByHarness, timedOut, cancelled, unavailable
+    }
+
+    public let harnessID: String
+    public let providerName: String
+    public let requestID: UUID
+    public let requestedOptionKinds: [String]
+    public let toolKind: ToolRequest.Kind?
+    public let workspaceScoped: Bool
+    public let policy: ExecutionPolicy
+    public let policyReason: String
+    public var actor: Actor
+    public var selectedOptionKind: String?
+    public var outcome: Outcome
+    public var providerAcknowledgement: ProviderAcknowledgement
+    public let createdAt: Date
+    public var updatedAt: Date
+
+    public init(
+        harnessID: String,
+        providerName: String,
+        requestID: UUID,
+        requestedOptionKinds: [String],
+        toolKind: ToolRequest.Kind?,
+        workspaceScoped: Bool,
+        policy: ExecutionPolicy,
+        policyReason: String,
+        actor: Actor,
+        selectedOptionKind: String? = nil,
+        outcome: Outcome = .pending,
+        providerAcknowledgement: ProviderAcknowledgement = .pending,
+        createdAt: Date = .now,
+        updatedAt: Date = .now
+    ) {
+        self.harnessID = Self.safe(harnessID, limit: 64)
+        self.providerName = Self.safe(providerName, limit: 96)
+        self.requestID = requestID
+        self.requestedOptionKinds = Array(requestedOptionKinds.prefix(16)).map { Self.safe($0, limit: 64) }
+        self.toolKind = toolKind
+        self.workspaceScoped = workspaceScoped
+        self.policy = policy
+        self.policyReason = Self.safe(policyReason, limit: 240)
+        self.actor = actor
+        self.selectedOptionKind = selectedOptionKind.map { Self.safe($0, limit: 64) }
+        self.outcome = outcome
+        self.providerAcknowledgement = providerAcknowledgement
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    private static func safe(_ value: String, limit: Int) -> String {
+        let oneLine = value.unicodeScalars.map { CharacterSet.controlCharacters.contains($0) ? " " : String($0) }.joined()
+        return String(oneLine.trimmingCharacters(in: .whitespacesAndNewlines).prefix(limit))
+    }
+}
+
 public struct SessionAction: Identifiable, Hashable, Codable, Sendable {
     public enum Kind: String, Codable, Sendable { case tool, approval, plan, reasoning }
     public enum Status: String, Codable, Sendable { case running, waiting, completed, failed, allowed, denied, cancelled, interrupted }
@@ -578,6 +640,7 @@ public struct SessionAction: Identifiable, Hashable, Codable, Sendable {
     public let workspaceScoped: Bool
     public let createdAt: Date
     public var updatedAt: Date
+    public var approvalProvenance: ApprovalProvenance?
 
     public init(
         id: UUID = UUID(),
@@ -589,7 +652,8 @@ public struct SessionAction: Identifiable, Hashable, Codable, Sendable {
         status: Status,
         workspaceScoped: Bool = false,
         createdAt: Date = .now,
-        updatedAt: Date = .now
+        updatedAt: Date = .now,
+        approvalProvenance: ApprovalProvenance? = nil
     ) {
         self.id = id
         self.messageID = messageID
@@ -601,6 +665,7 @@ public struct SessionAction: Identifiable, Hashable, Codable, Sendable {
         self.workspaceScoped = workspaceScoped
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.approvalProvenance = approvalProvenance
     }
 }
 

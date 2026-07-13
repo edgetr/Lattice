@@ -109,6 +109,23 @@ struct RecommendationTests {
         #expect(CLIActionStatusPolicy.updateMessage(status: 0, output: Data("done".utf8), beforeVersion: nil, afterVersion: nil) == "Update finished, but Lattice could not verify the active CLI version.")
     }
 
+    @Test func cliFailureMessagesRedactCredentialShapedOutput() {
+        let output = "authorization: Bearer abcdefghijklmnop session_id=session-12345678 sk-proj-abcdefghijklmnop\n"
+        let message = CLIActionStatusPolicy.failureMessage(prefix: "Install failed", output: Data(output.utf8))
+        #expect(message.contains("Install failed:"))
+        #expect(!message.contains("abcdefghijklmnop"))
+        #expect(message.contains("[REDACTED]"))
+        #expect(!message.contains("\n"))
+        #expect(message.count <= 156)
+    }
+
+    @Test func cliFailureMessagesKeepSafeSummaryAndBoundHugeOutput() {
+        let output = String(repeating: "safe detail ", count: 1_000) + "\n"
+        let message = CLIActionStatusPolicy.failureMessage(prefix: "Update failed", output: Data(output.utf8))
+        #expect(message.hasPrefix("Update failed: safe detail"))
+        #expect(message.count <= 156)
+    }
+
     @Test func grokTextCatalogDoesNotInferReasoningOptionsFromModelName() {
         let output = """
         You are logged in

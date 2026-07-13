@@ -63,7 +63,18 @@ struct SessionPortableArchiveTests {
                     detail: "token=replay-me",
                     status: .waiting,
                     createdAt: fixedDate,
-                    updatedAt: fixedDate
+                    updatedAt: fixedDate,
+                    approvalProvenance: .init(
+                        harnessID: "provider-only-harness-secret",
+                        providerName: "provider-only-name",
+                        requestID: UUID(uuidString: "99999999-9999-9999-9999-999999999999")!,
+                        requestedOptionKinds: ["allow_once"],
+                        toolKind: .write,
+                        workspaceScoped: true,
+                        policy: .ask,
+                        policyReason: "provider-only-policy-evidence",
+                        actor: .user
+                    )
                 ),
                 SessionAction(
                     id: UUID(),
@@ -96,6 +107,9 @@ struct SessionPortableArchiveTests {
         let text = try #require(String(data: data, encoding: .utf8))
         #expect(text.contains("lattice.session.archive"))
         #expect(!text.contains(threadID))
+        #expect(!text.contains("provider-only-harness-secret"))
+        #expect(!text.contains("provider-only-name"))
+        #expect(!text.contains("99999999-9999-9999-9999-999999999999"))
         #expect(!text.contains("unsent composer draft"))
         #expect(!text.contains("/Users/secret"))
         #expect(!text.contains(sessionID.uuidString))
