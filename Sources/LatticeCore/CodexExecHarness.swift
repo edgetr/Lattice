@@ -59,22 +59,12 @@ public final class CodexExecHarness: @unchecked Sendable {
 
     public func isAuthenticated() async -> Bool {
         guard let executableURL else { return false }
-        return await Task.detached {
-            let process = Process(); process.executableURL = executableURL
-            process.arguments = ["login", "-c", "service_tier=\"flex\"", "status"]
-            process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
-            do { try process.run(); process.waitUntilExit(); return process.terminationStatus == 0 } catch { return false }
-        }.value
+        return await Self.run(executableURL, arguments: ["login", "-c", "service_tier=\"flex\"", "status"], discardOutput: true).status == 0
     }
 
     public func login() async -> Bool {
         guard let executableURL else { return false }
-        return await Task.detached {
-            let process = Process(); process.executableURL = executableURL
-            process.arguments = ["login", "-c", "service_tier=\"flex\""]
-            process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
-            do { try process.run(); process.waitUntilExit(); return process.terminationStatus == 0 } catch { return false }
-        }.value
+        return await Self.run(executableURL, arguments: ["login", "-c", "service_tier=\"flex\""], discardOutput: true).status == 0
     }
 
     public func updateCLI() async -> Bool {
@@ -528,22 +518,17 @@ public final class CodexExecHarness: @unchecked Sendable {
     }
 
     private static func run(_ executable: URL, arguments: [String], discardOutput: Bool = false) async -> (status: Int32, output: Data) {
-        await Task.detached {
-            let process = Process()
-            let pipe = Pipe()
-            process.executableURL = executable
-            process.arguments = arguments
-            process.standardOutput = discardOutput ? FileHandle.nullDevice : pipe
-            process.standardError = discardOutput ? FileHandle.nullDevice : pipe
-            do {
-                try process.run()
-                let data = discardOutput ? Data() : pipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                return (process.terminationStatus, data)
-            } catch {
-                return (-1, Data())
-            }
-        }.value
+        let result = await BoundedSubprocess.run(
+            BoundedSubprocessRequest(
+                executableURL: executable,
+                arguments: arguments,
+                deadline: 30,
+                maximumOutputBytes: BoundedSubprocessRequest.defaultMaximumOutputBytes
+            )
+        )
+        let output = discardOutput ? Data() : result.combinedOutput
+        guard result.outcome == .exited, let status = result.exitStatus else { return (-1, output) }
+        return (status, output)
     }
 }
 
