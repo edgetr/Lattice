@@ -1184,10 +1184,12 @@ struct ConnectionCard<Actions: View, Content: View>: View {
 
 struct PageHeader: View {
     let title: String; let subtitle: String
+    @ScaledMetric(relativeTo: .title) private var titleFontSize: CGFloat = 30
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
-                .font(.system(size: 30, weight: .semibold, design: .rounded))
+                .font(.system(size: titleFontSize, weight: .semibold, design: .rounded))
                 .fixedSize(horizontal: false, vertical: true)
             Text(subtitle)
                 .foregroundStyle(.secondary)
