@@ -59,6 +59,26 @@ struct RunUIStateTests {
         #expect(state.activity == Array(items.suffix(4)))
     }
 
+    @Test("run smoke preserves approval, terminal state, and session isolation")
+    func completeRunSmokeCoversFailureAndPermissionTransitions() {
+        let active = UUID()
+        let failed = UUID()
+        var states = [active: RunUIState(), failed: RunUIState()]
+        reduce(.started, for: active, in: &states)
+        reduce(.started, for: failed, in: &states)
+        reduce(.permissionRequested, for: active, in: &states)
+        reduce(.permissionResolved, for: active, in: &states)
+        reduce(.setActivity([RunUIActivity(icon: "terminal", title: "Running", detail: "command")]), for: active, in: &states)
+        reduce(.failed("provider failed"), for: failed, in: &states)
+
+        #expect(states[active]?.overlayMode == .running)
+        #expect(states[active]?.composerState == .progress(0.5))
+        #expect(states[active]?.activity.count == 1)
+        #expect(states[failed]?.overlayMode == .prompt)
+        #expect(states[failed]?.errorMessage == "provider failed")
+        #expect(states[failed]?.activity.isEmpty == true)
+    }
+
     private func reduce(_ action: RunUIAction, for sessionID: UUID, in states: inout [UUID: RunUIState]) {
         var state = states[sessionID] ?? RunUIState()
         RunUIReducer.reduce(action, into: &state)
