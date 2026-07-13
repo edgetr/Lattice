@@ -135,7 +135,9 @@ struct InspectorView: View {
 struct ModelsView: View {
     @ObservedObject var state: AppState
     @AppStorage("lattice.models.showOnlyFittingLocalRecommendations") private var showOnlyFittingLocalRecommendations = true
-    var installedTags: Set<String> { Set(state.ollamaModels.map(\.name)) }
+    var installedTags: Set<String> {
+        state.ollamaCatalogStatus == .loaded ? Set(state.ollamaModels.map(\.name)) : []
+    }
 
     var body: some View {
         AdaptiveCatalogPage { contentWidth in
@@ -227,7 +229,8 @@ struct ModelsView: View {
 
                 if !state.ollamaModels.isEmpty {
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("Installed").font(.headline)
+                        Text(state.ollamaCatalogStatus == .failed ? "Last known installed models" : "Installed")
+                            .font(.headline)
                         CatalogCardGrid(contentWidth: contentWidth, minimum: LatticeCatalogPageLayout.modelCardMinimum, maximum: LatticeCatalogPageLayout.modelCardMaximum) {
                             ForEach(state.ollamaModels) { model in
                                 let backend = ChatBackend.ollama(model: model.name)
@@ -241,8 +244,8 @@ struct ModelsView: View {
                                     Spacer(minLength: 8)
                                     Button("Use") { state.useBackendInChat(backend) }
                                         .disabled(!runnable)
-                                        .accessibilityHint(runnable ? "Use \(model.name) in a chat." : "Start Ollama before using this local model.")
-                                        .help(runnable ? "Use \(model.name) in a chat." : "Start Ollama before using this local model.")
+                                        .accessibilityHint(runnable ? "Use \(model.name) in a chat." : (state.backendUnavailableMessage(for: backend) ?? "This local model is unavailable."))
+                                        .help(runnable ? "Use \(model.name) in a chat." : (state.backendUnavailableMessage(for: backend) ?? "This local model is unavailable."))
                                 }
                                 .padding(LatticeMetrics.cardPadding)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -252,7 +255,7 @@ struct ModelsView: View {
                     }
                 }
 
-                if !state.ollamaReady {
+                if !state.ollamaReady || state.ollamaCatalogStatus != .loaded {
                     ollamaStatusCard
                 }
 
@@ -365,17 +368,40 @@ struct ModelsView: View {
             Image(systemName: "cpu").font(.title2).foregroundStyle(.secondary).frame(width: 28)
             VStack(alignment: .leading, spacing: 3) {
                 Text("Ollama").fontWeight(.semibold)
-                Text(state.ollamaInstalled ? "Installed · not running" : "Required for local model installs").font(.caption).foregroundStyle(.secondary)
+                Text(ollamaStatusDetail).font(.caption).foregroundStyle(.secondary)
             }
             Spacer(minLength: 8)
-            Button(state.ollamaInstalled ? "Start" : "Get") {
-                state.ollamaInstalled ? state.openOllama() : state.installOllama()
+            Button(ollamaStatusActionTitle) {
+                if !state.ollamaInstalled {
+                    state.installOllama()
+                } else if !state.ollamaReady {
+                    state.openOllama()
+                } else {
+                    Task { await state.refreshConnections(refreshProviderCatalogs: true) }
+                }
             }
         }
         .padding(LatticeMetrics.cardPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
         .latticeGlass(cornerRadius: LatticeMetrics.cardRadius, interactive: true)
         .frame(maxWidth: LatticeCatalogPageLayout.featureCardMaximum, alignment: .leading)
+    }
+
+    private var ollamaStatusDetail: String {
+        if !state.ollamaInstalled { return "Required for local model installs" }
+        if !state.ollamaReady { return "Installed · not running" }
+        switch state.ollamaCatalogStatus {
+        case .loading: return "Running · refreshing local model catalog"
+        case .failed: return "Running · local model catalog unavailable"
+        case .unknown: return "Running · local model catalog not checked"
+        case .loaded: return state.ollamaModels.isEmpty ? "Running · no chat-capable models reported" : "Running"
+        }
+    }
+
+    private var ollamaStatusActionTitle: String {
+        if !state.ollamaInstalled { return "Get" }
+        if !state.ollamaReady { return "Start" }
+        return "Refresh"
     }
 }
 
