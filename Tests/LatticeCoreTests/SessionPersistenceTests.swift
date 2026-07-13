@@ -594,6 +594,17 @@ struct SessionPersistenceTests {
         #expect(imported.actions.first?.detail == "")
     }
 
+    @Test func providerDiagnosticActivitySurvivesWithoutAssistantActionTarget() {
+        let diagnostic = ProviderEventDiagnostic(provider: "Pi", eventType: "future_event", reason: "Unsupported event.")
+        #expect(ProviderDiagnosticRetentionPolicy.action(for: diagnostic, assistantMessageID: nil) == nil)
+
+        let assistantID = UUID()
+        let action = ProviderDiagnosticRetentionPolicy.action(for: diagnostic, assistantMessageID: assistantID)
+        #expect(action?.messageID == assistantID)
+        #expect(action?.kind == .diagnostic)
+        #expect(action?.status == .failed)
+    }
+
     @Test func deletingMessageTruncatesBranchAndProviderState() {
         let firstUser = ChatMessage(role: .user, text: "First")
         let firstAssistant = ChatMessage(role: .assistant, text: "First reply", isPinned: true)

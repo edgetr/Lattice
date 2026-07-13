@@ -4621,10 +4621,14 @@ Lattice self-edit rules:
             }
         case .metric: break
         case .providerDiagnostic(let diagnostic):
-            guard let messageID = sessions[index].messages.last(where: { $0.role == .assistant })?.id else { return }
-            upsertSessionAction(.init(id: diagnostic.id, messageID: messageID, kind: .diagnostic, title: diagnostic.title, detail: diagnostic.detail, status: .failed), at: index)
             upsertActivity(.init(icon: "exclamationmark.triangle", title: diagnostic.title, detail: diagnostic.detail), sessionID: id)
-            persist()
+            if let action = ProviderDiagnosticRetentionPolicy.action(
+                for: diagnostic,
+                assistantMessageID: sessions[index].messages.last(where: { $0.role == .assistant })?.id
+            ) {
+                upsertSessionAction(action, at: index)
+                persist()
+            }
         case .completed:
             activeRunIDs[id] = nil
             harnessPermissionNotices[id] = nil

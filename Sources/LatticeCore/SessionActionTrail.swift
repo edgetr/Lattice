@@ -69,3 +69,17 @@ public enum SessionActionTrail {
         actions.removeAll { !keepingMessageIDs.contains($0.messageID) }
     }
 }
+
+public enum ProviderDiagnosticRetentionPolicy {
+    public static func action(for diagnostic: ProviderEventDiagnostic, assistantMessageID: UUID?) -> SessionAction? {
+        guard let assistantMessageID else { return nil }
+        return SessionAction(
+            id: diagnostic.id,
+            messageID: assistantMessageID,
+            kind: .diagnostic,
+            title: diagnostic.title,
+            detail: diagnostic.detail,
+            status: .failed
+        )
+    }
+}
