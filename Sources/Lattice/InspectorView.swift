@@ -395,7 +395,8 @@ struct ProviderModelSection: View {
 
     private var statusText: String {
         guard ready else { return unavailableDetail }
-        guard !visibleModels.isEmpty else { return "No models reported" }
+        guard !models.isEmpty else { return "No models reported" }
+        guard !visibleModels.isEmpty else { return "All models hidden" }
         guard visibleModels.contains(where: { state.canUseBackendInNewChat(backend($0)) }) else {
             return "Unavailable for this chat"
         }

@@ -159,7 +159,7 @@ struct ConversationView: View {
 
     private func scrollAccessibilityValue(for sessionID: UUID) -> String {
         let following = state.conversationScrollStates[sessionID]?.isFollowingTail ?? true
-        return following ? "following-tail" : "browsing-history"
+        return following ? "Following latest messages" : "Reading earlier messages"
     }
 
     // MARK: - Scroll anchoring
