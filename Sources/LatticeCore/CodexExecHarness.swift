@@ -381,7 +381,7 @@ public final class CodexExecHarness: @unchecked Sendable {
                 kind: .command,
                 title: "Codex wants to run a command",
                 detail: command.hasPrefix("$") ? command : "$ \(command)",
-                workspaceScoped: cwd.map { Self.isWorkspaceScoped($0, workspace: workspace) } ?? false,
+                workspaceScoped: cwd.map { WorkspacePathScope.isWorkspaceScoped($0, workspace: workspace) } ?? false,
                 reversible: false
             )
             let decisions = (params["availableDecisions"] as? [Any])?.compactMap { $0 as? String } ?? ["accept", "decline"]
@@ -400,7 +400,7 @@ public final class CodexExecHarness: @unchecked Sendable {
                 kind: .write,
                 title: "Codex wants to change files",
                 detail: detail,
-                workspaceScoped: root.map { Self.isWorkspaceScoped($0, workspace: workspace) } ?? true,
+                workspaceScoped: root.map { WorkspacePathScope.isWorkspaceScoped($0, workspace: workspace) } ?? false,
                 reversible: false
             )
             return ApprovalRequest(
@@ -460,13 +460,13 @@ public final class CodexExecHarness: @unchecked Sendable {
             }
             let command = item["command"] as? String ?? "Command"
             let cwd = item["cwd"] as? String
-            return .toolRequested(.init(id: id, kind: .command, title: "Run command", detail: "$ \(command)", workspaceScoped: cwd.map { Self.isWorkspaceScoped($0, workspace: workspace) } ?? false, reversible: false))
+            return .toolRequested(.init(id: id, kind: .command, title: "Run command", detail: "$ \(command)", workspaceScoped: cwd.map { WorkspacePathScope.isWorkspaceScoped($0, workspace: workspace) } ?? false, reversible: false))
         case "fileChange":
             if completed {
                 return .toolProgress(id: id, fraction: 1, detail: item["status"] as? String == "completed" ? "Completed" : "Failed")
             }
             let paths = (item["changes"] as? [[String: Any]] ?? []).compactMap { $0["path"] as? String }
-            return .toolRequested(.init(id: id, kind: .write, title: "Change files", detail: paths.isEmpty ? "Workspace files" : paths.joined(separator: ", "), workspaceScoped: paths.allSatisfy { Self.isWorkspaceScoped($0, workspace: workspace) }, reversible: false))
+            return .toolRequested(.init(id: id, kind: .write, title: "Change files", detail: paths.isEmpty ? "Workspace files" : paths.joined(separator: ", "), workspaceScoped: !paths.isEmpty && paths.allSatisfy { WorkspacePathScope.isWorkspaceScoped($0, workspace: workspace) }, reversible: true))
         case "webSearch":
             if completed { return .toolProgress(id: id, fraction: 1, detail: "Completed") }
             return .toolRequested(.init(id: id, kind: .network, title: "Search the web", detail: item["query"] as? String ?? "", workspaceScoped: false, reversible: true))
@@ -485,12 +485,6 @@ public final class CodexExecHarness: @unchecked Sendable {
             default: nil
             }
         }
-    }
-
-    private static func isWorkspaceScoped(_ path: String, workspace: URL) -> Bool {
-        let root = workspace.standardizedFileURL.resolvingSymlinksInPath().path
-        let candidate = (path.hasPrefix("/") ? URL(fileURLWithPath: path) : workspace.appendingPathComponent(path)).standardizedFileURL.resolvingSymlinksInPath().path
-        return candidate == root || candidate.hasPrefix(root + "/")
     }
 
     private static func responseError(_ object: [String: Any], fallback: String) -> String {

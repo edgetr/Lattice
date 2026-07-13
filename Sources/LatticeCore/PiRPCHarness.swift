@@ -257,7 +257,7 @@ public final class PiRPCHarness: @unchecked Sendable {
               let rawInput = payload["input"] as? [String: Any] else { return nil }
         let detail = permissionDetail(toolName: toolName, input: rawInput)
         let path = rawInput["path"] as? String
-        let workspaceScoped = path.map { isWorkspaceScoped($0, workspace: workspace) } ?? false
+        let workspaceScoped = path.map { WorkspacePathScope.isWorkspaceScoped($0, workspace: workspace) } ?? false
         let kind: ToolRequest.Kind = toolName == "bash" ? .command : .write
         let toolRequest = ToolRequest(kind: kind, title: "Pi wants to use \(toolName)", detail: detail, workspaceScoped: workspaceScoped, reversible: false)
         return ApprovalRequest(
@@ -303,12 +303,6 @@ public final class PiRPCHarness: @unchecked Sendable {
               let data = try? JSONSerialization.data(withJSONObject: input, options: [.sortedKeys]),
               let text = String(data: data, encoding: .utf8) else { return toolName }
         return String(text.prefix(600))
-    }
-
-    private static func isWorkspaceScoped(_ path: String, workspace: URL) -> Bool {
-        let root = workspace.standardizedFileURL.resolvingSymlinksInPath().path
-        let candidate = (path.hasPrefix("/") ? URL(fileURLWithPath: path) : workspace.appendingPathComponent(path)).standardizedFileURL.resolvingSymlinksInPath().path
-        return candidate == root || candidate.hasPrefix(root + "/")
     }
 
     private static func write(_ object: [String: Any], to handle: FileHandle?) throws {

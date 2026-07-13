@@ -559,7 +559,7 @@ public final class ACPHarness: @unchecked Sendable {
             ),
             title: title,
             detail: detail,
-            workspaceScoped: ACPPathScope.isWorkspaceScoped(toolCall: toolCall, workspace: workspace),
+            workspaceScoped: WorkspacePathScope.isWorkspaceScoped(toolCall: toolCall, workspace: workspace),
             reversible: false
         )
     }

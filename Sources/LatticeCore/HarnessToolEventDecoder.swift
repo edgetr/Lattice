@@ -15,7 +15,7 @@ public enum HarnessToolEventDecoder {
                 kind: kind(for: toolName),
                 title: "Pi is using \(displayName(toolName))",
                 detail: detail(input: input, fallback: toolName),
-                workspaceScoped: ACPPathScope.isWorkspaceScoped(input["path"] as? String, workspace: workspace),
+                workspaceScoped: WorkspacePathScope.isWorkspaceScoped(input["path"] as? String, workspace: workspace),
                 reversible: false
             ))
         case "tool_execution_update":
@@ -50,7 +50,7 @@ public enum HarnessToolEventDecoder {
                 kind: kind(for: kindName),
                 title: title,
                 detail: detail,
-                workspaceScoped: ACPPathScope.isWorkspaceScoped(
+                workspaceScoped: WorkspacePathScope.isWorkspaceScoped(
                     rawInput: update["rawInput"],
                     locations: update["locations"],
                     workspace: workspace

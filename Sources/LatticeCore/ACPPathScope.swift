@@ -1,6 +1,6 @@
 import Foundation
 
-enum ACPPathScope {
+enum WorkspacePathScope {
     static func isWorkspaceScoped(toolCall: [String: Any], workspace: URL?) -> Bool {
         guard let workspace else { return false }
         return isWorkspaceScoped(
@@ -49,10 +49,7 @@ enum ACPPathScope {
     }
 
     private static func pathIsWorkspaceScoped(_ path: String?, workspace: URL) -> Bool {
-        guard let path,
-              !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              !path.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
-              workspace.isFileURL else { return false }
+        guard let path, isSupportedPOSIXPathEvidence(path), workspace.isFileURL else { return false }
 
         let rootURL = workspace.standardizedFileURL.resolvingSymlinksInPath()
         let candidateURL = (path.hasPrefix("/") ? URL(fileURLWithPath: path) : workspace.appendingPathComponent(path))
@@ -63,4 +60,32 @@ enum ACPPathScope {
         guard !root.isEmpty, !candidate.isEmpty else { return false }
         return candidate == root || candidate.hasPrefix(root + "/")
     }
+
+    private static func isSupportedPOSIXPathEvidence(_ path: String) -> Bool {
+        guard !path.isEmpty,
+              path == path.trimmingCharacters(in: .whitespacesAndNewlines),
+              !path.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+              !path.contains("\\"),
+              !path.hasPrefix("~"),
+              !path.hasPrefix("//") else { return false }
+
+        if path.count >= 2,
+           let first = path.unicodeScalars.first,
+           first.properties.isAlphabetic,
+           path.unicodeScalars.dropFirst().first == ":" {
+            return false
+        }
+        if let colon = path.firstIndex(of: ":") {
+            let scheme = path[..<colon]
+            guard let first = scheme.unicodeScalars.first,
+                  first.properties.isAlphabetic,
+                  scheme.unicodeScalars.dropFirst().allSatisfy({
+                      $0.properties.isAlphabetic || (48...57).contains($0.value) || $0 == "+" || $0 == "-" || $0 == "."
+                  }) else { return true }
+            return false
+        }
+        return true
+    }
 }
+
+typealias ACPPathScope = WorkspacePathScope
