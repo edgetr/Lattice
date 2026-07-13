@@ -229,7 +229,7 @@ struct ModelsView: View {
 
                 if !state.ollamaModels.isEmpty {
                     VStack(alignment: .leading, spacing: 10) {
-                        Text(state.ollamaCatalogStatus == .failed ? "Last known installed models" : "Installed")
+                        Text(state.ollamaCatalogStatus == .loaded ? "Installed" : "Last known installed models")
                             .font(.headline)
                         CatalogCardGrid(contentWidth: contentWidth, minimum: LatticeCatalogPageLayout.modelCardMinimum, maximum: LatticeCatalogPageLayout.modelCardMaximum) {
                             ForEach(state.ollamaModels) { model in
@@ -292,7 +292,12 @@ struct ModelsView: View {
                             }
                             CatalogCardGrid(contentWidth: contentWidth, minimum: LatticeCatalogPageLayout.modelCardMinimum, maximum: LatticeCatalogPageLayout.modelCardMaximum) {
                                 ForEach(values) { model in
-                                    RecommendationRow(model: model, installed: installedTags.contains(model.ollamaTag), state: state)
+                                    RecommendationRow(
+                                        model: model,
+                                        installed: installedTags.contains(model.ollamaTag),
+                                        catalogAuthoritative: state.ollamaCatalogStatus == .loaded,
+                                        state: state
+                                    )
                                 }
                             }
                         }
@@ -394,6 +399,7 @@ struct ModelsView: View {
         case .loading: return "Running · refreshing local model catalog"
         case .failed: return "Running · local model catalog unavailable"
         case .unknown: return "Running · local model catalog not checked"
+        case .empty: return "Running · no chat-capable models reported"
         case .loaded: return state.ollamaModels.isEmpty ? "Running · no chat-capable models reported" : "Running"
         }
     }
@@ -570,6 +576,7 @@ struct ProviderModelRow: View {
 struct RecommendationRow: View {
     let model: LocalModelRecommendation
     let installed: Bool
+    let catalogAuthoritative: Bool
     @ObservedObject var state: AppState
     var body: some View {
         let fit = model.fit(on: state.hardware)
@@ -621,6 +628,11 @@ struct RecommendationRow: View {
                 Button("Get Ollama") { state.installOllama() }.fixedSize(horizontal: true, vertical: false)
             } else if !state.ollamaReady {
                 Button("Start Ollama") { state.openOllama() }.fixedSize(horizontal: true, vertical: false)
+            } else if !catalogAuthoritative {
+                Button("Refresh") { Task { await state.refreshConnections(refreshProviderCatalogs: true) } }
+                    .fixedSize(horizontal: true, vertical: false)
+                    .accessibilityHint("Refresh the local model catalog before installing or using this recommendation.")
+                    .help("Refresh the local model catalog before installing or using this recommendation.")
             } else {
                 let installHint = fit == .risky ? "This model is too close to the safe memory budget." : fit == .unsupported ? "This model exceeds the safe memory budget." : "Install with Ollama."
                 Button(canInstall ? "Install" : "Too large") { state.installModel(model) }
