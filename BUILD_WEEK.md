@@ -40,13 +40,13 @@ The following findings should be resolved before adding more autonomous behavior
 | P2 | The most ambitious extension operations are review-only. | Model recommendations, harness routes, and automations can be proposed but do not have typed, enforceable runtimes. | `LatticeExtensionOperationRuntimePolicy` | Implement one typed operation at a time with manifest validation, permission review, dry-run preview, atomic apply, rollback, and tests. Never execute arbitrary extension entrypoints merely because a model generated them. |
 | P2 | Tests do not yet exercise the product's highest-risk orchestration boundary. | Core policy is well covered, but there is no deterministic end-to-end replay of interleaved app-server events through session state and UI-derived state. | `Tests/LatticeCoreTests` and the untested `AppState` event loop | Add protocol record/replay fixtures, run-state reducer tests, malformed-event tests, and a small UI smoke suite for approval, recovery, and concurrent-run flows. |
 
-P0 implementation update (2026-07-13, working tree pending a dated reviewable commit):
+P0 implementation update (reviewed and committed 2026-07-14):
 
 - Codex no longer receives an invented runnable model when discovery is missing; unknown imports preserve model provenance without bypassing the runtime catalog gate.
 - Workspace scope classification is shared across harnesses and fails closed for missing, malformed, unresolved, symlink-escaped, and empty path evidence.
 - A deterministic per-route capability matrix now drives Inspector and connection disclosures, including broker mediation, write containment, approvals, read/network limits, credential claims, and lifecycle support.
 
-These repairs complete the immediate P0 code changes, but they are not Build Week feature evidence until they are committed, reviewed, and recorded in the feature log with the verification result.
+These immediate P0 repairs are now represented by dated commits in the feature log. Later Build Week work should extend them rather than weakening their runtime-discovery, scope-evidence, or capability-disclosure guarantees.
 
 ## Build Week implementation sequence
 
@@ -125,7 +125,7 @@ The demo should use the same scenario vocabulary as the tests and show one recov
 
 ## How GPT-5.6 is used for Build Week
 
-OpenAI's current model catalog describes GPT-5.6 as a long-context, tool-capable family for complex reasoning and coding, and current Codex guidance describes stronger multi-agent workflows. Build Week should use those capabilities to understand Lattice, implement scoped changes, run independent review passes, and verify the real app. GPT-5.6 use is part of how Lattice is built, not a product requirement imposed on Lattice users.
+The 2026-07-14 review and integration task used GPT-5.6 Luna in Codex, with high or xhigh reasoning for scoped implementation and independent review agents. The work used those sessions to understand Lattice, implement isolated fixes, reconcile overlapping worktrees, and verify the real app. GPT-5.6 use is part of how Lattice is built, not a product requirement imposed on Lattice users. The primary Codex `/feedback` identifier still needs to be captured for the submission; this log does not invent one.
 
 Implementation rules:
 
@@ -166,6 +166,11 @@ Do not include prompts, transcripts, or identifiers that contain secrets or priv
 | Date | Feature | Commit / PR | Codex session | GPT-5.6 contribution | Human decisions | Verification |
 | --- | --- | --- | --- | --- | --- | --- |
 | 2026-07-13 | Initial open-source foundation | Initial release | Add after `/feedback` | Repository preparation and verification | Product scope, safety boundaries, MIT licensing, and public positioning | Core tests and packaged-app verification |
+| 2026-07-14 | Review-driven reliability, safety, usability, and accessibility baseline | `f828353`, `f72050d`, `e40c182`, `4fc50e4` | Current Codex desktop task; `/feedback` ID pending | GPT-5.6 Luna review tasks created isolated fixer work, then the lead task reconciled the results and audited the combined branch. | Fix every review finding, keep provider behavior truthful, preserve accessibility and reduced-motion behavior, and retain reviewable commits rather than flattening the history. | Combined source/test parsing passed; final fallback run at `7032a63` passed 810 checks. |
+| 2026-07-14 | Truthful routes, catalog refreshes, and local-model discovery | `cb0ccf8`, `a474d72`, `228ef94` | Current Codex desktop task; `/feedback` ID pending | GPT-5.6 Luna compared competing review branches, retained the stricter route/scope policy, added refresh generations, and reviewed partial Ollama discovery. | Runtime-discovered models only; stale refreshes cannot publish; any incomplete Ollama capability scan is non-authoritative and visible as failed. | Focused tests and typechecks passed; fallback inventory includes the new refresh and Ollama cases; 810-check fallback passed at `7032a63`. |
+| 2026-07-14 | Bounded interactive provider lifecycle and run ownership | `944b97c`, `db9aa60`, `b438964`, `7032a63` | Current Codex desktop task; `/feedback` ID pending | GPT-5.6 Luna implemented and independently re-reviewed pipe ownership, process groups, output limits, serialized writes, permission handoff, replacement-run ownership, and cancellation races. | Never let stale teardown cancel a replacement run; allow only final cancellation control frames during grace; keep time, output, workspace, and permission bounds explicit. | Core/app typechecks and live transport probes passed; fallback verifier passed 810 checks; native Swift Testing was unavailable on this Command Line Tools installation. |
+| 2026-07-14 | Validated ACP stale-session recovery | `638079e` | Current Codex desktop task; `/feedback` ID pending | GPT-5.6 Luna traced recovery and persistence ordering across the ACP harness, event domain, and AppState transcript handoff. | Recover only from explicit stale-session rejection; require a bounded visible-transcript handoff; persist a replacement ID only after model validation and successful prompt response. | Focused recovery tests and full source parsing passed; packaged app verification passed; fallback verifier passed at `7032a63`. |
+| 2026-07-14 | Integrated UI and verification repair | `5724576`, `2eecbd1` | Current Codex desktop task; `/feedback` ID pending | GPT-5.6 Luna reviewed the merged UI for contradictory catalog and scroll accessibility states and repaired fallback parity. | Use human-readable VoiceOver state, distinguish hidden from undiscovered models, and keep verification claims tied to observed results. | Real app built and packaged successfully; bundle structure and arm64 executable verification passed. |
 
 ## Submission checklist
 
