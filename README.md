@@ -69,7 +69,7 @@ The macOS harness sandbox is a **write-containment control**, not a confidential
 ### Build Lattice
 
 - Swift 6 toolchain
-- Full Xcode with a compatible macOS SDK, or Command Line Tools with a complete SDK
+- Xcode 26 or a current Swift 6 toolchain with a complete macOS SDK
 - Standard macOS packaging tools used by the build script
 
 ## Build and run
