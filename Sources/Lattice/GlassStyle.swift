@@ -76,7 +76,8 @@ struct GlassSurface: ViewModifier {
         } else if #available(macOS 26.0, *) {
             content
                 .glassEffect(
-                    interactive ? .regular.interactive() : .regular,
+                    (interactive ? Glass.regular.interactive() : Glass.regular)
+                        .tint(tint?.opacity(tintOpacity)),
                     in: shape
                 )
                 .overlay {
