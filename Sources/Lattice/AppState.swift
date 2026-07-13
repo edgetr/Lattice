@@ -1740,6 +1740,21 @@ final class AppState: ObservableObject {
             existingHarnessThreadID: usesPromptDrivenBackend ? session.harnessThreadID : "structured-message-list",
             managementMode: usesPromptDrivenBackend ? .providerManagedSession : .latticeManagedVisibleTranscript
         )
+        let supportsACPRecovery = ["grok", "openCode", "hermes"].contains(harnessID)
+        let hasPersistedACPSession = supportsACPRecovery && session.harnessThreadID != nil
+        let recoveryPlan = hasPersistedACPSession
+            ? LatticeContextHandoffPlanner.plan(
+                session: session,
+                submittedText: submittedText,
+                additionalContext: additionalContext,
+                tokenLimit: tokenLimit,
+                existingHarnessThreadID: nil,
+                managementMode: .providerManagedSession
+            )
+            : contextPlan
+        let recoveryPrompt = hasPersistedACPSession ? recoveryPlan.prompt : nil
+        let recoveryUsesVisibleTranscriptHandoff = hasPersistedACPSession && recoveryPlan.usesVisibleTranscriptHandoff
+        let recoveryDeliveryIssue = hasPersistedACPSession ? recoveryPlan.deliveryIssue : nil
         let prompt = contextPlan.prompt
         let routeThreadID: String? = contextPlan.resetsHarnessSession ? nil : session.harnessThreadID
         if contextPlan.resetsHarnessSession {
@@ -1762,14 +1777,14 @@ final class AppState: ObservableObject {
         if harnessID == "pi", let piRoute = piRoute(for: session.backend) {
             stream = pi.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, provider: piRoute.provider, model: piRoute.model, reasoningEffort: reasoningEffort, allowFileModification: !isExtensionSelfEdit)
         } else if harnessID == "hermes" {
-            stream = hermes.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: session.backend.displayName, allowFileModification: !isExtensionSelfEdit)
+            stream = hermes.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: session.backend.displayName, allowFileModification: !isExtensionSelfEdit, recoveryPrompt: recoveryPrompt, recoveryUsesVisibleTranscriptHandoff: recoveryUsesVisibleTranscriptHandoff, recoveryDeliveryIssue: recoveryDeliveryIssue)
         } else { switch session.backend {
         case .codex(let model):
             stream = codex.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, model: model, reasoningEffort: reasoningEffort, policy: session.policy)
         case .grok(let model):
-            stream = grokACP.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: model, allowFileModification: !isExtensionSelfEdit)
+            stream = grokACP.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: model, allowFileModification: !isExtensionSelfEdit, recoveryPrompt: recoveryPrompt, recoveryUsesVisibleTranscriptHandoff: recoveryUsesVisibleTranscriptHandoff, recoveryDeliveryIssue: recoveryDeliveryIssue)
         case .openCode(let model):
-            stream = openCodeACP.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: model, allowFileModification: !isExtensionSelfEdit)
+            stream = openCodeACP.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: model, allowFileModification: !isExtensionSelfEdit, recoveryPrompt: recoveryPrompt, recoveryUsesVisibleTranscriptHandoff: recoveryUsesVisibleTranscriptHandoff, recoveryDeliveryIssue: recoveryDeliveryIssue)
         case .appleIntelligence:
             let transcript = LatticeBackendMessageBuilder.transcript(session: session, submittedText: submittedText, additionalContext: additionalContext, contextPlan: contextPlan)
             stream = appleIntelligence.stream(prompt: transcript, sessionID: id)
@@ -4869,6 +4884,10 @@ Lattice self-edit rules:
         case .sessionStarted: break
         case .harnessSessionStarted(let threadID):
             sessions[index].harnessThreadID = threadID
+            persist()
+        case .harnessSessionRecovery(let detail):
+            sessions[index].harnessThreadID = nil
+            setActivity([.init(icon: "arrow.triangle.2.circlepath", title: "Provider session recovery", detail: detail)], sessionID: id)
             persist()
         case .assistantDelta(let delta):
             guard sessions[index].isStreaming,

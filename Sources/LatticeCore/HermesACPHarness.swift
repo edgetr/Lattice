@@ -146,7 +146,17 @@ public final class ACPHarness: @unchecked Sendable {
         }
     }
 
-    public func stream(prompt: String, sessionID: UUID, threadID: String?, workspace: URL, requestedModel: String, allowFileModification: Bool = true) -> AsyncStream<AgentEvent> {
+    public func stream(
+        prompt: String,
+        sessionID: UUID,
+        threadID: String?,
+        workspace: URL,
+        requestedModel: String,
+        allowFileModification: Bool = true,
+        recoveryPrompt: String? = nil,
+        recoveryUsesVisibleTranscriptHandoff: Bool = false,
+        recoveryDeliveryIssue: String? = nil
+    ) -> AsyncStream<AgentEvent> {
         AsyncStream { continuation in
             let start = processRegistry.beginStart(for: sessionID)
             let task = Task.detached(priority: .userInitiated) { [self] in
@@ -193,6 +203,8 @@ public final class ACPHarness: @unchecked Sendable {
                         if threadID.hasPrefix(profile.sessionPrefix) { return String(threadID.dropFirst(profile.sessionPrefix.count)) }
                         return profile == .grok || profile == .openCode ? threadID : nil
                     }()
+                    var didRecover = false
+                    var recoveryPromptForDelivery: String?
                     let method = storedID == nil ? "session/new" : "session/load"
                     try Self.write(Self.sessionRequest(id: sessionRequestID, method: method, workspace: canonicalWorkspace, threadID: storedID), to: runningTransport)
                     var sessionResponse = try Self.readResponse(id: sessionRequestID, from: reader, transport: runningTransport)
@@ -207,16 +219,36 @@ public final class ACPHarness: @unchecked Sendable {
                         try Self.write(Self.sessionRequest(id: sessionRequestID, method: method, workspace: canonicalWorkspace, threadID: storedID), to: runningTransport)
                         sessionResponse = try Self.readResponse(id: sessionRequestID, from: reader, transport: runningTransport)
                     }
-                    if Self.result(from: sessionResponse) == nil, storedID != nil {
+                    if storedID != nil, Self.isStaleSessionRejection(sessionResponse) {
+                        guard !processRegistry.isCancelled(registeredOwner, sessionID: sessionID) else {
+                            throw HarnessError.message("\(profile.displayName) request cancelled.")
+                        }
+                        guard let validatedRecoveryPrompt = Self.validatedRecoveryPrompt(
+                            recoveryPrompt,
+                            usesVisibleTranscriptHandoff: recoveryUsesVisibleTranscriptHandoff,
+                            deliveryIssue: recoveryDeliveryIssue
+                        ) else {
+                            if let recoveryDeliveryIssue {
+                                throw HarnessError.message("\(profile.displayName) rejected the saved session, but visible transcript handoff could not be delivered: \(recoveryDeliveryIssue)")
+                            }
+                            throw HarnessError.message("\(profile.displayName) rejected the saved session, but no visible transcript handoff was available for the replacement session.")
+                        }
+                        didRecover = true
+                        recoveryPromptForDelivery = validatedRecoveryPrompt
+                        let reason = Self.responseError(sessionResponse, fallback: "saved session was rejected or expired")
+                        continuation.yield(.harnessSessionRecovery(recoveryMessage(reason: reason)))
                         sessionRequestID += 1
                         try Self.write(Self.sessionRequest(id: sessionRequestID, method: "session/new", workspace: canonicalWorkspace, threadID: nil), to: runningTransport)
                         sessionResponse = try Self.readResponse(id: sessionRequestID, from: reader, transport: runningTransport)
                     }
-                    guard let result = Self.result(from: sessionResponse), let acpID = (result["sessionId"] as? String) ?? storedID else {
-                        throw HarnessError.message("\(profile.displayName) could not create a session.")
+                    guard let result = Self.result(from: sessionResponse),
+                          let acpID = (result["sessionId"] as? String) ?? (didRecover ? nil : storedID) else {
+                        let reason = Self.responseError(sessionResponse, fallback: "\(profile.displayName) did not return a session ID.")
+                        if didRecover {
+                            throw HarnessError.message("\(profile.displayName) started recovery, but could not create a fresh provider session: \(reason)")
+                        }
+                        throw HarnessError.message("\(profile.displayName) could not create a session: \(reason)")
                     }
-                    setACPSessionID(acpID, owner: registeredOwner, for: sessionID)
-                    continuation.yield(.harnessSessionStarted("\(profile.sessionPrefix)\(acpID)"))
 
                     let models = Self.models(from: sessionResponse)
                     guard let matched = Self.bestMatch(for: requestedModel, in: models) else {
@@ -232,12 +264,26 @@ public final class ACPHarness: @unchecked Sendable {
                             request = ["jsonrpc": "2.0", "id": sessionRequestID, "method": "session/set_model", "params": ["sessionId": acpID, "modelId": matched.id]]
                         }
                         try Self.write(request, to: runningTransport)
-                        _ = try Self.readResponse(id: sessionRequestID, from: reader, transport: runningTransport)
+                        let modelResponse = try Self.readResponse(id: sessionRequestID, from: reader, transport: runningTransport)
+                        guard Self.result(from: modelResponse) != nil else {
+                            throw HarnessError.message("\(profile.displayName) could not select model \(matched.id) for its provider session.")
+                        }
                     }
 
                     sessionRequestID += 1
-                    try Self.write(["jsonrpc": "2.0", "id": sessionRequestID, "method": "session/prompt", "params": ["sessionId": acpID, "prompt": [["type": "text", "text": prompt]]]], to: runningTransport)
+                    let promptText: String
+                    if didRecover {
+                        guard let recoveryPromptForDelivery else {
+                            throw HarnessError.message("\(profile.displayName) recovery lost its validated visible transcript handoff.")
+                        }
+                        promptText = recoveryPromptForDelivery
+                    } else {
+                        promptText = prompt
+                    }
+                    try Self.write(["jsonrpc": "2.0", "id": sessionRequestID, "method": "session/prompt", "params": ["sessionId": acpID, "prompt": [["type": "text", "text": promptText]]]], to: runningTransport)
                     try await readPromptResponse(id: sessionRequestID, sessionID: sessionID, owner: registeredOwner, workspace: canonicalWorkspace, allowFileModification: allowFileModification, from: reader, transport: runningTransport, continuation: continuation)
+                    setACPSessionID(acpID, owner: registeredOwner, for: sessionID)
+                    continuation.yield(.harnessSessionStarted("\(profile.sessionPrefix)\(acpID)"))
                     runningTransport.finish()
                     let didCancel = unregister(registeredOwner, start: start, sessionID: sessionID)
                     continuation.yield(didCancel ? .cancelled : .completed)
@@ -502,6 +548,9 @@ public final class ACPHarness: @unchecked Sendable {
             if object["method"] != nil { try await answerServerRequest(object, sessionID: sessionID, owner: owner, workspace: workspace, allowFileModification: allowFileModification, to: transport, continuation: continuation); continue }
             if (object["id"] as? NSNumber)?.intValue == id {
                 if let error = object["error"] as? [String: Any] { throw HarnessError.message(error["message"] as? String ?? "Hermes prompt failed.") }
+                guard object.keys.contains("result") else {
+                    throw HarnessError.message("ACP agent returned a malformed prompt response.")
+                }
                 return
             }
         }
@@ -653,6 +702,43 @@ public final class ACPHarness: @unchecked Sendable {
     private static func result(from response: [String: Any]) -> [String: Any]? {
         if response["error"] != nil { return nil }
         return response["result"] as? [String: Any]
+    }
+
+    static func isStaleSessionRejection(_ response: [String: Any]) -> Bool {
+        guard let error = response["error"] as? [String: Any],
+              let message = error["message"] as? String else { return false }
+        let normalized = message.lowercased()
+        let staleMarkers = [
+            "session not found",
+            "unknown session",
+            "session expired",
+            "session has expired",
+            "invalid session",
+            "no such session",
+            "session does not exist",
+            "could not find session"
+        ]
+        return staleMarkers.contains { normalized.contains($0) }
+    }
+
+    static func validatedRecoveryPrompt(
+        _ prompt: String?,
+        usesVisibleTranscriptHandoff: Bool,
+        deliveryIssue: String?
+    ) -> String? {
+        guard usesVisibleTranscriptHandoff,
+              deliveryIssue == nil,
+              let prompt,
+              !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return prompt
+    }
+
+    private static func responseError(_ response: [String: Any], fallback: String) -> String {
+        (response["error"] as? [String: Any])?["message"] as? String ?? fallback
+    }
+
+    private func recoveryMessage(reason: String) -> String {
+        "\(profile.displayName) provider session could not be resumed (\(reason)). Rebuilding continuity from a bounded visible-transcript handoff; hidden provider context is not restored."
     }
 
     private static func isAuthenticationRequired(_ response: [String: Any]) -> Bool {

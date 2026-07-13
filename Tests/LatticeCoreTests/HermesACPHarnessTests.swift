@@ -97,6 +97,37 @@ struct HermesACPHarnessTests {
         #expect(!request.workspaceScoped)
     }
 
+    @Test func recoveryRequiresRecognizedStaleSessionRejection() {
+        #expect(HermesACPHarness.isStaleSessionRejection(["error": ["message": "session not found"]]))
+        #expect(HermesACPHarness.isStaleSessionRejection(["error": ["message": "saved session has expired"]]))
+        #expect(!HermesACPHarness.isStaleSessionRejection(["error": ["message": "provider returned no result"]]))
+        #expect(!HermesACPHarness.isStaleSessionRejection(["error": ["message": "authentication required"]]))
+        #expect(!HermesACPHarness.isStaleSessionRejection(["result": [:]]))
+    }
+
+    @Test func recoveryRequiresDeliverableVisibleTranscriptHandoff() {
+        #expect(HermesACPHarness.validatedRecoveryPrompt(
+            "Visible transcript",
+            usesVisibleTranscriptHandoff: true,
+            deliveryIssue: nil
+        ) == "Visible transcript")
+        #expect(HermesACPHarness.validatedRecoveryPrompt(
+            "   ",
+            usesVisibleTranscriptHandoff: true,
+            deliveryIssue: nil
+        ) == nil)
+        #expect(HermesACPHarness.validatedRecoveryPrompt(
+            "Visible transcript",
+            usesVisibleTranscriptHandoff: false,
+            deliveryIssue: nil
+        ) == nil)
+        #expect(HermesACPHarness.validatedRecoveryPrompt(
+            "Visible transcript",
+            usesVisibleTranscriptHandoff: true,
+            deliveryIssue: "over context limit"
+        ) == nil)
+    }
+
     private func makeWorkspace() throws -> URL {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("lattice-acp-scope-\(UUID().uuidString)", isDirectory: true)
         let workspace = root.appendingPathComponent("workspace", isDirectory: true)

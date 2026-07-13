@@ -296,6 +296,8 @@ public struct ProviderEventDiagnostic: Hashable, Sendable {
 public enum AgentEvent: Sendable, Equatable {
     case sessionStarted(UUID)
     case harnessSessionStarted(String)
+    /// Provider rejected its persisted session; continuity is rebuilt only from visible transcript.
+    case harnessSessionRecovery(String)
     case assistantDelta(String)
     case plan(id: UUID, title: String, steps: [String])
     case reasoningSummary(id: UUID, delta: String)
