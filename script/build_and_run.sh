@@ -199,13 +199,13 @@ ensure_core_library() {
     CORE_BIN_PATH="$(swift build --show-bin-path)"
     return 0
   fi
-  # Never trust manual artifacts from an earlier source or toolchain state.
+  # Clean every fallback invocation; cache keys can miss source deletions and SDK/toolchain changes.
   build_manual_core
 }
 
 verify_fallback_test_inventory() {
-  local expected_files=15
-  local expected_tests=241
+  local expected_files=17
+  local expected_tests=256
   local test_sources=("$ROOT_DIR"/Tests/LatticeCoreTests/*.swift)
   if [[ ! -e "${test_sources[0]}" ]]; then
     echo "FAIL: fallback test inventory missing Tests/LatticeCoreTests/*.swift" >&2
