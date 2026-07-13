@@ -94,10 +94,10 @@ public enum ProviderReadinessPresentationPolicy: Sendable {
         guard readiness.authenticated else { return ProviderReadinessCopy(detail: "Sign in required", isReady: false) }
 
         switch readiness.catalogStatus {
-        case .unknown: return ProviderReadinessCopy(detail: "Signed in · (name) model catalog not checked", isReady: false)
-        case .loading: return ProviderReadinessCopy(detail: "Signed in · loading (name) model catalog", isReady: false)
-        case .empty: return ProviderReadinessCopy(detail: "Signed in · no (name) models found", isReady: false)
-        case .failed: return ProviderReadinessCopy(detail: "Signed in · (name) model catalog unavailable", isReady: false)
+        case .unknown: return ProviderReadinessCopy(detail: "Signed in · \(name) model catalog not checked", isReady: false)
+        case .loading: return ProviderReadinessCopy(detail: "Signed in · loading \(name) model catalog", isReady: false)
+        case .empty: return ProviderReadinessCopy(detail: "Signed in · no \(name) models found", isReady: false)
+        case .failed: return ProviderReadinessCopy(detail: "Signed in · \(name) model catalog unavailable", isReady: false)
         case .loaded:
             guard readiness.runnableModelCount > 0 else { return ProviderReadinessCopy(detail: "Signed in · no runnable models", isReady: false) }
             return ProviderReadinessCopy(detail: readyDetail, isReady: true)
