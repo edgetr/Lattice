@@ -92,11 +92,20 @@ struct ModelsView: View {
                     appleIntelligenceCard
                 }
 
-                if !state.codexModels.isEmpty || !state.grokModels.isEmpty || !state.openCodeModels.isEmpty || !state.antigravityModels.isEmpty {
+                if state.isRefreshingConnections {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Refreshing connected provider models…")
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Refreshing connected provider models")
+                    .accessibilityAddTraits(.updatesFrequently)
+                } else if state.hasConnectedProviderCatalog {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Connected provider models").font(.headline)
                         CatalogCardGrid(contentWidth: contentWidth, minimum: LatticeCatalogPageLayout.providerCardMinimum, maximum: LatticeCatalogPageLayout.providerCardMaximum) {
-                            if !state.codexModels.isEmpty {
+                            if state.codexReady || state.codex.isInstalled || !state.codexModels.isEmpty {
                                 ProviderModelSection(
                                     providerName: "Codex",
                                     providerID: "codex",
@@ -106,7 +115,7 @@ struct ModelsView: View {
                                     state: state
                                 ) { .codex(model: $0.id) }
                             }
-                            if !state.grokModels.isEmpty {
+                            if state.grokReady || state.grok.isInstalled || !state.grokModels.isEmpty {
                                 ProviderModelSection(
                                     providerName: "Grok",
                                     providerID: "grok",
@@ -116,7 +125,7 @@ struct ModelsView: View {
                                     state: state
                                 ) { .grok(model: $0.id) }
                             }
-                            if !state.openCodeModels.isEmpty {
+                            if state.openCodeReady || state.openCode.isInstalled || !state.openCodeModels.isEmpty {
                                 ProviderModelSection(
                                     providerName: "OpenCode",
                                     providerID: "opencode",
@@ -126,7 +135,7 @@ struct ModelsView: View {
                                     state: state
                                 ) { .openCode(model: $0.id) }
                             }
-                            if !state.antigravityModels.isEmpty {
+                            if state.antigravityAuthenticated || state.antigravityInstalled || !state.antigravityModels.isEmpty {
                                 ProviderModelSection(
                                     providerName: "Antigravity",
                                     providerID: "antigravity",
@@ -138,6 +147,10 @@ struct ModelsView: View {
                             }
                         }
                     }
+                } else if state.hasProviderCatalogProblem {
+                    catalogProblemState
+                } else {
+                    catalogEmptyState
                 }
 
                 if !state.ollamaModels.isEmpty {
@@ -156,6 +169,7 @@ struct ModelsView: View {
                                     Spacer(minLength: 8)
                                     Button("Use") { state.useBackendInChat(backend) }
                                         .disabled(!runnable)
+                                        .accessibilityHint(runnable ? "Use \(model.name\) in a chat." : "Start Ollama before using this local model.")
                                         .help(runnable ? "Use \(model.name) in a chat." : "Start Ollama before using this local model.")
                                 }
                                 .padding(LatticeMetrics.cardPadding)
@@ -215,6 +229,43 @@ struct ModelsView: View {
         .toolbar { Button { Task { await state.refreshConnections(refreshProviderCatalogs: true) } } label: { Label("Refresh", systemImage: "arrow.clockwise") } }
     }
 
+    private var catalogProblemState: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Provider catalog unavailable", systemImage: "exclamationmark.triangle").font(.headline)
+            Text(state.providerCatalogProblemMessage ?? "Refresh the provider connection to try again.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Open Connections") { state.selectedSection = .connections }
+        }
+        .padding(LatticeMetrics.cardPadding)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .latticeGlass(cornerRadius: LatticeMetrics.cardRadius, interactive: true)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var catalogEmptyState: some View {
+        let copy = CatalogEmptyStatePolicy.copy(for: .noConnectedProviderModels)
+        return VStack(alignment: .leading, spacing: 8) {
+            Label(copy.title, systemImage: "square.stack.3d.up.slash").font(.headline)
+            Text(copy.message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                Button(copy.primaryActionTitle ?? "Open Connections") { state.selectedSection = .connections }
+                Button(copy.secondaryActionTitle ?? "Refresh") {
+                    Task { await state.refreshConnections(refreshProviderCatalogs: true) }
+                }
+                .buttonStyle(.link)
+            }
+        }
+        .padding(LatticeMetrics.cardPadding)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .latticeGlass(cornerRadius: LatticeMetrics.cardRadius, interactive: true)
+        .accessibilityElement(children: .contain)
+    }
+
     private var appleIntelligenceCard: some View {
         HStack(spacing: 14) {
             Image(systemName: "apple.intelligence").font(.title2).frame(width: 28)
@@ -228,6 +279,7 @@ struct ModelsView: View {
                 let runnable = state.canUseBackendInNewChat(backend)
                 Button("Use") { state.useBackendInChat(backend) }
                     .disabled(!runnable)
+                    .accessibilityHint(runnable ? "Use Apple Intelligence in a chat." : (state.backendUnavailableMessage(for: backend) ?? "Apple Intelligence is unavailable."))
                     .help(runnable ? "Use Apple Intelligence in a chat." : (state.backendUnavailableMessage(for: backend) ?? "Apple Intelligence is unavailable."))
             }
         }
@@ -270,7 +322,16 @@ struct ProviderModelSection: View {
     }
 
     private var statusText: String {
-        ready ? "Ready" : unavailableDetail
+        guard ready else { return unavailableDetail }
+        guard !visibleModels.isEmpty else { return "No models reported" }
+        guard visibleModels.contains(where: { state.canUseBackendInNewChat(backend($0)) }) else {
+            return "Unavailable for this chat"
+        }
+        return "Ready"
+    }
+
+    private var isReadyForCurrentChat: Bool {
+        ready && visibleModels.contains(where: { state.canUseBackendInNewChat(backend($0)) })
     }
 
     private var displayedModels: [ProviderModel] {
@@ -289,14 +350,14 @@ struct ProviderModelSection: View {
                 }
                 Text(providerName).font(.subheadline.weight(.semibold))
                 Spacer(minLength: 8)
-                Image(systemName: ready ? "checkmark.circle.fill" : "minus.circle")
+                Image(systemName: isReadyForCurrentChat ? "checkmark.circle.fill" : "minus.circle")
                     .font(.caption.weight(.semibold))
                     .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(ready ? Color.green : Color.secondary)
+                    .foregroundStyle(isReadyForCurrentChat ? Color.green : Color.secondary)
                     .accessibilityHidden(true)
                 Text(statusText)
                     .font(.caption)
-                    .foregroundStyle(ready ? Color.green : Color.secondary)
+                    .foregroundStyle(isReadyForCurrentChat ? Color.green : Color.secondary)
                     .multilineTextAlignment(.trailing)
             }
             .accessibilityElement(children: .combine)
@@ -450,15 +511,18 @@ struct RecommendationRow: View {
                 Button("Use") { state.useBackendInChat(backend) }
                     .fixedSize(horizontal: true, vertical: false)
                     .disabled(!runnable)
+                    .accessibilityHint(runnable ? "Use \(model.name\) in a chat." : "Start Ollama before using this local model.")
                     .help(runnable ? "Use \(model.name) in a chat." : "Start Ollama before using this local model.")
             } else if !state.ollamaInstalled {
                 Button("Get Ollama") { state.installOllama() }.fixedSize(horizontal: true, vertical: false)
             } else if !state.ollamaReady {
                 Button("Start Ollama") { state.openOllama() }.fixedSize(horizontal: true, vertical: false)
             } else {
+                let installHint = fit == .risky ? "This model is too close to the safe memory budget." : fit == .unsupported ? "This model exceeds the safe memory budget." : "Install with Ollama."
                 Button(canInstall ? "Install" : "Too large") { state.installModel(model) }
                     .fixedSize(horizontal: true, vertical: false)
                     .disabled(state.installingModelTag != nil || !canInstall)
+                    .accessibilityHint(installHint)
                     .help(fit == .risky ? "This model is too close to the safe memory budget." : fit == .unsupported ? "This model exceeds the safe memory budget." : "Install with Ollama.")
             }
         }
@@ -1113,6 +1177,12 @@ struct ModelChecklist: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            Text("No models reported yet. Refresh after signing in.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityElement(children: .combine)
         }
     }
 }
