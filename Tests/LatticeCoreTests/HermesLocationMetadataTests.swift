@@ -4,9 +4,16 @@ import Testing
 
 @Suite("Hermes location metadata")
 struct HermesLocationMetadataTests {
-    private let workspace = URL(fileURLWithPath: "/tmp/lattice-hermes-workspace", isDirectory: true)
+    private func makeWorkspace() throws -> URL {
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lattice-hermes-workspace-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: false)
+        return workspace
+    }
 
     @Test func mixedEventLocationsFailClosed() throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
         let object: [String: Any] = [
             "method": "session/update",
             "params": [
@@ -33,6 +40,8 @@ struct HermesLocationMetadataTests {
     }
 
     @Test func mixedPermissionLocationsFailClosedEvenWithValidRawInputPath() throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
         let object: [String: Any] = [
             "method": "session/request_permission",
             "params": [
@@ -60,6 +69,8 @@ struct HermesLocationMetadataTests {
     }
 
     @Test func validRawInputPathFallbackRemainsWorkspaceScoped() throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
         let event: [String: Any] = [
             "method": "session/update",
             "params": [
