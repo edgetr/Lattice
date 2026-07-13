@@ -263,6 +263,7 @@ struct ProviderModelSection: View {
     let unavailableDetail: String
     @ObservedObject var state: AppState
     let backend: (ProviderModel) -> ChatBackend
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var visibleModels: [ProviderModel] {
         models.filter { state.isModelEnabled("\(providerID):\($0.id)") }
@@ -274,6 +275,10 @@ struct ProviderModelSection: View {
 
     private var displayedModels: [ProviderModel] {
         state.expandedProviderModelIDs.contains(providerID) ? visibleModels : Array(visibleModels.prefix(3))
+    }
+
+    private var disclosureAnimation: Animation? {
+        reduceMotion ? nil : .easeOut(duration: 0.18)
     }
 
     var body: some View {
@@ -317,13 +322,13 @@ struct ProviderModelSection: View {
                 }
                 if visibleModels.count > displayedModels.count {
                     Button("Show \(visibleModels.count - displayedModels.count) more") {
-                        withAnimation(.easeOut(duration: 0.18)) { state.setProviderModelsExpanded(providerID, expanded: true) }
+                        withAnimation(disclosureAnimation) { state.setProviderModelsExpanded(providerID, expanded: true) }
                     }
                     .buttonStyle(.link)
                     .font(.caption.weight(.medium))
                 } else if state.expandedProviderModelIDs.contains(providerID) && visibleModels.count > 3 {
                     Button("Show less") {
-                        withAnimation(.easeOut(duration: 0.18)) { state.setProviderModelsExpanded(providerID, expanded: false) }
+                        withAnimation(disclosureAnimation) { state.setProviderModelsExpanded(providerID, expanded: false) }
                     }
                     .buttonStyle(.link)
                     .font(.caption.weight(.medium))
