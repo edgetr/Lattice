@@ -202,6 +202,20 @@ public enum RemoteInstallerScriptPolicy {
         return .ok(buffer)
     }
 
+    /// Appends one streamed byte without allowing the body buffer past the cap.
+    @discardableResult
+    public static func accumulate(
+        byte: UInt8,
+        into buffer: inout Data,
+        maximumByteCount: Int = maximumByteCount
+    ) -> BoundedBodyAccumulation {
+        guard buffer.count < maximumByteCount else {
+            return .exceeded(maximumByteCount: maximumByteCount, observedByteCount: maximumByteCount + 1)
+        }
+        buffer.append(byte)
+        return buffer.isEmpty ? .empty : .ok(buffer)
+    }
+
     /// Accumulates an entire body from discrete chunks with a hard cap.
     public static func accumulate(
         chunks: [Data],

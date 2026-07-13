@@ -4180,21 +4180,14 @@ Lattice self-edit rules:
         guard let url = URL(string: urlString) else { return (-1, Data("Invalid installer URL.".utf8)) }
         if let message = RemoteInstallerScriptPolicy.validationMessage(for: url) { return (-1, Data(message.utf8)) }
         do {
-            let (data, response) = try await URLSession.shared.data(from: url)
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                return (-1, Data("Provider installer download failed.".utf8))
-            }
-            guard let finalURL = http.url,
-                  RemoteInstallerScriptPolicy.validateFinalURL(finalURL).isAccepted else {
-                return (-1, Data("Provider installer redirected outside Lattice's approved endpoint.".utf8))
-            }
+            let download = try await RemoteInstallerScriptDownloader().download(from: url)
             let evaluation = RemoteInstallerScriptPolicy.evaluateDownload(
-                data: data,
-                contentType: http.value(forHTTPHeaderField: "Content-Type")
+                data: download.data,
+                contentType: download.contentType
             )
             if let message = evaluation.contentMessage { return (-1, Data(message.utf8)) }
             let scriptURL = FileManager.default.temporaryDirectory.appendingPathComponent("lattice-installer-\(UUID().uuidString).sh")
-            try data.write(to: scriptURL, options: [.atomic])
+            try download.data.write(to: scriptURL, options: [.atomic])
             defer { try? FileManager.default.removeItem(at: scriptURL) }
             let syntax = await runCommand("bash", ["-n", scriptURL.path])
             guard syntax.status == 0 else {
