@@ -175,6 +175,7 @@ struct PersistenceRecoveryView: View {
         switch kind {
         case .unreadable: return .orange
         case .corrupt: return .red
+        case .oversized: return .red
         }
     }
 }

@@ -8,11 +8,13 @@ import CryptoKit
 public enum DurableStoreIssueKind: String, Sendable, Hashable, Codable {
     case corrupt
     case unreadable
+    case oversized
 
     public var displayName: String {
         switch self {
         case .corrupt: "Corrupt or invalid JSON"
         case .unreadable: "Unreadable"
+        case .oversized: "Too large"
         }
     }
 }
@@ -104,6 +106,7 @@ public struct DurableStoreFileIO: Sendable {
     public var fileExists: @Sendable (String) -> Bool
     public var attributesOfItem: @Sendable (String) throws -> [FileAttributeKey: Any]
     public var readData: @Sendable (URL) throws -> Data
+    public var readDataUpTo: @Sendable (URL, Int) throws -> Data
     public var writeDataAtomically: @Sendable (Data, URL) throws -> Void
     public var createDirectory: @Sendable (URL) throws -> Void
     public var copyItem: @Sendable (URL, URL) throws -> Void
@@ -115,6 +118,19 @@ public struct DurableStoreFileIO: Sendable {
         fileExists: @escaping @Sendable (String) -> Bool = { FileManager.default.fileExists(atPath: $0) },
         attributesOfItem: @escaping @Sendable (String) throws -> [FileAttributeKey: Any] = { try FileManager.default.attributesOfItem(atPath: $0) },
         readData: @escaping @Sendable (URL) throws -> Data = { try Data(contentsOf: $0) },
+        readDataUpTo: @escaping @Sendable (URL, Int) throws -> Data = { url, limit in
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+
+            var data = Data()
+            while data.count <= limit {
+                let remaining = limit + 1 - data.count
+                guard remaining > 0 else { break }
+                guard let chunk = try handle.read(upToCount: remaining), !chunk.isEmpty else { break }
+                data.append(chunk)
+            }
+            return data
+        },
         writeDataAtomically: @escaping @Sendable (Data, URL) throws -> Void = { try $0.write(to: $1, options: .atomic) },
         createDirectory: @escaping @Sendable (URL) throws -> Void = {
             try FileManager.default.createDirectory(at: $0, withIntermediateDirectories: true)
@@ -129,6 +145,7 @@ public struct DurableStoreFileIO: Sendable {
         self.fileExists = fileExists
         self.attributesOfItem = attributesOfItem
         self.readData = readData
+        self.readDataUpTo = readDataUpTo
         self.writeDataAtomically = writeDataAtomically
         self.createDirectory = createDirectory
         self.copyItem = copyItem
@@ -191,6 +208,7 @@ public enum DurableStorePreserveKind: String, Sendable {
 /// Focused, AppKit-free recovery primitives for durable JSON array stores.
 public enum DurableStoreRecovery: Sendable {
     public static let emptyJSONArray = Data("[]\n".utf8)
+    public static let maximumStoreByteCount = 10 * 1024 * 1024
 
     public static func enforceWritable(gate: DurableStoreWriteGate, storeName: String = "this store") throws {
         if gate.isBlocked {
@@ -244,14 +262,20 @@ public enum DurableStoreRecovery: Sendable {
         of fileURL: URL,
         io: DurableStoreFileIO = .default
     ) -> (modificationDate: Date?, fileSize: Int?, fingerprint: String?) {
-        let attrs = try? io.attributesOfItem(fileURL.path)
-        let modificationDate = attrs?[.modificationDate] as? Date
-        let fileSize = (attrs?[.size] as? NSNumber)?.intValue
-        let fingerprint = (try? io.readData(fileURL)).map(contentFingerprint(for:))
-        return (modificationDate, fileSize, fingerprint)
+        let metadata = metadata(of: fileURL, io: io)
+        let fingerprint: String?
+        if let fileSize = metadata.fileSize, fileSize > maximumStoreByteCount {
+            fingerprint = nil
+        } else if let data = try? io.readDataUpTo(fileURL, maximumStoreByteCount),
+                  data.count <= maximumStoreByteCount {
+            fingerprint = contentFingerprint(for: data)
+        } else {
+            fingerprint = nil
+        }
+        return (metadata.modificationDate, metadata.fileSize, fingerprint)
     }
 
-    /// Loads a JSON array store. Missing is normal empty; corrupt/unreadable become failed issues.
+    /// Loads a JSON array store. Missing is normal empty; corrupt, unreadable, and oversized stores fail.
     public static func loadJSONArray<Element: Decodable & Sendable>(
         from fileURL: URL,
         as elementType: Element.Type = Element.self,
@@ -259,10 +283,21 @@ public enum DurableStoreRecovery: Sendable {
         storeName: String,
         io: DurableStoreFileIO = .default
     ) -> DurableStoreLoadResult<[Element]> {
-        let observed = observation(of: fileURL, io: io)
+        let observed = metadata(of: fileURL, io: io)
+        if let fileSize = observed.fileSize, fileSize > maximumStoreByteCount {
+            return .failed(
+                oversizedIssue(
+                    storeID: storeID,
+                    storeName: storeName,
+                    fileURL: fileURL,
+                    observed: (observed.modificationDate, observed.fileSize, nil)
+                )
+            )
+        }
+
         let data: Data
         do {
-            data = try io.readData(fileURL)
+            data = try io.readDataUpTo(fileURL, maximumStoreByteCount)
         } catch {
             if isNotFoundError(error) {
                 return .missing
@@ -276,7 +311,22 @@ public enum DurableStoreRecovery: Sendable {
                     summary: "\(storeName) could not be read. Lattice left the original file untouched.",
                     error: error,
                     dataPreview: nil,
-                    observation: observed
+                    observation: (observed.modificationDate, observed.fileSize, nil)
+                )
+            )
+        }
+
+        if data.count > maximumStoreByteCount {
+            return .failed(
+                oversizedIssue(
+                    storeID: storeID,
+                    storeName: storeName,
+                    fileURL: fileURL,
+                    observed: (
+                        observed.modificationDate,
+                        observed.fileSize,
+                        nil
+                    )
                 )
             )
         }
@@ -499,6 +549,42 @@ public enum DurableStoreRecovery: Sendable {
     }
 
     // MARK: - Helpers
+
+    private static func metadata(
+        of fileURL: URL,
+        io: DurableStoreFileIO
+    ) -> (modificationDate: Date?, fileSize: Int?) {
+        let attrs = try? io.attributesOfItem(fileURL.path)
+        return (
+            attrs?[.modificationDate] as? Date,
+            (attrs?[.size] as? NSNumber)?.intValue
+        )
+    }
+
+    private static func oversizedIssue(
+        storeID: String,
+        storeName: String,
+        fileURL: URL,
+        observed: (modificationDate: Date?, fileSize: Int?, fingerprint: String?)
+    ) -> DurableStoreIssue {
+        let observedLength = observed.fileSize.map { String($0) } ?? "more than \(maximumStoreByteCount)"
+        return DurableStoreIssue(
+            storeID: storeID,
+            storeName: storeName,
+            filePath: fileURL.path,
+            kind: .oversized,
+            summary: "\(storeName) exceeds Lattice's safe storage limit. Lattice left the original file untouched.",
+            technicalDetails: [
+                "Path: \(fileURL.path)",
+                "Category: oversized",
+                "Observed byte length: \(observedLength)",
+                "Maximum allowed byte length: \(maximumStoreByteCount)"
+            ].joined(separator: "\n"),
+            observedModificationDate: observed.modificationDate,
+            observedFileSize: observed.fileSize,
+            observedContentFingerprint: observed.fingerprint
+        )
+    }
 
     private static func writeEmptyArray(at fileURL: URL, io: DurableStoreFileIO) throws {
         try io.createDirectory(fileURL.deletingLastPathComponent())

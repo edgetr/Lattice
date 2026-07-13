@@ -51,6 +51,74 @@ struct DurableStoreRecoveryTests {
         #expect((try Data(contentsOf: url)) == corrupt)
     }
 
+    @Test func loadUsesOneBoundedReadForDecodeAndFingerprint() {
+        let data = Data("{not-json".utf8)
+        let counter = ReadCounter()
+        let url = URL(fileURLWithPath: "/tmp/sessions.json")
+        let io = DurableStoreFileIO(
+            attributesOfItem: { _ in [.size: data.count, .modificationDate: Date(timeIntervalSince1970: 100)] },
+            readData: { _ in
+                counter.recordLegacyRead()
+                return data
+            },
+            readDataUpTo: { _, limit in
+                counter.recordBoundedRead(limit: limit)
+                return data
+            }
+        )
+
+        switch DurableStoreRecovery.loadJSONArray(
+            from: url,
+            as: LatticeSession.self,
+            storeID: SessionPersistence.storeID,
+            storeName: SessionPersistence.storeName,
+            io: io
+        ) {
+        case .failed(let issue):
+            #expect(issue.kind == .corrupt)
+            #expect(issue.observedContentFingerprint == DurableStoreRecovery.contentFingerprint(for: data))
+        case .missing, .loaded:
+            Issue.record("Invalid JSON must fail")
+        }
+        #expect(counter.boundedReads == 1)
+        #expect(counter.lastLimit == DurableStoreRecovery.maximumStoreByteCount)
+        #expect(counter.legacyReads == 0)
+    }
+
+    @Test func oversizedStoreFailsBeforeAnyDataRead() {
+        let counter = ReadCounter()
+        let oversizedByteCount = DurableStoreRecovery.maximumStoreByteCount + 1
+        let url = URL(fileURLWithPath: "/tmp/sessions.json")
+        let io = DurableStoreFileIO(
+            attributesOfItem: { _ in [.size: oversizedByteCount] },
+            readData: { _ in
+                counter.recordLegacyRead()
+                return Data()
+            },
+            readDataUpTo: { _, _ in
+                counter.recordBoundedRead(limit: 0)
+                return Data(repeating: 0, count: oversizedByteCount)
+            }
+        )
+
+        switch DurableStoreRecovery.loadJSONArray(
+            from: url,
+            as: LatticeSession.self,
+            storeID: SessionPersistence.storeID,
+            storeName: SessionPersistence.storeName,
+            io: io
+        ) {
+        case .failed(let issue):
+            #expect(issue.kind == .oversized)
+            #expect(issue.observedFileSize == oversizedByteCount)
+            #expect(issue.technicalDetails.contains("Maximum allowed byte length"))
+        case .missing, .loaded:
+            Issue.record("Oversized store must fail without loading")
+        }
+        #expect(counter.boundedReads == 0)
+        #expect(counter.legacyReads == 0)
+    }
+
     @Test func unreadablePermissionErrorUsesInjectableReader() throws {
         let root = uniqueTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -66,7 +134,8 @@ struct DurableStoreRecoveryTests {
         let io = DurableStoreFileIO(
             fileExists: { _ in true },
             attributesOfItem: { _ in [.size: 2, .modificationDate: Date(timeIntervalSince1970: 100)] },
-            readData: { _ in throw permissionError }
+            readData: { _ in throw permissionError },
+            readDataUpTo: { _, _ in throw permissionError }
         )
         let store = SessionPersistence(fileURL: url, io: io)
         switch store.loadResult() {
@@ -89,7 +158,8 @@ struct DurableStoreRecoveryTests {
         let io = DurableStoreFileIO(
             fileExists: { _ in false },
             attributesOfItem: { _ in throw permissionError },
-            readData: { _ in throw permissionError }
+            readData: { _ in throw permissionError },
+            readDataUpTo: { _, _ in throw permissionError }
         )
 
         switch DurableStoreRecovery.loadJSONArray(
@@ -537,6 +607,26 @@ struct DurableStoreRecoveryTests {
     }
 
     // MARK: - Helpers
+
+    private final class ReadCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private(set) var boundedReads = 0
+        private(set) var legacyReads = 0
+        private(set) var lastLimit: Int?
+
+        func recordBoundedRead(limit: Int) {
+            lock.lock()
+            boundedReads += 1
+            lastLimit = limit
+            lock.unlock()
+        }
+
+        func recordLegacyRead() {
+            lock.lock()
+            legacyReads += 1
+            lock.unlock()
+        }
+    }
 
     private func uniqueTempRoot() -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("lattice-recovery-\(UUID().uuidString)", isDirectory: true)
