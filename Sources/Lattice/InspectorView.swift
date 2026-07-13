@@ -92,9 +92,20 @@ struct ModelsView: View {
                     appleIntelligenceCard
                 }
 
-                if !state.codexModels.isEmpty || !state.grokModels.isEmpty || !state.openCodeModels.isEmpty || !state.antigravityModels.isEmpty {
+                let hasProviderCatalogState = [state.codexCatalogStatus, state.grokCatalogStatus, state.openCodeCatalogStatus]
+                    .contains { $0 == .loading || $0 == .failed }
+                if !state.codexModels.isEmpty || !state.grokModels.isEmpty || !state.openCodeModels.isEmpty || !state.antigravityModels.isEmpty || hasProviderCatalogState {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Connected provider models").font(.headline)
+                        if state.codexModels.isEmpty, state.codexCatalogStatus == .failed {
+                            ModelsCatalogNotice(provider: "Codex", state: state)
+                        }
+                        if state.grokModels.isEmpty, state.grokCatalogStatus == .failed {
+                            ModelsCatalogNotice(provider: "Grok", state: state)
+                        }
+                        if state.openCodeModels.isEmpty, state.openCodeCatalogStatus == .failed {
+                            ModelsCatalogNotice(provider: "OpenCode", state: state)
+                        }
                         CatalogCardGrid(contentWidth: contentWidth, minimum: LatticeCatalogPageLayout.providerCardMinimum, maximum: LatticeCatalogPageLayout.providerCardMaximum) {
                             if !state.codexModels.isEmpty {
                                 ProviderModelSection(
@@ -439,6 +450,31 @@ struct RecommendationRow: View {
         .padding(LatticeMetrics.cardPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
         .latticeGlass(cornerRadius: LatticeMetrics.cardRadius, interactive: true)
+    }
+}
+
+private struct ModelsCatalogNotice: View {
+    let provider: String
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+            Text("\(provider) model catalog unavailable. Connections can retry discovery.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Button("Retry") {
+                Task { await state.refreshConnections(refreshProviderCatalogs: true) }
+            }
+            .buttonStyle(.borderless)
+        }
+        .padding(10)
+        .latticeGlass(cornerRadius: 10, tint: Color.orange.opacity(0.08))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(provider) model catalog unavailable")
+        .accessibilityHint("Retry model discovery")
     }
 }
 

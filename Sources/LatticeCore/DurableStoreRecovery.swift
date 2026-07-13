@@ -471,12 +471,21 @@ public enum DurableStoreRecovery: Sendable {
             try ensureSourceMatchesExpected(fileURL: fileURL, expected: expected, io: io)
         }
 
+        let sourceBeforePreserve = observation(of: fileURL, io: io)
+
         let preserved: DurableStorePreserveResult
         do {
             preserved = try preserveCopy(of: fileURL, kind: .quarantine, io: io, now: now, uniqueToken: uniqueToken)
         } catch {
             throw DurableStoreRecoveryError.resetFailed(
                 message: "Reset aborted because a backup could not be created. Original left unchanged. \(error.localizedDescription)"
+            )
+        }
+
+        let sourceAfterPreserve = observation(of: fileURL, io: io)
+        guard observationsMatch(sourceBeforePreserve, sourceAfterPreserve) else {
+            throw DurableStoreRecoveryError.resetFailed(
+                message: "Reset aborted because the original changed while its backup was being created. Original left unchanged."
             )
         }
 
@@ -559,6 +568,15 @@ public enum DurableStoreRecovery: Sendable {
             attrs?[.modificationDate] as? Date,
             (attrs?[.size] as? NSNumber)?.intValue
         )
+    }
+
+    private static func observationsMatch(
+        _ lhs: (modificationDate: Date?, fileSize: Int?, fingerprint: String?),
+        _ rhs: (modificationDate: Date?, fileSize: Int?, fingerprint: String?)
+    ) -> Bool {
+        lhs.fileSize == rhs.fileSize &&
+            lhs.fingerprint == rhs.fingerprint &&
+            lhs.modificationDate.map { date in rhs.modificationDate.map { abs(date.timeIntervalSince($0)) <= 0.001 } ?? false } ?? rhs.modificationDate == nil
     }
 
     private static func oversizedIssue(

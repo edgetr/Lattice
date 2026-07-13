@@ -364,7 +364,7 @@ public final class CodexExecHarness: @unchecked Sendable {
                 kind: .write,
                 title: "Codex wants to change files",
                 detail: detail,
-                workspaceScoped: root.map { Self.isWorkspaceScoped($0, workspace: workspace) } ?? true,
+                workspaceScoped: root.map { Self.isWorkspaceScoped($0, workspace: workspace) } ?? false,
                 reversible: true
             )
             return ApprovalRequest(

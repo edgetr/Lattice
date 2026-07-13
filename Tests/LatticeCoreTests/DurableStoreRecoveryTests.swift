@@ -538,6 +538,33 @@ struct DurableStoreRecoveryTests {
         }
     }
 
+    @Test func resetRefusesSourceMutationDuringBackup() throws {
+        let root = uniqueTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let url = root.appendingPathComponent("sessions.json")
+        let original = Data("before-race".utf8)
+        let changed = Data("changed-during-backup".utf8)
+        try original.write(to: url)
+
+        let io = DurableStoreFileIO(
+            copyItem: { source, destination in
+                try FileManager.default.copyItem(at: source, to: destination)
+                try changed.write(to: source, options: .atomic)
+            }
+        )
+
+        do {
+            _ = try DurableStoreRecovery.resetReplacingWithEmptyArray(at: url, io: io)
+            Issue.record("Reset must reject a source mutation during backup")
+        } catch DurableStoreRecoveryError.resetFailed(let message) {
+            #expect(message.contains("changed while its backup was being created"))
+        } catch {
+            Issue.record("Expected resetFailed for a backup race, got \(error)")
+        }
+        #expect(try Data(contentsOf: url) == changed)
+    }
+
     @Test func resetOfObservedFailureRefusesWhenOriginalDisappeared() throws {
         let root = uniqueTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
