@@ -87,6 +87,15 @@ struct HarnessPermissionNotice: Identifiable {
     let request: ApprovalRequest
 }
 
+struct UnsafeProviderRouteAcknowledgement: Identifiable {
+    let id: String
+    let sessionID: UUID
+    let routeKey: String
+    let providerName: String
+    let modelName: String
+    let detail: String
+}
+
 private struct PreparedSubmission {
     let userText: String
     let runText: String
@@ -156,6 +165,7 @@ final class AppState: ObservableObject {
     @Published var errorMessage: String?
     @Published var errorMessageSessionID: UUID?
     @Published var harnessPermissionNotices: [UUID: HarnessPermissionNotice] = [:]
+    @Published private(set) var pendingUnsafeProviderRouteAcknowledgement: UnsafeProviderRouteAcknowledgement?
     @Published var editingMessageContext: MessageEditContext?
     /// Composer draft present before the current edit began; restored when edit mode exits without a successful send.
     private var preservedComposerDraftBeforeEdit: String = ""
@@ -280,6 +290,8 @@ final class AppState: ObservableObject {
     private var submittedRequests: [UUID: String] = [:]
     private var selfEditRunIDs: Set<UUID> = []
     private var activeRunIDs: [UUID: UUID] = [:]
+    /// Deliberately in-memory: provider tool bypass consent expires when Lattice exits.
+    private var acknowledgedUnsafeProviderRouteKeys: Set<String> = []
     /// Suppresses draft→session write-back while loading a session's draft into the composer.
     private var isApplyingComposerDraft = false
     private static let idleUnloadKey = "localModelIdleUnloadMinutes"
@@ -1318,6 +1330,10 @@ final class AppState: ObservableObject {
             setError(activeRouteStatusText ?? "Choose a connected model.", sessionID: selectedSessionID)
             return
         }
+        if let session = selectedSession,
+           !ensureUnsafeProviderRouteAcknowledged(for: session) {
+            return
+        }
         if selectedSession?.isStreaming == true {
             // Capture text first, then clear/persist only this chat's ordinary draft.
             draft = ComposerSessionDraftTransition.clearingOrdinaryDraft()
@@ -1414,6 +1430,7 @@ final class AppState: ObservableObject {
             overlayControlState = .expanded
             return false
         }
+        guard ensureUnsafeProviderRouteAcknowledged(for: sessions[index]) else { return false }
         markConversationOutgoingAction(for: id)
         if submission.startsSelfEdit {
             sessions[index].intent = .selfEdit
@@ -1443,6 +1460,7 @@ final class AppState: ObservableObject {
             overlayControlState = .expanded
             return
         }
+        guard ensureUnsafeProviderRouteAcknowledged(for: sessions[index]) else { return }
         markConversationOutgoingAction(for: id)
         sessions[index].messages[messageIndex].text = submission.userText
         sessions[index].messages.removeSubrange(sessions[index].messages.index(after: messageIndex)..<sessions[index].messages.endIndex)
@@ -1534,6 +1552,13 @@ final class AppState: ObservableObject {
     }
 
     private func startRun(for id: UUID, at index: Int, submittedText: String) {
+        // Defense in depth: every provider stream launch stays behind the same
+        // acknowledgement check, even if a future caller skips send validation.
+        guard ensureUnsafeProviderRouteAcknowledged(for: sessions[index]) else {
+            sessions[index].isStreaming = false
+            setError("Provider route blocked until its unsafe-route acknowledgement is accepted.", sessionID: id)
+            return
+        }
         sessions[index].isStreaming = true
         sessions[index].lastUpdated = .now
         clearError()
@@ -1765,6 +1790,41 @@ final class AppState: ObservableObject {
             }
         }
         return "Choose a connected model."
+    }
+
+    private func ensureUnsafeProviderRouteAcknowledged(for session: LatticeSession) -> Bool {
+        let engineID = Self.engineID(for: session.backend)
+        let harnessID = effectiveHarnessID(for: session)
+        guard ProviderRouteSafetyPolicy.requiresAcknowledgement(engineID: engineID, harnessID: harnessID) else {
+            return true
+        }
+        let routeKey = ProviderRouteSafetyPolicy.routeKey(engineID: engineID, harnessID: harnessID)
+        guard !acknowledgedUnsafeProviderRouteKeys.contains(routeKey) else { return true }
+        let providerName: String
+        switch harnessID {
+        case "pi": providerName = "Pi"
+        case "hermes": providerName = "Hermes"
+        default: providerName = session.backend.harnessName
+        }
+        pendingUnsafeProviderRouteAcknowledgement = UnsafeProviderRouteAcknowledgement(
+            id: routeKey,
+            sessionID: session.id,
+            routeKey: routeKey,
+            providerName: providerName,
+            modelName: session.backend.displayName,
+            detail: ProviderRouteSafetyPolicy.acknowledgementDetail(providerName: providerName)
+        )
+        return false
+    }
+
+    func acknowledgeUnsafeProviderRoute() {
+        guard let pending = pendingUnsafeProviderRouteAcknowledgement else { return }
+        acknowledgedUnsafeProviderRouteKeys.insert(pending.routeKey)
+        pendingUnsafeProviderRouteAcknowledgement = nil
+    }
+
+    func dismissUnsafeProviderRouteAcknowledgement() {
+        pendingUnsafeProviderRouteAcknowledgement = nil
     }
 
     func stop() {

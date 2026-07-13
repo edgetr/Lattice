@@ -86,6 +86,26 @@ struct WorkspaceView: View {
         } message: {
             Text("Lattice will use the provider’s verified installer or package source, then check that the CLI is available before enabling it.")
         }
+        .alert(
+            "Provider tools bypass Lattice's broker",
+            isPresented: Binding(
+                get: { state.pendingUnsafeProviderRouteAcknowledgement != nil },
+                set: { if !$0 { state.dismissUnsafeProviderRouteAcknowledgement() } }
+            )
+        ) {
+            Button("Cancel", role: .cancel) {
+                state.dismissUnsafeProviderRouteAcknowledgement()
+            }
+            Button("Acknowledge") {
+                state.acknowledgeUnsafeProviderRoute()
+            }
+        } message: {
+            if let pending = state.pendingUnsafeProviderRouteAcknowledgement {
+                Text("\(pending.providerName) · \(pending.modelName)\n\n\(pending.detail)\n\nAcknowledge, then send again. Consent lasts until Lattice exits.")
+            } else {
+                Text("Provider-owned tool calls are not brokered by Lattice.")
+            }
+        }
         .safeAreaInset(edge: .top, spacing: 0) {
             VStack(spacing: 8) {
                 // Non-blocking save-failure status; load-recovery modal remains the exclusive recovery surface when present.
