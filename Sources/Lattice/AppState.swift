@@ -160,6 +160,7 @@ final class AppState: ObservableObject {
     @Published var copiedMessageID: UUID?
     @Published var defaultBackend: ChatBackend
     @Published var ollamaModels: [OllamaModel] = []
+    @Published var ollamaCatalogStatus: ProviderCatalogStatus = .unknown
     @Published var columnVisibility: NavigationSplitViewVisibility = .all
     /// Last measured conversations workspace width; used only for split-column adaptation.
     private var lastMeasuredWorkspaceWidth: CGFloat = 0
@@ -1029,7 +1030,7 @@ final class AppState: ObservableObject {
     }
 
     var canStartLocalOnlyChat: Bool {
-        appleIntelligenceReady || (ollamaReady && !ollamaModels.isEmpty)
+        appleIntelligenceReady || (ollamaReady && ollamaCatalogStatus == .loaded && !ollamaModels.isEmpty)
     }
 
     func startLocalOnlyChatFromSelected() {
@@ -1825,6 +1826,7 @@ final class AppState: ObservableObject {
             return appleIntelligenceReady
         case .ollama(let model):
             return ollamaReady
+                && ollamaCatalogStatus == .loaded
                 && !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 && ollamaModels.contains(where: { $0.name == model })
         case .antigravity(let model):
@@ -1885,6 +1887,7 @@ final class AppState: ObservableObject {
             return appleIntelligenceReady
         case .ollama(let model):
             return ollamaReady
+                && ollamaCatalogStatus == .loaded
                 && !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 && ollamaModels.contains(where: { $0.name == model })
         case .antigravity(let model):
@@ -1930,6 +1933,8 @@ final class AppState: ObservableObject {
             if model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Choose a local model." }
             if !ollamaInstalled { return "Ollama is not installed." }
             if !ollamaReady { return "Start Ollama before this chat can continue." }
+            if ollamaCatalogStatus == .loading { return "Ollama is refreshing its local model catalog." }
+            if ollamaCatalogStatus == .failed { return "Ollama's local model catalog is unavailable. Refresh Connections before continuing." }
             if !ollamaModels.contains(where: { $0.name == model }) {
                 return "The local model \(model) is not installed."
             }
@@ -2284,9 +2289,11 @@ final class AppState: ObservableObject {
 
     func refreshLocalModels(normalizeAfterRefresh: Bool = true) async {
         let generation = localModelRefreshGeneration.begin()
-        let models = await ollama.models()
+        ollamaCatalogStatus = .loading
+        let catalog = await ollama.modelsResult()
         guard !Task.isCancelled, localModelRefreshGeneration.isCurrent(generation) else { return }
-        ollamaModels = models
+        ollamaCatalogStatus = catalog.status
+        if catalog.status != .failed { ollamaModels = catalog.models }
         if normalizeAfterRefresh {
             normalizeBackendsAfterCatalogRefresh()
             normalizeExecutionRouteAfterCatalogRefresh()
@@ -2451,10 +2458,13 @@ final class AppState: ObservableObject {
     }
 
     private func refreshLocalConnection(generation: UInt64, localGeneration: UInt64) async {
+        guard canApplyCatalogRefresh(generation),
+              localModelRefreshGeneration.isCurrent(localGeneration) else { return }
+        ollamaCatalogStatus = .loading
         async let local = ollama.isAvailable()
-        async let models = ollama.models()
+        async let models = ollama.modelsResult()
         let localReady = await local
-        let localModels = await models
+        let localCatalog = await models
         let localInstalled = ExecutableDiscovery.locate("ollama") != nil || Self.ollamaAppURL() != nil
         let intelligenceReady = appleIntelligence.isAvailable
         let intelligenceStatus = appleIntelligence.statusDescription
@@ -2464,7 +2474,8 @@ final class AppState: ObservableObject {
         appleIntelligenceStatus = intelligenceStatus
         ollamaInstalled = localInstalled
         ollamaReady = localReady
-        ollamaModels = localModels
+        ollamaCatalogStatus = localCatalog.status
+        if localCatalog.status != .failed { ollamaModels = localCatalog.models }
     }
 
     func connectCodex() {
@@ -4621,7 +4632,7 @@ Lattice self-edit rules:
             grokCatalogKnown: grokCatalogStatus.isResolved,
             openCodeCatalogKnown: openCodeCatalogStatus.isResolved,
             appleIntelligenceReady: appleIntelligenceReady,
-            ollamaModelNames: ollamaModels.map(\.name),
+            ollamaModelNames: ollamaCatalogStatus == .loaded ? ollamaModels.map(\.name) : [],
             codexInstalled: codex.isInstalled
         ))
     }
@@ -4636,7 +4647,7 @@ Lattice self-edit rules:
 
     private func localBackendFallback() -> ChatBackend {
         if appleIntelligenceReady { return .appleIntelligence }
-        if let model = ollamaModels.first?.name { return .ollama(model: model) }
+        if ollamaCatalogStatus == .loaded, let model = ollamaModels.first?.name { return .ollama(model: model) }
         return .ollama(model: "")
     }
 
@@ -4811,7 +4822,7 @@ Lattice self-edit rules:
         case "apple":
             return appleIntelligenceReady ? [.appleIntelligence] : []
         case "ollama":
-            return ollamaModels.map { .ollama(model: $0.name) }
+            return ollamaCatalogStatus == .loaded ? ollamaModels.map { .ollama(model: $0.name) } : []
         default:
             return []
         }

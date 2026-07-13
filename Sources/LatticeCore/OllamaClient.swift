@@ -99,6 +99,11 @@ public final class OllamaClient: @unchecked Sendable {
         }
     }
 
+    /// Legacy list-only view. Use `modelsResult()` when catalog authority matters.
+    public func models() async -> [OllamaModel] {
+        await modelsResult().models
+    }
+
     /// Discovers completion-capable models with bounded concurrent `/api/show` detail fetches.
     ///
     /// **Detail failure / omission policy:** When a model’s `/api/show` request fails (timeout,
@@ -107,21 +112,27 @@ public final class OllamaClient: @unchecked Sendable {
     /// chat-capable without verified `"completion"` support. Successful sibling detail
     /// requests remain available. Final order matches `/api/tags` order among models that
     /// both appear in tags and report the `completion` capability.
-    public func models() async -> [OllamaModel] {
-        guard let url = endpoint("/api/tags") else { return [] }
+    public func modelsResult() async -> ProviderCatalogResult<OllamaModel> {
+        guard let url = endpoint("/api/tags") else {
+            return ProviderCatalogResult(models: [], status: .failed)
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = Self.tagsTimeout
         let data: Data
         do {
             let (body, response) = try await transport.data(for: request)
-            guard try isSuccessStatus(response) else { return [] }
+            guard try isSuccessStatus(response) else {
+                return ProviderCatalogResult(models: [], status: .failed)
+            }
             data = body
         } catch {
-            return []
+            return ProviderCatalogResult(models: [], status: .failed)
         }
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let items = root["models"] as? [[String: Any]] else { return [] }
+              let items = root["models"] as? [[String: Any]] else {
+            return ProviderCatalogResult(models: [], status: .failed)
+        }
 
         struct TagEntry: Sendable {
             let index: Int
@@ -145,12 +156,12 @@ public final class OllamaClient: @unchecked Sendable {
             ))
         }
 
-        let capabilitiesByIndex = await fetchCapabilitiesBounded(entries.map { ($0.index, $0.name) })
+        let detailBatch = await fetchCapabilitiesBounded(entries.map { ($0.index, $0.name) })
 
         var models: [OllamaModel] = []
         models.reserveCapacity(entries.count)
         for entry in entries {
-            guard let capabilities = capabilitiesByIndex[entry.index],
+            guard let capabilities = detailBatch.capabilitiesByIndex[entry.index],
                   capabilities.contains("completion") else { continue }
             models.append(OllamaModel(
                 name: entry.name,
@@ -160,16 +171,20 @@ public final class OllamaClient: @unchecked Sendable {
                 capabilities: capabilities
             ))
         }
-        return models
+        let status: ProviderCatalogStatus = detailBatch.hadFailure
+            ? .failed
+            : .resolved(modelCount: models.count, succeeded: true)
+        return ProviderCatalogResult(models: models, status: status)
     }
 
     /// Fetches `/api/show` for each tagged model with at most `modelDetailConcurrencyLimit` in flight.
-    /// Failed detail requests map to missing entries (omission policy); they do not fail the batch.
-    private func fetchCapabilitiesBounded(_ named: [(index: Int, name: String)]) async -> [Int: Set<String>] {
-        guard !named.isEmpty else { return [:] }
+    /// Verified siblings remain available, but any failed detail marks the batch non-authoritative.
+    private func fetchCapabilitiesBounded(_ named: [(index: Int, name: String)]) async -> CapabilityFetchBatch {
+        guard !named.isEmpty else { return CapabilityFetchBatch(capabilitiesByIndex: [:], hadFailure: false) }
         let limit = Self.modelDetailConcurrencyLimit
-        return await withTaskGroup(of: (Int, Set<String>?).self, returning: [Int: Set<String>].self) { group in
+        return await withTaskGroup(of: (Int, Set<String>?).self, returning: CapabilityFetchBatch.self) { group in
             var results: [Int: Set<String>] = [:]
+            var hadFailure = false
             var nextIndex = 0
             var inFlight = 0
 
@@ -189,10 +204,16 @@ public final class OllamaClient: @unchecked Sendable {
             for await (index, caps) in group {
                 inFlight -= 1
                 if let caps { results[index] = caps }
+                else { hadFailure = true }
                 startNextIfPossible()
             }
-            return results
+            return CapabilityFetchBatch(capabilitiesByIndex: results, hadFailure: hadFailure)
         }
+    }
+
+    private struct CapabilityFetchBatch: Sendable {
+        let capabilitiesByIndex: [Int: Set<String>]
+        let hadFailure: Bool
     }
 
     /// Returns verified capabilities, or `nil` when detail cannot be trusted (omit model).

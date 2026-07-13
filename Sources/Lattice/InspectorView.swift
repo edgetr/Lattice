@@ -637,6 +637,24 @@ private struct ModelsCatalogNotice: View {
 
 struct ConnectionsView: View {
     @ObservedObject var state: AppState
+
+    private var ollamaConnectionReady: Bool {
+        state.ollamaReady && state.ollamaCatalogStatus == .loaded
+    }
+
+    private var ollamaConnectionDetail: String {
+        guard state.ollamaInstalled else { return "Not installed" }
+        guard state.ollamaReady else { return "Installed · not running" }
+        switch state.ollamaCatalogStatus {
+        case .unknown: return "Running · model catalog not checked"
+        case .loading: return "Running · loading model catalog"
+        case .failed: return "Running · model catalog unavailable"
+        case .empty: return "Running · no chat models"
+        case .loaded:
+            return "Running · \(state.ollamaModels.count) chat model\(state.ollamaModels.count == 1 ? "" : "s")"
+        }
+    }
+
     var body: some View {
         AdaptiveCatalogPage { contentWidth in
             VStack(alignment: .leading, spacing: 20) {
@@ -850,7 +868,7 @@ struct ConnectionsView: View {
                     } content: {
                         EmptyView()
                     }
-                    ConnectionCard(identity: .systemImage("cpu"), name: "Ollama", detail: state.ollamaReady ? (state.ollamaModels.isEmpty ? "Running · no chat models" : "Running · \(state.ollamaModels.count) chat model\(state.ollamaModels.count == 1 ? "" : "s")") : (state.ollamaInstalled ? "Installed · not running" : "Not installed"), ready: state.ollamaReady, showsContent: false) {
+                    ConnectionCard(identity: .systemImage("cpu"), name: "Ollama", detail: ollamaConnectionDetail, ready: ollamaConnectionReady, showsContent: false) {
                         if state.ollamaReady {
                             Button("Refresh") { Task { await state.refreshLocalModels() } }
                         } else if state.ollamaInstalled {
