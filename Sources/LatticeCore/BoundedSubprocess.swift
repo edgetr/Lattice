@@ -105,8 +105,9 @@ public struct BoundedSubprocessResult: Sendable, Equatable {
 /// Design notes:
 /// - Never uses shell string interpolation.
 /// - Never calls unbounded `readDataToEndOfFile` while a child may keep writing.
-/// - Closes stdin immediately after launch so children that wait on input do not hang.
-/// - On timeout / cancel / output-cap: `SIGTERM`, short grace, then `SIGKILL`, then reap.
+/// - Writes optional finite stdin before closing it so input readers do not hang.
+/// - On timeout / cancel / output-cap: terminate the process group, short grace, then
+///   `SIGKILL`, then reap.
 /// - Parent-task cancellation is bridged explicitly because `Task.detached` does not
 ///   inherit cancellation from the caller.
 public enum BoundedSubprocess {
@@ -205,6 +206,15 @@ public enum BoundedSubprocess {
             )
         }
 
+        // `Process` launches each task in a process group led by its PID on macOS. Keep
+        // the group only when that invariant is observable; never signal an unrelated
+        // group if launch behavior changes or the child exits before this check.
+        let processGroupID: pid_t? = {
+            let pid = process.processIdentifier
+            guard pid > 0, getpgid(pid) == pid else { return nil }
+            return pid
+        }()
+
         attachDrain(stdoutPipe.fileHandleForReading, stream: .stdout, capture: capture)
         attachDrain(stderrPipe.fileHandleForReading, stream: .stderr, capture: capture)
 
@@ -240,9 +250,15 @@ public enum BoundedSubprocess {
 
         switch stopReason {
         case .waitForExit:
-            break
-        case .completed, .timedOut, .cancelled, .outputLimit:
-            forceStop(process, grace: request.terminateGraceInterval)
+            // The child can exit while a descendant keeps writing to the pipe. Treat
+            // output observed after that race as a stop condition so the descendant's
+            // inherited descriptors are closed before the final drain.
+            if capture.isOverLimit {
+                stopReason = .outputLimit
+                forceStop(process, processGroupID: processGroupID, grace: request.terminateGraceInterval)
+            }
+        case .timedOut, .cancelled, .outputLimit:
+            forceStop(process, processGroupID: processGroupID, grace: request.terminateGraceInterval)
         }
 
         // Drop handlers before reaping so late EOF callbacks do not race with cleanup.
@@ -250,7 +266,7 @@ public enum BoundedSubprocess {
         stderrPipe.fileHandleForReading.readabilityHandler = nil
 
         if process.isRunning {
-            forceStop(process, grace: request.terminateGraceInterval)
+            forceStop(process, processGroupID: processGroupID, grace: request.terminateGraceInterval)
         }
         process.waitUntilExit()
 
@@ -338,23 +354,45 @@ public enum BoundedSubprocess {
         }
     }
 
-    private static func forceStop(_ process: Process, grace: TimeInterval) {
-        guard process.isRunning else { return }
-        process.terminate()
-        let graceDeadline = Date().addingTimeInterval(grace)
-        while process.isRunning, Date() < graceDeadline {
-            Thread.sleep(forTimeInterval: 0.01)
+    private static func forceStop(_ process: Process, processGroupID: pid_t?, grace: TimeInterval) {
+        let pid = process.processIdentifier
+        if let processGroupID, processGroupID > 0 {
+            _ = kill(-processGroupID, SIGTERM)
         }
         if process.isRunning {
-            let pid = process.processIdentifier
-            if pid > 0 {
-                kill(pid, SIGKILL)
-            }
-            let killDeadline = Date().addingTimeInterval(max(0.1, grace))
-            while process.isRunning, Date() < killDeadline {
-                Thread.sleep(forTimeInterval: 0.01)
-            }
+            // Keep Foundation's direct-child fallback for platforms or launch modes
+            // where the process-group invariant is unavailable.
+            process.terminate()
         }
+        let graceDeadline = Date().addingTimeInterval(grace)
+        while Date() < graceDeadline {
+            if !process.isRunning && !processGroupExists(processGroupID) { break }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        if let processGroupID, processGroupID > 0 {
+            _ = kill(-processGroupID, SIGKILL)
+        }
+        if process.isRunning, pid > 0 {
+            _ = kill(pid, SIGKILL)
+        }
+        let killDeadline = Date().addingTimeInterval(max(0.1, grace))
+        while Date() < killDeadline {
+            if !process.isRunning && !processGroupExists(processGroupID) { break }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+    }
+
+    private static func setNonBlocking(_ handle: FileHandle) -> Bool {
+        let descriptor = handle.fileDescriptor
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags >= 0 else { return false }
+        return fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0
+    }
+
+    private static func processGroupExists(_ processGroupID: pid_t?) -> Bool {
+        guard let processGroupID, processGroupID > 0 else { return false }
+        if kill(-processGroupID, 0) == 0 { return true }
+        return errno == EPERM
     }
 
     private static func cleanupPipes(stdout: Pipe, stderr: Pipe, stdin: Pipe) {
@@ -420,16 +458,21 @@ public enum BoundedSubprocess {
         }
 
         func ingestRemaining(from handle: FileHandle, stream: Stream) {
+            guard BoundedSubprocess.setNonBlocking(handle) else { return }
+            var buffer = [UInt8](repeating: 0, count: 16_384)
             while true {
-                let chunk: Data
-                do {
-                    chunk = try handle.read(upToCount: 16_384) ?? Data()
-                } catch {
-                    break
+                let count = buffer.withUnsafeMutableBytes { bytes in
+                    Darwin.read(handle.fileDescriptor, bytes.baseAddress, bytes.count)
                 }
-                if chunk.isEmpty { break }
-                append(chunk, stream: stream)
-                if isOverLimit { break }
+                if count > 0 {
+                    append(Data(buffer.prefix(count)), stream: stream)
+                    if isOverLimit { return }
+                    continue
+                }
+                if count == 0 { return }
+                if errno == EINTR { continue }
+                if errno == EAGAIN || errno == EWOULDBLOCK { return }
+                return
             }
         }
 
