@@ -11,33 +11,6 @@ public struct HarnessModel: Hashable, Sendable {
 }
 
 public final class ACPHarness: @unchecked Sendable {
-    private final class JSONLineReader {
-        private let handle: FileHandle
-        private var buffer = Data()
-
-        init(_ handle: FileHandle) {
-            self.handle = handle
-        }
-
-        func next() throws -> [String: Any]? {
-            while true {
-                if let newline = buffer.firstIndex(of: 0x0A) {
-                    let line = Data(buffer[..<newline])
-                    buffer.removeSubrange(...newline)
-                    if line.isEmpty { continue }
-                    return try JSONSerialization.jsonObject(with: line) as? [String: Any]
-                }
-                let chunk = handle.availableData
-                if chunk.isEmpty {
-                    guard !buffer.isEmpty else { return nil }
-                    defer { buffer.removeAll(keepingCapacity: true) }
-                    return try JSONSerialization.jsonObject(with: buffer) as? [String: Any]
-                }
-                buffer.append(chunk)
-            }
-        }
-    }
-
     public enum Profile: String, Sendable {
         case hermes
         case grok
@@ -137,55 +110,44 @@ public final class ACPHarness: @unchecked Sendable {
     public var isInstalled: Bool { executableURL != nil }
 
     public func models(workspace: URL) async -> [HarnessModel] {
-        guard let executableURL else { return [] }
-        let sandboxExecutableURL = sandboxExecutableURL
-        return await Task.detached {
-            let process = Process(); let input = Pipe(); let output = Pipe()
-            let scratchDirectory = self.scratchDirectory(for: UUID())
-            process.standardInput = input; process.standardOutput = output; process.standardError = FileHandle.nullDevice
-            do {
-                try FileManager.default.createDirectory(at: scratchDirectory, withIntermediateDirectories: true)
-                let canonicalWorkspace = try HarnessSandbox.canonicalDirectory(workspace)
-                let launch = try self.sandboxedLaunch(
-                    executableURL: executableURL,
-                    sandboxExecutableURL: sandboxExecutableURL,
-                    workspace: canonicalWorkspace,
-                    scratchDirectory: scratchDirectory
-                )
-                process.executableURL = launch.executableURL; process.arguments = launch.arguments
-                process.currentDirectoryURL = canonicalWorkspace
-                var environment = ProcessInfo.processInfo.environment
-                environment["TMPDIR"] = scratchDirectory.path + "/"
-                process.environment = environment
-                try process.run()
-                let reader = JSONLineReader(output.fileHandleForReading)
-                try Self.write(Self.initializeRequest(id: 1), to: input.fileHandleForWriting)
-                let initializeResponse = try Self.readResponse(id: 1, from: reader, input: input.fileHandleForWriting)
-                let initializedModels = Self.models(from: initializeResponse)
-                if !initializedModels.isEmpty {
-                    if process.isRunning { process.terminate() }
-                    process.waitUntilExit()
-                    try? FileManager.default.removeItem(at: scratchDirectory)
-                    return initializedModels
-                }
-                try Self.write(Self.sessionRequest(id: 2, method: "session/new", workspace: canonicalWorkspace, threadID: nil), to: input.fileHandleForWriting)
-                let response = try Self.readResponse(id: 2, from: reader, input: input.fileHandleForWriting)
-                if self.profile == .openCode,
-                   let sessionID = Self.result(from: response)?["sessionId"] as? String {
-                    try? Self.write(["jsonrpc": "2.0", "id": 3, "method": "session/close", "params": ["sessionId": sessionID]], to: input.fileHandleForWriting)
-                    _ = try? Self.readResponse(id: 3, from: reader, input: input.fileHandleForWriting)
-                }
-                if process.isRunning { process.terminate() }
-                process.waitUntilExit()
-                try? FileManager.default.removeItem(at: scratchDirectory)
-                return Self.models(from: response)
-            } catch {
-                if process.isRunning { process.terminate() }
-                if process.isRunning { process.waitUntilExit() }
-                try? FileManager.default.removeItem(at: scratchDirectory)
-                return []
-            }
-        }.value
+        await modelsResult(workspace: workspace).models
+    }
+
+    public func modelsResult(workspace: URL) async -> ProviderCatalogResult<HarnessModel> {
+        guard let executableURL else { return .unknown() }
+        let scratchDirectory = scratchDirectory(for: UUID())
+        defer { try? FileManager.default.removeItem(at: scratchDirectory) }
+        do {
+            try FileManager.default.createDirectory(at: scratchDirectory, withIntermediateDirectories: true)
+            let canonicalWorkspace = try HarnessSandbox.canonicalDirectory(workspace)
+            let launch = try sandboxedLaunch(
+                executableURL: executableURL,
+                sandboxExecutableURL: sandboxExecutableURL,
+                workspace: canonicalWorkspace,
+                scratchDirectory: scratchDirectory
+            )
+            var environment = ProcessInfo.processInfo.environment
+            environment["TMPDIR"] = scratchDirectory.path + "/"
+            var stdinData = Data()
+            stdinData.append(contentsOf: try Self.serialized(Self.initializeRequest(id: 1)))
+            stdinData.append(contentsOf: try Self.serialized(Self.sessionRequest(id: 2, method: "session/new", workspace: canonicalWorkspace, threadID: nil)))
+            let result = await BoundedSubprocess.run(
+                .init(
+                    executableURL: launch.executableURL,
+                    arguments: launch.arguments,
+                    stdinData: stdinData,
+                    currentDirectoryURL: canonicalWorkspace,
+                    environment: environment,
+                    deadline: 10,
+                    maximumOutputBytes: 1_000_000
+                ),
+                stopWhen: { stdout, _ in !Self.modelsFromOutput(stdout).isEmpty }
+            )
+            let models = Self.modelsFromOutput(result.stdout)
+            return ProviderCatalogResult(models: models, succeeded: result.isSuccess)
+        } catch {
+            return ProviderCatalogResult(models: [], status: .failed)
+        }
     }
 
     public func stream(prompt: String, sessionID: UUID, threadID: String?, workspace: URL, requestedModel: String) -> AsyncStream<AgentEvent> {
@@ -213,7 +175,7 @@ public final class ACPHarness: @unchecked Sendable {
                     process.environment = environment
                     try process.run()
                     register(process: process, input: input.fileHandleForWriting, for: sessionID)
-                    let reader = JSONLineReader(output.fileHandleForReading)
+                    let reader = BoundedJSONLineReader(output.fileHandleForReading)
                     try Self.write(Self.initializeRequest(id: 1), to: input.fileHandleForWriting)
                     _ = try Self.readResponse(id: 1, from: reader, input: input.fileHandleForWriting)
 
@@ -455,7 +417,7 @@ public final class ACPHarness: @unchecked Sendable {
         return ["jsonrpc": "2.0", "id": id, "method": method, "params": params]
     }
 
-    private static func readResponse(id: Int, from reader: JSONLineReader, input: FileHandle) throws -> [String: Any] {
+    private static func readResponse(id: Int, from reader: BoundedJSONLineReader, input: FileHandle) throws -> [String: Any] {
         while let object = try reader.next() {
             if object["method"] != nil { try answerNoninteractiveServerRequest(object, to: input); continue }
             if (object["id"] as? NSNumber)?.intValue == id { return object }
@@ -472,7 +434,7 @@ public final class ACPHarness: @unchecked Sendable {
         }
     }
 
-    private func readPromptResponse(id: Int, sessionID: UUID, workspace: URL, from reader: JSONLineReader, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) throws {
+    private func readPromptResponse(id: Int, sessionID: UUID, workspace: URL, from reader: BoundedJSONLineReader, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) throws {
         while let object = try reader.next() {
             if object["method"] as? String == "session/update" {
                 let update = ((object["params"] as? [String: Any])?["update"] as? [String: Any])
@@ -538,13 +500,17 @@ public final class ACPHarness: @unchecked Sendable {
 
     private static func toolRequest(from toolCall: [String: Any], title: String, detail: String, workspace: URL?) -> ToolRequest {
         let rawInput = toolCall["rawInput"] as? [String: Any] ?? [:]
-        let locations = (toolCall["locations"] as? [[String: Any]] ?? []).compactMap { $0["path"] as? String }
+        let locationMetadata = WorkspacePathScope.locationMetadata(in: toolCall)
+        let locations = locationMetadata.paths
         let path = (rawInput["path"] as? String) ?? locations.first
+        let workspaceScoped = locationMetadata.isMalformed
+            ? false
+            : workspace.map { WorkspacePathScope.isWorkspaceScoped(path, workspace: $0) } ?? false
         return ToolRequest(
             kind: toolKind(for: [toolCall["kind"] as? String, title, rawInput["command"] as? String].compactMap { $0 }.joined(separator: " ")),
             title: title,
             detail: detail,
-            workspaceScoped: workspace.map { isWorkspaceScoped(path, workspace: $0) } ?? false,
+            workspaceScoped: workspaceScoped,
             reversible: false
         )
     }
@@ -557,16 +523,6 @@ public final class ACPHarness: @unchecked Sendable {
         if name.contains("web") || name.contains("fetch") || name.contains("network") { return .network }
         if name.contains("browser") || name.contains("automation") { return .automation }
         return .read
-    }
-
-    private static func isWorkspaceScoped(_ path: String?, workspace: URL) -> Bool {
-        guard let path, !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
-        let root = workspace.standardizedFileURL.resolvingSymlinksInPath().path
-        let candidate = (path.hasPrefix("/") ? URL(fileURLWithPath: path) : workspace.appendingPathComponent(path))
-            .standardizedFileURL
-            .resolvingSymlinksInPath()
-            .path
-        return candidate == root || candidate.hasPrefix(root + "/")
     }
 
     private static func permissionDetail(toolCall: [String: Any]) -> String {
@@ -598,6 +554,21 @@ public final class ACPHarness: @unchecked Sendable {
             }
         }
         return nil
+    }
+
+    private static func serialized(_ object: [String: Any]) throws -> Data {
+        var data = try JSONSerialization.data(withJSONObject: object, options: [.withoutEscapingSlashes])
+        data.append(0x0A)
+        return data
+    }
+
+    private static func modelsFromOutput(_ data: Data) -> [HarnessModel] {
+        for line in data.split(separator: 0x0A) where !line.isEmpty {
+            guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
+            let values = models(from: object)
+            if !values.isEmpty { return values }
+        }
+        return []
     }
 
     private static func write(_ object: [String: Any], to handle: FileHandle?) throws {

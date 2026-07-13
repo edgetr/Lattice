@@ -25,8 +25,6 @@ enum WorkspaceSection: String, CaseIterable, Identifiable {
     }
 }
 
-enum OverlayMode: String, CaseIterable { case idle, prompt, context, running, result, compactChat }
-
 struct EditableSelfEditSkillDraft: Equatable {
     var title: String
     var summary: String
@@ -65,19 +63,7 @@ struct EditableSelfEditOperationPreviewDraft: Equatable {
     var detail: String
 }
 
-struct ActivityItem: Identifiable {
-    let id: UUID
-    let icon: String
-    let title: String
-    let detail: String
-
-    init(id: UUID = UUID(), icon: String, title: String, detail: String) {
-        self.id = id
-        self.icon = icon
-        self.title = title
-        self.detail = detail
-    }
-}
+typealias ActivityItem = RunUIActivity
 
 struct HarnessPermissionNotice: Identifiable {
     let id = UUID()
@@ -147,14 +133,9 @@ final class AppState: ObservableObject {
     @Published var pendingDeleteExtensionRecord: LatticeExtensionRecord?
     @Published var showDeleteSkillConfirmation = false
     @Published var pendingDeleteSkillRecord: LatticeSkillRecord?
-    @Published var overlayMode: OverlayMode = .idle
     @Published var isOverlayVisible = false
     @Published var policy: ExecutionPolicy = .ask
     @Published var privacyMode: SessionPrivacyMode = .cloudAllowed
-    @Published var activity: [ActivityItem] = []
-    @Published var activitySessionID: UUID?
-    @Published var errorMessage: String?
-    @Published var errorMessageSessionID: UUID?
     @Published var harnessPermissionNotices: [UUID: HarnessPermissionNotice] = [:]
     @Published var editingMessageContext: MessageEditContext?
     /// Composer draft present before the current edit began; restored when edit mode exits without a successful send.
@@ -162,10 +143,6 @@ final class AppState: ObservableObject {
     @Published var copiedMessageID: UUID?
     @Published var defaultBackend: ChatBackend
     @Published var ollamaModels: [OllamaModel] = []
-    @Published var composerState: MorphingControlState = .expanded
-    @Published var activeComposerState: MorphingControlState?
-    @Published var activeComposerStateSessionID: UUID?
-    @Published var overlayControlState: MorphingControlState = .expanded
     @Published var columnVisibility: NavigationSplitViewVisibility = .all
     /// Last measured conversations workspace width; used only for split-column adaptation.
     private var lastMeasuredWorkspaceWidth: CGFloat = 0
@@ -179,15 +156,21 @@ final class AppState: ObservableObject {
     @Published var localModelIdleUnloadMinutes: Int
     @Published var localModelStatus: String?
     @Published var codexReady = false
+    @Published var codexAuthenticated = false
+    @Published var codexCatalogStatus: ProviderCatalogStatus = .unknown
     @Published var codexModels: [ProviderModel] = []
     @Published var codexUsage: ProviderUsage?
     @Published var codexCLIVersion: String?
     @Published var codexLatestCLIVersion: String?
     @Published var grokReady = false
+    @Published var grokAuthenticated = false
+    @Published var grokCatalogStatus: ProviderCatalogStatus = .unknown
     @Published var grokModels: [ProviderModel] = []
     var grokACPModels: [HarnessModel] = []
     @Published var grokCLIInfo = CLIUpdateInfo()
     @Published var openCodeReady = false
+    @Published var openCodeAuthenticated = false
+    @Published var openCodeCatalogStatus: ProviderCatalogStatus = .unknown
     @Published var openCodeModels: [ProviderModel] = []
     var openCodeACPModels: [HarnessModel] = []
     @Published var openCodeCLIVersion: String?
@@ -211,6 +194,7 @@ final class AppState: ObservableObject {
     @Published var piLatestCLIVersion: String?
     @Published var piModelIDs: Set<String> = []
     @Published var hermesInstalled = false
+    @Published var hermesCatalogStatus: ProviderCatalogStatus = .unknown
     @Published var hermesCLIInfo = CLIUpdateInfo()
     @Published var hermesModels: [HarnessModel] = []
     @Published var appleIntelligenceReady = false
@@ -280,6 +264,8 @@ final class AppState: ObservableObject {
     private var submittedRequests: [UUID: String] = [:]
     private var selfEditRunIDs: Set<UUID> = []
     private var activeRunIDs: [UUID: UUID] = [:]
+    @Published private var runUIStates: [UUID: RunUIState] = [:]
+    @Published private var globalErrorMessage: String?
     /// Suppresses draft→session write-back while loading a session's draft into the composer.
     private var isApplyingComposerDraft = false
     private static let idleUnloadKey = "localModelIdleUnloadMinutes"
@@ -474,6 +460,20 @@ final class AppState: ObservableObject {
     var activeBackend: ChatBackend { selectedSession?.backend ?? defaultBackend }
     var activePrivacyMode: SessionPrivacyMode { selectedSession?.privacyMode ?? privacyMode }
     var activeHarnessID: String { selectedSession.map(effectiveHarnessID(for:)) ?? selectedRouteHarnessID }
+    var overlayMode: OverlayMode {
+        get { selectedRunUIState?.overlayMode ?? .idle }
+        set { updateSelectedRunUI { $0.overlayMode = newValue } }
+    }
+    var activity: [ActivityItem] { selectedRunUIState?.activity ?? [] }
+    var errorMessage: String? { selectedRunUIState?.errorMessage ?? globalErrorMessage }
+    var composerState: MorphingControlState {
+        get { selectedRunUIState?.composerState ?? .expanded }
+        set { updateSelectedRunUI { $0.composerState = newValue } }
+    }
+    var overlayControlState: MorphingControlState {
+        get { selectedRunUIState?.overlayControlState ?? .expanded }
+        set { updateSelectedRunUI { $0.overlayControlState = newValue } }
+    }
     var activeReasoningOptions: [ReasoningOption] { reasoningOptions(for: activeBackend, harnessID: activeHarnessID) }
     var activeReasoningEffort: ReasoningEffort? { selectedSession?.reasoningEffort ?? defaultReasoning(for: activeBackend, harnessID: activeHarnessID) }
     var isSelectedSessionRouteLocked: Bool {
@@ -495,7 +495,34 @@ final class AppState: ObservableObject {
     var runnableGrokModels: [ProviderModel] { visibleGrokModels.filter { ACPHarness.bestMatch(for: $0.id, in: grokACPModels) != nil } }
     var runnableOpenCodeModels: [ProviderModel] { visibleOpenCodeModels.filter { ACPHarness.bestMatch(for: $0.id, in: openCodeACPModels) != nil } }
     var localModelIdleUnloadLabel: String { localModelIdleUnloadMinutes == 0 ? "Off" : "\(localModelIdleUnloadMinutes)m" }
-    var hermesReady: Bool { hermesInstalled && !hermesModels.isEmpty }
+    var codexReadinessCopy: ProviderReadinessCopy {
+        ProviderReadinessPresentationPolicy.copy(
+            providerName: "Codex",
+            readiness: ProviderReadinessSnapshot(installed: codex.isInstalled, authenticated: codexAuthenticated, catalogStatus: codexCatalogStatus, runnableModelCount: visibleCodexModels.count)
+        )
+    }
+    var grokReadinessCopy: ProviderReadinessCopy {
+        ProviderReadinessPresentationPolicy.copy(
+            providerName: "Grok",
+            readiness: ProviderReadinessSnapshot(installed: grok.isInstalled, authenticated: grokAuthenticated, catalogStatus: grokCatalogStatus, runnableModelCount: runnableGrokModels.count),
+            readyDetail: "Ready · ACP"
+        )
+    }
+    var openCodeReadinessCopy: ProviderReadinessCopy {
+        ProviderReadinessPresentationPolicy.copy(
+            providerName: "OpenCode",
+            readiness: ProviderReadinessSnapshot(installed: openCode.isInstalled, authenticated: openCodeAuthenticated, catalogStatus: openCodeCatalogStatus, runnableModelCount: runnableOpenCodeModels.count),
+            readyDetail: "Ready · ACP"
+        )
+    }
+    var hermesReadinessCopy: ProviderReadinessCopy {
+        ProviderReadinessPresentationPolicy.copy(
+            providerName: "Hermes",
+            readiness: ProviderReadinessSnapshot(installed: hermesInstalled, authenticated: hermesInstalled, catalogStatus: hermesCatalogStatus, runnableModelCount: hermesModels.count),
+            readyDetail: "Ready · \(hermesModels.count) models"
+        )
+    }
+    var hermesReady: Bool { hermesReadinessCopy.isReady }
     var piCLIInfo: CLIUpdateInfo {
         CLIUpdateInfo(
             currentVersion: piCLIVersion,
@@ -549,25 +576,34 @@ final class AppState: ObservableObject {
         return routeUnavailableMessage(for: session)
     }
     func visibleErrorMessage(for sessionID: UUID) -> String? {
-        guard let errorMessage else { return nil }
-        guard let errorMessageSessionID else { return errorMessage }
-        return errorMessageSessionID == sessionID ? errorMessage : nil
+        runUIStates[sessionID]?.errorMessage ?? globalErrorMessage
     }
     func visibleActivity(for sessionID: UUID) -> [ActivityItem] {
-        activitySessionID == sessionID ? activity : []
+        runUIStates[sessionID]?.activity ?? []
     }
     func visibleComposerState(for sessionID: UUID) -> MorphingControlState {
-        if activeComposerStateSessionID == sessionID, let activeComposerState {
-            return activeComposerState
-        }
-        return composerState
+        runUIStates[sessionID]?.composerState ?? .expanded
     }
     func setVisibleComposerState(_ state: MorphingControlState, for sessionID: UUID?) {
-        if let sessionID, activeComposerStateSessionID == sessionID {
-            activeComposerState = state
-        } else {
-            composerState = state
-        }
+        guard let sessionID else { return }
+        reduceRunUI(.setComposerState(state), for: sessionID)
+    }
+
+    private var selectedRunUIState: RunUIState? {
+        selectedSessionID.flatMap { runUIStates[$0] }
+    }
+
+    private func updateSelectedRunUI(_ update: (inout RunUIState) -> Void) {
+        guard let sessionID = selectedSessionID else { return }
+        var state = runUIStates[sessionID] ?? RunUIState()
+        update(&state)
+        runUIStates[sessionID] = state
+    }
+
+    private func reduceRunUI(_ action: RunUIAction, for sessionID: UUID) {
+        var state = runUIStates[sessionID] ?? RunUIState()
+        RunUIReducer.reduce(action, into: &state)
+        runUIStates[sessionID] = state
     }
 
     func contextBudgetEstimate(for session: LatticeSession) -> LatticeContextBudgetEstimate {
@@ -1188,6 +1224,7 @@ final class AppState: ObservableObject {
     func clearConversationScrollState(for sessionID: UUID) {
         conversationScrollStates.removeValue(forKey: sessionID)
         conversationOutgoingActionSequence.removeValue(forKey: sessionID)
+        runUIStates.removeValue(forKey: sessionID)
         if conversationJumpAffordances[sessionID] != nil {
             conversationJumpAffordances.removeValue(forKey: sessionID)
         }
@@ -1197,6 +1234,8 @@ final class AppState: ObservableObject {
         conversationScrollStates.removeAll()
         conversationOutgoingActionSequence.removeAll()
         conversationJumpAffordances.removeAll()
+        runUIStates.removeAll()
+        globalErrorMessage = nil
     }
 
     func publishConversationJumpAffordance(for sessionID: UUID) {
@@ -1247,7 +1286,7 @@ final class AppState: ObservableObject {
             selfEditPreviews = updated
         }
         harnessPermissionNotices[context.sessionID] = nil
-        if activitySessionID == context.sessionID { clearActivity() }
+        clearActivity(for: context.sessionID)
         clearError()
         persist()
     }
@@ -1536,11 +1575,8 @@ final class AppState: ObservableObject {
     private func startRun(for id: UUID, at index: Int, submittedText: String) {
         sessions[index].isStreaming = true
         sessions[index].lastUpdated = .now
-        clearError()
-        clearActivity()
-        overlayMode = .running
-        setActiveComposerState(.progress(0.1), sessionID: id)
-        overlayControlState = .progress(0.1)
+        globalErrorMessage = nil
+        reduceRunUI(.started, for: id)
         persist()
 
         let session = sessions[index]
@@ -1782,13 +1818,7 @@ final class AppState: ObservableObject {
         if sessions[index].messages.last?.role == .assistant, sessions[index].messages.last?.text.isEmpty == true {
             sessions[index].messages.removeLast()
         }
-        if selectedSessionID == id {
-            clearActivity()
-            overlayMode = .result
-            clearActiveComposerState()
-            composerState = .expanded
-            overlayControlState = .expanded
-        }
+        reduceRunUI(.cancelled, for: id)
         harnessPermissionNotices[id] = nil
         persist()
         let harnessID = effectiveHarnessID(for: session)
@@ -1835,11 +1865,7 @@ final class AppState: ObservableObject {
                 detail: notice.request.title
             )
         ], sessionID: notice.sessionID)
-        setActiveComposerState(.progress(0.5), sessionID: notice.sessionID)
-        if selectedSessionID == notice.sessionID {
-            overlayControlState = .progress(0.5)
-            overlayMode = .running
-        }
+        reduceRunUI(.permissionResolved, for: notice.sessionID)
     }
 
     private func forwardHarnessPermission(_ notice: HarnessPermissionNotice, optionID: String?) -> Bool {
@@ -2064,14 +2090,17 @@ final class AppState: ObservableObject {
     private func refreshCodexConnection() async {
         let executable = ExecutableDiscovery.locate("codex")
         if codex.isInstalled != (executable != nil) { codex = CodexExecHarness(executableURL: executable) }
+        codexCatalogStatus = .loading
         async let codexAuth = codex.isAuthenticated()
         async let codexData = codex.providerSnapshot()
         async let codexVersion = codex.cliVersion()
         async let codexLatest = Self.latestCLIVersion(executableName: "codex", homebrewFormula: "codex", homebrewCask: "codex", npmPackage: "@openai/codex", pnpmPackage: "@openai/codex", directPackage: "@openai/codex")
         let auth = await codexAuth
         let snapshot = await codexData
-        codexReady = auth
+        codexAuthenticated = auth
+        codexCatalogStatus = snapshot.catalogStatus
         codexModels = snapshot.models
+        codexReady = ProviderReadinessSnapshot(installed: codex.isInstalled, authenticated: auth, catalogStatus: snapshot.catalogStatus, runnableModelCount: visibleCodexModels.count).isRunnable
         codexUsage = snapshot.usage
         codexCLIVersion = await codexVersion
         codexLatestCLIVersion = await codexLatest
@@ -2081,16 +2110,19 @@ final class AppState: ObservableObject {
         let executable = ExecutableDiscovery.locate("grok")
         if grok.isInstalled != (executable != nil) { grok = StructuredCLIHarness(kind: .grok, executableURL: executable) }
         if grokACP.isInstalled != (executable != nil) { grokACP = ACPHarness(profile: .grok, executableURL: executable) }
+        grokCatalogStatus = .loading
         async let grokAuth = grok.isAuthenticated()
-        async let grokCatalog = grok.models()
-        async let grokACPCatalog = grokACP.models(workspace: URL(fileURLWithPath: selectedWorkspacePath))
+        async let grokCatalog = grok.modelsResult()
+        async let grokACPCatalog = grokACP.modelsResult(workspace: URL(fileURLWithPath: selectedWorkspacePath))
         async let grokUpdate = grok.updateStatus()
         let auth = await grokAuth
         let cliCatalog = await grokCatalog
         let acpCatalog = await grokACPCatalog
-        grokACPModels = acpCatalog
-        grokReady = auth && !acpCatalog.isEmpty
-        grokModels = cliCatalog.isEmpty ? acpCatalog.map { ProviderModel(id: $0.id, name: $0.name) } : cliCatalog
+        grokAuthenticated = auth
+        grokACPModels = acpCatalog.models
+        grokCatalogStatus = ProviderCatalogStatus.combined(cliCatalog.status, acpCatalog.status)
+        grokModels = cliCatalog.models.isEmpty ? acpCatalog.models.map { ProviderModel(id: $0.id, name: $0.name) } : cliCatalog.models
+        grokReady = ProviderReadinessSnapshot(installed: grok.isInstalled, authenticated: auth, catalogStatus: grokCatalogStatus, runnableModelCount: runnableGrokModels.count).isRunnable
         grokCLIInfo = await grokUpdate
         grokUpdateStatus = grokCLIInfo.statusText
     }
@@ -2099,9 +2131,10 @@ final class AppState: ObservableObject {
         let executable = ExecutableDiscovery.locate("opencode")
         if openCode.isInstalled != (executable != nil) { openCode = StructuredCLIHarness(kind: .openCode, executableURL: executable) }
         if openCodeACP.isInstalled != (executable != nil) { openCodeACP = ACPHarness(profile: .openCode, executableURL: executable) }
+        openCodeCatalogStatus = .loading
         async let openCodeAuth = openCode.isAuthenticated()
-        async let openCodeCatalog = openCode.models(refreshCache: refreshCatalog)
-        async let openCodeACPCatalog = openCodeACP.models(workspace: URL(fileURLWithPath: selectedWorkspacePath))
+        async let openCodeCatalog = openCode.modelsResult(refreshCache: refreshCatalog)
+        async let openCodeACPCatalog = openCodeACP.modelsResult(workspace: URL(fileURLWithPath: selectedWorkspacePath))
         async let openCodeVersion = openCode.cliVersion()
         async let openCodeInstalledVersion = Self.homebrewInstalledFormulaVersion("opencode")
         async let openCodeLatest = Self.latestCLIVersion(executableName: "opencode", homebrewFormula: "opencode", homebrewCask: nil, npmPackage: "opencode-ai", pnpmPackage: "opencode-ai", directPackage: "opencode-ai")
@@ -2111,9 +2144,11 @@ final class AppState: ObservableObject {
         let detectedVersion = await openCodeVersion
         let installedVersion = await openCodeInstalledVersion
         openCodeAPIKeySaved = OpenCodeAuthBridge.hasGoCredential()
-        openCodeACPModels = acpCatalog
-        openCodeReady = (auth || openCodeAPIKeySaved) && catalog.contains { ACPHarness.bestMatch(for: $0.id, in: acpCatalog) != nil }
-        openCodeModels = catalog
+        openCodeAuthenticated = auth || openCodeAPIKeySaved
+        openCodeACPModels = acpCatalog.models
+        openCodeCatalogStatus = ProviderCatalogStatus.combined(catalog.status, acpCatalog.status)
+        openCodeModels = catalog.models
+        openCodeReady = ProviderReadinessSnapshot(installed: openCode.isInstalled, authenticated: openCodeAuthenticated, catalogStatus: openCodeCatalogStatus, runnableModelCount: runnableOpenCodeModels.count).isRunnable
         openCodeCLIVersion = detectedVersion ?? installedVersion
         openCodeLatestCLIVersion = await openCodeLatest
     }
@@ -2148,10 +2183,13 @@ final class AppState: ObservableObject {
     private func refreshHermesConnection() async {
         let executable = ExecutableDiscovery.locate("hermes")
         if hermes.isInstalled != (executable != nil) { hermes = ACPHarness(executableURL: executable) }
+        hermesCatalogStatus = .loading
         async let hermesInfo = Self.hermesUpdateInfo()
-        async let hermesCatalog = hermes.models(workspace: URL(fileURLWithPath: selectedWorkspacePath))
+        async let hermesCatalog = hermes.modelsResult(workspace: URL(fileURLWithPath: selectedWorkspacePath))
         hermesInstalled = executable != nil
-        hermesModels = await hermesCatalog
+        let catalog = await hermesCatalog
+        hermesCatalogStatus = catalog.status
+        hermesModels = catalog.models
         hermesCLIInfo = await hermesInfo
     }
 
@@ -4142,21 +4180,14 @@ Lattice self-edit rules:
         guard let url = URL(string: urlString) else { return (-1, Data("Invalid installer URL.".utf8)) }
         if let message = RemoteInstallerScriptPolicy.validationMessage(for: url) { return (-1, Data(message.utf8)) }
         do {
-            let (data, response) = try await URLSession.shared.data(from: url)
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                return (-1, Data("Provider installer download failed.".utf8))
-            }
-            guard let finalURL = http.url,
-                  RemoteInstallerScriptPolicy.validateFinalURL(finalURL).isAccepted else {
-                return (-1, Data("Provider installer redirected outside Lattice's approved endpoint.".utf8))
-            }
+            let download = try await RemoteInstallerScriptDownloader().download(from: url)
             let evaluation = RemoteInstallerScriptPolicy.evaluateDownload(
-                data: data,
-                contentType: http.value(forHTTPHeaderField: "Content-Type")
+                data: download.data,
+                contentType: download.contentType
             )
             if let message = evaluation.contentMessage { return (-1, Data(message.utf8)) }
             let scriptURL = FileManager.default.temporaryDirectory.appendingPathComponent("lattice-installer-\(UUID().uuidString).sh")
-            try data.write(to: scriptURL, options: [.atomic])
+            try download.data.write(to: scriptURL, options: [.atomic])
             defer { try? FileManager.default.removeItem(at: scriptURL) }
             let syntax = await runCommand("bash", ["-n", scriptURL.path])
             guard syntax.status == 0 else {
@@ -4170,38 +4201,49 @@ Lattice self-edit rules:
 
     nonisolated private static func antigravityCredentialsExist() -> Bool {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        return [".gemini/oauth_creds.json", ".gemini/google_accounts.json"].contains {
-            let url = home.appendingPathComponent($0)
-            return (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) ?? 0 > 2
+        let oauthURL = home.appendingPathComponent(".gemini/oauth_creds.json")
+        guard let oauthData = try? Data(contentsOf: oauthURL),
+              CredentialPresencePolicy.hasAntigravityOAuthCredential(in: oauthData) else {
+            return false
         }
+
+        // google_accounts.json is only an account-selection cache. It can
+        // refine a valid OAuth state, but must not establish authentication.
+        let accountsURL = home.appendingPathComponent(".gemini/google_accounts.json")
+        guard FileManager.default.fileExists(atPath: accountsURL.path) else { return true }
+        guard let accountsData = try? Data(contentsOf: accountsURL) else { return false }
+        return CredentialPresencePolicy.hasAntigravityAccountMarker(in: accountsData)
     }
 
     private static func runAntigravityLogin() async -> (status: Int32, output: Data) {
         guard let executable = ExecutableDiscovery.locate("agy") else {
             return (-1, Data("Antigravity CLI is not installed.".utf8))
         }
-        return await Task.detached {
-            let process = Process()
-            let pipe = Pipe()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/script")
-            process.arguments = ["-q", "/dev/null", executable.path]
-            process.standardOutput = pipe
-            process.standardError = pipe
-            do {
-                try process.run()
-                let deadline = Date().addingTimeInterval(180)
-                while process.isRunning && Date() < deadline && !antigravityCredentialsExist() {
-                    try? await Task.sleep(nanoseconds: 400_000_000)
-                }
-                if process.isRunning { process.terminate() }
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                if antigravityCredentialsExist() { return (0, data) }
-                return (process.terminationStatus, data)
-            } catch {
-                return (-1, Data(error.localizedDescription.utf8))
-            }
-        }.value
+        let result = await BoundedSubprocess.run(
+            .init(
+                executableURL: URL(fileURLWithPath: "/usr/bin/script"),
+                arguments: ["-q", "/dev/null", executable.path],
+                deadline: 180
+            ),
+            isCancelled: { Self.antigravityCredentialsExist() }
+        )
+        if Self.antigravityCredentialsExist() {
+            return (0, result.combinedOutput)
+        }
+        switch result.outcome {
+        case .exited:
+            return (result.exitStatus ?? -1, result.combinedOutput)
+        case .timedOut:
+            return (-1, Data("Antigravity login timed out after 180 seconds.".utf8))
+        case .cancelled:
+            return (-1, Data("Antigravity login was cancelled.".utf8))
+        case .launchFailed:
+            return (-1, Data((result.launchErrorDescription ?? "Antigravity login failed to launch.").utf8))
+        case .outputLimitExceeded:
+            return (-1, Data("Antigravity login output exceeded Lattice's safety limit.".utf8))
+        case .completed:
+            return (-1, Data("Antigravity login ended before credentials were available.".utf8))
+        }
     }
 
     private static func runCommand(
@@ -4218,8 +4260,8 @@ Lattice self-edit rules:
             maximumOutputBytes: discardOutput ? 0 : 2_000_000
         ))
         switch result.outcome {
-        case .exited:
-            return (result.exitStatus ?? -1, discardOutput ? Data() : result.combinedOutput)
+        case .exited, .completed:
+            return (result.exitStatus ?? 0, discardOutput ? Data() : result.combinedOutput)
         case .timedOut:
             return (-1, Data("Command timed out after \(Int(deadline)) seconds.".utf8))
         case .cancelled:
@@ -4301,9 +4343,9 @@ Lattice self-edit rules:
             grokReady: grokReady,
             openCodeReady: openCodeReady,
             antigravityReady: antigravityAuthenticated && !visibleAntigravityModels.isEmpty,
-            codexCatalogKnown: !codexModels.isEmpty,
-            grokCatalogKnown: !grokModels.isEmpty,
-            openCodeCatalogKnown: !openCodeModels.isEmpty,
+            codexCatalogKnown: codexCatalogStatus.isResolved,
+            grokCatalogKnown: grokCatalogStatus.isResolved,
+            openCodeCatalogKnown: openCodeCatalogStatus.isResolved,
             appleIntelligenceReady: appleIntelligenceReady,
             ollamaModelNames: ollamaModels.map(\.name),
             codexInstalled: codex.isInstalled
@@ -4587,7 +4629,7 @@ Lattice self-edit rules:
                 workspaceScoped: request.workspaceScoped
             ), at: index)
         case .toolProgress(let toolID, _, let detail):
-            updateSessionAction(id: toolID, status: detail == "Failed" ? .failed : (detail == "Completed" ? .completed : .running), at: index)
+            updateSessionAction(id: toolID, status: detail == "Failed" ? .failed : (detail == "Cancelled" ? .cancelled : (detail == "Completed" ? .completed : .running)), at: index)
         case .permissionRequested(let request):
             let harnessID = effectiveHarnessID(for: sessions[index])
             let notice = HarnessPermissionNotice(
@@ -4622,15 +4664,24 @@ Lattice self-edit rules:
             } else {
                 harnessPermissionNotices[id] = notice
                 setActivity([.init(icon: "hand.raised.fill", title: request.title, detail: "Waiting for your decision")], sessionID: id)
-                setActiveComposerState(.approval, sessionID: id)
-                if selectedSessionID == id { overlayControlState = .approval }
+                reduceRunUI(.permissionRequested, for: id)
             }
         case .metric: break
+        case .providerDiagnostic(let diagnostic):
+            upsertActivity(.init(icon: "exclamationmark.triangle", title: diagnostic.title, detail: diagnostic.detail), sessionID: id)
+            if let action = ProviderDiagnosticRetentionPolicy.action(
+                for: diagnostic,
+                assistantMessageID: sessions[index].messages.last(where: { $0.role == .assistant })?.id
+            ) {
+                upsertSessionAction(action, at: index)
+                persist()
+            }
         case .completed:
             activeRunIDs[id] = nil
             harnessPermissionNotices[id] = nil
             finishCompletedTurnActions(at: index)
-            sessions[index].isStreaming = false; clearActivity(); clearActiveComposerState(); overlayMode = .result; composerState = .expanded; overlayControlState = .expanded
+            sessions[index].isStreaming = false
+            reduceRunUI(.completed, for: id)
             let request = submittedRequests[id]
             if selfEditRunIDs.remove(id) != nil {
                 _ = prepareGeneratedExtensionPreview(at: index, request: request)
@@ -4644,7 +4695,9 @@ Lattice self-edit rules:
             harnessPermissionNotices[id] = nil
             selfEditRunIDs.remove(id)
             finishPendingActions(status: .cancelled, at: index)
-            sessions[index].isStreaming = false; clearActivity(); clearActiveComposerState(); overlayMode = .result; composerState = .expanded; overlayControlState = .expanded; persist()
+            sessions[index].isStreaming = false
+            reduceRunUI(.cancelled, for: id)
+            persist()
             scheduleIdleUnloadIfNeeded(for: backend)
         case .failed(let message):
             activeRunIDs[id] = nil
@@ -4652,9 +4705,10 @@ Lattice self-edit rules:
             selfEditRunIDs.remove(id)
             submittedRequests[id] = nil
             finishPendingActions(status: .failed, at: index)
-            sessions[index].isStreaming = false; clearActivity(); clearActiveComposerState(); setError(message, sessionID: id)
+            sessions[index].isStreaming = false
+            reduceRunUI(.failed(message), for: id)
             if sessions[index].messages.last?.text.isEmpty == true { sessions[index].messages.removeLast() }
-            overlayMode = .prompt; composerState = .expanded; overlayControlState = .expanded; persist()
+            persist()
             scheduleIdleUnloadIfNeeded(for: backend)
         }
     }
@@ -4971,40 +5025,40 @@ Lattice self-edit rules:
     }
 
     private func setActivity(_ items: [ActivityItem], sessionID: UUID) {
-        activity = items
-        activitySessionID = sessionID
+        reduceRunUI(.setActivity(items), for: sessionID)
     }
 
     private func upsertActivity(_ item: ActivityItem, sessionID: UUID) {
-        var items = activitySessionID == sessionID ? activity : []
-        if let index = items.firstIndex(where: { $0.id == item.id }) { items[index] = item }
-        else { items.append(item) }
-        setActivity(Array(items.suffix(4)), sessionID: sessionID)
+        reduceRunUI(.upsertActivity(item), for: sessionID)
     }
 
-    private func clearActivity() {
-        activity = []
-        activitySessionID = nil
+    private func clearActivity(for sessionID: UUID? = nil) {
+        guard let sessionID = sessionID ?? selectedSessionID else { return }
+        reduceRunUI(.clearActivity, for: sessionID)
     }
 
     private func setActiveComposerState(_ state: MorphingControlState, sessionID: UUID) {
-        activeComposerState = state
-        activeComposerStateSessionID = sessionID
+        reduceRunUI(.setComposerState(state), for: sessionID)
     }
 
-    private func clearActiveComposerState() {
-        activeComposerState = nil
-        activeComposerStateSessionID = nil
+    private func clearActiveComposerState(for sessionID: UUID? = nil) {
+        guard let sessionID = sessionID ?? selectedSessionID else { return }
+        reduceRunUI(.setComposerState(.expanded), for: sessionID)
     }
 
     private func setError(_ message: String, sessionID: UUID? = nil) {
-        errorMessage = message
-        errorMessageSessionID = sessionID
+        if let sessionID {
+            reduceRunUI(.setError(message), for: sessionID)
+        } else {
+            globalErrorMessage = message
+        }
     }
 
     private func clearError() {
-        errorMessage = nil
-        errorMessageSessionID = nil
+        globalErrorMessage = nil
+        if let selectedSessionID {
+            reduceRunUI(.clearError, for: selectedSessionID)
+        }
     }
 
     private static func activityIcon(for kind: ToolRequest.Kind) -> String {

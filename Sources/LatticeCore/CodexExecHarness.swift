@@ -59,34 +59,24 @@ public final class CodexExecHarness: @unchecked Sendable {
 
     public func isAuthenticated() async -> Bool {
         guard let executableURL else { return false }
-        return await Task.detached {
-            let process = Process(); process.executableURL = executableURL
-            process.arguments = ["login", "-c", "service_tier=\"flex\"", "status"]
-            process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
-            do { try process.run(); process.waitUntilExit(); return process.terminationStatus == 0 } catch { return false }
-        }.value
+        return await Self.run(executableURL, arguments: ["login", "-c", "service_tier=\"flex\"", "status"]).isSuccess
     }
 
     public func login() async -> Bool {
         guard let executableURL else { return false }
-        return await Task.detached {
-            let process = Process(); process.executableURL = executableURL
-            process.arguments = ["login", "-c", "service_tier=\"flex\""]
-            process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
-            do { try process.run(); process.waitUntilExit(); return process.terminationStatus == 0 } catch { return false }
-        }.value
+        return await Self.run(executableURL, arguments: ["login", "-c", "service_tier=\"flex\""]).isSuccess
     }
 
     public func updateCLI() async -> Bool {
         guard let executableURL else { return false }
-        return await Self.run(executableURL, arguments: ["update"], discardOutput: true).status == 0
+        return await Self.run(executableURL, arguments: ["update"]).isSuccess
     }
 
     public func cliVersion() async -> String? {
         guard let executableURL else { return nil }
         let result = await Self.run(executableURL, arguments: ["--version"])
-        guard result.status == 0 else { return nil }
-        let value = String(decoding: result.output, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard result.isSuccess else { return nil }
+        let value = String(decoding: result.combinedOutput, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return nil }
         if let version = value.split(separator: " ").last { return String(version) }
         return value
@@ -94,45 +84,39 @@ public final class CodexExecHarness: @unchecked Sendable {
 
     public func providerSnapshot() async -> CodexProviderSnapshot {
         guard let executableURL else { return .empty }
-        return await Task.detached {
-            let process = Process()
-            let input = Pipe()
-            let output = Pipe()
-            process.executableURL = executableURL
-            process.arguments = ["app-server", "-c", "service_tier=\"flex\""]
-            process.standardInput = input
-            process.standardOutput = output
-            process.standardError = FileHandle.nullDevice
-            do {
-                try process.run()
-                let messages: [[String: Any]] = [
-                    ["method": "initialize", "id": 0, "params": ["clientInfo": ["name": "lattice", "title": "Lattice", "version": "0.1.0"], "capabilities": ["experimentalApi": true]]],
-                    ["method": "initialized", "params": [:]],
-                    ["method": "model/list", "id": 1, "params": ["includeHidden": false, "limit": 100]],
-                    ["method": "account/rateLimits/read", "id": 2]
-                ]
-                for message in messages {
-                    var data = try JSONSerialization.data(withJSONObject: message)
-                    data.append(0x0A)
-                    try input.fileHandleForWriting.write(contentsOf: data)
-                }
-                let accumulator = AppServerAccumulator()
-                output.fileHandleForReading.readabilityHandler = { handle in
-                    let chunk = handle.availableData
-                    if chunk.isEmpty { return }
-                    accumulator.append(chunk)
-                }
-                let deadline = Date().addingTimeInterval(6)
-                while !accumulator.isComplete && Date() < deadline { try? await Task.sleep(nanoseconds: 50_000_000) }
-                output.fileHandleForReading.readabilityHandler = nil
-                if process.isRunning { process.terminate() }
-                try? input.fileHandleForWriting.close()
-                return accumulator.snapshot
-            } catch {
-                if process.isRunning { process.terminate() }
-                return .empty
+        let messages: [[String: Any]] = [
+            ["method": "initialize", "id": 0, "params": ["clientInfo": ["name": "lattice", "title": "Lattice", "version": "0.1.0"], "capabilities": ["experimentalApi": true]]],
+            ["method": "initialized", "params": [:]],
+            ["method": "model/list", "id": 1, "params": ["includeHidden": false, "limit": 100]],
+            ["method": "account/rateLimits/read", "id": 2]
+        ]
+        let stdinData: Data
+        do {
+            stdinData = try messages.reduce(into: Data()) { data, message in
+                data.append(contentsOf: try JSONSerialization.data(withJSONObject: message))
+                data.append(0x0A)
             }
-        }.value
+        } catch {
+            return CodexProviderSnapshot(models: [], usage: nil, catalogStatus: .failed)
+        }
+        let accumulator = AppServerAccumulator()
+        let result = await BoundedSubprocess.run(
+            .init(
+                executableURL: executableURL,
+                arguments: ["app-server", "-c", "service_tier=\"flex\""],
+                stdinData: stdinData,
+                deadline: 6
+            ),
+            stopWhen: { stdout, _ in
+                accumulator.append(stdout)
+                return accumulator.isComplete
+            }
+        )
+        guard result.outcome == .completed || result.outcome == .exited else {
+            return CodexProviderSnapshot(models: [], usage: nil, catalogStatus: .failed)
+        }
+        accumulator.append(result.stdout)
+        return accumulator.snapshot
     }
 
     public func stream(prompt: String, sessionID: UUID, threadID: String?, workspace: URL, model: String, reasoningEffort: ReasoningEffort? = nil, policy: ExecutionPolicy = .ask, workspaceWrite: Bool = false) -> AsyncStream<AgentEvent> {
@@ -153,8 +137,9 @@ public final class CodexExecHarness: @unchecked Sendable {
                 do {
                     try process.run()
                     register(process: process, input: input.fileHandleForWriting, for: sessionID)
+                    let reader = BoundedJSONLineReader(output.fileHandleForReading)
                     try Self.write(Self.initializeRequest(id: 1), to: input.fileHandleForWriting)
-                    _ = try readResponse(id: 1, sessionID: sessionID, from: output.fileHandleForReading, input: input.fileHandleForWriting, continuation: continuation)
+                    _ = try readResponse(id: 1, sessionID: sessionID, from: reader, input: input.fileHandleForWriting, continuation: continuation)
                     try Self.write(["method": "initialized", "params": [:]], to: input.fileHandleForWriting)
 
                     let route = Self.executionRoute(policy: policy, workspaceWrite: workspaceWrite)
@@ -170,7 +155,7 @@ public final class CodexExecHarness: @unchecked Sendable {
                     ]
                     if let threadID { threadParams["threadId"] = threadID }
                     try Self.write(["method": method, "id": 2, "params": threadParams], to: input.fileHandleForWriting)
-                    let threadResponse = try readResponse(id: 2, sessionID: sessionID, from: output.fileHandleForReading, input: input.fileHandleForWriting, continuation: continuation)
+                    let threadResponse = try readResponse(id: 2, sessionID: sessionID, from: reader, input: input.fileHandleForWriting, continuation: continuation)
                     guard let result = threadResponse["result"] as? [String: Any],
                           let thread = result["thread"] as? [String: Any],
                           let activeThreadID = thread["id"] as? String else {
@@ -193,14 +178,14 @@ public final class CodexExecHarness: @unchecked Sendable {
                         turnParams["summary"] = "auto"
                     }
                     try Self.write(["method": "turn/start", "id": 3, "params": turnParams], to: input.fileHandleForWriting)
-                    let turnResponse = try readResponse(id: 3, sessionID: sessionID, from: output.fileHandleForReading, input: input.fileHandleForWriting, continuation: continuation)
+                    let turnResponse = try readResponse(id: 3, sessionID: sessionID, from: reader, input: input.fileHandleForWriting, continuation: continuation)
                     guard let turnResult = turnResponse["result"] as? [String: Any],
                           let turn = turnResult["turn"] as? [String: Any],
                           let turnID = turn["id"] as? String else {
                         throw CodexHarnessError.message(Self.responseError(turnResponse, fallback: "Codex did not start the turn."))
                     }
                     setTurnID(turnID, for: sessionID)
-                    let turnReportedCancellation = try readTurn(sessionID: sessionID, workspace: workspace, from: output.fileHandleForReading, input: input.fileHandleForWriting, continuation: continuation)
+                    let turnReportedCancellation = try readTurn(sessionID: sessionID, workspace: workspace, from: reader, input: input.fileHandleForWriting, continuation: continuation)
                     if process.isRunning { process.terminate() }
                     process.waitUntilExit()
                     let didCancel = unregister(sessionID)
@@ -285,11 +270,11 @@ public final class CodexExecHarness: @unchecked Sendable {
     private func readResponse(
         id: Int,
         sessionID: UUID,
-        from output: FileHandle,
+        from reader: BoundedJSONLineReader,
         input: FileHandle,
         continuation: AsyncStream<AgentEvent>.Continuation
     ) throws -> [String: Any] {
-        while let object = try Self.readObject(from: output) {
+        while let object = try reader.next() {
             if object["method"] != nil {
                 if object["id"] != nil {
                     try handleServerRequest(object, sessionID: sessionID, workspace: nil, input: input, continuation: continuation)
@@ -307,26 +292,20 @@ public final class CodexExecHarness: @unchecked Sendable {
     private func readTurn(
         sessionID: UUID,
         workspace: URL,
-        from output: FileHandle,
+        from reader: BoundedJSONLineReader,
         input: FileHandle,
         continuation: AsyncStream<AgentEvent>.Continuation
     ) throws -> Bool {
-        while let object = try Self.readObject(from: output) {
+        while let object = try reader.next() {
             if object["id"] != nil, object["method"] != nil {
                 try handleServerRequest(object, sessionID: sessionID, workspace: workspace, input: input, continuation: continuation)
                 continue
             }
             guard let method = object["method"] as? String else { continue }
             if method == "turn/completed" {
-                let turn = (object["params"] as? [String: Any])?["turn"] as? [String: Any]
-                switch turn?["status"] as? String {
-                case "interrupted": continuation.yield(.cancelled)
-                case "failed":
-                    let error = turn?["error"] as? [String: Any]
-                    continuation.yield(.failed(error?["message"] as? String ?? "Codex could not complete the turn."))
-                default: continuation.yield(.completed)
-                }
-                return turn?["status"] as? String == "interrupted"
+                let event = Self.turnCompletionEvent(from: object)
+                continuation.yield(event)
+                return event == .cancelled
             }
             if let event = Self.appServerEvent(from: object, workspace: workspace) { continuation.yield(event) }
         }
@@ -385,7 +364,7 @@ public final class CodexExecHarness: @unchecked Sendable {
                 kind: .write,
                 title: "Codex wants to change files",
                 detail: detail,
-                workspaceScoped: root.map { Self.isWorkspaceScoped($0, workspace: workspace) } ?? true,
+                workspaceScoped: root.map { Self.isWorkspaceScoped($0, workspace: workspace) } ?? false,
                 reversible: true
             )
             return ApprovalRequest(
@@ -399,14 +378,19 @@ public final class CodexExecHarness: @unchecked Sendable {
     }
 
     public static func appServerEvent(from object: [String: Any], workspace: URL) -> AgentEvent? {
-        guard let method = object["method"] as? String,
-              let params = object["params"] as? [String: Any] else { return nil }
-        if method == "item/agentMessage/delta", let delta = params["delta"] as? String { return .assistantDelta(delta) }
+        guard let method = object["method"] as? String else { return HarnessToolEventDecoder.diagnostic(provider: "Codex", object: object, reason: "App-server event is missing method.") }
+        guard let params = object["params"] as? [String: Any] else { return method == "item/reasoning/textDelta" ? nil : HarnessToolEventDecoder.diagnostic(provider: "Codex", object: object, reason: "App-server event is missing params.") }
+        if method == "item/agentMessage/delta" {
+            guard let delta = params["delta"] as? String else { return HarnessToolEventDecoder.diagnostic(provider: "Codex", object: object, reason: "Agent message delta is malformed.") }
+            return .assistantDelta(delta)
+        }
         if method == "item/reasoning/summaryTextDelta",
            let externalID = params["itemId"] as? String,
            let delta = params["delta"] as? String, !delta.isEmpty {
             return .reasoningSummary(id: HarnessToolEventDecoder.stableID(for: "codex:reasoning:\(externalID)"), delta: delta)
         }
+        if method == "item/reasoning/summaryTextDelta" { return HarnessToolEventDecoder.diagnostic(provider: "Codex", object: object, reason: "Reasoning summary delta is malformed.") }
+        if method == "item/reasoning/textDelta" { return nil }
         if method == "turn/plan/updated",
            let turnID = params["turnId"] as? String,
            let rawSteps = params["plan"] as? [[String: Any]] {
@@ -425,9 +409,10 @@ public final class CodexExecHarness: @unchecked Sendable {
                 }
                 return "\(label) — \(step)"
             }
-            guard !steps.isEmpty else { return nil }
+            guard !steps.isEmpty else { return HarnessToolEventDecoder.diagnostic(provider: "Codex", object: object, reason: "Turn plan update has no usable steps.") }
             return .plan(id: HarnessToolEventDecoder.stableID(for: "codex:plan:\(turnID)"), title: "Plan", steps: steps)
         }
+        if method == "turn/plan/updated" { return HarnessToolEventDecoder.diagnostic(provider: "Codex", object: object, reason: "Turn plan update is malformed.") }
         if method == "error" {
             let error = params["error"] as? [String: Any]
             return .failed(error?["message"] as? String ?? params["message"] as? String ?? "Codex error")
@@ -435,29 +420,52 @@ public final class CodexExecHarness: @unchecked Sendable {
         guard ["item/started", "item/completed"].contains(method),
               let item = params["item"] as? [String: Any],
               let type = item["type"] as? String,
-              let externalID = item["id"] as? String else { return nil }
+              let externalID = item["id"] as? String else { return HarnessToolEventDecoder.diagnostic(provider: "Codex", object: object, reason: "Item event is malformed.") }
         let id = HarnessToolEventDecoder.stableID(for: "codex:\(externalID)")
         let completed = method == "item/completed"
         switch type {
         case "commandExecution":
             if completed {
-                return .toolProgress(id: id, fraction: 1, detail: item["status"] as? String == "completed" ? "Completed" : "Failed")
+                return terminalToolProgress(id: id, status: item["status"])
             }
             let command = item["command"] as? String ?? "Command"
             let cwd = item["cwd"] as? String
             return .toolRequested(.init(id: id, kind: .command, title: "Run command", detail: "$ \(command)", workspaceScoped: cwd.map { Self.isWorkspaceScoped($0, workspace: workspace) } ?? false, reversible: false))
         case "fileChange":
             if completed {
-                return .toolProgress(id: id, fraction: 1, detail: item["status"] as? String == "completed" ? "Completed" : "Failed")
+                return terminalToolProgress(id: id, status: item["status"])
             }
             let paths = (item["changes"] as? [[String: Any]] ?? []).compactMap { $0["path"] as? String }
             return .toolRequested(.init(id: id, kind: .write, title: "Change files", detail: paths.isEmpty ? "Workspace files" : paths.joined(separator: ", "), workspaceScoped: paths.allSatisfy { Self.isWorkspaceScoped($0, workspace: workspace) }, reversible: true))
         case "webSearch":
-            if completed { return .toolProgress(id: id, fraction: 1, detail: "Completed") }
+            if completed { return terminalToolProgress(id: id, status: item["status"]) }
             return .toolRequested(.init(id: id, kind: .network, title: "Search the web", detail: item["query"] as? String ?? "", workspaceScoped: false, reversible: true))
         default:
-            return nil
+            return HarnessToolEventDecoder.diagnostic(provider: "Codex", object: item, reason: "Unsupported item event.")
         }
+    }
+
+    static func turnCompletionEvent(from object: [String: Any]) -> AgentEvent {
+        let turn = (object["params"] as? [String: Any])?["turn"] as? [String: Any]
+        switch turn?["status"] as? String {
+        case "completed": return .completed
+        case "interrupted": return .cancelled
+        case "failed":
+            let error = turn?["error"] as? [String: Any]
+            return .failed(error?["message"] as? String ?? "Codex could not complete the turn.")
+        default: return .failed("Codex returned malformed turn status.")
+        }
+    }
+
+    private static func terminalToolProgress(id: UUID, status: Any?) -> AgentEvent {
+        let detail: String
+        switch status as? String {
+        case "completed": detail = "Completed"
+        case "failed": detail = "Failed"
+        case "cancelled", "canceled", "interrupted", "declined": detail = "Cancelled"
+        default: detail = "Failed"
+        }
+        return .toolProgress(id: id, fraction: 1, detail: detail)
     }
 
     private static func approvalOptions(_ decisions: [String]) -> [ApprovalOption] {
@@ -488,17 +496,6 @@ public final class CodexExecHarness: @unchecked Sendable {
         try handle.write(contentsOf: data)
     }
 
-    private static func readObject(from handle: FileHandle) throws -> [String: Any]? {
-        var data = Data()
-        while true {
-            let byte = try handle.read(upToCount: 1) ?? Data()
-            if byte.isEmpty { return data.isEmpty ? nil : (try JSONSerialization.jsonObject(with: data) as? [String: Any]) }
-            if byte[byte.startIndex] == 0x0A { break }
-            data.append(byte)
-        }
-        return try JSONSerialization.jsonObject(with: data) as? [String: Any]
-    }
-
     fileprivate static func parseModels(_ response: [String: Any]) -> [ProviderModel] {
         guard let result = response["result"] as? [String: Any], let values = result["data"] as? [[String: Any]] else { return [] }
         return values.compactMap { value in
@@ -527,45 +524,57 @@ public final class CodexExecHarness: @unchecked Sendable {
         return windows.isEmpty && credits == nil ? nil : ProviderUsage(windows: windows, creditsBalance: credits)
     }
 
-    private static func run(_ executable: URL, arguments: [String], discardOutput: Bool = false) async -> (status: Int32, output: Data) {
-        await Task.detached {
-            let process = Process()
-            let pipe = Pipe()
-            process.executableURL = executable
-            process.arguments = arguments
-            process.standardOutput = discardOutput ? FileHandle.nullDevice : pipe
-            process.standardError = discardOutput ? FileHandle.nullDevice : pipe
-            do {
-                try process.run()
-                let data = discardOutput ? Data() : pipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                return (process.terminationStatus, data)
-            } catch {
-                return (-1, Data())
-            }
-        }.value
+    private static func run(_ executable: URL, arguments: [String]) async -> BoundedSubprocessResult {
+        await BoundedSubprocess.run(.init(
+            executableURL: executable,
+            arguments: arguments
+        ))
     }
+
+
 }
 
 private final class AppServerAccumulator: @unchecked Sendable {
     private let lock = NSLock()
-    private var buffer = Data()
+    private var frameBuffer = BoundedJSONLineBuffer()
+    private var processedInputBytes = 0
     private var models: [ProviderModel] = []
     private var usage: ProviderUsage?
     private var received: Set<Int> = []
+    private var failed = false
+    private var modelCatalogSucceeded = false
 
-    var isComplete: Bool { lock.withLock { received.isSuperset(of: [1, 2]) } }
-    var snapshot: CodexProviderSnapshot { lock.withLock { CodexProviderSnapshot(models: models, usage: usage) } }
+    var isComplete: Bool { lock.withLock { failed || received.isSuperset(of: [1, 2]) } }
+    var snapshot: CodexProviderSnapshot {
+        lock.withLock {
+            if failed { return CodexProviderSnapshot(models: [], usage: nil, catalogStatus: .failed) }
+            let status = received.contains(1)
+                ? ProviderCatalogStatus.resolved(modelCount: models.count, succeeded: modelCatalogSucceeded)
+                : .failed
+            return CodexProviderSnapshot(models: models, usage: usage, catalogStatus: status)
+        }
+    }
 
     func append(_ chunk: Data) {
         lock.withLock {
-            buffer.append(chunk)
-            while let newline = buffer.firstIndex(of: 0x0A) {
-                let line = Data(buffer[..<newline])
-                buffer.removeSubrange(...newline)
-                guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any], let id = object["id"] as? Int else { continue }
-                if id == 1 { models = CodexExecHarness.parseModels(object); received.insert(id) }
-                if id == 2 { usage = CodexExecHarness.parseUsage(object); received.insert(id) }
+            guard !failed, chunk.count >= processedInputBytes else { return }
+            let delta = chunk.dropFirst(processedInputBytes)
+            processedInputBytes = chunk.count
+            do {
+                for object in try frameBuffer.append(Data(delta)) {
+                    guard let id = object["id"] as? Int else { continue }
+                    if id == 1 {
+                        modelCatalogSucceeded = object["error"] == nil
+                        models = CodexExecHarness.parseModels(object)
+                        received.insert(id)
+                    }
+                    if id == 2 { usage = CodexExecHarness.parseUsage(object); received.insert(id) }
+                }
+            } catch {
+                failed = true
+                models.removeAll(keepingCapacity: false)
+                usage = nil
+                received.removeAll(keepingCapacity: false)
             }
         }
     }
@@ -574,6 +583,9 @@ private final class AppServerAccumulator: @unchecked Sendable {
 public struct CodexProviderSnapshot: Sendable {
     public let models: [ProviderModel]
     public let usage: ProviderUsage?
-    public init(models: [ProviderModel], usage: ProviderUsage?) { self.models = models; self.usage = usage }
-    public static let empty = CodexProviderSnapshot(models: [], usage: nil)
+    public let catalogStatus: ProviderCatalogStatus
+    public init(models: [ProviderModel], usage: ProviderUsage?, catalogStatus: ProviderCatalogStatus = .unknown) {
+        self.models = models; self.usage = usage; self.catalogStatus = catalogStatus
+    }
+    public static let empty = CodexProviderSnapshot(models: [], usage: nil, catalogStatus: .unknown)
 }

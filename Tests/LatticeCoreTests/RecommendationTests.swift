@@ -205,6 +205,26 @@ struct RecommendationTests {
         #expect(ExecutionRoutePolicy.normalize(.init(engineID: "codex", harnessID: "lattice"), fallbackEngineID: "codex", fallbackHarnessID: "codex") == .init(engineID: "codex", harnessID: "codex"))
     }
 
+    @Test func antigravityCatalogUsesBoundedFakeExecutable() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let executable = root.appendingPathComponent("agy")
+        let script = """
+        #!/bin/sh
+        if [ "$1" = "models" ]; then
+          printf '%s\\n' 'gemini-test'
+          exit 0
+        fi
+        exit 1
+        """
+        try Data(script.utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+
+        let models = await AntigravityCLIHarness(executableURL: executable).models()
+        #expect(models.map(\.id) == ["gemini-test"])
+    }
+
     @Test func antigravityAvailabilityKeepsRunnableModelsAndRepairsStaleOnes() {
         let models = [ProviderModel(id: "Gemini 3.5 Flash (High)", name: "Gemini 3.5 Flash (High)", isDefault: true)]
         let snapshot = BackendAvailabilitySnapshot(antigravityModels: models, antigravityReady: true)

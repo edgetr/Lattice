@@ -8,6 +8,8 @@ import Foundation
 public struct BoundedSubprocessRequest: Sendable, Equatable {
     public var executableURL: URL
     public var arguments: [String]
+    /// Bytes written to stdin before it is closed. `nil` keeps the existing EOF-only behavior.
+    public var stdinData: Data?
     public var currentDirectoryURL: URL?
     /// When non-nil, replaces the child environment entirely.
     public var environment: [String: String]?
@@ -24,6 +26,7 @@ public struct BoundedSubprocessRequest: Sendable, Equatable {
     public init(
         executableURL: URL,
         arguments: [String] = [],
+        stdinData: Data? = nil,
         currentDirectoryURL: URL? = nil,
         environment: [String: String]? = nil,
         deadline: TimeInterval? = 60,
@@ -32,6 +35,7 @@ public struct BoundedSubprocessRequest: Sendable, Equatable {
     ) {
         self.executableURL = executableURL
         self.arguments = arguments
+        self.stdinData = stdinData
         self.currentDirectoryURL = currentDirectoryURL
         self.environment = environment
         self.deadline = deadline
@@ -44,6 +48,8 @@ public struct BoundedSubprocessRequest: Sendable, Equatable {
 
 public enum BoundedSubprocessOutcome: String, Sendable, Equatable, Codable {
     case exited
+    /// Supervisor stopped process after caller-provided finite-protocol completion condition.
+    case completed
     case timedOut
     case cancelled
     case launchFailed
@@ -84,7 +90,11 @@ public struct BoundedSubprocessResult: Sendable, Equatable {
     }
 
     public var isSuccess: Bool {
-        outcome == .exited && exitStatus == 0
+        switch outcome {
+        case .exited: return exitStatus == 0
+        case .completed: return true
+        case .timedOut, .cancelled, .launchFailed, .outputLimitExceeded: return false
+        }
     }
 }
 
@@ -95,8 +105,9 @@ public struct BoundedSubprocessResult: Sendable, Equatable {
 /// Design notes:
 /// - Never uses shell string interpolation.
 /// - Never calls unbounded `readDataToEndOfFile` while a child may keep writing.
-/// - Closes stdin immediately after launch so children that wait on input do not hang.
-/// - On timeout / cancel / output-cap: `SIGTERM`, short grace, then `SIGKILL`, then reap.
+/// - Writes optional finite stdin before closing it so input readers do not hang.
+/// - On timeout / cancel / output-cap: terminate the process group, short grace, then
+///   `SIGKILL`, then reap.
 /// - Parent-task cancellation is bridged explicitly because `Task.detached` does not
 ///   inherit cancellation from the caller.
 public enum BoundedSubprocess {
@@ -104,7 +115,22 @@ public enum BoundedSubprocess {
         let flag = CancellationFlag()
         return await withTaskCancellationHandler {
             if Task.isCancelled { flag.cancel() }
-            return await runUninterruptibly(request, isCancelled: { flag.isCancelled })
+            return await runUninterruptibly(request, isCancelled: { flag.isCancelled }, stopWhen: nil)
+        } onCancel: {
+            flag.cancel()
+        }
+    }
+
+    /// Runs finite protocols that can declare completion before child naturally exits.
+    /// Output remains bounded and timeout/cap/cancel outcomes stay typed.
+    public static func run(
+        _ request: BoundedSubprocessRequest,
+        stopWhen: @escaping @Sendable (_ stdout: Data, _ stderr: Data) -> Bool
+    ) async -> BoundedSubprocessResult {
+        let flag = CancellationFlag()
+        return await withTaskCancellationHandler {
+            if Task.isCancelled { flag.cancel() }
+            return await runUninterruptibly(request, isCancelled: { flag.isCancelled }, stopWhen: stopWhen)
         } onCancel: {
             flag.cancel()
         }
@@ -115,16 +141,17 @@ public enum BoundedSubprocess {
         _ request: BoundedSubprocessRequest,
         isCancelled: @escaping @Sendable () -> Bool
     ) async -> BoundedSubprocessResult {
-        await runUninterruptibly(request, isCancelled: isCancelled)
+        await runUninterruptibly(request, isCancelled: isCancelled, stopWhen: nil)
     }
 
     private static func runUninterruptibly(
         _ request: BoundedSubprocessRequest,
-        isCancelled: @escaping @Sendable () -> Bool
+        isCancelled: @escaping @Sendable () -> Bool,
+        stopWhen: (@Sendable (_ stdout: Data, _ stderr: Data) -> Bool)?
     ) async -> BoundedSubprocessResult {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                continuation.resume(returning: runSync(request, isCancelled: isCancelled))
+                continuation.resume(returning: runSync(request, isCancelled: isCancelled, stopWhen: stopWhen))
             }
         }
     }
@@ -147,7 +174,8 @@ public enum BoundedSubprocess {
 
     private static func runSync(
         _ request: BoundedSubprocessRequest,
-        isCancelled: @escaping @Sendable () -> Bool
+        isCancelled: @escaping @Sendable () -> Bool,
+        stopWhen: (@Sendable (_ stdout: Data, _ stderr: Data) -> Bool)?
     ) -> BoundedSubprocessResult {
         let process = Process()
         process.executableURL = request.executableURL
@@ -166,7 +194,7 @@ public enum BoundedSubprocess {
         process.standardError = stderrPipe
         process.standardInput = stdinPipe
 
-        let capture = OutputCapture(maximumOutputBytes: request.maximumOutputBytes)
+        let capture = OutputCapture(maximumOutputBytes: request.maximumOutputBytes, stopWhen: stopWhen)
 
         do {
             try process.run()
@@ -178,11 +206,24 @@ public enum BoundedSubprocess {
             )
         }
 
-        // Close our write end of stdin immediately so the child sees EOF.
-        try? stdinPipe.fileHandleForWriting.close()
+        // `Process` launches each task in a process group led by its PID on macOS. Keep
+        // the group only when that invariant is observable; never signal an unrelated
+        // group if launch behavior changes or the child exits before this check.
+        let processGroupID: pid_t? = {
+            let pid = process.processIdentifier
+            guard pid > 0, getpgid(pid) == pid else { return nil }
+            return pid
+        }()
 
         attachDrain(stdoutPipe.fileHandleForReading, stream: .stdout, capture: capture)
         attachDrain(stderrPipe.fileHandleForReading, stream: .stderr, capture: capture)
+
+        if let stdinData = request.stdinData, !stdinData.isEmpty {
+            try? stdinPipe.fileHandleForWriting.write(contentsOf: stdinData)
+        }
+
+        // Close our write end of stdin immediately so the child sees EOF.
+        try? stdinPipe.fileHandleForWriting.close()
 
         let deadlineDate: Date? = request.deadline.map { Date().addingTimeInterval($0) }
         var stopReason: StopReason = .waitForExit
@@ -196,6 +237,10 @@ public enum BoundedSubprocess {
                 stopReason = .outputLimit
                 break
             }
+            if capture.isComplete {
+                stopReason = .completed
+                break
+            }
             if let deadlineDate, Date() >= deadlineDate {
                 stopReason = .timedOut
                 break
@@ -204,10 +249,18 @@ public enum BoundedSubprocess {
         }
 
         switch stopReason {
-        case .waitForExit:
+        case .completed:
             break
+        case .waitForExit:
+            // The child can exit while a descendant keeps writing to the pipe. Treat
+            // output observed after that race as a stop condition so the descendant's
+            // inherited descriptors are closed before the final drain.
+            if capture.isOverLimit {
+                stopReason = .outputLimit
+                forceStop(process, processGroupID: processGroupID, grace: request.terminateGraceInterval)
+            }
         case .timedOut, .cancelled, .outputLimit:
-            forceStop(process, grace: request.terminateGraceInterval)
+            forceStop(process, processGroupID: processGroupID, grace: request.terminateGraceInterval)
         }
 
         // Drop handlers before reaping so late EOF callbacks do not race with cleanup.
@@ -215,7 +268,7 @@ public enum BoundedSubprocess {
         stderrPipe.fileHandleForReading.readabilityHandler = nil
 
         if process.isRunning {
-            forceStop(process, grace: request.terminateGraceInterval)
+            forceStop(process, processGroupID: processGroupID, grace: request.terminateGraceInterval)
         }
         process.waitUntilExit()
 
@@ -227,6 +280,14 @@ public enum BoundedSubprocess {
 
         let snapshot = capture.snapshot()
         switch stopReason {
+        case .completed:
+            return BoundedSubprocessResult(
+                outcome: .completed,
+                exitStatus: process.terminationStatus,
+                stdout: snapshot.stdout,
+                stderr: snapshot.stderr,
+                observedOutputBytes: snapshot.observed
+            )
         case .timedOut:
             return BoundedSubprocessResult(
                 outcome: .timedOut,
@@ -273,6 +334,7 @@ public enum BoundedSubprocess {
 
     private enum StopReason {
         case waitForExit
+        case completed
         case timedOut
         case cancelled
         case outputLimit
@@ -294,23 +356,45 @@ public enum BoundedSubprocess {
         }
     }
 
-    private static func forceStop(_ process: Process, grace: TimeInterval) {
-        guard process.isRunning else { return }
-        process.terminate()
-        let graceDeadline = Date().addingTimeInterval(grace)
-        while process.isRunning, Date() < graceDeadline {
-            Thread.sleep(forTimeInterval: 0.01)
+    private static func forceStop(_ process: Process, processGroupID: pid_t?, grace: TimeInterval) {
+        let pid = process.processIdentifier
+        if let processGroupID, processGroupID > 0 {
+            _ = kill(-processGroupID, SIGTERM)
         }
         if process.isRunning {
-            let pid = process.processIdentifier
-            if pid > 0 {
-                kill(pid, SIGKILL)
-            }
-            let killDeadline = Date().addingTimeInterval(max(0.1, grace))
-            while process.isRunning, Date() < killDeadline {
-                Thread.sleep(forTimeInterval: 0.01)
-            }
+            // Keep Foundation's direct-child fallback for platforms or launch modes
+            // where the process-group invariant is unavailable.
+            process.terminate()
         }
+        let graceDeadline = Date().addingTimeInterval(grace)
+        while Date() < graceDeadline {
+            if !process.isRunning && !processGroupExists(processGroupID) { break }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        if let processGroupID, processGroupID > 0 {
+            _ = kill(-processGroupID, SIGKILL)
+        }
+        if process.isRunning, pid > 0 {
+            _ = kill(pid, SIGKILL)
+        }
+        let killDeadline = Date().addingTimeInterval(max(0.1, grace))
+        while Date() < killDeadline {
+            if !process.isRunning && !processGroupExists(processGroupID) { break }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+    }
+
+    private static func setNonBlocking(_ handle: FileHandle) -> Bool {
+        let descriptor = handle.fileDescriptor
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags >= 0 else { return false }
+        return fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0
+    }
+
+    private static func processGroupExists(_ processGroupID: pid_t?) -> Bool {
+        guard let processGroupID, processGroupID > 0 else { return false }
+        if kill(-processGroupID, 0) == 0 { return true }
+        return errno == EPERM
     }
 
     private static func cleanupPipes(stdout: Pipe, stderr: Pipe, stdin: Pipe) {
@@ -326,18 +410,29 @@ public enum BoundedSubprocess {
     private final class OutputCapture: @unchecked Sendable {
         private let lock = NSLock()
         private let maximumOutputBytes: Int
+        private let stopWhen: (@Sendable (_ stdout: Data, _ stderr: Data) -> Bool)?
         private var stdout = Data()
         private var stderr = Data()
         private var observed = 0
         private var overLimit = false
+        private var complete = false
 
-        init(maximumOutputBytes: Int) {
+        init(
+            maximumOutputBytes: Int,
+            stopWhen: (@Sendable (_ stdout: Data, _ stderr: Data) -> Bool)?
+        ) {
             self.maximumOutputBytes = maximumOutputBytes
+            self.stopWhen = stopWhen
         }
 
         var isOverLimit: Bool {
             lock.lock(); defer { lock.unlock() }
             return overLimit
+        }
+
+        var isComplete: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return complete
         }
 
         func append(_ chunk: Data, stream: Stream) {
@@ -359,19 +454,27 @@ public enum BoundedSubprocess {
             if chunk.count > remaining {
                 overLimit = true
             }
+            if !overLimit, stopWhen?(stdout, stderr) == true {
+                complete = true
+            }
         }
 
         func ingestRemaining(from handle: FileHandle, stream: Stream) {
+            guard BoundedSubprocess.setNonBlocking(handle) else { return }
+            var buffer = [UInt8](repeating: 0, count: 16_384)
             while true {
-                let chunk: Data
-                do {
-                    chunk = try handle.read(upToCount: 16_384) ?? Data()
-                } catch {
-                    break
+                let count = buffer.withUnsafeMutableBytes { bytes in
+                    Darwin.read(handle.fileDescriptor, bytes.baseAddress, bytes.count)
                 }
-                if chunk.isEmpty { break }
-                append(chunk, stream: stream)
-                if isOverLimit { break }
+                if count > 0 {
+                    append(Data(buffer.prefix(count)), stream: stream)
+                    if isOverLimit { return }
+                    continue
+                }
+                if count == 0 { return }
+                if errno == EINTR { continue }
+                if errno == EAGAIN || errno == EWOULDBLOCK { return }
+                return
             }
         }
 

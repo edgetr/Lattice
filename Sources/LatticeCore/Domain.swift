@@ -268,6 +268,31 @@ public enum LatticeCommandPaletteSelection: Sendable {
     }
 }
 
+public struct ProviderEventDiagnostic: Hashable, Sendable {
+    public let id: UUID
+    public let provider: String
+    public let eventType: String?
+    public let reason: String
+    public let fields: [String]
+
+    public init(id: UUID = UUID(), provider: String, eventType: String? = nil, reason: String, fields: [String] = []) {
+        self.id = id
+        self.provider = String(provider.prefix(80))
+        self.eventType = eventType.map { String($0.prefix(120)) }
+        self.reason = String(reason.prefix(240))
+        self.fields = Array(fields.sorted().prefix(32))
+    }
+
+    public var title: String { "\(provider) provider event not understood" }
+    /// Metadata only. Never includes provider payload values.
+    public var detail: String {
+        var parts = [reason]
+        if let eventType, !eventType.isEmpty { parts.append("Event: \(eventType)") }
+        if !fields.isEmpty { parts.append("Fields: \(fields.joined(separator: ", "))") }
+        return parts.joined(separator: " ")
+    }
+}
+
 public enum AgentEvent: Sendable, Equatable {
     case sessionStarted(UUID)
     case harnessSessionStarted(String)
@@ -278,6 +303,7 @@ public enum AgentEvent: Sendable, Equatable {
     case toolProgress(id: UUID, fraction: Double, detail: String)
     case permissionRequested(ApprovalRequest)
     case metric(name: String, value: Double, unit: String)
+    case providerDiagnostic(ProviderEventDiagnostic)
     case completed
     case cancelled
     case failed(String)
@@ -565,7 +591,7 @@ public struct ApprovalRequest: Identifiable, Hashable, Sendable {
 }
 
 public struct SessionAction: Identifiable, Hashable, Codable, Sendable {
-    public enum Kind: String, Codable, Sendable { case tool, approval, plan, reasoning }
+    public enum Kind: String, Codable, Sendable { case tool, approval, plan, reasoning, diagnostic }
     public enum Status: String, Codable, Sendable { case running, waiting, completed, failed, allowed, denied, cancelled, interrupted }
 
     public let id: UUID

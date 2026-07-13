@@ -51,6 +51,74 @@ struct DurableStoreRecoveryTests {
         #expect((try Data(contentsOf: url)) == corrupt)
     }
 
+    @Test func loadUsesOneBoundedReadForDecodeAndFingerprint() {
+        let data = Data("{not-json".utf8)
+        let counter = ReadCounter()
+        let url = URL(fileURLWithPath: "/tmp/sessions.json")
+        let io = DurableStoreFileIO(
+            attributesOfItem: { _ in [.size: data.count, .modificationDate: Date(timeIntervalSince1970: 100)] },
+            readData: { _ in
+                counter.recordLegacyRead()
+                return data
+            },
+            readDataUpTo: { _, limit in
+                counter.recordBoundedRead(limit: limit)
+                return data
+            }
+        )
+
+        switch DurableStoreRecovery.loadJSONArray(
+            from: url,
+            as: LatticeSession.self,
+            storeID: SessionPersistence.storeID,
+            storeName: SessionPersistence.storeName,
+            io: io
+        ) {
+        case .failed(let issue):
+            #expect(issue.kind == .corrupt)
+            #expect(issue.observedContentFingerprint == DurableStoreRecovery.contentFingerprint(for: data))
+        case .missing, .loaded:
+            Issue.record("Invalid JSON must fail")
+        }
+        #expect(counter.boundedReads == 1)
+        #expect(counter.lastLimit == DurableStoreRecovery.maximumStoreByteCount)
+        #expect(counter.legacyReads == 0)
+    }
+
+    @Test func oversizedStoreFailsBeforeAnyDataRead() {
+        let counter = ReadCounter()
+        let oversizedByteCount = DurableStoreRecovery.maximumStoreByteCount + 1
+        let url = URL(fileURLWithPath: "/tmp/sessions.json")
+        let io = DurableStoreFileIO(
+            attributesOfItem: { _ in [.size: oversizedByteCount] },
+            readData: { _ in
+                counter.recordLegacyRead()
+                return Data()
+            },
+            readDataUpTo: { _, _ in
+                counter.recordBoundedRead(limit: 0)
+                return Data(repeating: 0, count: oversizedByteCount)
+            }
+        )
+
+        switch DurableStoreRecovery.loadJSONArray(
+            from: url,
+            as: LatticeSession.self,
+            storeID: SessionPersistence.storeID,
+            storeName: SessionPersistence.storeName,
+            io: io
+        ) {
+        case .failed(let issue):
+            #expect(issue.kind == .oversized)
+            #expect(issue.observedFileSize == oversizedByteCount)
+            #expect(issue.technicalDetails.contains("Maximum allowed byte length"))
+        case .missing, .loaded:
+            Issue.record("Oversized store must fail without loading")
+        }
+        #expect(counter.boundedReads == 0)
+        #expect(counter.legacyReads == 0)
+    }
+
     @Test func unreadablePermissionErrorUsesInjectableReader() throws {
         let root = uniqueTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -66,7 +134,8 @@ struct DurableStoreRecoveryTests {
         let io = DurableStoreFileIO(
             fileExists: { _ in true },
             attributesOfItem: { _ in [.size: 2, .modificationDate: Date(timeIntervalSince1970: 100)] },
-            readData: { _ in throw permissionError }
+            readData: { _ in throw permissionError },
+            readDataUpTo: { _, _ in throw permissionError }
         )
         let store = SessionPersistence(fileURL: url, io: io)
         switch store.loadResult() {
@@ -89,7 +158,8 @@ struct DurableStoreRecoveryTests {
         let io = DurableStoreFileIO(
             fileExists: { _ in false },
             attributesOfItem: { _ in throw permissionError },
-            readData: { _ in throw permissionError }
+            readData: { _ in throw permissionError },
+            readDataUpTo: { _, _ in throw permissionError }
         )
 
         switch DurableStoreRecovery.loadJSONArray(
@@ -190,8 +260,10 @@ struct DurableStoreRecoveryTests {
         do {
             try store.save([])
             Issue.record("Blocked gate must refuse save")
+        } catch DurableStoreRecoveryError.writeBlocked(let storeName) {
+            #expect(storeName == SessionPersistence.storeName)
         } catch {
-            #expect(true)
+            Issue.record("Expected writeBlocked, got \(error)")
         }
         #expect(!FileManager.default.fileExists(atPath: url.path))
         gate.unblock()
@@ -328,11 +400,14 @@ struct DurableStoreRecoveryTests {
         do {
             _ = try DurableStoreRecovery.resetReplacingWithEmptyArray(at: url, io: io)
             Issue.record("Reset must fail when backup cannot be created")
-        } catch {
+        } catch DurableStoreRecoveryError.resetFailed(let message) {
+            #expect(message == "Reset aborted because a backup could not be created. Original left unchanged. Could not create a quarantine of sessions.json: I/O error")
             #expect((try Data(contentsOf: url)) == original)
             let leftovers = try FileManager.default.contentsOfDirectory(atPath: root.path)
                 .filter { $0.contains(".partial-") }
             #expect(leftovers.isEmpty)
+        } catch {
+            Issue.record("Expected resetFailed for backup failure, got \(error)")
         }
     }
 
@@ -368,12 +443,66 @@ struct DurableStoreRecoveryTests {
         do {
             _ = try DurableStoreRecovery.resetReplacingWithEmptyArray(at: url, io: io)
             Issue.record("Reset must fail when the preservation copy cannot be verified")
-        } catch {
+        } catch DurableStoreRecoveryError.resetFailed(let message) {
+            #expect(message.contains("Reset aborted because a backup could not be created."))
+            #expect(message.contains("Verification read failed"))
             #expect((try Data(contentsOf: url)) == original)
             let remaining = try FileManager.default.contentsOfDirectory(atPath: root.path)
             #expect(!remaining.contains { $0.hasSuffix(".backup") })
             #expect(!remaining.contains { $0.contains(".partial-") })
+        } catch {
+            Issue.record("Expected resetFailed for backup verification failure, got \(error)")
         }
+    }
+
+    @Test func resetRecoversAfterReplacementFailureWithoutLosingVerifiedBackup() throws {
+        let root = uniqueTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let url = root.appendingPathComponent("sessions.json")
+        let original = Data("preserve-before-replace-failure".utf8)
+        try original.write(to: url)
+
+        let replacementFailure = NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(EIO),
+            userInfo: [NSLocalizedDescriptionKey: "Replacement failed"]
+        )
+        let io = DurableStoreFileIO(
+            fileExists: { FileManager.default.fileExists(atPath: $0) },
+            attributesOfItem: { try FileManager.default.attributesOfItem(atPath: $0) },
+            readData: { try Data(contentsOf: $0) },
+            writeDataAtomically: { data, destination in try data.write(to: destination, options: .atomic) },
+            createDirectory: { try FileManager.default.createDirectory(at: $0, withIntermediateDirectories: true) },
+            copyItem: { try FileManager.default.copyItem(at: $0, to: $1) },
+            moveItem: { try FileManager.default.moveItem(at: $0, to: $1) },
+            removeItem: { try FileManager.default.removeItem(at: $0) },
+            replaceItem: { _, _ in throw replacementFailure }
+        )
+
+        do {
+            _ = try DurableStoreRecovery.resetReplacingWithEmptyArray(at: url, io: io)
+            Issue.record("Reset must fail when replacing the original fails")
+        } catch DurableStoreRecoveryError.resetFailed(let message) {
+            #expect(message.contains("replacing the original failed"))
+            #expect(message.contains("Replacement failed"))
+        } catch {
+            Issue.record("Expected resetFailed for replacement failure, got \(error)")
+        }
+
+        #expect((try Data(contentsOf: url)) == original)
+        let backups = try FileManager.default.contentsOfDirectory(at: root.path)
+            .filter { $0.hasSuffix(".backup") }
+        #expect(backups.count == 1)
+        if let backup = backups.first {
+            #expect((try Data(contentsOf: root.appendingPathComponent(backup))) == original)
+        }
+        let temporaryFiles = try FileManager.default.contentsOfDirectory(atPath: root.path)
+            .filter { $0.contains(".tmp-") || $0.contains(".partial-") }
+        #expect(temporaryFiles.isEmpty)
+
+        try DurableStoreRecovery.resetReplacingWithEmptyArray(at: url)
+        #expect(String(data: try Data(contentsOf: url), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) == "[]")
     }
 
     @Test func staleSourceProtectionRejectsResetWhenFileChanged() throws {
@@ -407,6 +536,33 @@ struct DurableStoreRecoveryTests {
         } catch {
             Issue.record("Expected sourceChanged, got \(error)")
         }
+    }
+
+    @Test func resetRefusesSourceMutationDuringBackup() throws {
+        let root = uniqueTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let url = root.appendingPathComponent("sessions.json")
+        let original = Data("before-race".utf8)
+        let changed = Data("changed-during-backup".utf8)
+        try original.write(to: url)
+
+        let io = DurableStoreFileIO(
+            copyItem: { source, destination in
+                try FileManager.default.copyItem(at: source, to: destination)
+                try changed.write(to: source, options: .atomic)
+            }
+        )
+
+        do {
+            _ = try DurableStoreRecovery.resetReplacingWithEmptyArray(at: url, io: io)
+            Issue.record("Reset must reject a source mutation during backup")
+        } catch DurableStoreRecoveryError.resetFailed(let message) {
+            #expect(message.contains("changed while its backup was being created"))
+        } catch {
+            Issue.record("Expected resetFailed for a backup race, got \(error)")
+        }
+        #expect(try Data(contentsOf: url) == changed)
     }
 
     @Test func resetOfObservedFailureRefusesWhenOriginalDisappeared() throws {
@@ -478,6 +634,26 @@ struct DurableStoreRecoveryTests {
     }
 
     // MARK: - Helpers
+
+    private final class ReadCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private(set) var boundedReads = 0
+        private(set) var legacyReads = 0
+        private(set) var lastLimit: Int?
+
+        func recordBoundedRead(limit: Int) {
+            lock.lock()
+            boundedReads += 1
+            lastLimit = limit
+            lock.unlock()
+        }
+
+        func recordLegacyRead() {
+            lock.lock()
+            legacyReads += 1
+            lock.unlock()
+        }
+    }
 
     private func uniqueTempRoot() -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("lattice-recovery-\(UUID().uuidString)", isDirectory: true)

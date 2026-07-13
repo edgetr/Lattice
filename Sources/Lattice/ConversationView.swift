@@ -979,6 +979,7 @@ struct AssistantActivityDisclosure: View {
     }
 
     private var summaryIcon: String {
+        if actions.contains(where: { $0.kind == .diagnostic }) { return "exclamationmark.triangle" }
         if actions.contains(where: { $0.kind == .reasoning }) { return "brain" }
         if actions.contains(where: { $0.kind == .plan }) { return "list.bullet.clipboard" }
         return "checklist"
@@ -1029,6 +1030,7 @@ private struct SessionActionDetailRow: View {
         case .approval: return action.status == .waiting ? "hand.raised.fill" : "checkmark.shield"
         case .plan: return "list.bullet.clipboard"
         case .reasoning: return "brain"
+        case .diagnostic: return "exclamationmark.triangle"
         case .tool: break
         }
         switch action.toolKind {

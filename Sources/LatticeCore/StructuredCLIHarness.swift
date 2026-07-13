@@ -16,22 +16,22 @@ public final class StructuredCLIHarness: @unchecked Sendable {
     public func isAuthenticated() async -> Bool {
         guard let executableURL else { return false }
         let result = await Self.run(executableURL, arguments: kind == .grok ? ["models"] : ["auth", "list"])
-        guard result.status == 0 else { return false }
-        let text = String(decoding: result.output, as: UTF8.self)
+        guard result.isSuccess else { return false }
+        let text = String(decoding: result.combinedOutput, as: UTF8.self)
         return kind == .grok ? text.contains("You are logged in") : text.contains("Credentials") && text.contains("●")
     }
 
     public func login() async -> Bool {
         guard let executableURL else { return false }
         let arguments = kind == .grok ? ["login"] : ["auth", "login"]
-        return await Self.run(executableURL, arguments: arguments, discardOutput: true).status == 0
+        return await Self.run(executableURL, arguments: arguments).isSuccess
     }
 
     public func cliVersion() async -> String? {
         guard let executableURL else { return nil }
         let result = await Self.run(executableURL, arguments: ["--version"])
-        guard result.status == 0 else { return nil }
-        return Self.parseVersion(String(decoding: result.output, as: UTF8.self), kind: kind)
+        guard result.isSuccess else { return nil }
+        return Self.parseVersion(String(decoding: result.combinedOutput, as: UTF8.self), kind: kind)
     }
 
     public func updateStatus() async -> CLIUpdateInfo {
@@ -39,8 +39,8 @@ public final class StructuredCLIHarness: @unchecked Sendable {
             return CLIUpdateInfo(currentVersion: await cliVersion(), detail: "Update status unavailable")
         }
         let result = await Self.run(executableURL, arguments: ["update", "--check", "--json"])
-        guard result.status == 0,
-              let object = try? JSONSerialization.jsonObject(with: result.output) as? [String: Any] else {
+        guard result.isSuccess,
+              let object = try? JSONSerialization.jsonObject(with: result.combinedOutput) as? [String: Any] else {
             return CLIUpdateInfo(currentVersion: await cliVersion(), detail: "Update check failed")
         }
         let notes = (object["releaseNotes"] as? String) ?? (object["notes"] as? String) ?? (object["changelog"] as? String)
@@ -56,11 +56,15 @@ public final class StructuredCLIHarness: @unchecked Sendable {
     public func updateCLI() async -> Bool {
         guard let executableURL else { return false }
         let arguments = kind == .grok ? ["update"] : ["upgrade"]
-        return await Self.run(executableURL, arguments: arguments, discardOutput: true).status == 0
+        return await Self.run(executableURL, arguments: arguments).isSuccess
     }
 
     public func models(refreshCache: Bool = false) async -> [ProviderModel] {
-        guard let executableURL else { return [] }
+        await modelsResult(refreshCache: refreshCache).models
+    }
+
+    public func modelsResult(refreshCache: Bool = false) async -> ProviderCatalogResult<ProviderModel> {
+        guard let executableURL else { return .unknown() }
         if kind == .openCode {
             if refreshCache {
                 _ = await Self.run(executableURL, arguments: ["models", "--refresh"])
@@ -69,11 +73,20 @@ public final class StructuredCLIHarness: @unchecked Sendable {
             async let go = Self.run(executableURL, arguments: ["models", "opencode-go", "--verbose"])
             let (freeResult, goResult) = await (free, go)
             let results = [freeResult, goResult]
-            return results.filter { $0.status == 0 }.flatMap { Self.parseOpenCodeModels($0.output) }
+            let successful = results.filter(\.isSuccess)
+            let models = successful.flatMap { Self.parseOpenCodeModels($0.combinedOutput) }
+            let status: ProviderCatalogStatus = if !models.isEmpty {
+                .loaded
+            } else if successful.count == results.count {
+                .empty
+            } else {
+                .failed
+            }
+            return ProviderCatalogResult(models: models, status: status)
         }
         let result = await Self.run(executableURL, arguments: ["models"])
-        guard result.status == 0 else { return [] }
-        return Self.parseModels(result.output, kind: kind)
+        guard result.isSuccess else { return ProviderCatalogResult(models: [], status: .failed) }
+        return ProviderCatalogResult(models: Self.parseModels(result.combinedOutput, kind: kind), succeeded: true)
     }
 
     public static func parseModels(_ data: Data, kind: Kind) -> [ProviderModel] {
@@ -83,19 +96,11 @@ public final class StructuredCLIHarness: @unchecked Sendable {
         }
     }
 
-    private static func run(_ executable: URL, arguments: [String], discardOutput: Bool = false) async -> (status: Int32, output: Data) {
-        await Task.detached {
-            let process = Process(); let pipe = Pipe()
-            process.executableURL = executable; process.arguments = arguments
-            process.standardOutput = discardOutput ? FileHandle.nullDevice : pipe
-            process.standardError = discardOutput ? FileHandle.nullDevice : pipe
-            do {
-                try process.run()
-                let data = discardOutput ? Data() : pipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                return (process.terminationStatus, data)
-            } catch { return (-1, Data()) }
-        }.value
+    private static func run(_ executable: URL, arguments: [String]) async -> BoundedSubprocessResult {
+        await BoundedSubprocess.run(.init(
+            executableURL: executable,
+            arguments: arguments
+        ))
     }
 
     private static func parseGrokModels(_ data: Data) -> [ProviderModel] {

@@ -56,8 +56,10 @@ struct RemoteInstallerScriptPolicyTests {
     @Test func rejectsQueryOrFragmentAdditionOnRedirect() {
         let withQuery = URL(string: "https://x.ai/cli/install.sh?token=1")!
         let withFragment = URL(string: "https://x.ai/cli/install.sh#part")!
+        let withCredentials = URL(string: "https://user:pass@opencode.ai/install")!
         #expect(!RemoteInstallerScriptPolicy.validateRedirect(from: approvedGrok, to: withQuery).isAccepted)
         #expect(!RemoteInstallerScriptPolicy.validateRedirect(from: approvedGrok, to: withFragment).isAccepted)
+        #expect(!RemoteInstallerScriptPolicy.validateRedirect(from: approvedGrok, to: withCredentials).isAccepted)
     }
 
     @Test func validateURLChainWalksEveryHop() {

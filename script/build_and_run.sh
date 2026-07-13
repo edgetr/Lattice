@@ -23,14 +23,61 @@ INFO_PLIST="$APP_CONTENTS/Info.plist"
 ICON_NAME="AppIcon"
 ICON_SOURCE="$ROOT_DIR/Resources/$ICON_NAME.png"
 COMPANION_SOURCE="$ROOT_DIR/Resources/LatticeCompanion.png"
-LOCK_DIR="${TMPDIR:-/tmp}/lattice-build-and-run.lock"
-LOCK_PID_FILE="$LOCK_DIR/pid"
+PACKAGE_STAGING_ROOT=""
+PACKAGE_BACKUP_ROOT=""
+PACKAGE_FINAL_BUNDLE="$APP_BUNDLE"
+PACKAGE_PROMOTION_IN_PROGRESS=0
+LOCK_FILE="${LATTICE_LOCK_FILE:-${TMPDIR:-/tmp}/lattice-build-and-run.lock}"
+LOCK_PID_FILE="$LOCK_FILE"
+LOCK_TOOL="${LATTICE_LOCK_TOOL:-/usr/bin/shlock}"
+LOCK_WAIT_SECONDS="${LATTICE_LOCK_WAIT_SECONDS:-0.2}"
+LOCK_WAIT_LIMIT="${LATTICE_LOCK_WAIT_LIMIT:-600}"
 MANUAL_BUILD="$ROOT_DIR/.build/manual"
 SDK_CANDIDATES=(
   "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+  "/Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk"
   "/Library/Developer/CommandLineTools/SDKs/MacOSX27.sdk"
+  "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk"
+  "/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk"
   "/Library/Developer/CommandLineTools/SDKs/MacOSX15.sdk"
 )
+
+set_bundle_paths() {
+  APP_BUNDLE="$1"
+  APP_CONTENTS="$APP_BUNDLE/Contents"
+  APP_MACOS="$APP_CONTENTS/MacOS"
+  APP_RESOURCES="$APP_CONTENTS/Resources"
+  APP_BINARY="$APP_MACOS/$APP_NAME"
+  INFO_PLIST="$APP_CONTENTS/Info.plist"
+}
+
+path_exists() {
+  [[ -e "$1" || -L "$1" ]]
+}
+
+cleanup_package_artifacts() {
+  if [[ -n "$PACKAGE_BACKUP_ROOT" ]]; then
+    local backup_bundle="$PACKAGE_BACKUP_ROOT/$APP_NAME.app"
+    if path_exists "$backup_bundle"; then
+      if [[ "$PACKAGE_PROMOTION_IN_PROGRESS" -eq 1 ]]; then
+        rm -rf "$PACKAGE_FINAL_BUNDLE"
+      fi
+      if ! path_exists "$PACKAGE_FINAL_BUNDLE"; then
+        mv "$backup_bundle" "$PACKAGE_FINAL_BUNDLE" || true
+      fi
+    fi
+    rm -rf "$PACKAGE_BACKUP_ROOT"
+    PACKAGE_BACKUP_ROOT=""
+    PACKAGE_PROMOTION_IN_PROGRESS=0
+  fi
+
+  if [[ -n "$PACKAGE_STAGING_ROOT" ]]; then
+    rm -rf "$PACKAGE_STAGING_ROOT"
+    PACKAGE_STAGING_ROOT=""
+  fi
+}
+
+set_bundle_paths "$APP_BUNDLE"
 
 usage() {
   cat >&2 <<'USAGE'
@@ -56,39 +103,33 @@ USAGE
 }
 
 acquire_lock() {
+  if [[ ! -x "$LOCK_TOOL" ]]; then
+    echo "Cannot acquire build lock: shlock unavailable at $LOCK_TOOL." >&2
+    return 1
+  fi
+
   local waited=0
-  while ! mkdir "$LOCK_DIR" >/dev/null 2>&1; do
-    if [[ -f "$LOCK_PID_FILE" ]]; then
-      local owner
-      owner="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
-      if [[ -n "$owner" ]] && ! kill -0 "$owner" >/dev/null 2>&1; then
-        rm -rf "$LOCK_DIR"
-        continue
-      fi
-    else
-      sleep 1
-      if [[ ! -f "$LOCK_PID_FILE" ]]; then
-        rm -rf "$LOCK_DIR"
-        continue
-      fi
-    fi
-    sleep 0.2
+  # shlock prepares PID record and publishes it with atomic link(2).
+  # Stale-PID check/removal stays inside same protocol; shell never splits
+  # lock acquisition from PID creation.
+  while ! "$LOCK_TOOL" -f "$LOCK_FILE" -p "$$" >/dev/null 2>&1; do
+    sleep "$LOCK_WAIT_SECONDS"
     waited=$((waited + 1))
-    if [[ "$waited" -ge 600 ]]; then
+    if [[ "$waited" -ge "$LOCK_WAIT_LIMIT" ]]; then
       echo "Timed out waiting for another Lattice build/run task to finish." >&2
-      exit 1
+      return 1
     fi
   done
-  printf '%s\n' "$$" >"$LOCK_PID_FILE"
 }
 
 release_lock() {
   if [[ -f "$LOCK_PID_FILE" ]] && [[ "$(cat "$LOCK_PID_FILE" 2>/dev/null || true)" == "$$" ]]; then
-    rm -rf "$LOCK_DIR"
+    rm -f "$LOCK_FILE"
   fi
 }
 
 on_exit() {
+  cleanup_package_artifacts
   release_lock
 }
 
@@ -120,7 +161,7 @@ build_with_swiftpm() {
   BUILD_BINARY="$(swift build --show-bin-path)/$APP_NAME"
 }
 
-build_manual() {
+build_manual_core() {
   local sdk
   if ! sdk="$(resolve_manual_sdk)"; then
     echo "Lattice requires full Xcode or a complete macOS SDK. Swift Package Manager is unavailable." >&2
@@ -130,11 +171,20 @@ build_manual() {
   rm -rf "$MANUAL_BUILD"
   mkdir -p "$MANUAL_BUILD"
   # shellcheck disable=SC2086
-  swiftc -sdk "$sdk" -target arm64-apple-macosx15.0 -parse-as-library -emit-module -emit-library -static \
+  swiftc -sdk "$sdk" -target arm64-apple-macosx15.0 -parse-as-library -enable-testing \
+    -module-cache-path "$MANUAL_BUILD/module-cache" -emit-module -emit-library -static \
     -module-name LatticeCore "$ROOT_DIR"/Sources/LatticeCore/*.swift \
     -emit-module-path "$MANUAL_BUILD/LatticeCore.swiftmodule" -o "$MANUAL_BUILD/libLatticeCore.a"
+  CORE_BIN_PATH="$MANUAL_BUILD"
+}
+
+build_manual() {
+  build_manual_core
+  local sdk
+  sdk="$(resolve_manual_sdk)"
   # shellcheck disable=SC2086
-  swiftc -sdk "$sdk" -target arm64-apple-macosx15.0 -I "$MANUAL_BUILD" "$MANUAL_BUILD/libLatticeCore.a" -framework Security \
+  swiftc -sdk "$sdk" -target arm64-apple-macosx15.0 -module-cache-path "$MANUAL_BUILD/module-cache" \
+    -I "$MANUAL_BUILD" "$MANUAL_BUILD/libLatticeCore.a" -framework Security \
     "$ROOT_DIR"/Sources/Lattice/*.swift -o "$MANUAL_BUILD/Lattice"
   BUILD_BINARY="$MANUAL_BUILD/Lattice"
 }
@@ -145,17 +195,48 @@ ensure_core_library() {
     CORE_BIN_PATH="$(swift build --show-bin-path)"
     return 0
   fi
-  if [[ ! -f "$MANUAL_BUILD/libLatticeCore.a" || ! -f "$MANUAL_BUILD/LatticeCore.swiftmodule" ]]; then
-    build_manual
+  # Clean every fallback invocation; cache keys can miss source deletions and SDK/toolchain changes.
+  build_manual_core
+}
+
+verify_fallback_test_inventory() {
+  local expected_files=19
+  local expected_tests=266
+  local test_sources=("$ROOT_DIR"/Tests/LatticeCoreTests/*.swift)
+  if [[ ! -e "${test_sources[0]}" ]]; then
+    echo "FAIL: fallback test inventory missing Tests/LatticeCoreTests/*.swift" >&2
+    return 1
   fi
-  CORE_BIN_PATH="$MANUAL_BUILD"
+  if [[ "${#test_sources[@]}" -ne "$expected_files" ]]; then
+    echo "FAIL: fallback/native test-file parity changed (expected $expected_files, found ${#test_sources[@]})" >&2
+    return 1
+  fi
+
+  local test_file test_count total_tests=0
+  for test_file in "${test_sources[@]}"; do
+    if ! /usr/bin/grep -q '^import Testing$' "$test_file"; then
+      echo "FAIL: fallback test inventory found non-Swift-Testing file: $test_file" >&2
+      return 1
+    fi
+    test_count="$(/usr/bin/grep -Ec '^[[:space:]]*@Test(\(|[[:space:]]|$)' "$test_file")"
+    total_tests=$((total_tests + test_count))
+  done
+  if [[ "$total_tests" -ne "$expected_tests" ]]; then
+    echo "FAIL: fallback/native test-declaration parity changed (expected $expected_tests, found $total_tests)" >&2
+    return 1
+  fi
+  if [[ ! -s "$ROOT_DIR/script/verify_core.swift" ]]; then
+    echo "FAIL: fallback verifier missing or empty: script/verify_core.swift" >&2
+    return 1
+  fi
+  echo "Fallback inventory: ${#test_sources[@]} native test files / $total_tests native Swift Testing declarations; native declarations are not executed in fallback mode."
 }
 
 run_tests() {
-  echo "==> Running tests (non-destructive)"
   if have_swiftpm; then
+    echo "==> Running native Swift Testing suite (non-destructive)"
     swift test
-    echo "OK: swift test passed"
+    echo "OK: native Swift Testing suite passed"
     return 0
   fi
 
@@ -165,14 +246,23 @@ run_tests() {
     exit 1
   fi
 
-  echo "==> SwiftPM unavailable; building LatticeCore and running script/verify_core.swift"
+  echo "==> SwiftPM unavailable; running deterministic fallback core verification"
+  echo "    Native Swift Testing suite is not run in fallback mode."
+  verify_fallback_test_inventory
   ensure_core_library
   # shellcheck disable=SC2086
-  swiftc -parse-as-library -sdk "$sdk" -target arm64-apple-macosx15.0 \
+  if ! swiftc -parse-as-library -sdk "$sdk" -target arm64-apple-macosx15.0 \
+    -module-cache-path "$MANUAL_BUILD/module-cache" \
     -I "$CORE_BIN_PATH" "$CORE_BIN_PATH/libLatticeCore.a" \
-    "$ROOT_DIR/script/verify_core.swift" -o "$MANUAL_BUILD/verify_core"
-  "$MANUAL_BUILD/verify_core"
-  echo "OK: verify_core passed (manual core verification path)"
+    "$ROOT_DIR/script/verify_core.swift" -o "$MANUAL_BUILD/verify_core"; then
+    echo "FAIL: fallback verifier compilation failed" >&2
+    return 1
+  fi
+  if ! "$MANUAL_BUILD/verify_core"; then
+    echo "FAIL: fallback core verification failed" >&2
+    return 1
+  fi
+  echo "OK: fallback core verification passed (native Swift Testing suite not run)"
 }
 
 build_binary() {
@@ -188,8 +278,12 @@ build_binary() {
 }
 
 package_app() {
-  echo "==> Packaging $APP_BUNDLE"
-  rm -rf "$APP_BUNDLE"
+  local final_bundle="$APP_BUNDLE"
+  PACKAGE_FINAL_BUNDLE="$final_bundle"
+  mkdir -p "$DIST_DIR"
+  PACKAGE_STAGING_ROOT="$(mktemp -d "$DIST_DIR/.${APP_NAME}.app-staging.XXXXXX")"
+  set_bundle_paths "$PACKAGE_STAGING_ROOT/$APP_NAME.app"
+  echo "==> Packaging $final_bundle (staging: $APP_BUNDLE)"
   mkdir -p "$APP_MACOS" "$APP_RESOURCES"
   cp "$BUILD_BINARY" "$APP_BINARY"
   chmod +x "$APP_BINARY"
@@ -248,6 +342,38 @@ package_app() {
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
+
+  if ! verify_bundle; then
+    echo "FAIL: staged app bundle validation failed; preserving existing $final_bundle" >&2
+    set_bundle_paths "$final_bundle"
+    cleanup_package_artifacts
+    return 1
+  fi
+
+  local backup_root=""
+  if path_exists "$final_bundle"; then
+    backup_root="$(mktemp -d "$DIST_DIR/.${APP_NAME}.app-backup.XXXXXX")"
+    PACKAGE_BACKUP_ROOT="$backup_root"
+    PACKAGE_PROMOTION_IN_PROGRESS=1
+    if ! mv "$final_bundle" "$backup_root/$APP_NAME.app"; then
+      echo "FAIL: could not move existing app into transactional backup" >&2
+      set_bundle_paths "$final_bundle"
+      cleanup_package_artifacts
+      return 1
+    fi
+  fi
+
+  if ! mv "$APP_BUNDLE" "$final_bundle"; then
+    echo "FAIL: could not promote staged app; preserving existing $final_bundle" >&2
+    set_bundle_paths "$final_bundle"
+    cleanup_package_artifacts
+    return 1
+  fi
+
+  set_bundle_paths "$final_bundle"
+  PACKAGE_PROMOTION_IN_PROGRESS=0
+  cleanup_package_artifacts
+  echo "OK: packaged app promoted transactionally to $APP_BUNDLE"
 }
 
 plist_print() {

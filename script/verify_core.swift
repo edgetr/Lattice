@@ -174,7 +174,8 @@ struct CoreVerification {
         let unreadableIO = DurableStoreFileIO(
             fileExists: { _ in true },
             attributesOfItem: { _ in [.size: 4, .modificationDate: Date(timeIntervalSince1970: 42)] },
-            readData: { _ in throw permissionError }
+            readData: { _ in throw permissionError },
+            readDataUpTo: { _, _ in throw permissionError }
         )
         if case .failed(let unreadableIssue) = SessionPersistence(fileURL: corruptURL, io: unreadableIO).loadResult() {
             expect(unreadableIssue.kind == .unreadable, "Permission denial classifies as unreadable")
@@ -185,7 +186,8 @@ struct CoreVerification {
         let inaccessibleIO = DurableStoreFileIO(
             fileExists: { _ in false },
             attributesOfItem: { _ in throw permissionError },
-            readData: { _ in throw permissionError }
+            readData: { _ in throw permissionError },
+            readDataUpTo: { _, _ in throw permissionError }
         )
         if case .failed(let inaccessibleIssue) = SessionPersistence(fileURL: corruptURL, io: inaccessibleIO).loadResult() {
             expect(inaccessibleIssue.kind == .unreadable, "Failed existence probe does not hide permission denial as missing")

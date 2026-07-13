@@ -71,6 +71,28 @@ struct CatalogPresentationPolicyTests {
         #expect(none.secondaryActionTitle == "Refresh")
     }
 
+    @Test func catalogFailureAndValidEmptyStayDistinct() {
+        let failed = ProviderCatalogResult<String>(models: [], succeeded: false)
+        let empty = ProviderCatalogResult<String>(models: [], succeeded: true)
+        #expect(failed.models.isEmpty)
+        #expect(empty.models.isEmpty)
+        #expect(failed.status == .failed)
+        #expect(empty.status == .empty)
+
+        let failedCopy = ProviderReadinessPresentationPolicy.copy(
+            providerName: "Codex",
+            readiness: ProviderReadinessSnapshot(installed: true, authenticated: true, catalogStatus: failed.status, runnableModelCount: 0)
+        )
+        let emptyCopy = ProviderReadinessPresentationPolicy.copy(
+            providerName: "Codex",
+            readiness: ProviderReadinessSnapshot(installed: true, authenticated: true, catalogStatus: empty.status, runnableModelCount: 0)
+        )
+        #expect(failedCopy.detail.contains("catalog unavailable"))
+        #expect(emptyCopy.detail.contains("no Codex models found"))
+        #expect(!failedCopy.isReady)
+        #expect(!emptyCopy.isReady)
+    }
+
     @Test func privacyCopyIsWriteContainedNotConfidentialityContained() {
         let body = LatticeSettingsCopy.privacySecurityBody
         #expect(body.contains("workspace write containment") || body.contains("write containment"))

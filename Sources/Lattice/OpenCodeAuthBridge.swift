@@ -76,7 +76,7 @@ enum OpenCodeAuthBridge {
     static func hasGoCredential() -> Bool {
         switch readAuthRoot(at: authURL) {
         case .success(let root):
-            return root[goProviderKey] != nil
+            return CredentialPresencePolicy.hasOpenCodeGoCredential(in: root)
         case .failure:
             // Malformed file: do not claim a credential is present.
             return false

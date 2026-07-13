@@ -688,6 +688,8 @@ public enum SessionPortableArchiveExporter {
             return "Plan summary"
         case .reasoning:
             return "Reasoning summary"
+        case .diagnostic:
+            return "Provider event diagnostic"
         }
     }
 
