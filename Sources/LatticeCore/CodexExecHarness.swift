@@ -465,8 +465,9 @@ public final class CodexExecHarness: @unchecked Sendable {
             if completed {
                 return .toolProgress(id: id, fraction: 1, detail: item["status"] as? String == "completed" ? "Completed" : "Failed")
             }
-            let paths = (item["changes"] as? [[String: Any]] ?? []).compactMap { $0["path"] as? String }
-            return .toolRequested(.init(id: id, kind: .write, title: "Change files", detail: paths.isEmpty ? "Workspace files" : paths.joined(separator: ", "), workspaceScoped: !paths.isEmpty && paths.allSatisfy { WorkspacePathScope.isWorkspaceScoped($0, workspace: workspace) }, reversible: false))
+            let pathEvidence = (item["changes"] as? [[String: Any]] ?? []).map { $0["path"] as? String }
+            let paths = pathEvidence.compactMap { $0 }
+            return .toolRequested(.init(id: id, kind: .write, title: "Change files", detail: paths.isEmpty ? "Workspace files" : paths.joined(separator: ", "), workspaceScoped: !pathEvidence.isEmpty && pathEvidence.allSatisfy { WorkspacePathScope.isWorkspaceScoped($0, workspace: workspace) }, reversible: false))
         case "webSearch":
             if completed { return .toolProgress(id: id, fraction: 1, detail: "Completed") }
             return .toolRequested(.init(id: id, kind: .network, title: "Search the web", detail: item["query"] as? String ?? "", workspaceScoped: false, reversible: true))

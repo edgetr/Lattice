@@ -80,6 +80,23 @@ struct HermesACPHarnessTests {
         #expect(request.detail == "Sources/App.swift, Tests/AppTests.swift")
     }
 
+    @Test func malformedCodexFileChangePathIsNotDropped() {
+        let workspace = URL(fileURLWithPath: "/tmp/lattice-workspace")
+        let event: [String: Any] = [
+            "method": "item/started",
+            "params": ["item": [
+                "type": "fileChange",
+                "id": "change-1",
+                "changes": [["path": "Sources/App.swift"], ["path": 42]]
+            ]]
+        ]
+        guard case .toolRequested(let request)? = CodexExecHarness.appServerEvent(from: event, workspace: workspace) else {
+            Issue.record("Codex file-change event did not decode")
+            return
+        }
+        #expect(!request.workspaceScoped)
+    }
+
     private func makeWorkspace() throws -> URL {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("lattice-acp-scope-\(UUID().uuidString)", isDirectory: true)
         let workspace = root.appendingPathComponent("workspace", isDirectory: true)
