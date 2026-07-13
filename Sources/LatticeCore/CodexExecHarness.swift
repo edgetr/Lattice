@@ -10,14 +10,16 @@ private enum CodexHarnessError: LocalizedError {
 
 public final class CodexExecHarness: @unchecked Sendable {
     private final class PendingPermission: @unchecked Sendable {
+        enum Decision: Sendable {
+            case selected(String)
+            case cancelled
+        }
+
         let sessionID: UUID
         let requestID: UUID
         let serverRequestID: Any
         let allowedDecisions: Set<String>
-        private let semaphore = DispatchSemaphore(value: 0)
-        private let lock = NSLock()
-        private var decision: String?
-        private var resolved = false
+        private let waiter = PermissionWaiter<Decision>()
 
         init(sessionID: UUID, requestID: UUID, serverRequestID: Any, allowedDecisions: Set<String>) {
             self.sessionID = sessionID
@@ -27,22 +29,24 @@ public final class CodexExecHarness: @unchecked Sendable {
         }
 
         func resolve(_ decision: String?) -> Bool {
-            lock.lock(); defer { lock.unlock() }
-            guard !resolved, decision == nil || allowedDecisions.contains(decision!) else { return false }
-            self.decision = decision
-            resolved = true
-            semaphore.signal()
-            return true
+            if let decision {
+                guard allowedDecisions.contains(decision) else { return false }
+                return waiter.resolve(.selected(decision))
+            }
+            return waiter.resolve(.cancelled)
         }
 
-        func wait() -> String {
-            semaphore.wait()
-            lock.lock(); defer { lock.unlock() }
-            return decision ?? "cancel"
+        func wait(timeoutNanoseconds: UInt64) async -> PermissionWaitResult<Decision> {
+            await withTaskCancellationHandler(operation: {
+                await waiter.wait(timeoutNanoseconds: timeoutNanoseconds)
+            }, onCancel: {
+                _ = waiter.resolve(.cancelled)
+            })
         }
     }
 
     private let executableURL: URL?
+    private let permissionTimeoutNanoseconds: UInt64
     private let lock = NSLock()
     private var processes: [UUID: Process] = [:]
     private var inputs: [UUID: FileHandle] = [:]
@@ -51,8 +55,9 @@ public final class CodexExecHarness: @unchecked Sendable {
     private var pendingPermissions: [UUID: PendingPermission] = [:]
     private var cancelled: Set<UUID> = []
 
-    public init(executableURL: URL? = ExecutableDiscovery.locate("codex")) {
+    public init(executableURL: URL? = ExecutableDiscovery.locate("codex"), permissionTimeout: TimeInterval = 120) {
         self.executableURL = executableURL
+        self.permissionTimeoutNanoseconds = PermissionTimeout.nanoseconds(for: permissionTimeout)
     }
 
     public var isInstalled: Bool { executableURL != nil }
@@ -144,7 +149,7 @@ public final class CodexExecHarness: @unchecked Sendable {
                     try process.run()
                     register(process: process, input: input.fileHandleForWriting, for: sessionID)
                     try Self.write(Self.initializeRequest(id: 1), to: input.fileHandleForWriting)
-                    _ = try readResponse(id: 1, sessionID: sessionID, from: output.fileHandleForReading, input: input.fileHandleForWriting, continuation: continuation)
+                    _ = try await readResponse(id: 1, sessionID: sessionID, from: output.fileHandleForReading, input: input.fileHandleForWriting, continuation: continuation)
                     try Self.write(["method": "initialized", "params": [:]], to: input.fileHandleForWriting)
 
                     let route = Self.executionRoute(policy: policy, workspaceWrite: workspaceWrite)
@@ -160,7 +165,7 @@ public final class CodexExecHarness: @unchecked Sendable {
                     ]
                     if let threadID { threadParams["threadId"] = threadID }
                     try Self.write(["method": method, "id": 2, "params": threadParams], to: input.fileHandleForWriting)
-                    let threadResponse = try readResponse(id: 2, sessionID: sessionID, from: output.fileHandleForReading, input: input.fileHandleForWriting, continuation: continuation)
+                    let threadResponse = try await readResponse(id: 2, sessionID: sessionID, from: output.fileHandleForReading, input: input.fileHandleForWriting, continuation: continuation)
                     guard let result = threadResponse["result"] as? [String: Any],
                           let thread = result["thread"] as? [String: Any],
                           let activeThreadID = thread["id"] as? String else {
@@ -183,14 +188,14 @@ public final class CodexExecHarness: @unchecked Sendable {
                         turnParams["summary"] = "auto"
                     }
                     try Self.write(["method": "turn/start", "id": 3, "params": turnParams], to: input.fileHandleForWriting)
-                    let turnResponse = try readResponse(id: 3, sessionID: sessionID, from: output.fileHandleForReading, input: input.fileHandleForWriting, continuation: continuation)
+                    let turnResponse = try await readResponse(id: 3, sessionID: sessionID, from: output.fileHandleForReading, input: input.fileHandleForWriting, continuation: continuation)
                     guard let turnResult = turnResponse["result"] as? [String: Any],
                           let turn = turnResult["turn"] as? [String: Any],
                           let turnID = turn["id"] as? String else {
                         throw CodexHarnessError.message(Self.responseError(turnResponse, fallback: "Codex did not start the turn."))
                     }
                     setTurnID(turnID, for: sessionID)
-                    let turnReportedCancellation = try readTurn(sessionID: sessionID, workspace: workspace, from: output.fileHandleForReading, input: input.fileHandleForWriting, continuation: continuation)
+                    let turnReportedCancellation = try await readTurn(sessionID: sessionID, workspace: workspace, from: output.fileHandleForReading, input: input.fileHandleForWriting, continuation: continuation)
                     if process.isRunning { process.terminate() }
                     process.waitUntilExit()
                     let didCancel = unregister(sessionID)
@@ -250,11 +255,23 @@ public final class CodexExecHarness: @unchecked Sendable {
         lock.lock(); turnIDs[id] = turnID; lock.unlock()
     }
 
+    private func register(_ pending: PendingPermission) {
+        lock.lock(); pendingPermissions[pending.requestID] = pending; lock.unlock()
+    }
+
+    private func removePendingPermission(_ requestID: UUID) {
+        lock.lock(); pendingPermissions[requestID] = nil; lock.unlock()
+    }
+
     private func unregister(_ id: UUID) -> Bool {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
+        let pending = pendingPermissions.values.filter { $0.sessionID == id }
         processes[id] = nil; inputs[id] = nil; threadIDs[id] = nil; turnIDs[id] = nil
         pendingPermissions = pendingPermissions.filter { $0.value.sessionID != id }
-        return cancelled.remove(id) != nil
+        let didCancel = cancelled.remove(id) != nil
+        lock.unlock()
+        pending.forEach { _ = $0.resolve(nil) }
+        return didCancel
     }
 
     private static func initializeRequest(id: Int) -> [String: Any] {
@@ -278,11 +295,11 @@ public final class CodexExecHarness: @unchecked Sendable {
         from output: FileHandle,
         input: FileHandle,
         continuation: AsyncStream<AgentEvent>.Continuation
-    ) throws -> [String: Any] {
+    ) async throws -> [String: Any] {
         while let object = try Self.readObject(from: output) {
             if object["method"] != nil {
                 if object["id"] != nil {
-                    try handleServerRequest(object, sessionID: sessionID, workspace: nil, input: input, continuation: continuation)
+                    try await handleServerRequest(object, sessionID: sessionID, workspace: nil, input: input, continuation: continuation)
                 }
                 continue
             }
@@ -300,10 +317,10 @@ public final class CodexExecHarness: @unchecked Sendable {
         from output: FileHandle,
         input: FileHandle,
         continuation: AsyncStream<AgentEvent>.Continuation
-    ) throws -> Bool {
+    ) async throws -> Bool {
         while let object = try Self.readObject(from: output) {
             if object["id"] != nil, object["method"] != nil {
-                try handleServerRequest(object, sessionID: sessionID, workspace: workspace, input: input, continuation: continuation)
+                try await handleServerRequest(object, sessionID: sessionID, workspace: workspace, input: input, continuation: continuation)
                 continue
             }
             guard let method = object["method"] as? String else { continue }
@@ -329,7 +346,7 @@ public final class CodexExecHarness: @unchecked Sendable {
         workspace: URL?,
         input: FileHandle,
         continuation: AsyncStream<AgentEvent>.Continuation
-    ) throws {
+    ) async throws {
         guard let serverID = object["id"], let method = object["method"] as? String else { return }
         guard let workspace,
               ["item/commandExecution/requestApproval", "item/fileChange/requestApproval"].contains(method),
@@ -339,11 +356,19 @@ public final class CodexExecHarness: @unchecked Sendable {
         }
         let decisions = Set(request.options.map(\.id)).union(["cancel"])
         let pending = PendingPermission(sessionID: sessionID, requestID: request.id, serverRequestID: serverID, allowedDecisions: decisions)
-        lock.lock(); pendingPermissions[request.id] = pending; lock.unlock()
+        register(pending)
         continuation.yield(.permissionRequested(request))
-        let decision = pending.wait()
-        lock.lock(); pendingPermissions[request.id] = nil; lock.unlock()
-        try Self.write(["id": pending.serverRequestID, "result": ["decision": decision]], to: input)
+        let result = await pending.wait(timeoutNanoseconds: permissionTimeoutNanoseconds)
+        removePendingPermission(request.id)
+        switch result {
+        case .resolved(.selected(let decision)):
+            try Self.write(["id": pending.serverRequestID, "result": ["decision": decision]], to: input)
+        case .resolved(.cancelled):
+            try Self.write(["id": pending.serverRequestID, "result": ["decision": "cancel"]], to: input)
+        case .timedOut:
+            try? Self.write(["id": pending.serverRequestID, "result": ["decision": "cancel"]], to: input)
+            throw CodexHarnessError.message(PermissionTimeout.message)
+        }
     }
 
     public static func appServerPermissionRequest(from object: [String: Any], workspace: URL) -> ApprovalRequest? {

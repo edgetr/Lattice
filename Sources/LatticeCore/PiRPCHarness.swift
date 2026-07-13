@@ -2,13 +2,11 @@ import Foundation
 
 public final class PiRPCHarness: @unchecked Sendable {
     private final class PendingPermission: @unchecked Sendable {
-        enum Decision { case selected(String), cancelled }
+        enum Decision: Sendable { case selected(String), cancelled }
 
         let sessionID: UUID
         let requestID: UUID
-        private let semaphore = DispatchSemaphore(value: 0)
-        private let lock = NSLock()
-        private var decision: Decision?
+        private let waiter = PermissionWaiter<Decision>()
 
         init(sessionID: UUID, requestID: UUID) {
             self.sessionID = sessionID
@@ -17,23 +15,23 @@ public final class PiRPCHarness: @unchecked Sendable {
 
         @discardableResult
         func resolve(optionID: String?) -> Bool {
-            lock.lock(); defer { lock.unlock() }
-            guard decision == nil else { return false }
-            decision = optionID.map(Decision.selected) ?? .cancelled
-            semaphore.signal()
-            return true
+            waiter.resolve(optionID.map(Decision.selected) ?? .cancelled)
         }
 
-        func wait() -> Decision {
-            semaphore.wait()
-            lock.lock(); defer { lock.unlock() }
-            return decision ?? .cancelled
+        func wait(timeoutNanoseconds: UInt64) async -> PermissionWaitResult<Decision> {
+            await withTaskCancellationHandler(operation: {
+                await waiter.wait(timeoutNanoseconds: timeoutNanoseconds)
+            }, onCancel: {
+                _ = waiter.resolve(.cancelled)
+            })
         }
     }
 
     private let executableURL: URL?
     private let permissionExtensionURL: URL?
     private let sandboxExecutableURL: URL?
+    private let applicationSupportDirectory: URL?
+    private let permissionTimeoutNanoseconds: UInt64
     private let lock = NSLock()
     private var processes: [UUID: Process] = [:]
     private var inputs: [UUID: FileHandle] = [:]
@@ -43,11 +41,15 @@ public final class PiRPCHarness: @unchecked Sendable {
     public init(
         executableURL: URL? = ExecutableDiscovery.locate("pi"),
         permissionExtensionURL: URL? = nil,
-        sandboxExecutableURL: URL? = HarnessSandbox.systemExecutableURL
+        sandboxExecutableURL: URL? = HarnessSandbox.systemExecutableURL,
+        permissionTimeout: TimeInterval = 120,
+        applicationSupportDirectory: URL? = nil
     ) {
         self.executableURL = executableURL
         self.permissionExtensionURL = permissionExtensionURL
         self.sandboxExecutableURL = sandboxExecutableURL
+        self.permissionTimeoutNanoseconds = PermissionTimeout.nanoseconds(for: permissionTimeout)
+        self.applicationSupportDirectory = applicationSupportDirectory
     }
 
     public var isInstalled: Bool { executableURL != nil }
@@ -66,8 +68,8 @@ public final class PiRPCHarness: @unchecked Sendable {
                 process.standardError = FileHandle.nullDevice
                 let tools = allowFileModification ? "read,grep,find,ls,write,edit,bash" : "read,grep,find,ls"
                 let piThreadID = Self.piThreadID(from: threadID) ?? UUID().uuidString.lowercased()
-                let sessionDirectory = Self.sessionDirectory()
-                let scratchDirectory = Self.scratchDirectory(for: sessionID)
+                let sessionDirectory = sessionDirectory()
+                let scratchDirectory = scratchDirectory(for: sessionID)
                 do {
                     try FileManager.default.createDirectory(at: sessionDirectory, withIntermediateDirectories: true)
                     try FileManager.default.createDirectory(at: scratchDirectory, withIntermediateDirectories: true)
@@ -103,7 +105,7 @@ public final class PiRPCHarness: @unchecked Sendable {
                     var finished = false
                     while !finished {
                         guard let line = try Self.readLine(from: output.fileHandleForReading) else { break }
-                        finished = try parse(line, sessionID: sessionID, workspace: canonicalWorkspace, input: input.fileHandleForWriting, continuation: continuation)
+                        finished = try await parse(line, sessionID: sessionID, workspace: canonicalWorkspace, input: input.fileHandleForWriting, continuation: continuation)
                     }
                     if process.isRunning { process.terminate() }
                     process.waitUntilExit()
@@ -111,8 +113,9 @@ public final class PiRPCHarness: @unchecked Sendable {
                     if didCancel { continuation.yield(.cancelled) }
                     else if !finished { continuation.yield(.failed("Pi ended before completing the response.")) }
                 } catch {
+                    if process.isRunning { process.terminate() }
                     _ = unregister(sessionID)
-                    continuation.yield(.failed(error.localizedDescription))
+                    continuation.yield(.failed((error as? PiHarnessError)?.text ?? error.localizedDescription))
                 }
                 try? FileManager.default.removeItem(at: scratchDirectory)
                 continuation.finish()
@@ -140,10 +143,10 @@ public final class PiRPCHarness: @unchecked Sendable {
         return pending?.resolve(optionID: optionID) == true
     }
 
-    private func parse(_ data: Data, sessionID: UUID, workspace: URL, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) throws -> Bool {
+    private func parse(_ data: Data, sessionID: UUID, workspace: URL, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) async throws -> Bool {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let type = object["type"] as? String else { return false }
         if type == "extension_ui_request" {
-            try handleExtensionUIRequest(object, sessionID: sessionID, workspace: workspace, input: input, continuation: continuation)
+            try await handleExtensionUIRequest(object, sessionID: sessionID, workspace: workspace, input: input, continuation: continuation)
             return false
         }
         if type == "extension_error" {
@@ -183,14 +186,26 @@ public final class PiRPCHarness: @unchecked Sendable {
         lock.lock(); processes[id] = process; inputs[id] = input; lock.unlock()
     }
 
-    private func unregister(_ id: UUID) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        processes[id] = nil; inputs[id] = nil
-        pendingPermissions = pendingPermissions.filter { $0.value.sessionID != id }
-        return cancelled.remove(id) != nil
+    private func register(_ pending: PendingPermission) {
+        lock.lock(); pendingPermissions[pending.requestID] = pending; lock.unlock()
     }
 
-    private func handleExtensionUIRequest(_ object: [String: Any], sessionID: UUID, workspace: URL, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) throws {
+    private func removePendingPermission(_ requestID: UUID) {
+        lock.lock(); pendingPermissions[requestID] = nil; lock.unlock()
+    }
+
+    private func unregister(_ id: UUID) -> Bool {
+        lock.lock()
+        let pending = pendingPermissions.values.filter { $0.sessionID == id }
+        processes[id] = nil; inputs[id] = nil
+        pendingPermissions = pendingPermissions.filter { $0.value.sessionID != id }
+        let didCancel = cancelled.remove(id) != nil
+        lock.unlock()
+        pending.forEach { _ = $0.resolve(optionID: nil) }
+        return didCancel
+    }
+
+    private func handleExtensionUIRequest(_ object: [String: Any], sessionID: UUID, workspace: URL, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) async throws {
         guard let externalID = object["id"] as? String else { return }
         guard object["method"] as? String == "confirm",
               let request = Self.permissionRequest(from: object, workspace: workspace) else {
@@ -198,17 +213,20 @@ public final class PiRPCHarness: @unchecked Sendable {
             return
         }
         let pending = PendingPermission(sessionID: sessionID, requestID: request.id)
-        lock.lock(); pendingPermissions[request.id] = pending; lock.unlock()
+        register(pending)
         continuation.yield(.permissionRequested(request))
-        let decision = pending.wait()
-        lock.lock(); pendingPermissions[request.id] = nil; lock.unlock()
-        switch decision {
-        case .selected("allow_once"):
+        let result = await pending.wait(timeoutNanoseconds: permissionTimeoutNanoseconds)
+        removePendingPermission(request.id)
+        switch result {
+        case .resolved(.selected("allow_once")):
             try Self.write(["type": "extension_ui_response", "id": externalID, "confirmed": true], to: input)
-        case .selected:
+        case .resolved(.selected):
             try Self.write(["type": "extension_ui_response", "id": externalID, "confirmed": false], to: input)
-        case .cancelled:
+        case .resolved(.cancelled):
             try Self.write(["type": "extension_ui_response", "id": externalID, "cancelled": true], to: input)
+        case .timedOut:
+            try? Self.write(["type": "extension_ui_response", "id": externalID, "cancelled": true], to: input)
+            throw PiHarnessError.permissionTimedOut
         }
     }
 
@@ -216,6 +234,16 @@ public final class PiRPCHarness: @unchecked Sendable {
         lock.lock(); let pending = pendingPermissions.values.filter { $0.sessionID == sessionID }; lock.unlock()
         pending.forEach { $0.resolve(optionID: nil) }
         return !pending.isEmpty
+    }
+
+    private enum PiHarnessError: Error {
+        case permissionTimedOut
+
+        var text: String {
+            switch self {
+            case .permissionTimedOut: PermissionTimeout.message
+            }
+        }
     }
 
     public static func permissionRequest(from object: [String: Any], workspace: URL) -> ApprovalRequest? {
@@ -317,9 +345,16 @@ public final class PiRPCHarness: @unchecked Sendable {
         return id.isEmpty ? nil : id
     }
 
-    private static func sessionDirectory() -> URL {
+    private func productRootURL() -> URL {
+        if let applicationSupportDirectory {
+            return applicationSupportDirectory.appendingPathComponent(LatticeApplicationSupport.productFolderName, isDirectory: true)
+        }
         LatticeApplicationSupport.migrateLegacyProductDataIfNeeded()
-        return LatticeApplicationSupport.productRootURL().appendingPathComponent("HarnessSessions/Pi", isDirectory: true)
+        return LatticeApplicationSupport.productRootURL()
+    }
+
+    private func sessionDirectory() -> URL {
+        productRootURL().appendingPathComponent("HarnessSessions/Pi", isDirectory: true)
     }
 
     private static func supportDirectory() -> URL {
@@ -327,9 +362,8 @@ public final class PiRPCHarness: @unchecked Sendable {
         return LatticeApplicationSupport.productRootURL().appendingPathComponent("HarnessSupport/Pi", isDirectory: true)
     }
 
-    private static func scratchDirectory(for sessionID: UUID) -> URL {
-        LatticeApplicationSupport.migrateLegacyProductDataIfNeeded()
-        return LatticeApplicationSupport.productRootURL().appendingPathComponent("HarnessScratch/Pi/\(sessionID.uuidString.lowercased())", isDirectory: true)
+    private func scratchDirectory(for sessionID: UUID) -> URL {
+        productRootURL().appendingPathComponent("HarnessScratch/Pi/\(sessionID.uuidString.lowercased())", isDirectory: true)
     }
 
     private static func piSettingsLockURL() -> URL {

@@ -77,14 +77,12 @@ public final class ACPHarness: @unchecked Sendable {
     }
 
     private final class PendingPermission: @unchecked Sendable {
-        enum Decision { case selected(String), cancelled }
+        enum Decision: Sendable { case selected(String), cancelled }
 
         let sessionID: UUID
         let requestID: UUID
         let optionIDs: Set<String>
-        private let semaphore = DispatchSemaphore(value: 0)
-        private let lock = NSLock()
-        private var decision: Decision?
+        private let waiter = PermissionWaiter<Decision>()
 
         init(sessionID: UUID, requestID: UUID, optionIDs: Set<String>) {
             self.sessionID = sessionID
@@ -94,29 +92,26 @@ public final class ACPHarness: @unchecked Sendable {
 
         @discardableResult
         func resolve(optionID: String?) -> Bool {
-            lock.lock()
-            guard decision == nil else { lock.unlock(); return false }
             if let optionID {
-                guard optionIDs.contains(optionID) else { lock.unlock(); return false }
-                decision = .selected(optionID)
-            } else {
-                decision = .cancelled
+                guard optionIDs.contains(optionID) else { return false }
+                return waiter.resolve(.selected(optionID))
             }
-            lock.unlock()
-            semaphore.signal()
-            return true
+            return waiter.resolve(.cancelled)
         }
 
-        func wait() -> Decision {
-            semaphore.wait()
-            lock.lock(); defer { lock.unlock() }
-            return decision ?? .cancelled
+        func wait(timeoutNanoseconds: UInt64) async -> PermissionWaitResult<Decision> {
+            await withTaskCancellationHandler(operation: {
+                await waiter.wait(timeoutNanoseconds: timeoutNanoseconds)
+            }, onCancel: {
+                _ = waiter.resolve(.cancelled)
+            })
         }
     }
 
     private let executableURL: URL?
     private let sandboxExecutableURL: URL?
     private let profile: Profile
+    private let permissionTimeoutNanoseconds: UInt64
     private let lock = NSLock()
     private var processes: [UUID: Process] = [:]
     private var inputs: [UUID: FileHandle] = [:]
@@ -127,11 +122,13 @@ public final class ACPHarness: @unchecked Sendable {
     public init(
         profile: Profile = .hermes,
         executableURL: URL? = nil,
-        sandboxExecutableURL: URL? = HarnessSandbox.systemExecutableURL
+        sandboxExecutableURL: URL? = HarnessSandbox.systemExecutableURL,
+        permissionTimeout: TimeInterval = 120
     ) {
         self.profile = profile
         self.executableURL = executableURL ?? ExecutableDiscovery.locate(profile.executableName)
         self.sandboxExecutableURL = sandboxExecutableURL
+        self.permissionTimeoutNanoseconds = PermissionTimeout.nanoseconds(for: permissionTimeout)
     }
 
     public var isInstalled: Bool { executableURL != nil }
@@ -269,7 +266,7 @@ public final class ACPHarness: @unchecked Sendable {
 
                     sessionRequestID += 1
                     try Self.write(["jsonrpc": "2.0", "id": sessionRequestID, "method": "session/prompt", "params": ["sessionId": acpID, "prompt": [["type": "text", "text": prompt]]]], to: input.fileHandleForWriting)
-                    try readPromptResponse(id: sessionRequestID, sessionID: sessionID, workspace: canonicalWorkspace, allowFileModification: allowFileModification, from: reader, input: input.fileHandleForWriting, continuation: continuation)
+                    try await readPromptResponse(id: sessionRequestID, sessionID: sessionID, workspace: canonicalWorkspace, allowFileModification: allowFileModification, from: reader, input: input.fileHandleForWriting, continuation: continuation)
                     if process.isRunning { process.terminate() }
                     process.waitUntilExit()
                     let didCancel = unregister(sessionID)
@@ -422,10 +419,14 @@ public final class ACPHarness: @unchecked Sendable {
     }
 
     private func unregister(_ id: UUID) -> Bool {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
+        let pending = pendingPermissions.values.filter { $0.sessionID == id }
         processes[id] = nil; inputs[id] = nil; acpSessionIDs[id] = nil
         pendingPermissions = pendingPermissions.filter { $0.value.sessionID != id }
-        return cancelled.remove(id) != nil
+        let didCancel = cancelled.remove(id) != nil
+        lock.unlock()
+        pending.forEach { _ = $0.resolve(optionID: nil) }
+        return didCancel
     }
 
     private func register(_ pending: PendingPermission) {
@@ -474,7 +475,7 @@ public final class ACPHarness: @unchecked Sendable {
         }
     }
 
-    private func readPromptResponse(id: Int, sessionID: UUID, workspace: URL, allowFileModification: Bool, from reader: JSONLineReader, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) throws {
+    private func readPromptResponse(id: Int, sessionID: UUID, workspace: URL, allowFileModification: Bool, from reader: JSONLineReader, input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) async throws {
         while let object = try reader.next() {
             if object["method"] as? String == "session/update" {
                 let update = ((object["params"] as? [String: Any])?["update"] as? [String: Any])
@@ -487,7 +488,7 @@ public final class ACPHarness: @unchecked Sendable {
                 }
                 continue
             }
-            if object["method"] != nil { try answerServerRequest(object, sessionID: sessionID, workspace: workspace, allowFileModification: allowFileModification, to: input, continuation: continuation); continue }
+            if object["method"] != nil { try await answerServerRequest(object, sessionID: sessionID, workspace: workspace, allowFileModification: allowFileModification, to: input, continuation: continuation); continue }
             if (object["id"] as? NSNumber)?.intValue == id {
                 if let error = object["error"] as? [String: Any] { throw HarnessError.message(error["message"] as? String ?? "Hermes prompt failed.") }
                 return
@@ -496,7 +497,7 @@ public final class ACPHarness: @unchecked Sendable {
         throw HarnessError.message("ACP agent ended before completing the response.")
     }
 
-    private func answerServerRequest(_ object: [String: Any], sessionID: UUID, workspace: URL, allowFileModification: Bool, to input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) throws {
+    private func answerServerRequest(_ object: [String: Any], sessionID: UUID, workspace: URL, allowFileModification: Bool, to input: FileHandle, continuation: AsyncStream<AgentEvent>.Continuation) async throws {
         guard let id = object["id"], let method = object["method"] as? String else { return }
         guard method == "session/request_permission", let request = Self.permissionRequest(from: object, workspace: workspace) else {
             try Self.write(["jsonrpc": "2.0", "id": id, "error": ["code": -32601, "message": "Unsupported client request: \(method)"]], to: input)
@@ -509,12 +510,18 @@ public final class ACPHarness: @unchecked Sendable {
         let pending = PendingPermission(sessionID: sessionID, requestID: request.id, optionIDs: Set(request.options.map(\.id)))
         register(pending)
         continuation.yield(.permissionRequested(request))
-        let decision = pending.wait()
+        let result = await pending.wait(timeoutNanoseconds: permissionTimeoutNanoseconds)
         removePendingPermission(request.id)
         let outcome: [String: Any]
-        switch decision {
-        case .selected(let optionID): outcome = ["outcome": "selected", "optionId": optionID]
-        case .cancelled: outcome = ["outcome": "cancelled"]
+        switch result {
+        case .resolved(.selected(let optionID)):
+            outcome = ["outcome": "selected", "optionId": optionID]
+        case .resolved(.cancelled):
+            outcome = ["outcome": "cancelled"]
+        case .timedOut:
+            outcome = ["outcome": "cancelled"]
+            try? Self.write(["jsonrpc": "2.0", "id": id, "result": ["outcome": outcome]], to: input)
+            throw HarnessError.message(PermissionTimeout.message)
         }
         try Self.write(["jsonrpc": "2.0", "id": id, "result": ["outcome": outcome]], to: input)
     }
