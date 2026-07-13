@@ -580,10 +580,10 @@ public final class ACPHarness: @unchecked Sendable {
             outcome = ["outcome": "cancelled"]
         case .timedOut:
             outcome = ["outcome": "cancelled"]
-            try? Self.write(["jsonrpc": "2.0", "id": id, "result": ["outcome": outcome]], to: transport)
+            try? Self.writeControl(["jsonrpc": "2.0", "id": id, "result": ["outcome": outcome]], to: transport)
             throw HarnessError.message(PermissionTimeout.message)
         }
-        try Self.write(["jsonrpc": "2.0", "id": id, "result": ["outcome": outcome]], to: transport)
+        try Self.writeControl(["jsonrpc": "2.0", "id": id, "result": ["outcome": outcome]], to: transport)
     }
 
     public static func permissionRequest(from object: [String: Any], workspace: URL? = nil) -> ApprovalRequest? {
@@ -697,6 +697,12 @@ public final class ACPHarness: @unchecked Sendable {
         guard let transport else { return }
         var data = try JSONSerialization.data(withJSONObject: object, options: [.withoutEscapingSlashes]); data.append(0x0A)
         try transport.write(data)
+    }
+
+
+    private static func writeControl(_ object: [String: Any], to transport: BoundedProcessTransport) throws {
+        var data = try JSONSerialization.data(withJSONObject: object, options: [.withoutEscapingSlashes]); data.append(0x0A)
+        try transport.writeControl(data)
     }
 
     private static func result(from response: [String: Any]) -> [String: Any]? {

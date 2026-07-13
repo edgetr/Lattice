@@ -166,10 +166,21 @@ public final class BoundedProcessTransport: @unchecked Sendable {
     }
 
     public func write(_ data: Data) throws {
+        try write(data, allowingCancellation: false)
+    }
+
+    /// Writes a final protocol-control frame during the bounded cancellation grace period.
+    /// Use only for cancellation/denial acknowledgements, never for new work.
+    public func writeControl(_ data: Data) throws {
+        try write(data, allowingCancellation: true)
+    }
+
+    private func write(_ data: Data, allowingCancellation: Bool) throws {
         guard !data.isEmpty else { return }
         writeLock.lock()
         defer { writeLock.unlock() }
-        if let reason = terminationReason {
+        if let reason = terminationReason,
+           !(allowingCancellation && reason == .cancelled) {
             throw error(for: reason)
         }
         do {
@@ -259,7 +270,12 @@ public final class BoundedProcessTransport: @unchecked Sendable {
 
     private func readChunkFromPipe(maxLength: Int) throws -> Data? {
         do {
-            let data = try output.read(upToCount: maxLength) ?? Data()
+            // `read(upToCount:)` may wait for the requested byte count while an
+            // interactive child remains alive. `availableData` returns as soon as
+            // the pipe has bytes, which is required for request/response protocols.
+            // A pipe read is kernel-bounded; the aggregate cap is enforced below.
+            _ = maxLength
+            let data = output.availableData
             if data.isEmpty { return nil }
             try recordOutput(data.count)
             return data

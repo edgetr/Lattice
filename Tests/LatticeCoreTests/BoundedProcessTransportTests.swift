@@ -133,6 +133,28 @@ struct BoundedProcessTransportTests {
         #expect(line == "round-trip")
     }
 
+    @Test func interactiveReadReturnsBeforeChildExits() async {
+        let line = await BoundedSubprocess.performOffCooperativeExecutor { () -> String? in
+            let transport = BoundedProcessTransport(request: .init(
+                executableURL: self.shell,
+                arguments: ["-c", "IFS= read -r first; printf 'ack:%s\\n' \"$first\"; IFS= read -r second"],
+                deadline: 2,
+                maximumOutputBytes: 1024
+            ))
+            do {
+                try transport.start()
+                try transport.write(Data("request\n".utf8))
+                let data = try transport.readLine()
+                transport.cancel()
+                return data.map { String(decoding: $0, as: UTF8.self) }
+            } catch {
+                transport.cancel()
+                return nil
+            }
+        }
+        #expect(line == "ack:request")
+    }
+
     @Test func fastExitRetainsBufferedOutputWithoutFalseLaunchFailure() async {
         let result = await BoundedSubprocess.performOffCooperativeExecutor { () -> (String?, Int32?) in
             let transport = BoundedProcessTransport(request: .init(

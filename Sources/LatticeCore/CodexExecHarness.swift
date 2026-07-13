@@ -392,11 +392,11 @@ public final class CodexExecHarness: @unchecked Sendable {
         removePendingPermission(request.id, owner: owner, sessionID: sessionID)
         switch result {
         case .resolved(.selected(let decision)):
-            try Self.write(["id": pending.serverRequestID, "result": ["decision": decision]], to: transport)
+            try Self.writeControl(["id": pending.serverRequestID, "result": ["decision": decision]], to: transport)
         case .resolved(.cancelled):
-            try Self.write(["id": pending.serverRequestID, "result": ["decision": "cancel"]], to: transport)
+            try Self.writeControl(["id": pending.serverRequestID, "result": ["decision": "cancel"]], to: transport)
         case .timedOut:
-            try? Self.write(["id": pending.serverRequestID, "result": ["decision": "cancel"]], to: transport)
+            try? Self.writeControl(["id": pending.serverRequestID, "result": ["decision": "cancel"]], to: transport)
             throw CodexHarnessError.message(PermissionTimeout.message)
         }
     }
@@ -555,6 +555,12 @@ public final class CodexExecHarness: @unchecked Sendable {
         var data = try JSONSerialization.data(withJSONObject: object)
         data.append(0x0A)
         try transport.write(data)
+    }
+
+    private static func writeControl(_ object: [String: Any], to transport: BoundedProcessTransport) throws {
+        var data = try JSONSerialization.data(withJSONObject: object)
+        data.append(0x0A)
+        try transport.writeControl(data)
     }
 
     fileprivate static func parseModels(_ response: [String: Any]) -> [ProviderModel] {

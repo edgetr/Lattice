@@ -814,7 +814,7 @@ struct CoreVerification {
             codexCatalogKnown: true,
             codexInstalled: true
         )
-        expect(BackendAvailabilityPolicy.normalize(.codex(model: ""), using: discoveredCatalog) == .codex(model: "gpt-discovered"), "Discovered Codex catalog replaces empty selection with preferred model")
+        expect(BackendAvailabilityPolicy.normalize(.codex(model: ""), using: discoveredCatalog) == .codex(model: ""), "Discovered Codex catalog preserves the explicit no-model selection")
         expect(BackendAvailabilityPolicy.normalize(.codex(model: "retired"), using: discoveredCatalog) == .codex(model: "gpt-discovered"), "Discovered Codex catalog replaces stale selection with preferred model")
         expect(BackendAvailabilityPolicy.normalize(.codex(model: "gpt-other"), using: discoveredCatalog) == .codex(model: "gpt-other"), "Discovered Codex catalog preserves known membership without version heuristics")
         let disconnectedCloud = BackendAvailabilitySnapshot(

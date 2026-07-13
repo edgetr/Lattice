@@ -276,13 +276,13 @@ public final class PiRPCHarness: @unchecked Sendable {
         removePendingPermission(request.id, owner: owner, sessionID: sessionID)
         switch result {
         case .resolved(.selected("allow_once")):
-            try Self.write(["type": "extension_ui_response", "id": externalID, "confirmed": true], to: transport)
+            try Self.writeControl(["type": "extension_ui_response", "id": externalID, "confirmed": true], to: transport)
         case .resolved(.selected):
-            try Self.write(["type": "extension_ui_response", "id": externalID, "confirmed": false], to: transport)
+            try Self.writeControl(["type": "extension_ui_response", "id": externalID, "confirmed": false], to: transport)
         case .resolved(.cancelled):
-            try Self.write(["type": "extension_ui_response", "id": externalID, "cancelled": true], to: transport)
+            try Self.writeControl(["type": "extension_ui_response", "id": externalID, "cancelled": true], to: transport)
         case .timedOut:
-            try? Self.write(["type": "extension_ui_response", "id": externalID, "cancelled": true], to: transport)
+            try? Self.writeControl(["type": "extension_ui_response", "id": externalID, "cancelled": true], to: transport)
             throw PiHarnessError.permissionTimedOut
         }
     }
@@ -367,6 +367,12 @@ public final class PiRPCHarness: @unchecked Sendable {
         var data = try JSONSerialization.data(withJSONObject: object)
         data.append(0x0A)
         try transport.write(data)
+    }
+
+    private static func writeControl(_ object: [String: Any], to transport: BoundedProcessTransport) throws {
+        var data = try JSONSerialization.data(withJSONObject: object)
+        data.append(0x0A)
+        try transport.writeControl(data)
     }
 
     private static func piThinkingLevel(_ effort: ReasoningEffort) -> String {
