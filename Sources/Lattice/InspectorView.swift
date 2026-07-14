@@ -676,7 +676,7 @@ struct ConnectionsView: View {
     var body: some View {
         AdaptiveCatalogPage { contentWidth in
             VStack(alignment: .leading, spacing: 20) {
-                PageHeader(title: "Connections", subtitle: "Providers and model visibility")
+                PageHeader(title: "Connections", subtitle: "Provider setup, harnesses, and cloud model visibility")
 
                 CatalogCardGrid(contentWidth: contentWidth, minimum: LatticeCatalogPageLayout.connectionCardMinimum, maximum: LatticeCatalogPageLayout.connectionCardMaximum) {
                     ConnectionCard(
@@ -815,6 +815,7 @@ struct ConnectionsView: View {
                                     .foregroundStyle(.secondary)
                             }
                             CLIActionMessage(provider: "antigravity", state: state)
+                            ModelChecklist(providerID: "antigravity", models: state.antigravityModels, state: state)
                         }
                     }
                 }
