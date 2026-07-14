@@ -3286,6 +3286,16 @@ struct CoreVerification {
         laneStore.apply(.queued(2), to: selectedLaneID)
         expect(laneStore.lane(for: selectedLaneID).queuedCount == 2, "Queued follow-ups are counted per thread")
 
+        var controlAction = ControlActionState()
+        expect(!controlAction.begin(progressMessage: "Blocked", disabledReason: "Runtime unavailable"), "Disabled control prerequisite prevents dispatch")
+        expect(controlAction.begin(progressMessage: "Checking…"), "Control action dispatch starts from idle")
+        expect(!controlAction.begin(progressMessage: "Duplicate"), "Control action suppresses duplicate dispatch while running")
+        controlAction.fail("Unavailable")
+        expect(controlAction.phase == .failed && controlAction.message == "Unavailable", "Control action surfaces failure")
+        expect(controlAction.begin(progressMessage: "Retrying…"), "Failed control action can recover through retry")
+        controlAction.succeed("Ready")
+        expect(controlAction.phase == .succeeded && controlAction.message == "Ready", "Retried control action surfaces success")
+
         print("Core verification passed: \(checks) checks")
     }
 }

@@ -200,8 +200,8 @@ ensure_core_library() {
 }
 
 verify_fallback_test_inventory() {
-  local expected_files=44
-  local expected_tests=465
+  local expected_files=45
+  local expected_tests=470
   local test_sources=("$ROOT_DIR"/Tests/LatticeCoreTests/*.swift)
   if [[ ! -e "${test_sources[0]}" ]]; then
     echo "FAIL: fallback test inventory missing Tests/LatticeCoreTests/*.swift" >&2

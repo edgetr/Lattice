@@ -54,6 +54,12 @@ struct LatticeApp: App {
                 .keyboardShortcut(.delete, modifiers: [.command])
                 .disabled(!delegate.state.canDeleteSelectedSession)
             }
+            CommandMenu("Connections") {
+                Button("Refresh Connections") { delegate.state.requestConnectionRefresh() }
+                    .keyboardShortcut("r", modifiers: [.command, .shift])
+                    .disabled(!delegate.state.canRequestConnectionRefresh)
+                    .accessibilityHint(delegate.state.connectionRefreshDisabledReason ?? "Refresh provider readiness and model catalogs")
+            }
         }
 
         Settings {

@@ -44,6 +44,7 @@ struct MessageContentView: View {
 private struct FencedCodeBlockView: View {
     let language: String
     let code: String
+    @StateObject private var copyFeedback = CodeCopyFeedback()
 
     private var languageLabel: String {
         let trimmed = language.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -60,15 +61,16 @@ private struct FencedCodeBlockView: View {
                 Spacer(minLength: 8)
                 Button {
                     NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(code, forType: .string)
+                    copyFeedback.succeeded = NSPasteboard.general.setString(code, forType: .string)
                 } label: {
-                    Label("Copy", systemImage: "doc.on.doc")
+                    Label(copyFeedback.succeeded == true ? "Copied" : (copyFeedback.succeeded == false ? "Copy failed" : "Copy"), systemImage: copyFeedback.succeeded == true ? "checkmark" : "doc.on.doc")
                         .font(.caption2.weight(.semibold))
                         .labelStyle(.titleAndIcon)
                 }
                 .buttonStyle(.borderless)
                 .help("Copy code")
                 .accessibilityLabel("Copy code")
+                .accessibilityValue(copyFeedback.succeeded == true ? "Copied" : (copyFeedback.succeeded == false ? "Copy failed" : "Ready"))
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 7)
@@ -93,4 +95,9 @@ private struct FencedCodeBlockView: View {
         .accessibilityElement(children: .contain)
         .accessibilityLabel(language.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Code block" : "Code block, \(languageLabel)")
     }
+}
+
+@MainActor
+private final class CodeCopyFeedback: ObservableObject {
+    @Published var succeeded: Bool?
 }

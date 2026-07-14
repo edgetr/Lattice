@@ -40,7 +40,8 @@ struct InspectorView: View {
                 .pickerStyle(.segmented)
                 .disabled(session.isStreaming)
                 .accessibilityLabel("Execution policy")
-                .accessibilityHint("Controls approvals and provider tool risk for this chat.")
+                .accessibilityHint(session.isStreaming ? "Stop the current response before changing execution policy." : "Controls approvals and provider tool risk for this chat.")
+                .help(session.isStreaming ? "Stop the current response before changing execution policy" : "Controls approvals and provider tool risk for this chat")
                 Picker("Model privacy", selection: Binding(get: { session.privacyMode }, set: { state.setSessionPrivacyMode($0) })) {
                     ForEach(SessionPrivacyMode.allCases, id: \.self) { Text($0.displayName).tag($0) }
                 }
@@ -48,12 +49,14 @@ struct InspectorView: View {
                 .pickerStyle(.segmented)
                 .disabled(session.isStreaming)
                 .accessibilityLabel("Model privacy")
+                .accessibilityHint(session.isStreaming ? "Stop the current response before changing model privacy." : "Controls whether this chat may use cloud providers.")
+                .help(session.isStreaming ? "Stop the current response before changing model privacy" : "Controls whether this chat may use cloud providers")
                 if state.selectedSessionUsesLegacyDirectOpenCode {
                     Button("Enable saved key for this legacy OpenCode chat") {
                         state.enableLegacyDirectOpenCodeCredential()
                     }
                     .disabled(!state.openCodeAPIKeySaved)
-                    .help("Compatibility only: copy the saved API key into OpenCode's provider-owned auth file for this persisted direct route")
+                    .help(state.openCodeAPIKeySaved ? "Compatibility only: copy the saved API key into OpenCode's provider-owned auth file for this persisted direct route" : "Save an OpenCode key in Connections first")
                 }
                 if session.privacyMode == .localOnly {
                     Label("Cloud routes blocked for this chat.", systemImage: "lock.fill")
@@ -85,7 +88,8 @@ struct InspectorView: View {
                 ))
                 .toggleStyle(.switch)
                 .disabled(session.workspacePath == nil && state.selectedWorkspacePath.isEmpty)
-                .accessibilityHint("Allows exact AGENTS.md, AGENTS.MD, CLAUDE.md, and CLAUDE.MD files to be applied as workspace guidance. Does not grant credentials or bypass policy.")
+                .accessibilityHint(session.workspacePath == nil && state.selectedWorkspacePath.isEmpty ? "Choose a workspace before trusting instruction files." : "Allows exact AGENTS.md, AGENTS.MD, CLAUDE.md, and CLAUDE.MD files to be applied as workspace guidance. Does not grant credentials or bypass policy.")
+                .help(session.workspacePath == nil && state.selectedWorkspacePath.isEmpty ? "Choose a workspace before trusting instruction files" : "Apply recognized workspace instruction files as guidance")
                 Text("Trust means Lattice may apply only these exact filenames as guidance. It does not make files safe, grant credentials, or change approval policy.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -291,6 +295,7 @@ struct ModelsView: View {
         AdaptiveCatalogPage { contentWidth in
             VStack(alignment: .leading, spacing: 20) {
                 PageHeader(title: "Local Models", subtitle: "Recommended for \(state.hardware.chipName) · \(state.hardware.physicalMemoryGB) GB unified memory · \(state.hardware.thermalState)")
+                ControlActionFeedback(state: state.localModelRefreshAction)
 
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Built into macOS").font(.headline)
@@ -392,7 +397,11 @@ struct ModelsView: View {
             }
         }
         .navigationTitle("Local Models")
-        .toolbar { Button { Task { await state.refreshLocalModels() } } label: { Label("Refresh Local Models", systemImage: "arrow.clockwise") } }
+        .toolbar {
+            Button { state.requestLocalModelRefresh() } label: { Label("Refresh Local Models", systemImage: "arrow.clockwise") }
+                .disabled(!state.canRequestLocalModelRefresh)
+                .help(state.localModelRefreshDisabledReason ?? "Refresh locally discovered Ollama models")
+        }
     }
 
     private var catalogProblemState: some View {
@@ -421,9 +430,11 @@ struct ModelsView: View {
             HStack(spacing: 10) {
                 Button(copy.primaryActionTitle ?? "Open Connections") { state.selectedSection = .connections }
                 Button(copy.secondaryActionTitle ?? "Refresh") {
-                    Task { await state.refreshConnections(refreshProviderCatalogs: true) }
+                    state.requestConnectionRefresh()
                 }
                 .buttonStyle(.link)
+                .disabled(!state.canRequestConnectionRefresh)
+                .help(state.connectionRefreshDisabledReason ?? "Refresh provider readiness and model catalogs")
             }
         }
         .padding(LatticeMetrics.cardPadding)
@@ -468,9 +479,11 @@ struct ModelsView: View {
                 } else if !state.ollamaReady {
                     state.openOllama()
                 } else {
-                    Task { await state.refreshLocalModels() }
+                    state.requestLocalModelRefresh()
                 }
             }
+            .disabled(state.ollamaReady && !state.canRequestLocalModelRefresh)
+            .help(state.ollamaReady ? (state.localModelRefreshDisabledReason ?? ollamaStatusDetail) : ollamaStatusDetail)
         }
         .padding(LatticeMetrics.cardPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -715,8 +728,9 @@ struct RecommendationRow: View {
             } else if !state.ollamaReady {
                 Button("Start Ollama") { state.openOllama() }.fixedSize(horizontal: true, vertical: false)
             } else if !catalogAuthoritative {
-                Button("Refresh") { Task { await state.refreshConnections(refreshProviderCatalogs: true) } }
+                Button("Refresh") { state.requestConnectionRefresh() }
                     .fixedSize(horizontal: true, vertical: false)
+                    .disabled(!state.canRequestConnectionRefresh)
                     .accessibilityHint("Refresh the local model catalog before installing or using this recommendation.")
                     .help("Refresh the local model catalog before installing or using this recommendation.")
             } else {
@@ -747,9 +761,10 @@ private struct ModelsCatalogNotice: View {
                 .foregroundStyle(.secondary)
             Spacer(minLength: 8)
             Button("Retry") {
-                Task { await state.refreshConnections(refreshProviderCatalogs: true) }
+                state.requestConnectionRefresh()
             }
             .buttonStyle(.borderless)
+            .disabled(!state.canRequestConnectionRefresh)
         }
         .padding(10)
         .latticeGlass(cornerRadius: 10, tint: Color.orange.opacity(0.08))
@@ -787,10 +802,18 @@ struct ConnectionsView: View {
                 providerPanel
                 runtimeComponents
                 localPanel
+                ControlActionFeedback(state: state.connectionRefreshAction)
+                ControlActionFeedback(state: state.localModelRefreshAction)
             }
         }
         .navigationTitle("Connections")
-        .toolbar { Button { Task { await state.refreshConnections(refreshProviderCatalogs: true) } } label: { Label("Refresh", systemImage: "arrow.clockwise") } }
+        .toolbar {
+            Button { state.requestConnectionRefresh() } label: {
+                Label(state.connectionRefreshAction.isRunning ? "Refreshing" : "Refresh", systemImage: "arrow.clockwise")
+            }
+            .disabled(!state.canRequestConnectionRefresh)
+            .help(state.connectionRefreshDisabledReason ?? "Refresh provider readiness and model catalogs")
+        }
     }
 
     private var providerPanel: some View {
@@ -817,6 +840,7 @@ struct ConnectionsView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 ModelChecklist(providerID: "codex", models: state.codexModels, state: state)
+                CLIActionMessage(provider: "codex", state: state)
             }
             providerRow(
                 identity: .provider(.grok), name: "Grok", detail: "Code via Grok Build · Work via Hermes",
@@ -828,6 +852,7 @@ struct ConnectionsView: View {
                 grokActions
             } content: {
                 ModelChecklist(providerID: "grok", models: state.grokModels, state: state)
+                CLIActionMessage(provider: "grok", state: state)
             }
             providerRow(
                 identity: .provider(.opencode), name: "OpenCode", detail: "One Keychain credential · separate mode consent",
@@ -840,6 +865,7 @@ struct ConnectionsView: View {
             } content: {
                 openCodeKeyControls
                 ModelChecklist(providerID: "opencode", models: state.openCodeModels, state: state)
+                CLIActionMessage(provider: "opencode", state: state)
             }
             providerRow(
                 identity: .systemImage("paperplane"), name: "Antigravity",
@@ -849,6 +875,7 @@ struct ConnectionsView: View {
                 antigravityActions
             } content: {
                 ModelChecklist(providerID: "antigravity", models: state.antigravityModels, state: state)
+                CLIActionMessage(provider: "antigravity", state: state)
             }
         }
         .padding(12)
@@ -877,6 +904,8 @@ struct ConnectionsView: View {
             Image(systemName: "ellipsis.circle").accessibilityLabel("Codex setup actions")
         }
         .menuStyle(.borderlessButton)
+        .disabled(!state.canRequestConnectionRefresh)
+        .help(state.connectionRefreshDisabledReason ?? "Codex setup actions")
     }
 
     @ViewBuilder private var grokActions: some View {
@@ -892,6 +921,8 @@ struct ConnectionsView: View {
             }
         } label: { Image(systemName: "ellipsis.circle").accessibilityLabel("Grok setup actions") }
         .menuStyle(.borderlessButton)
+        .disabled(!state.canRequestConnectionRefresh)
+        .help(state.connectionRefreshDisabledReason ?? "Grok setup actions")
     }
 
     @ViewBuilder private var openCodeActions: some View {
@@ -903,6 +934,8 @@ struct ConnectionsView: View {
             if state.hermesInstalled { Button("Validate Work") { state.validateHermesOpenCodeAuthentication() } }
         } label: { Image(systemName: "ellipsis.circle").accessibilityLabel("OpenCode setup actions") }
         .menuStyle(.borderlessButton)
+        .disabled(!state.canRequestConnectionRefresh)
+        .help(state.connectionRefreshDisabledReason ?? "OpenCode setup actions")
     }
 
     @ViewBuilder private var antigravityActions: some View {
@@ -922,13 +955,14 @@ struct ConnectionsView: View {
     private func providerInstallOrUpdate(provider: String, installed: Bool, authenticated: Bool, install: @escaping () -> Void, signIn: @escaping () -> Void, update: @escaping () -> Void, version: String?, latest: String?) -> some View {
         Group {
             if !installed {
-                CLIActionButton(title: "Install", provider: provider, state: state, action: install)
+                CLIActionButton(title: "Install", provider: provider, state: state, isEnabled: state.canRequestConnectionRefresh, action: install)
             } else if !authenticated {
-                CLIActionButton(title: "Sign in", provider: provider, state: state, action: signIn)
+                CLIActionButton(title: "Sign in", provider: provider, state: state, isEnabled: state.canRequestConnectionRefresh, action: signIn)
             } else if CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: version, latestVersion: latest) {
-                CLIActionButton(title: "Update", provider: provider, state: state, action: update)
+                CLIActionButton(title: "Update", provider: provider, state: state, isEnabled: state.canRequestConnectionRefresh, action: update)
             }
         }
+        .disabled(!state.canRequestConnectionRefresh)
     }
 
     private func runtimeAction(provider: String, installed: Bool, install: @escaping () -> Void, update: @escaping () -> Void, version: String?, latest: String?) -> some View {
@@ -959,6 +993,7 @@ struct ConnectionsView: View {
                     .toggleStyle(.checkbox)
                     .disabled(!state.openCodeAPIKeySaved)
                     .accessibilityHint("Allow Pi Code routes to receive this key through their child environment.")
+                    .help(state.openCodeAPIKeySaved ? "Allow Pi Code routes to use the saved key" : "Save the key before enabling Code")
                 Toggle("Work", isOn: Binding(
                     get: { state.isOpenCodeCredentialEnabled(for: .work) },
                     set: { state.setOpenCodeCredentialEnabled($0, for: .work) }
@@ -966,6 +1001,7 @@ struct ConnectionsView: View {
                     .toggleStyle(.checkbox)
                     .disabled(!state.openCodeAPIKeySaved)
                     .accessibilityHint("Allow Hermes Work routes to receive this key through their child environment.")
+                    .help(state.openCodeAPIKeySaved ? "Allow Hermes Work routes to use the saved key" : "Save the key before enabling Work")
             }
             if state.openCodeAPIKeySaved {
                 Text("Each mode validates independently. The key is injected only for an enabled OpenCode route and is never written to its arguments.")
@@ -974,8 +1010,10 @@ struct ConnectionsView: View {
                 HStack(spacing: 8) {
                     Button("Validate Code") { state.validatePiAuthentication(providerID: "opencode") }
                         .disabled(!state.isOpenCodeCredentialEnabled(for: .code) || !state.piInstalled)
+                        .help(!state.piInstalled ? "Install Pi before validating Code" : (state.isOpenCodeCredentialEnabled(for: .code) ? "Validate the saved key through Pi" : "Enable the saved key for Code first"))
                     Button("Validate Work") { state.validateHermesOpenCodeAuthentication() }
                         .disabled(!state.isOpenCodeCredentialEnabled(for: .work) || !state.hermesInstalled)
+                        .help(!state.hermesInstalled ? "Install Hermes before validating Work" : (state.isOpenCodeCredentialEnabled(for: .work) ? "Validate the saved key through Hermes" : "Enable the saved key for Work first"))
                 }
                 .controlSize(.small)
             } else {
@@ -992,9 +1030,12 @@ struct ConnectionsView: View {
                         .textFieldStyle(.roundedBorder)
                     Button("Save") { state.saveOpenCodeAPIKey() }
                         .disabled(state.openCodeAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .help(state.openCodeAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Paste an API key before saving" : "Save the key in macOS Keychain")
                 }
             }
         }
+        .disabled(!state.canRequestConnectionRefresh)
+        .help(state.connectionRefreshDisabledReason ?? "Manage the OpenCode Keychain credential")
     }
 
     private var openCodeCredentialStatusLabel: String {
@@ -1041,7 +1082,8 @@ struct ConnectionsView: View {
             LocalConnectionRow(name: "Apple Intelligence", detail: state.appleIntelligenceStatus, ready: state.appleIntelligenceReady)
             LocalConnectionRow(name: "Ollama", detail: ollamaConnectionDetail, ready: ollamaConnectionReady) {
                 if state.ollamaReady {
-                    Button("Refresh") { Task { await state.refreshLocalModels() } }
+                    Button("Refresh") { state.requestLocalModelRefresh() }
+                        .disabled(!state.canRequestLocalModelRefresh)
                 } else if state.ollamaInstalled {
                     Button("Start") { state.openOllama() }
                 } else {
@@ -1056,6 +1098,32 @@ struct ConnectionsView: View {
 
     private func providerRow<Actions: View, Content: View>(identity: ConnectionIdentity, name: String, detail: String, modes: [ModeReadiness], @ViewBuilder actions: () -> Actions, @ViewBuilder content: () -> Content) -> some View {
         ProviderConnectionRow(identity: identity, name: name, detail: detail, modes: modes, actions: actions, content: content)
+    }
+}
+
+private struct ControlActionFeedback: View {
+    let state: ControlActionState
+
+    var body: some View {
+        if let message = state.message {
+            HStack(spacing: 8) {
+                if state.isRunning {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: state.phase == .failed ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                        .foregroundStyle(state.phase == .failed ? Color.orange : Color.green)
+                }
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(state.isRunning ? "Action in progress" : (state.phase == .failed ? "Action failed" : "Action completed"))
+            .accessibilityValue(message)
+            .accessibilityAddTraits(state.isRunning ? .updatesFrequently : [])
+        }
     }
 }
 
@@ -1152,6 +1220,7 @@ private struct RuntimeComponentRow: View {
                         .foregroundStyle(lifecycle.phase == .failed ? .orange : .secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                CLIActionMessage(provider: provider, state: state)
             }
             Spacer(minLength: 8)
             VStack(alignment: .trailing, spacing: 5) {
@@ -1162,16 +1231,20 @@ private struct RuntimeComponentRow: View {
                 } else if installed {
                     Button("Reinstall Pin") {
                         if provider == "pi" { state.updatePi() } else { state.updateHermes() }
-                    }.controlSize(.small)
-                    Button("Diagnostics") { Task { await state.refreshConnections(refreshProviderCatalogs: true) } }
+                    }
+                    .controlSize(.small)
+                    .disabled(!state.canRequestConnectionRefresh)
+                    .help(state.connectionRefreshDisabledReason ?? "Reinstall Lattice's pinned runtime version after confirmation")
+                    Button("Diagnostics") { state.requestConnectionRefresh(diagnosticsRuntime: runtime) }
                         .controlSize(.small)
-                        .help("Re-run runtime and model discovery")
+                        .disabled(!state.canRequestConnectionRefresh)
+                        .help(state.connectionRefreshDisabledReason ?? "Re-run runtime and model discovery")
                     Button("Remove", role: .destructive) { state.requestRuntimeAction(.uninstall, runtime: runtime) }
                         .controlSize(.small)
-                        .disabled(!managedByLattice)
-                        .help("Remove the runtime after confirmation; Lattice-owned profile data is preserved")
+                        .disabled(!managedByLattice || !state.canRequestConnectionRefresh)
+                        .help(!managedByLattice ? "This runtime is externally managed and cannot be removed by Lattice" : (state.connectionRefreshDisabledReason ?? "Remove the runtime after confirmation; Lattice-owned profile data is preserved"))
                 } else {
-                    CLIActionButton(title: "Install", provider: provider, state: state) {
+                    CLIActionButton(title: "Install", provider: provider, state: state, isEnabled: state.canRequestConnectionRefresh) {
                         if provider == "pi" { state.installPi() } else { state.installHermes() }
                     }
                 }
@@ -1225,8 +1298,9 @@ struct CatalogRefreshButton: View {
     var body: some View {
         if status.isRefreshable {
             Button(status == .failed ? "Retry catalog" : "Refresh catalog") {
-                Task { await state.refreshConnections(refreshProviderCatalogs: true) }
+                state.requestConnectionRefresh()
             }
+            .disabled(!state.canRequestConnectionRefresh)
         }
     }
 }
@@ -1249,6 +1323,14 @@ struct ExtensionsView: View {
                 } else {
                     extensionsPanel
                     skillsPanel
+                }
+
+                if let message = state.folderActionMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("Folder action result")
+                        .accessibilityValue(message)
                 }
 
                 if !state.selfEditJobs.isEmpty {
@@ -1539,11 +1621,11 @@ struct CLIActionMessage: View {
     @ObservedObject var state: AppState
 
     var body: some View {
-        if state.isCLIBusy(provider) {
+        if let actionID = state.activeCLIActionID(for: provider) {
             TimelineView(.periodic(from: .now, by: 1)) { context in
                 HStack(spacing: 7) {
                     ProgressView().controlSize(.mini)
-                    Text(state.cliProgressText(provider, at: context.date))
+                    Text(state.cliProgressText(actionID, at: context.date))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
@@ -1817,11 +1899,17 @@ struct SettingsView: View {
                 if let status = state.localModelStatus {
                     Text(status).font(.caption).foregroundStyle(.secondary)
                 }
-                Button("Refresh Models") { Task { await state.refreshLocalModels() } }
+                ControlActionFeedback(state: state.localModelRefreshAction)
+                Button("Refresh Models") { state.requestLocalModelRefresh() }
+                    .disabled(!state.canRequestLocalModelRefresh)
+                    .help(state.localModelRefreshDisabledReason ?? "Refresh locally discovered Ollama models")
             }
             Section("Extensions & Skills") {
                 Button("Open Extensions Folder") { state.openExtensionsFolder() }
                 Button("Open Skills Folder") { state.openSkillsFolder() }
+                if let message = state.folderActionMessage {
+                    Text(message).font(.caption).foregroundStyle(.secondary)
+                }
             }
             Section("Privacy & Security") {
                 Text(LatticeSettingsCopy.privacySecurityBody)

@@ -33,12 +33,16 @@ struct WorkspaceView: View {
                         .accessibilityIdentifier(LatticeAccessibilityID.toolbarCommands)
                     Button { state.overlayMode = .prompt; state.showOverlayAction?() } label: { Label("Overlay", systemImage: "rectangle.on.rectangle") }
                         .accessibilityIdentifier(LatticeAccessibilityID.toolbarOverlay)
+                        .disabled(state.showOverlayAction == nil)
+                        .help(state.showOverlayAction == nil ? "Overlay is not ready" : "Show Lattice overlay")
                     Button { state.showInspector.toggle() } label: { Label("Inspector", systemImage: "sidebar.trailing") }
                 } else {
                     Button { state.openCommandPalette() } label: { Label("Commands", systemImage: "command") }
                         .accessibilityIdentifier(LatticeAccessibilityID.toolbarCommands)
                     Button { state.overlayMode = .prompt; state.showOverlayAction?() } label: { Label("Overlay", systemImage: "rectangle.on.rectangle") }
                         .accessibilityIdentifier(LatticeAccessibilityID.toolbarOverlay)
+                        .disabled(state.showOverlayAction == nil)
+                        .help(state.showOverlayAction == nil ? "Overlay is not ready" : "Show Lattice overlay")
                 }
             }
         }
@@ -533,18 +537,21 @@ struct SessionListView: View {
             Label("Export Chat…", systemImage: "square.and.arrow.up")
         }
         .disabled(session.isStreaming)
-        .accessibilityHint("Export this chat as a portable archive or Markdown")
+        .help(session.isStreaming ? "Stop the current response before exporting this chat" : "Export this chat as a portable archive or Markdown")
+        .accessibilityHint(session.isStreaming ? "Stop the current response before exporting this chat." : "Export this chat as a portable archive or Markdown")
         Button {
             state.requestImportChat()
         } label: {
             Label("Import Chat…", systemImage: "square.and.arrow.down")
         }
         .disabled(!state.canImportChat)
-        .accessibilityHint("Import a Lattice JSON archive as a new chat")
+        .help(state.canImportChat ? "Import a Lattice JSON archive as a new chat" : "Resolve chat store recovery before importing")
+        .accessibilityHint(state.canImportChat ? "Import a Lattice JSON archive as a new chat" : "Resolve chat store recovery before importing")
         Button(role: .destructive) { state.requestDeleteSession(session.id) } label: {
             Label("Delete Chat", systemImage: "trash")
         }
         .disabled(session.isStreaming)
+        .help(session.isStreaming ? "Stop the current response before deleting this chat" : "Delete this chat after confirmation")
     }
 }
 
@@ -825,6 +832,13 @@ struct ProjectsView: View {
                 workspaceActions(stacking: true)
             }
             .controlSize(.regular)
+            if let message = state.workspaceActionMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Workspace action result")
+                    .accessibilityValue(message)
+            }
         }
     }
 

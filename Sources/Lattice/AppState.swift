@@ -194,6 +194,7 @@ final class AppState: ObservableObject {
     /// When true, do not auto-change columns until the window is comfortably wide again.
     private var respectsUserColumnChoice = false
     @Published var selectedWorkspacePath: String
+    @Published private(set) var workspaceActionMessage: String?
     /// New Chat setup lives in memory until first send. No placeholder session or route is persisted.
     @Published private(set) var isTransientNewChat = false
     @Published private(set) var composerSelectionMode: ConversationMode?
@@ -247,6 +248,8 @@ final class AppState: ObservableObject {
     @Published var cliBusyProviders: Set<String> = []
     @Published var cliActionMessages: [String: String] = [:]
     @Published private(set) var isRefreshingConnections = false
+    @Published private(set) var connectionRefreshAction = ControlActionState()
+    @Published private(set) var localModelRefreshAction = ControlActionState()
     @Published var cliActionStartedAt: [String: Date] = [:]
     @Published var cliActionEstimatedSeconds: [String: TimeInterval] = [:]
     @Published var pendingCLIInstallProvider: String?
@@ -273,6 +276,7 @@ final class AppState: ObservableObject {
     @Published var extensions: [LatticeExtensionRecord] = []
     @Published var skills: [LatticeSkillRecord] = []
     @Published var selfEditJobs: [LatticeExtensionJobRecord] = []
+    @Published private(set) var folderActionMessage: String?
     @Published var selfEditPreviews: [LatticeExtensionPreviewRecord] = []
     @Published var expandedSelfEditSkillPreviewIDs: Set<String> = []
     @Published var expandedSelfEditReviewIDs: Set<UUID> = []
@@ -1306,7 +1310,14 @@ final class AppState: ObservableObject {
                 disabledReason: "Inspector is available on chats"
             ),
             .init(id: "choose-workspace", title: "Choose Workspace…", detail: "Select the project folder for new or empty chats", keywords: ["project", "folder", "path"]),
-            .init(id: "refresh-connections", title: "Refresh Connections", detail: "Refresh provider readiness and model catalogs", keywords: ["models", "providers", "sync"]),
+            .init(
+                id: "refresh-connections",
+                title: "Refresh Connections",
+                detail: "Refresh provider readiness and model catalogs",
+                keywords: ["models", "providers", "sync"],
+                isEnabled: canRequestConnectionRefresh,
+                disabledReason: connectionRefreshDisabledReason ?? "Connection refresh is unavailable"
+            ),
             .init(id: "open-extensions-folder", title: "Open Extensions Folder", detail: "Show the user-owned Lattice modification layer", keywords: ["self edit", "customization", "application support"]),
             .init(id: "open-skills-folder", title: "Open Skills Folder", detail: "Show Lattice’s shared SKILL.md folder for imported and generated skills", keywords: ["skills", "skill.md", "agents", "customization", "application support"]),
             .init(id: "policy-ask", title: "Set Policy: Ask", detail: "Ask before material changes and external control", keywords: ["permission", "safe", "approval"]),
@@ -1374,7 +1385,7 @@ final class AppState: ObservableObject {
         case "choose-workspace":
             chooseWorkspace()
         case "refresh-connections":
-            Task { await refreshConnections(refreshProviderCatalogs: true) }
+            requestConnectionRefresh()
         case "open-extensions-folder":
             openExtensionsFolder()
         case "open-skills-folder":
@@ -3050,24 +3061,37 @@ final class AppState: ObservableObject {
     /// If the folder is missing, opens an existing parent when possible; never mutates the filesystem.
     func revealSelectedWorkspaceInFinder() {
         let trimmed = selectedWorkspacePath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else {
+            workspaceActionMessage = "Choose a workspace before revealing it in Finder."
+            return
+        }
         let url = URL(fileURLWithPath: trimmed).standardizedFileURL
         if FileManager.default.fileExists(atPath: url.path) {
             NSWorkspace.shared.activateFileViewerSelecting([url])
+            workspaceActionMessage = "Revealed the workspace in Finder."
             return
         }
         let parent = url.deletingLastPathComponent()
-        if parent.path != url.path, FileManager.default.fileExists(atPath: parent.path) {
-            NSWorkspace.shared.open(parent)
+        if parent.path != url.path,
+           FileManager.default.fileExists(atPath: parent.path),
+           NSWorkspace.shared.open(parent) {
+            workspaceActionMessage = "The workspace folder is missing. Opened its nearest existing parent in Finder."
+        } else {
+            workspaceActionMessage = "The workspace folder and its parent are unavailable."
         }
     }
 
     /// Copies the current workspace path to the pasteboard. No-ops when empty/whitespace; does not touch the filesystem.
     func copySelectedWorkspacePath() {
         let trimmed = selectedWorkspacePath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else {
+            workspaceActionMessage = "Choose a workspace before copying its path."
+            return
+        }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(trimmed, forType: .string)
+        workspaceActionMessage = NSPasteboard.general.setString(trimmed, forType: .string)
+            ? "Copied the workspace path."
+            : "The workspace path could not be copied."
     }
 
     /// Opens an existing chat from the Workspace surface. Does not create sessions.
@@ -3095,6 +3119,114 @@ final class AppState: ObservableObject {
         if normalizeAfterRefresh {
             normalizeBackendsAfterCatalogRefresh()
             normalizeExecutionRouteAfterCatalogRefresh()
+        }
+    }
+
+    var canRequestConnectionRefresh: Bool {
+        connectionRefreshDisabledReason == nil
+    }
+
+    var connectionRefreshDisabledReason: String? {
+        if isRefreshingConnections || connectionRefreshAction.isRunning {
+            return "A connection refresh is already running"
+        }
+        if !cliBusyProviders.isEmpty {
+            return "Wait for the current connection setup action to finish"
+        }
+        return nil
+    }
+
+    var canRequestLocalModelRefresh: Bool {
+        localModelRefreshDisabledReason == nil
+    }
+
+    var localModelRefreshDisabledReason: String? {
+        if !ollamaReady { return "Start Ollama before refreshing local models" }
+        if ollamaCatalogStatus == .loading || localModelRefreshAction.isRunning {
+            return "A local model refresh is already running"
+        }
+        return nil
+    }
+
+    /// Dispatches a visible Connections refresh exactly once and owns its user-facing result.
+    /// Background refreshes continue to use `refreshConnections` directly.
+    func requestConnectionRefresh(
+        refreshProviderCatalogs: Bool = true,
+        diagnosticsRuntime: LatticeRuntimeID? = nil
+    ) {
+        let progress = diagnosticsRuntime.map { "Diagnosing \($0.displayName)…" } ?? "Refreshing connections…"
+        guard connectionRefreshAction.begin(
+            progressMessage: progress,
+            disabledReason: connectionRefreshDisabledReason
+        ) else { return }
+        Task {
+            await refreshConnections(refreshProviderCatalogs: refreshProviderCatalogs)
+            guard !Task.isCancelled else {
+                connectionRefreshAction.fail("Connection refresh was cancelled.")
+                return
+            }
+            finishConnectionRefreshAction(diagnosticsRuntime: diagnosticsRuntime)
+        }
+    }
+
+    /// Dispatches local model discovery once, including feedback on surfaces that do not show the catalog.
+    func requestLocalModelRefresh() {
+        guard localModelRefreshAction.begin(
+            progressMessage: "Refreshing local models…",
+            disabledReason: localModelRefreshDisabledReason
+        ) else { return }
+        Task {
+            await refreshLocalModels()
+            guard !Task.isCancelled else {
+                localModelRefreshAction.fail("Local model refresh was cancelled.")
+                return
+            }
+            if ollamaCatalogStatus == .failed {
+                localModelRefreshAction.fail("Ollama is running, but its model catalog is unavailable.")
+            } else {
+                localModelRefreshAction.succeed("Local model refresh completed. \(ollamaModels.count) chat model\(ollamaModels.count == 1 ? "" : "s") found.")
+            }
+        }
+    }
+
+    private func finishConnectionRefreshAction(diagnosticsRuntime: LatticeRuntimeID?) {
+        if let runtime = diagnosticsRuntime {
+            switch runtime {
+            case .pi:
+                guard piInstalled else {
+                    connectionRefreshAction.fail("Pi is no longer available on PATH.")
+                    return
+                }
+                if piModelIDs.isEmpty {
+                    connectionRefreshAction.fail("Pi was detected, but it reported no compatible models.")
+                } else {
+                    connectionRefreshAction.succeed("Pi diagnostics completed. \(piModelIDs.count) model route\(piModelIDs.count == 1 ? "" : "s") reported.")
+                }
+            case .hermes:
+                guard hermesInstalled else {
+                    connectionRefreshAction.fail("Hermes is no longer available on PATH.")
+                    return
+                }
+                if hermesCatalogStatus == .failed {
+                    connectionRefreshAction.fail("Hermes was detected, but its model catalog is unavailable.")
+                } else {
+                    connectionRefreshAction.succeed("Hermes diagnostics completed. \(hermesModels.count) model route\(hermesModels.count == 1 ? "" : "s") reported.")
+                }
+            }
+            return
+        }
+
+        let unavailableCatalogs = [
+            ("Codex", codexCatalogStatus),
+            ("Grok", grokCatalogStatus),
+            ("OpenCode", openCodeCatalogStatus),
+            ("Hermes", hermesCatalogStatus),
+            ("Ollama", ollamaCatalogStatus)
+        ].compactMap { entry -> String? in entry.1 == .failed ? entry.0 : nil }
+        if unavailableCatalogs.isEmpty {
+            connectionRefreshAction.succeed("Connections refreshed.")
+        } else {
+            connectionRefreshAction.fail("Refresh completed, but these catalogs remain unavailable: \(unavailableCatalogs.joined(separator: ", ")).")
         }
     }
 
@@ -3828,6 +3960,10 @@ final class AppState: ObservableObject {
         }
     }
     func isCLIBusy(_ provider: String) -> Bool { cliBusyProviders.contains(provider) }
+    func activeCLIActionID(for provider: String) -> String? {
+        if cliBusyProviders.contains(provider) { return provider }
+        return cliBusyProviders.sorted().first { $0.hasPrefix("\(provider)-") }
+    }
     func cliActionMessage(_ provider: String) -> String? { cliActionMessages[provider] }
 
     func refreshExtensions() {
@@ -4970,13 +5106,25 @@ Lattice self-edit rules:
     }
 
     func openExtensionsFolder() {
-        try? extensionStore.prepareDirectory()
-        NSWorkspace.shared.open(extensionStore.rootURL)
+        do {
+            try extensionStore.prepareDirectory()
+            folderActionMessage = NSWorkspace.shared.open(extensionStore.rootURL)
+                ? "Opened the Extensions folder."
+                : "The Extensions folder could not be opened."
+        } catch {
+            folderActionMessage = "The Extensions folder could not be prepared: \(error.localizedDescription)"
+        }
     }
 
     func openSkillsFolder() {
-        try? skillStore.prepareDirectory()
-        NSWorkspace.shared.open(skillStore.rootURL)
+        do {
+            try skillStore.prepareDirectory()
+            folderActionMessage = NSWorkspace.shared.open(skillStore.rootURL)
+                ? "Opened the Skills folder."
+                : "The Skills folder could not be opened."
+        } catch {
+            folderActionMessage = "The Skills folder could not be prepared: \(error.localizedDescription)"
+        }
     }
 
     func isExtensionEnabled(_ record: LatticeExtensionRecord) -> Bool {
