@@ -10,7 +10,10 @@ let package = Package(
     ],
     targets: [
         .target(name: "LatticeCore"),
-        .executableTarget(name: "Lattice", dependencies: ["LatticeCore"], linkerSettings: [.linkedFramework("Security")]),
+        .executableTarget(name: "Lattice", dependencies: ["LatticeCore"], linkerSettings: [
+            .linkedFramework("Security"),
+            .linkedFramework("LocalAuthentication")
+        ]),
         .testTarget(name: "LatticeCoreTests", dependencies: ["LatticeCore"])
     ]
 )

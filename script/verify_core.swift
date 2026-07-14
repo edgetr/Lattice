@@ -12,6 +12,29 @@ struct CoreVerification {
             checks += 1
         }
 
+        let connectionCacheNow = Date(timeIntervalSince1970: 1_750_000_000)
+        let connectionCache = PersistedConnectionState(
+            observedAt: connectionCacheNow,
+            providers: ["opencode": .init(installed: true, authenticated: true, catalogStatus: .loaded, runnableModelCount: 1)],
+            openCodeCredentialRecorded: true
+        )
+        if let data = PersistedConnectionStatePolicy.encode(connectionCache) {
+            expect(
+                PersistedConnectionStatePolicy.hydrate(data, now: connectionCacheNow) == .fresh(connectionCache),
+                "Fresh secret-free connection state hydrates for relaunch continuity"
+            )
+            expect(
+                !PersistedConnectionStatePolicy.hydrate(data, now: connectionCacheNow).canAuthorizeExecution,
+                "Persisted connection state never authorizes execution"
+            )
+            expect(
+                PersistedConnectionStatePolicy.hydrate(data, now: connectionCacheNow.addingTimeInterval(3_600), maximumAge: 60) == .stale(connectionCache),
+                "Stale persisted readiness is invalidated"
+            )
+        } else {
+            expect(false, "Secret-free connection state encodes")
+        }
+
         let transportRoundTrip = await BoundedSubprocess.performOffCooperativeExecutor {
             let transport = BoundedProcessTransport(request: .init(
                 executableURL: URL(fileURLWithPath: "/bin/sh"),

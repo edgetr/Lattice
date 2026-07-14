@@ -233,6 +233,7 @@ final class AppState: ObservableObject {
     @Published var openCodeLatestCLIVersion: String?
     @Published var openCodeAPIKeyDraft = ""
     @Published var openCodeAPIKeySaved = false
+    @Published private(set) var openCodeCredentialAvailability: CredentialStoreAvailability = .unavailable
     @Published private(set) var openCodeCredentialEnabledModes: Set<ConversationMode> = []
     @Published private(set) var validatedPiCodexModels: Set<String> = []
     @Published private(set) var validatedPiOpenCodeModels: Set<String> = []
@@ -338,6 +339,7 @@ final class AppState: ObservableObject {
     private var retryableRequests: [UUID: String] = [:]
     private var selfEditRunIDs: Set<UUID> = []
     private var activeRunIDs: [UUID: UUID] = [:]
+    private var lastAutomaticConnectionRefreshRequest = Date.distantPast
     @Published private var runUIStates: [UUID: RunUIState] = [:]
     @Published private(set) var threadActivityLanes = ThreadActivityLaneStore()
     @Published private var globalErrorMessage: String?
@@ -357,6 +359,7 @@ final class AppState: ObservableObject {
     private static let trustedWorkspacePathsKey = "trustedWorkspacePaths"
     private static let openCodeCredentialModesKey = "openCodeCredentialEnabledModes"
     private static let managedRuntimeIDsKey = "latticeManagedRuntimeIDs"
+    private static let persistedConnectionStateKey = "persistedConnectionState.v1"
 
     private var executionRuntimes: LatticeExecutionRuntimes {
         LatticeExecutionRuntimes(
@@ -528,9 +531,10 @@ final class AppState: ObservableObject {
         if sessionSaveFailure == nil, let pending = sessionSaveCoordinator.currentFailure {
             sessionSaveFailure = pending
         }
+        hydratePersistedConnectionState()
         startExtensionMonitoring()
         startResourceMonitoring()
-        Task { await refreshConnections() }
+        requestAutomaticConnectionRefresh(refreshProviderCatalogs: false)
     }
 
     /// Crash-safe termination flush: sync the selected session's ordinary draft, then write the latest snapshot.
@@ -3137,6 +3141,7 @@ final class AppState: ObservableObject {
         guard canApplyCatalogRefresh(generation) else { return }
         normalizeBackendsAfterCatalogRefresh()
         normalizeExecutionRouteAfterCatalogRefresh()
+        persistConnectionState()
     }
 
     private func canApplyCatalogRefresh(_ generation: UInt64) -> Bool {
@@ -3209,9 +3214,20 @@ final class AppState: ObservableObject {
         let detectedVersion = await openCodeVersion
         let installedVersion = await openCodeInstalledVersion
         let latest = await openCodeLatest
-        let apiKeySaved = KeychainStore.hasValue(account: OpenCodeCredentialPolicy.keychainAccount)
+        let keychainPresence = KeychainStore.presence(account: OpenCodeCredentialPolicy.keychainAccount)
         guard canApplyCatalogRefresh(generation) else { return }
-        openCodeAPIKeySaved = apiKeySaved
+        let credentialResolution = CredentialPresenceReconciler.resolve(
+            keychainPresence,
+            previouslyRecorded: openCodeAPIKeySaved
+        )
+        openCodeCredentialAvailability = keychainPresence
+        openCodeAPIKeySaved = credentialResolution.recorded
+        if credentialResolution.shouldInvalidateConsent {
+            openCodeCredentialEnabledModes.removeAll()
+            validatedPiOpenCodeModels.removeAll()
+            validatedHermesOpenCodeModels.removeAll()
+            UserDefaults.standard.removeObject(forKey: Self.openCodeCredentialModesKey)
+        }
         // Direct OpenCode authentication remains a compatibility route. A
         // Lattice Keychain credential is separately consented for Pi/Hermes.
         openCodeAuthenticated = auth
@@ -5718,10 +5734,17 @@ Lattice self-edit rules:
         guard !value.isEmpty else { return }
         switch KeychainStore.saveResult(value, account: OpenCodeCredentialPolicy.keychainAccount) {
         case .failure(let error):
-            openCodeAPIKeySaved = false
+            let availability = KeychainStore.presence(account: OpenCodeCredentialPolicy.keychainAccount)
+            let resolution = CredentialPresenceReconciler.resolve(
+                availability,
+                previouslyRecorded: openCodeAPIKeySaved
+            )
+            openCodeAPIKeySaved = resolution.recorded
+            openCodeCredentialAvailability = availability
             cliActionMessages["opencode"] = error.message
         case .success:
             openCodeAPIKeySaved = true
+            openCodeCredentialAvailability = .present
             validatedPiOpenCodeModels.removeAll()
             validatedHermesOpenCodeModels.removeAll()
             openCodeAPIKeyDraft = ""
@@ -5771,14 +5794,85 @@ Lattice self-edit rules:
     }
 
     func clearOpenCodeAPIKey() {
-        KeychainStore.delete(account: OpenCodeCredentialPolicy.keychainAccount)
-        openCodeAPIKeySaved = false
+        let availability = KeychainStore.remove(account: OpenCodeCredentialPolicy.keychainAccount)
+        let resolution = CredentialPresenceReconciler.resolve(
+            availability,
+            previouslyRecorded: openCodeAPIKeySaved
+        )
+        openCodeCredentialAvailability = availability
+        openCodeAPIKeySaved = resolution.recorded
+        guard resolution.shouldInvalidateConsent else {
+            cliActionMessages["opencode"] = "Keychain removal could not complete. Unlock or authorize Keychain, then try again."
+            persistConnectionState()
+            return
+        }
         openCodeCredentialEnabledModes.removeAll()
         validatedPiOpenCodeModels.removeAll()
         validatedHermesOpenCodeModels.removeAll()
         UserDefaults.standard.removeObject(forKey: Self.openCodeCredentialModesKey)
         openCodeAPIKeyDraft = ""
+        persistConnectionState()
         Task { await refreshConnections() }
+    }
+
+    /// Called when Lattice regains focus after a provider login, logout, runtime
+    /// install, or Keychain unlock. Generation checks prevent older probes from
+    /// publishing after this observation begins.
+    func refreshConnectionsAfterExternalStateChange() {
+        requestAutomaticConnectionRefresh(refreshProviderCatalogs: true)
+    }
+
+    private func requestAutomaticConnectionRefresh(refreshProviderCatalogs: Bool) {
+        let now = Date.now
+        guard now.timeIntervalSince(lastAutomaticConnectionRefreshRequest) >= 1 else { return }
+        lastAutomaticConnectionRefreshRequest = now
+        Task { await refreshConnections(refreshProviderCatalogs: refreshProviderCatalogs) }
+    }
+
+    private func hydratePersistedConnectionState() {
+        guard let data = UserDefaults.standard.data(forKey: Self.persistedConnectionStateKey) else { return }
+        switch PersistedConnectionStatePolicy.hydrate(data, now: .now) {
+        case .rejected:
+            UserDefaults.standard.removeObject(forKey: Self.persistedConnectionStateKey)
+        case .stale(let cached):
+            // Presence is secret-free and useful if Keychain is temporarily locked.
+            // All readiness/authentication observations are intentionally discarded.
+            openCodeAPIKeySaved = cached.openCodeCredentialRecorded
+        case .fresh(let cached):
+            openCodeAPIKeySaved = cached.openCodeCredentialRecorded
+            codexAuthenticated = cached.providers["codex"]?.authenticated ?? false
+            grokAuthenticated = cached.providers["grok"]?.authenticated ?? false
+            openCodeAuthenticated = cached.providers["opencode"]?.authenticated ?? false
+            antigravityAuthenticated = cached.providers["antigravity"]?.authenticated ?? false
+            antigravityInstalled = cached.providers["antigravity"]?.installed ?? false
+            piInstalled = cached.providers["pi"]?.installed ?? false
+            hermesInstalled = cached.providers["hermes"]?.installed ?? false
+            ollamaInstalled = cached.providers["ollama"]?.installed ?? false
+            ollamaReady = cached.providers["ollama"]?.authenticated ?? false
+            // Cached state never makes a route runnable. Live model/runtime probes
+            // repopulate catalogs and readiness immediately after initialization.
+            codexReady = false
+            grokReady = false
+            openCodeReady = false
+        }
+    }
+
+    private func persistConnectionState() {
+        let state = PersistedConnectionState(
+            observedAt: .now,
+            providers: [
+                "codex": .init(installed: codex.isInstalled, authenticated: codexAuthenticated, catalogStatus: codexCatalogStatus, runnableModelCount: visibleCodexModels.count),
+                "grok": .init(installed: grok.isInstalled, authenticated: grokAuthenticated, catalogStatus: grokCatalogStatus, runnableModelCount: runnableGrokModels.count),
+                "opencode": .init(installed: openCode.isInstalled, authenticated: openCodeAuthenticated, catalogStatus: openCodeCatalogStatus, runnableModelCount: runnableOpenCodeModels.count),
+                "antigravity": .init(installed: antigravityInstalled, authenticated: antigravityAuthenticated, catalogStatus: antigravityModels.isEmpty ? .empty : .loaded, runnableModelCount: antigravityModels.count),
+                "pi": .init(installed: piInstalled, authenticated: false, catalogStatus: piModelIDs.isEmpty ? .empty : .loaded, runnableModelCount: piModelIDs.count),
+                "hermes": .init(installed: hermesInstalled, authenticated: false, catalogStatus: hermesCatalogStatus, runnableModelCount: hermesModels.count),
+                "ollama": .init(installed: ollamaInstalled, authenticated: ollamaReady, catalogStatus: ollamaCatalogStatus, runnableModelCount: ollamaModels.count)
+            ],
+            openCodeCredentialRecorded: openCodeAPIKeySaved
+        )
+        guard let data = PersistedConnectionStatePolicy.encode(state) else { return }
+        UserDefaults.standard.set(data, forKey: Self.persistedConnectionStateKey)
     }
 
     private func invalidateRuntimeAuthenticationValidations() {

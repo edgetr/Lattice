@@ -947,7 +947,7 @@ struct ConnectionsView: View {
                 Text("OpenCode Go key")
                     .font(.caption.weight(.semibold))
                 Spacer()
-                Label(state.openCodeAPIKeySaved ? "Saved in Keychain" : "Not saved", systemImage: state.openCodeAPIKeySaved ? "checkmark.circle.fill" : "minus.circle")
+                Label(openCodeCredentialStatusLabel, systemImage: state.openCodeAPIKeySaved ? "checkmark.circle.fill" : "minus.circle")
                     .font(.caption)
                     .foregroundStyle(state.openCodeAPIKeySaved ? .green : .secondary)
             }
@@ -994,6 +994,21 @@ struct ConnectionsView: View {
                         .disabled(state.openCodeAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
+        }
+    }
+
+    private var openCodeCredentialStatusLabel: String {
+        switch state.openCodeCredentialAvailability {
+        case .present:
+            "Saved in Keychain"
+        case .missing:
+            "Not saved"
+        case .locked:
+            "Keychain locked · saved state retained"
+        case .denied:
+            "Keychain access denied · saved state retained"
+        case .unavailable:
+            state.openCodeAPIKeySaved ? "Keychain unavailable · saved state retained" : "Keychain unavailable"
         }
     }
 

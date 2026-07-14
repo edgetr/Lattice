@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import LocalAuthentication
 import LatticeCore
 
 // MARK: - Structured results
@@ -46,7 +47,24 @@ enum KeychainStore {
     /// Bounded retries when update/add races with a concurrent writer (duplicate item).
     private static let maxDuplicateRaceAttempts = 4
 
-    static func hasValue(account: String) -> Bool { read(account: account) != nil }
+    /// Checks item metadata with authentication UI explicitly disabled. Automatic
+    /// launch/refresh work must never request secret bytes or trigger a password prompt.
+    static func presence(account: String) -> CredentialStoreAvailability {
+        switch presence(account: account, service: service) {
+        case .present:
+            return .present
+        case .locked:
+            return .locked
+        case .denied:
+            return .denied
+        case .unavailable:
+            return .unavailable
+        case .missing:
+            return presence(account: account, service: legacyService)
+        }
+    }
+
+    static func hasValue(account: String) -> Bool { presence(account: account) == .present }
 
     static func read(account: String) -> String? {
         if let value = read(account: account, service: service) {
@@ -75,8 +93,27 @@ enum KeychainStore {
     }
 
     static func delete(account: String) {
-        delete(account: account, service: service)
-        delete(account: account, service: legacyService)
+        _ = remove(account: account)
+    }
+
+    /// Removes current and migration-compatibility items. A failed deletion is
+    /// never reported as sign-out, because either service may still hold the key.
+    static func remove(account: String) -> CredentialStoreAvailability {
+        let statuses = [
+            deleteStatus(account: account, service: service),
+            deleteStatus(account: account, service: legacyService)
+        ]
+        for status in statuses where status != errSecSuccess && status != errSecItemNotFound {
+            switch status {
+            case errSecInteractionNotAllowed:
+                return .locked
+            case errSecAuthFailed, errSecUserCanceled:
+                return .denied
+            default:
+                return .unavailable
+            }
+        }
+        return .missing
     }
 
     // MARK: - Internals
@@ -141,12 +178,43 @@ enum KeychainStore {
         return String(data: data, encoding: .utf8)
     }
 
+    private static func presence(account: String, service: String) -> CredentialStoreAvailability {
+        let authenticationContext = LAContext()
+        authenticationContext.interactionNotAllowed = true
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecUseAuthenticationContext as String: authenticationContext
+        ]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        switch status {
+        case errSecSuccess:
+            return .present
+        case errSecItemNotFound:
+            return .missing
+        case errSecInteractionNotAllowed:
+            return .locked
+        case errSecAuthFailed, errSecUserCanceled:
+            return .denied
+        default:
+            return .unavailable
+        }
+    }
+
     private static func delete(account: String, service: String) {
+        _ = deleteStatus(account: account, service: service)
+    }
+
+    private static func deleteStatus(account: String, service: String) -> OSStatus {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account
         ]
-        SecItemDelete(query as CFDictionary)
+        return SecItemDelete(query as CFDictionary)
     }
 }

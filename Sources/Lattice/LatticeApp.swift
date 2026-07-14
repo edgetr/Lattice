@@ -124,6 +124,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.showOverlayAction = { [weak self] in self?.overlay.show() }
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        guard !isTerminatingDuplicateInstance else { return }
+        state.refreshConnectionsAfterExternalStateChange()
+    }
+
     func applicationDidResignActive(_ notification: Notification) {
         guard !isTerminatingDuplicateInstance else { return }
         _ = state.flushPersistenceForLifecycleBoundary()

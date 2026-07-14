@@ -184,7 +184,7 @@ build_manual() {
   sdk="$(resolve_manual_sdk)"
   # shellcheck disable=SC2086
   swiftc -sdk "$sdk" -target arm64-apple-macosx15.0 -module-cache-path "$MANUAL_BUILD/module-cache" \
-    -I "$MANUAL_BUILD" "$MANUAL_BUILD/libLatticeCore.a" -framework Security \
+    -I "$MANUAL_BUILD" "$MANUAL_BUILD/libLatticeCore.a" -framework Security -framework LocalAuthentication \
     "$ROOT_DIR"/Sources/Lattice/*.swift -o "$MANUAL_BUILD/Lattice"
   BUILD_BINARY="$MANUAL_BUILD/Lattice"
 }
@@ -200,8 +200,8 @@ ensure_core_library() {
 }
 
 verify_fallback_test_inventory() {
-  local expected_files=43
-  local expected_tests=457
+  local expected_files=44
+  local expected_tests=465
   local test_sources=("$ROOT_DIR"/Tests/LatticeCoreTests/*.swift)
   if [[ ! -e "${test_sources[0]}" ]]; then
     echo "FAIL: fallback test inventory missing Tests/LatticeCoreTests/*.swift" >&2
