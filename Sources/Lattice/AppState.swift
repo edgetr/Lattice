@@ -174,6 +174,8 @@ final class AppState: ObservableObject {
     /// Shared UI command channel. User-driven binding updates stay quiet; explicit corrections
     /// notify once from ConversationView so normal scrolling does not re-render the workspace.
     var conversationScrollPosition = ScrollPosition(idType: String.self)
+    @Published var workOriginJumpTarget: UUID?
+    @Published var workQuestionAnswers: [UUID: String] = [:]
     @Published var showDeleteChatConfirmation = false
     @Published var pendingDeleteSessionID: UUID?
     @Published var showExportChatSheet = false
@@ -1087,6 +1089,114 @@ final class AppState: ObservableObject {
         submittedRequests[id] = request
         retryableRequests[id] = nil
         startRun(for: id, at: index, submittedText: request)
+    }
+
+    func workProjection(for session: LatticeSession) -> WorkProjection.Snapshot {
+        let liveApprovalIDs = harnessPermissionNotices[session.id].map { Set([$0.request.id]) } ?? []
+        let retryable = Set(session.actions.compactMap { action in
+            action.status == .failed && originatingUserMessage(for: action, in: session) != nil
+                ? action.id
+                : nil
+        })
+        return WorkProjection.project(
+            mode: session.executionRoute.mode,
+            actions: session.actions,
+            liveApprovalIDs: liveApprovalIDs,
+            retryableActionIDs: retryable
+        )
+    }
+
+    func confirmWorkTask(actionID: UUID) {
+        guard let sessionID = selectedSessionID,
+              let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }),
+              !sessions[sessionIndex].isStreaming,
+              let actionIndex = sessions[sessionIndex].actions.firstIndex(where: { $0.id == actionID }),
+              let updated = WorkProjection.applyingTaskMark(.confirmed, to: sessions[sessionIndex].actions[actionIndex]) else { return }
+        sessions[sessionIndex].actions[actionIndex] = updated
+        sessions[sessionIndex].lastUpdated = .now
+        persist()
+    }
+
+    func answerWorkQuestion(actionID: UUID, answer: String) {
+        let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let sessionID = selectedSessionID,
+              let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }),
+              !sessions[sessionIndex].isStreaming,
+              let actionIndex = sessions[sessionIndex].actions.firstIndex(where: { $0.id == actionID }),
+              sessions[sessionIndex].actions[actionIndex].work?.kind == .question,
+              sessions[sessionIndex].actions[actionIndex].work?.ownership == .userOwned,
+              sessions[sessionIndex].actions[actionIndex].status == .waiting,
+              let submission = prepareSubmission(trimmed),
+              startPreparedSubmission(submission, for: sessionID, at: sessionIndex),
+              let refreshedIndex = sessions.firstIndex(where: { $0.id == sessionID }),
+              let refreshedActionIndex = sessions[refreshedIndex].actions.firstIndex(where: { $0.id == actionID }),
+              sessions[refreshedIndex].messages.count >= 2 else { return }
+        let answerMessageID = sessions[refreshedIndex].messages[sessions[refreshedIndex].messages.count - 2].id
+        guard let updated = WorkProjection.applyingAnswer(
+            messageID: answerMessageID,
+            to: sessions[refreshedIndex].actions[refreshedActionIndex]
+        ) else { return }
+        sessions[refreshedIndex].actions[refreshedActionIndex] = updated
+        persist()
+    }
+
+    func retryWorkItem(actionID: UUID) {
+        guard let sessionID = selectedSessionID,
+              let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }),
+              !sessions[sessionIndex].isStreaming,
+              let action = sessions[sessionIndex].actions.first(where: { $0.id == actionID && $0.status == .failed }),
+              let request = originatingUserMessage(for: action, in: sessions[sessionIndex])?.text,
+              let submission = prepareSubmission(request) else { return }
+        _ = startPreparedSubmission(submission, for: sessionID, at: sessionIndex)
+    }
+
+    func openWorkArtifact(actionID: UUID) {
+        guard let artifact = resolvedWorkArtifact(actionID: actionID) else { return }
+        guard WorkArtifactAccessPolicy.canOpen(locator: artifact.locator, workspace: artifact.workspace) else {
+            setError("This artifact is reveal-only because it is outside the workspace or is not a safe document type.", sessionID: selectedSessionID)
+            return
+        }
+        guard FileManager.default.fileExists(atPath: artifact.url.path) else {
+            setError("The artifact is no longer available at its recorded path.", sessionID: selectedSessionID)
+            return
+        }
+        if !NSWorkspace.shared.open(artifact.url) {
+            setError("The artifact could not be opened.", sessionID: selectedSessionID)
+        }
+    }
+
+    func revealWorkArtifact(actionID: UUID) {
+        guard let artifact = resolvedWorkArtifact(actionID: actionID) else { return }
+        if FileManager.default.fileExists(atPath: artifact.url.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([artifact.url])
+            return
+        }
+        let parent = artifact.url.deletingLastPathComponent()
+        if FileManager.default.fileExists(atPath: parent.path) {
+            _ = NSWorkspace.shared.open(parent)
+        } else {
+            setError("The artifact and its parent folder are no longer available.", sessionID: selectedSessionID)
+        }
+    }
+
+    private func resolvedWorkArtifact(actionID: UUID) -> (locator: String, url: URL, workspace: URL)? {
+        guard let session = selectedSession,
+              let action = session.actions.first(where: { $0.id == actionID }),
+              action.work?.kind == .artifact,
+              let locator = action.work?.artifactLocator else { return nil }
+        let workspace = URL(fileURLWithPath: session.workspacePath ?? selectedWorkspacePath).standardizedFileURL
+        guard let url = WorkArtifactAccessPolicy.resolvedFileURL(locator: locator, workspace: workspace) else {
+            setError("The recorded artifact path is invalid.", sessionID: session.id)
+            return nil
+        }
+        return (locator, url, workspace)
+    }
+
+    private func originatingUserMessage(for action: SessionAction, in session: LatticeSession) -> ChatMessage? {
+        let originID = action.work?.originMessageID ?? action.messageID
+        guard let originIndex = session.messages.firstIndex(where: { $0.id == originID }) else { return nil }
+        return session.messages[...originIndex].last(where: { $0.role == .user && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
     }
     var canDeleteSelectedSession: Bool {
         guard let session = selectedSession else { return false }
@@ -3034,6 +3144,7 @@ final class AppState: ObservableObject {
         if sessions[index].messages.last?.role == .assistant, sessions[index].messages.last?.text.isEmpty == true {
             sessions[index].messages.removeLast()
         }
+        recordWorkOutcome(.cancelled, title: "Work stopped", detail: "The run was cancelled before every item finished.", at: index)
         reduceRunUI(.cancelled, for: id)
         threadActivityLanes.apply(.cancelled, to: id)
         harnessPermissionNotices[id] = nil
@@ -6665,16 +6776,37 @@ Lattice self-edit rules:
             sessions[index].messages[sessions[index].messages.count - 1].text += delta
             sessions[index].lastUpdated = .now
             scheduleStreamingPersist()
-        case .plan(let actionID, let title, let steps):
+        case .plan(let actionID, let title, let explanation, let steps):
             guard let messageID = sessions[index].messages.last(where: { $0.role == .assistant })?.id else { return }
             upsertSessionAction(.init(
                 id: actionID,
                 messageID: messageID,
                 kind: .plan,
                 title: title,
-                detail: steps.joined(separator: "\n"),
+                detail: explanation ?? "",
                 status: .running
             ), at: index)
+            for step in steps {
+                let status: SessionAction.Status = switch step.status {
+                case .pending: .waiting
+                case .inProgress: .running
+                case .completed: .completed
+                }
+                upsertSessionAction(.init(
+                    id: step.id,
+                    messageID: messageID,
+                    kind: .plan,
+                    title: step.title,
+                    detail: "",
+                    status: status,
+                    work: .init(
+                        kind: .planStep,
+                        ownership: .providerBound,
+                        stepKey: step.id.uuidString,
+                        originActionID: actionID
+                    )
+                ), at: index)
+            }
         case .reasoningSummary(let actionID, let delta):
             guard let messageID = sessions[index].messages.last(where: { $0.role == .assistant })?.id else { return }
             if SessionActionTrail.appendDetail(id: actionID, delta: delta, in: &sessions[index].actions) {
@@ -6739,7 +6871,8 @@ Lattice self-edit rules:
                         policy: sessions[index].policy,
                         policyReason: policyReason,
                         actor: .user
-                    )
+                    ),
+                    work: .init(kind: .approval, ownership: .providerBound)
                 ), at: index)
             }
             let automaticResolution = AutomaticPermissionResolutionPolicy.resolve(
@@ -6893,6 +7026,7 @@ Lattice self-edit rules:
             activeRunIDs[id] = nil
             harnessPermissionNotices[id] = nil
             finishCompletedTurnActions(at: index)
+            recordWorkOutcome(.succeeded, title: "Work completed", detail: "", at: index)
             sessions[index].isStreaming = false
             reduceRunUI(.completed, for: id)
             threadActivityLanes.apply(.completed, to: id)
@@ -6911,6 +7045,7 @@ Lattice self-edit rules:
             harnessPermissionNotices[id] = nil
             selfEditRunIDs.remove(id)
             finishPendingActions(status: .cancelled, at: index)
+            recordWorkOutcome(.cancelled, title: "Work stopped", detail: "The run was cancelled before every item finished.", at: index)
             sessions[index].isStreaming = false
             if let request = submittedRequests[id] { retryableRequests[id] = request }
             submittedRequests[id] = nil
@@ -6937,9 +7072,29 @@ Lattice self-edit rules:
             threadActivityLanes.apply(.failed(message), to: id)
             handleSchedulerAdmissions(taskScheduler.finish(id))
             if sessions[index].messages.last?.text.isEmpty == true { sessions[index].messages.removeLast() }
+            recordWorkOutcome(.failed, title: "Work failed", detail: message, at: index)
             persist()
             scheduleIdleUnloadIfNeeded(for: backend)
         }
+    }
+
+    private func recordWorkOutcome(
+        _ outcome: SessionWorkSemantics.OutcomeKind,
+        title: String,
+        detail: String,
+        at sessionIndex: Int
+    ) {
+        guard sessions[sessionIndex].executionRoute.mode == .work,
+              let messageID = sessions[sessionIndex].messages.last(where: { $0.role == .assistant })?.id
+                ?? sessions[sessionIndex].messages.last?.id else { return }
+        upsertSessionAction(.init(
+            messageID: messageID,
+            kind: .harness,
+            title: title,
+            detail: detail,
+            status: outcome == .failed ? .failed : (outcome == .cancelled ? .cancelled : .completed),
+            work: .init(kind: .outcome, ownership: .providerBound, outcomeKind: outcome)
+        ), at: sessionIndex)
     }
 
     private static func providerSessionIssueDetail(_ issue: ProviderSessionIssue) -> String {

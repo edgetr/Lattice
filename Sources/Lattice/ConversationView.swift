@@ -61,8 +61,17 @@ struct ConversationView: View {
                                             )
                                             .id(message.id)
                                             let messageActions = session.actions.filter { $0.messageID == message.id }
-                                            if !messageActions.isEmpty {
+                                            if session.executionRoute.mode != .work, !messageActions.isEmpty {
                                                 AssistantActivityDisclosure(actions: messageActions)
+                                            }
+                                        }
+                                        if session.executionRoute.mode == .work {
+                                            let projectedActionIDs = Set(state.workProjection(for: session).log.map(\.actionID))
+                                            let workLogActions = session.actions.filter { projectedActionIDs.contains($0.id) }
+                                            if !workLogActions.isEmpty {
+                                                WorkLogDisclosure(actions: workLogActions) { target in
+                                                    state.workOriginJumpTarget = target
+                                                }
                                             }
                                         }
                                         ForEach(session.queuedFollowUps) { followUp in
@@ -73,7 +82,8 @@ struct ConversationView: View {
                                             SelfEditPreviewRow(preview: preview, state: state)
                                                 .id(preview.id)
                                         }
-                                        if let notice = state.harnessPermissionNotice(for: session.id) {
+                                        if session.executionRoute.mode != .work,
+                                           let notice = state.harnessPermissionNotice(for: session.id) {
                                             HarnessPermissionNoticeRow(notice: notice, state: state)
                                                 .id(notice.id)
                                         }
@@ -145,6 +155,9 @@ struct ConversationView: View {
                                     handleSessionActivation(sessionID: session.id, proxy: proxy)
                                     scheduleSessionActivation(sessionID: session.id, proxy: proxy)
                                 }
+                                .onChange(of: state.workOriginJumpTarget) { _, target in
+                                    handleWorkOriginJump(target, proxy: proxy)
+                                }
 
                                 if let affordance = state.conversationJumpAffordances[session.id],
                                    affordance.isVisible,
@@ -162,6 +175,11 @@ struct ConversationView: View {
                     }
                 }
                 if showsComposer {
+                    if session.executionRoute.mode == .work {
+                        WorkActionDock(session: session, state: state) { target in
+                            state.workOriginJumpTarget = target
+                        }
+                    }
                     ComposerView(state: state)
                 }
             } else if state.isTransientNewChat {
@@ -183,6 +201,12 @@ struct ConversationView: View {
     private func scrollAccessibilityValue(for sessionID: UUID) -> String {
         let following = state.conversationScrollStates[sessionID]?.isFollowingTail ?? true
         return following ? "Following latest messages" : "Reading earlier messages"
+    }
+
+    private func handleWorkOriginJump(_ target: UUID?, proxy: ScrollViewProxy) {
+        guard let target else { return }
+        proxy.scrollTo(target, anchor: .center)
+        state.workOriginJumpTarget = nil
     }
 
     // MARK: - Scroll anchoring
@@ -1324,6 +1348,206 @@ private struct MessageActionButton: View {
         .buttonStyle(LatticeIconButtonStyle(size: .compact, isDestructive: isDestructive))
         .accessibilityLabel(label)
         .help(label)
+    }
+}
+
+private struct WorkLogDisclosure: View {
+    let actions: [SessionAction]
+    let onJump: (UUID) -> Void
+
+    private var orderedActions: [SessionAction] {
+        actions.sorted {
+            if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
+            return $0.id.uuidString < $1.id.uuidString
+        }
+    }
+
+    var body: some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(orderedActions) { action in
+                    HStack(alignment: .top, spacing: 8) {
+                        SessionActionDetailRow(action: action)
+                        Spacer(minLength: 8)
+                        Button {
+                            onJump(action.work?.originMessageID ?? action.messageID)
+                        } label: {
+                            Label("Jump", systemImage: "arrow.up.left")
+                        }
+                        .buttonStyle(.borderless)
+                        .controlSize(.small)
+                        .accessibilityLabel("Jump to originating message")
+                        .accessibilityIdentifier(LatticeAccessibilityID.workOriginJump(action.id))
+                    }
+                    .id(action.id)
+                    if action.id != orderedActions.last?.id { Divider() }
+                }
+            }
+            .padding(.top, 10)
+        } label: {
+            HStack {
+                Label("Work log", systemImage: "list.bullet.rectangle")
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                Text("\(actions.count) items")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier(LatticeAccessibilityID.workLog)
+            .accessibilityLabel("Work log, \(actions.count) items")
+            .accessibilityHint("Expand to review chronological work and jump to its source")
+        }
+        .padding(11)
+        .latticeGlass(cornerRadius: 12, interactive: true)
+    }
+}
+
+private struct WorkActionDock: View {
+    let session: LatticeSession
+    @ObservedObject var state: AppState
+    let onJump: (UUID) -> Void
+
+    private var snapshot: WorkProjection.Snapshot { state.workProjection(for: session) }
+    private var request: WorkProjection.ActionableRequest? { snapshot.actionable }
+    private var action: SessionAction? {
+        guard let request else { return nil }
+        return session.actions.first(where: { $0.id == request.id })
+    }
+
+    private var artifactCanOpen: Bool {
+        guard let locator = request?.artifactLocator else { return false }
+        let workspace = URL(fileURLWithPath: session.workspacePath ?? state.selectedWorkspacePath).standardizedFileURL
+        return WorkArtifactAccessPolicy.canOpen(locator: locator, workspace: workspace)
+    }
+
+    var body: some View {
+        if let request, let action {
+            let presentation = WorkItemPresentationPolicy.presentation(for: request, action: action)
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("Current request")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Text(presentation.status)
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(.orange.opacity(0.12), in: Capsule())
+                    Spacer()
+                    Button {
+                        let actionOrigin = request.originActionID
+                        let visibleActionOrigin = snapshot.log.contains(where: { $0.actionID == actionOrigin })
+                        onJump(visibleActionOrigin ? actionOrigin : request.originMessageID)
+                    } label: {
+                        Label("Jump to source", systemImage: "arrow.up.left")
+                    }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                    .accessibilityLabel("Jump to originating message or action")
+                    .accessibilityIdentifier(LatticeAccessibilityID.workOriginJump(request.id))
+                }
+
+                Text(presentation.heading)
+                    .font(.headline)
+                Text(action.title)
+                    .font(.callout.weight(.semibold))
+                if !action.detail.isEmpty {
+                    Text(action.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(5)
+                        .textSelection(.enabled)
+                }
+
+                if request.kind == .liveQuestion {
+                    TextField("Type your answer", text: answerBinding(for: request.id), axis: .vertical)
+                        .lineLimit(1...4)
+                        .textFieldStyle(.roundedBorder)
+                        .accessibilityLabel("Answer question")
+                        .onSubmit { sendAnswer(request) }
+                }
+
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        Spacer(minLength: 0)
+                        dockActions(for: request)
+                    }
+                    VStack(alignment: .leading, spacing: 8) {
+                        dockActions(for: request)
+                    }
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: state.composerMaxWidth())
+            .latticeGlass(cornerRadius: 14, interactive: true, tint: .orange.opacity(0.05))
+            .padding(.horizontal, state.composerHorizontalPadding())
+            .padding(.top, 8)
+            .frame(maxWidth: .infinity)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier(LatticeAccessibilityID.workDock)
+            .accessibilityLabel(presentation.accessibilityLabel)
+            .accessibilityHint(presentation.accessibilityHint)
+        }
+    }
+
+    @ViewBuilder
+    private func dockActions(for request: WorkProjection.ActionableRequest) -> some View {
+        switch request.kind {
+        case .liveApproval:
+            if let notice = state.harnessPermissionNotice(for: session.id), notice.request.id == request.id {
+                let options = state.availableHarnessPermissionOptions(for: notice)
+                ForEach(options.filter(\.isReject)) { option in
+                    Button(option.name) { state.respondToHarnessPermission(notice, option: option) }
+                }
+                if options.filter(\.isReject).isEmpty {
+                    Button("Stop") { state.stop(sessionID: session.id) }
+                }
+                ForEach(options.filter(\.isAllow)) { option in
+                    Button(option.name) { state.respondToHarnessPermission(notice, option: option) }
+                        .buttonStyle(.borderedProminent)
+                        .accessibilityIdentifier(LatticeAccessibilityID.workPrimaryAction(request.id))
+                }
+            }
+        case .liveQuestion:
+            Button("Send answer") { sendAnswer(request) }
+                .buttonStyle(.borderedProminent)
+                .disabled(answerText(for: request.id).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .keyboardShortcut(.return, modifiers: [.command])
+                .accessibilityIdentifier(LatticeAccessibilityID.workPrimaryAction(request.id))
+        case .userTaskConfirmation:
+            Button("Confirm task") { state.confirmWorkTask(actionID: request.id) }
+                .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier(LatticeAccessibilityID.workPrimaryAction(request.id))
+        case .retryableFailure:
+            Button("Retry turn") { state.retryWorkItem(actionID: request.id) }
+                .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier(LatticeAccessibilityID.workPrimaryAction(request.id))
+        case .artifactOperation:
+            Button("Reveal in Finder") { state.revealWorkArtifact(actionID: request.id) }
+            Button("Open artifact") { state.openWorkArtifact(actionID: request.id) }
+                .buttonStyle(.borderedProminent)
+                .disabled(!artifactCanOpen)
+                .help(artifactCanOpen ? "Open this safe workspace document" : "Reveal only: this artifact is not a safe workspace document")
+                .accessibilityIdentifier(LatticeAccessibilityID.workPrimaryAction(request.id))
+        }
+    }
+
+    private func sendAnswer(_ request: WorkProjection.ActionableRequest) {
+        let submitted = answerText(for: request.id)
+        state.workQuestionAnswers[request.id] = ""
+        state.answerWorkQuestion(actionID: request.id, answer: submitted)
+    }
+
+    private func answerText(for id: UUID) -> String {
+        state.workQuestionAnswers[id] ?? ""
+    }
+
+    private func answerBinding(for id: UUID) -> Binding<String> {
+        Binding(
+            get: { state.workQuestionAnswers[id] ?? "" },
+            set: { state.workQuestionAnswers[id] = $0 }
+        )
     }
 }
 

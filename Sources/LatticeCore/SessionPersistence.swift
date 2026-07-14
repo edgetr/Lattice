@@ -231,15 +231,12 @@ public struct SessionPersistence: Sendable {
     }
 
     public static func restoreRuntimeState(_ sessions: [LatticeSession]) -> [LatticeSession] {
-        sessions.map { session in
-            var restored = session
-            restored.isStreaming = false
-            for index in restored.actions.indices where [.running, .waiting].contains(restored.actions[index].status) {
-                restored.actions[index].status = .interrupted
-                restored.actions[index].updatedAt = .now
-            }
-            return restored
-        }.sorted { $0.lastUpdated > $1.lastUpdated }
+        // WorkRuntimeReconciliation fails closed for provider-bound live state without
+        // reconstructing permission callbacks. User-owned pending tasks and terminal
+        // artifacts/outcomes are preserved; restored approvals/questions are never live.
+        sessions
+            .map { WorkRuntimeReconciliation.reconcileSession($0) }
+            .sorted { $0.lastUpdated > $1.lastUpdated }
     }
 
     private func loadSearchIndex() -> SessionSearchIndex? {

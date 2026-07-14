@@ -556,9 +556,11 @@ struct SessionPersistenceTests {
                 ]
             ]
         ]
-        if case .plan(_, let title, let steps)? = CodexExecHarness.appServerEvent(from: plan, workspace: workspace) {
+        if case .plan(_, let title, let explanation, let steps)? = CodexExecHarness.appServerEvent(from: plan, workspace: workspace) {
             #expect(title == "Plan")
-            #expect(steps == ["Updating the chat surface", "Completed — Inspect", "In progress — Verify"])
+            #expect(explanation == "Updating the chat surface")
+            #expect(steps.map(\.title) == ["Inspect", "Verify"])
+            #expect(steps.map(\.status) == [.completed, .inProgress])
         } else {
             Issue.record("Expected a Codex plan event")
         }

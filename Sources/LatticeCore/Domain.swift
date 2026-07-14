@@ -370,13 +370,31 @@ public struct HarnessActivityEvent: Hashable, Sendable {
     }
 }
 
+public struct AgentPlanStep: Sendable, Equatable {
+    public enum Status: String, Sendable, Equatable {
+        case pending
+        case inProgress
+        case completed
+    }
+
+    public let id: UUID
+    public let title: String
+    public let status: Status
+
+    public init(id: UUID, title: String, status: Status) {
+        self.id = id
+        self.title = title
+        self.status = status
+    }
+}
+
 public enum AgentEvent: Sendable, Equatable {
     case sessionStarted(UUID)
     case harnessSessionStarted(String)
     /// Provider rejected its persisted session; continuity is rebuilt only from visible transcript.
     case harnessSessionRecovery(String)
     case assistantDelta(String)
-    case plan(id: UUID, title: String, steps: [String])
+    case plan(id: UUID, title: String, explanation: String?, steps: [AgentPlanStep])
     case reasoningSummary(id: UUID, delta: String)
     case toolRequested(ToolRequest)
     case toolProgress(id: UUID, fraction: Double, detail: String)
@@ -942,6 +960,101 @@ public struct ApprovalProvenance: Hashable, Codable, Sendable {
     }
 }
 
+/// Privacy-bounded structured Work-mode semantics attached to a durable `SessionAction`.
+/// Title/detail stay on the host action (or origin message); this payload only carries typed
+/// structure needed for projection, jump origins, and restore reconciliation.
+public struct SessionWorkSemantics: Hashable, Codable, Sendable {
+    public enum Kind: String, Codable, Sendable {
+        case planStep
+        case taskStep
+        case question
+        case approval
+        case artifact
+        case outcome
+    }
+
+    /// Provider-bound rows require live runtime IDs before they are actionable.
+    /// User-owned rows may be marked/confirmed without reconstructing a provider callback.
+    public enum Ownership: String, Codable, Sendable {
+        case providerBound
+        case userOwned
+    }
+
+    public enum TaskMark: String, Codable, Sendable {
+        case unchecked
+        case checked
+        case confirmed
+    }
+
+    public enum OutcomeKind: String, Codable, Sendable {
+        case succeeded
+        case failed
+        case cancelled
+        case partial
+    }
+
+    public let kind: Kind
+    public let ownership: Ownership
+    /// Bounded machine key within a plan (not free-form prose).
+    public let stepKey: String?
+    /// User mark for user-owned task steps only. Never used for provider-bound permissions.
+    public var taskMark: TaskMark?
+    /// Explicit deliverable locator for artifact rows only. Never derived from `action.detail`.
+    public let artifactLocator: String?
+    public let outcomeKind: OutcomeKind?
+    /// Jump target when different from the host action's `messageID`.
+    public let originMessageID: UUID?
+    /// Jump target when this row was derived from another durable action.
+    public let originActionID: UUID?
+    /// Durable link to the user message that answered or resolved this request.
+    public var resolutionMessageID: UUID?
+
+    public init(
+        kind: Kind,
+        ownership: Ownership,
+        stepKey: String? = nil,
+        taskMark: TaskMark? = nil,
+        artifactLocator: String? = nil,
+        outcomeKind: OutcomeKind? = nil,
+        originMessageID: UUID? = nil,
+        originActionID: UUID? = nil,
+        resolutionMessageID: UUID? = nil
+    ) {
+        self.kind = kind
+        self.ownership = ownership
+        self.stepKey = stepKey.map { Self.safe($0, limit: 64) }
+        self.taskMark = taskMark
+        // Artifact locators are explicit product data, still bounded and single-line.
+        self.artifactLocator = kind == .artifact
+            ? artifactLocator.map { Self.safe($0, limit: 512) }
+            : nil
+        self.outcomeKind = kind == .outcome ? outcomeKind : nil
+        self.originMessageID = originMessageID
+        self.originActionID = originActionID
+        self.resolutionMessageID = resolutionMessageID
+    }
+
+    /// True when restore must keep this row pending instead of treating it as a live provider wait.
+    public var isPendingUserOwnedTask: Bool {
+        ownership == .userOwned && (kind == .taskStep || kind == .planStep)
+    }
+
+    /// True when this row is provider-dependent live work that cannot be reconstructed from disk alone.
+    public var isProviderDependentLiveState: Bool {
+        switch kind {
+        case .approval, .question:
+            return true
+        case .planStep, .taskStep, .artifact, .outcome:
+            return ownership == .providerBound
+        }
+    }
+
+    private static func safe(_ value: String, limit: Int) -> String {
+        let oneLine = value.unicodeScalars.map { CharacterSet.controlCharacters.contains($0) ? " " : String($0) }.joined()
+        return String(oneLine.trimmingCharacters(in: .whitespacesAndNewlines).prefix(limit))
+    }
+}
+
 public struct SessionAction: Identifiable, Hashable, Codable, Sendable {
     public enum Kind: String, Codable, Sendable { case tool, approval, plan, reasoning, harness, diagnostic }
     public enum Status: String, Codable, Sendable { case running, waiting, completed, failed, allowed, denied, cancelled, interrupted }
@@ -957,6 +1070,8 @@ public struct SessionAction: Identifiable, Hashable, Codable, Sendable {
     public let createdAt: Date
     public var updatedAt: Date
     public var approvalProvenance: ApprovalProvenance?
+    /// Optional Work-mode structured payload. Absent in legacy JSON; never required for decode.
+    public var work: SessionWorkSemantics?
 
     public init(
         id: UUID = UUID(),
@@ -969,7 +1084,8 @@ public struct SessionAction: Identifiable, Hashable, Codable, Sendable {
         workspaceScoped: Bool = false,
         createdAt: Date = .now,
         updatedAt: Date = .now,
-        approvalProvenance: ApprovalProvenance? = nil
+        approvalProvenance: ApprovalProvenance? = nil,
+        work: SessionWorkSemantics? = nil
     ) {
         self.id = id
         self.messageID = messageID
@@ -982,6 +1098,43 @@ public struct SessionAction: Identifiable, Hashable, Codable, Sendable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.approvalProvenance = approvalProvenance
+        self.work = work
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, messageID, kind, toolKind, title, detail, status, workspaceScoped, createdAt, updatedAt, approvalProvenance, work
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        messageID = try container.decode(UUID.self, forKey: .messageID)
+        kind = try container.decode(Kind.self, forKey: .kind)
+        toolKind = try container.decodeIfPresent(ToolRequest.Kind.self, forKey: .toolKind)
+        title = try container.decode(String.self, forKey: .title)
+        detail = try container.decode(String.self, forKey: .detail)
+        status = try container.decode(Status.self, forKey: .status)
+        workspaceScoped = try container.decodeIfPresent(Bool.self, forKey: .workspaceScoped) ?? false
+        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? .distantPast
+        updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
+        approvalProvenance = try container.decodeIfPresent(ApprovalProvenance.self, forKey: .approvalProvenance)
+        work = try container.decodeIfPresent(SessionWorkSemantics.self, forKey: .work)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(messageID, forKey: .messageID)
+        try container.encode(kind, forKey: .kind)
+        try container.encodeIfPresent(toolKind, forKey: .toolKind)
+        try container.encode(title, forKey: .title)
+        try container.encode(detail, forKey: .detail)
+        try container.encode(status, forKey: .status)
+        try container.encode(workspaceScoped, forKey: .workspaceScoped)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(updatedAt, forKey: .updatedAt)
+        try container.encodeIfPresent(approvalProvenance, forKey: .approvalProvenance)
+        try container.encodeIfPresent(work, forKey: .work)
     }
 }
 

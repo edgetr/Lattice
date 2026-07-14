@@ -705,23 +705,28 @@ public final class CodexExecHarness: @unchecked Sendable {
         if method == "turn/plan/updated",
            let turnID = params["turnId"] as? String,
            let rawSteps = params["plan"] as? [[String: Any]] {
-            var steps: [String] = []
-            if let explanation = (params["explanation"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !explanation.isEmpty {
-                steps.append(explanation)
-            }
-            steps += rawSteps.compactMap { value in
+            let explanation = (params["explanation"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let steps = rawSteps.enumerated().compactMap { index, value -> AgentPlanStep? in
                 guard let step = (value["step"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !step.isEmpty else { return nil }
-                let status = value["status"] as? String
-                let label: String
-                switch status {
-                case "completed": label = "Completed"
-                case "inProgress": label = "In progress"
-                default: label = "Pending"
+                let status: AgentPlanStep.Status
+                switch value["status"] as? String {
+                case "completed": status = .completed
+                case "inProgress": status = .inProgress
+                default: status = .pending
                 }
-                return "\(label) — \(step)"
+                return AgentPlanStep(
+                    id: HarnessToolEventDecoder.stableID(for: "codex:plan:\(turnID):\(index):\(step)"),
+                    title: step,
+                    status: status
+                )
             }
             guard !steps.isEmpty else { return HarnessToolEventDecoder.diagnostic(provider: "Codex", object: object, reason: "Turn plan update has no usable steps.") }
-            return .plan(id: HarnessToolEventDecoder.stableID(for: "codex:plan:\(turnID)"), title: "Plan", steps: steps)
+            return .plan(
+                id: HarnessToolEventDecoder.stableID(for: "codex:plan:\(turnID)"),
+                title: "Plan",
+                explanation: explanation?.isEmpty == false ? explanation : nil,
+                steps: steps
+            )
         }
         if method == "turn/plan/updated" { return HarnessToolEventDecoder.diagnostic(provider: "Codex", object: object, reason: "Turn plan update is malformed.") }
         if method == "error" {

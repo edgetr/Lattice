@@ -7,8 +7,9 @@ public enum SessionActionTrail {
         } else {
             actions.append(action)
         }
-        if actions.count > limit {
-            actions.removeFirst(actions.count - limit)
+        while actions.count > limit {
+            let removableIndex = actions.firstIndex(where: { !isDurableWorkRecord($0) }) ?? actions.startIndex
+            actions.remove(at: removableIndex)
         }
     }
 
@@ -54,6 +55,8 @@ public enum SessionActionTrail {
             switch (actions[index].kind, actions[index].status) {
             case (.tool, .running), (.plan, .running), (.reasoning, .running), (.harness, .running):
                 actions[index].status = .completed
+            case (.plan, .waiting):
+                actions[index].status = .interrupted
             case (.approval, .waiting):
                 actions[index].status = .cancelled
             default:
@@ -67,6 +70,15 @@ public enum SessionActionTrail {
 
     public static func prune(in actions: inout [SessionAction], keepingMessageIDs: Set<UUID>) {
         actions.removeAll { !keepingMessageIDs.contains($0.messageID) }
+    }
+
+    private static func isDurableWorkRecord(_ action: SessionAction) -> Bool {
+        switch action.work?.kind {
+        case .question, .taskStep, .artifact, .outcome:
+            true
+        case .approval, .planStep, .none:
+            false
+        }
     }
 }
 
