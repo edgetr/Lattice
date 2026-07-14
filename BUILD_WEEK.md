@@ -63,6 +63,31 @@ Acceptance criteria:
 - A route cannot be described as broker-controlled when execution bypasses the broker.
 - Local-only and unavailable-route tests cover first run, continuation, import, catalog failure, and recovery.
 
+#### Harness customization boundary and future direction
+
+Lattice should support provider-owned subscriptions without pretending every provider exposes the same customization surface. Today the implemented routes are intentionally different:
+
+| Route | Transport used by Lattice | Workflow guidance | Custom tools / MCP controlled by Lattice | Important boundary |
+| --- | --- | --- | --- | --- |
+| Codex | Structured app-server JSON-RPC | Injected into the visible task prompt; ambient Codex configuration and `AGENTS.md` may also apply | Not yet | Codex owns its tool runtime; Lattice exposes only reviewed model, reasoning, sandbox, and approval controls. |
+| Grok Build | Structured ACP | Injected into the visible task prompt | Not yet; Lattice currently sends no MCP servers | Grok owns tools, profiles, plugins, and hooks used by its CLI. |
+| OpenCode | Structured ACP in pure mode | Injected into the visible task prompt | Not yet; Lattice currently sends no MCP servers | Pure mode deliberately avoids inheriting unreviewed plugins and agents. |
+| Hermes | Structured ACP | Injected into the visible task prompt | Not yet; Lattice currently sends no MCP servers | Hermes owns its skills, plugins, rules, memory, and toolsets. |
+| Pi | Structured NDJSON/RPC | Injected into the visible task prompt | Fixed provider-owned allowlist; no Lattice tool injection yet | Pi supports more prompt, extension, skill, and tool configuration than Lattice currently exposes. |
+| Antigravity | Streamed CLI transcript | Injected into the visible task prompt | No | The current print route is not a structured tool-event protocol and cannot offer resume or audited tool injection. |
+| Ollama | Local HTTP/NDJSON chat | Visible transcript messages | No tools | Local inference is supported, but a true system role and tool loop are future work. |
+| Apple Intelligence | Foundation Models session | Fixed Lattice instructions | No tools | The system model is fixed and local; no external agent tool harness is exposed. |
+
+The near-term direction is hybrid, not one lowest-common-denominator abstraction:
+
+1. Keep subscription-backed provider harnesses and expose only capabilities proven by their structured protocols.
+2. Add isolated, reviewable provider configuration profiles where a CLI supports them; never silently inherit ambient plugins, MCP servers, hooks, or memory.
+3. Route any Lattice-supplied MCP server or tool through the existing permission, scope, redaction, and audit design before enabling it for ACP or RPC harnesses.
+4. Build a Lattice-owned API harness for workflows that require uniform custom system prompts, a common brokered tool loop, and explicit API-key billing. Store those credentials only in Keychain.
+5. Treat Antigravity as a transcript route until a stable structured protocol can provide typed events, approvals, cancellation, and session resume.
+
+This keeps the product honest: workflow guidance works across current routes, but true custom system prompts and Lattice-owned tools are not uniformly available. The Lattice-owned API harness is the path to uniform control; provider subscriptions continue to bring their own harness behavior.
+
 ### 2. Durable run ledger and protocol replay
 
 Turn normalized harness traffic into an append-only per-run ledger. The visible timeline should be derived from structured events rather than transient global UI flags. Add sanitized protocol fixtures so a run can be replayed without provider credentials.
@@ -171,6 +196,8 @@ Do not include prompts, transcripts, or identifiers that contain secrets or priv
 | 2026-07-14 | Bounded interactive provider lifecycle and run ownership | `944b97c`, `db9aa60`, `b438964`, `7032a63` | Current Codex desktop task; `/feedback` ID pending | GPT-5.6 Luna implemented and independently re-reviewed pipe ownership, process groups, output limits, serialized writes, permission handoff, replacement-run ownership, and cancellation races. | Never let stale teardown cancel a replacement run; allow only final cancellation control frames during grace; keep time, output, workspace, and permission bounds explicit. | Core/app typechecks and live transport probes passed; fallback verifier passed 810 checks; native Swift Testing was unavailable on this Command Line Tools installation. |
 | 2026-07-14 | Validated ACP stale-session recovery | `638079e` | Current Codex desktop task; `/feedback` ID pending | GPT-5.6 Luna traced recovery and persistence ordering across the ACP harness, event domain, and AppState transcript handoff. | Recover only from explicit stale-session rejection; require a bounded visible-transcript handoff; persist a replacement ID only after model validation and successful prompt response. | Focused recovery tests and full source parsing passed; packaged app verification passed; fallback verifier passed at `7032a63`. |
 | 2026-07-14 | Integrated UI and verification repair | `5724576`, `2eecbd1` | Current Codex desktop task; `/feedback` ID pending | GPT-5.6 Luna reviewed the merged UI for contradictory catalog and scroll accessibility states and repaired fallback parity. | Use human-readable VoiceOver state, distinguish hidden from undiscovered models, and keep verification claims tied to observed results. | Real app built and packaged successfully; bundle structure and arm64 executable verification passed. |
+| 2026-07-14 | Bounded slash commands and usable chat inspector | `9652a7d`, `d9752b3` | Current Codex desktop task; `/feedback` ID pending | GPT-5.6 traced the slash-only layout collapse and reshaped the inspector around the information hierarchy. | Keep the transcript visible, preserve every searchable command, widen the inspector, and collapse secondary safety/usage detail without hiding warnings. | Fallback verifier passed 812 checks; the manually compiled app packaged and verified successfully. |
+| 2026-07-14 | Local-first Models and provider-owned Connections | `178d74b`, `a129fb3`, `58b357f` | Current Codex desktop task; `/feedback` ID pending | GPT-5.6 separated local model discovery from provider setup and implemented the bounded Ollama delete flow with failure tests. | Models launches new local chats and manages local storage; Connections owns provider authentication, harnesses, and cloud model visibility; deletion always asks first and never removes chat history. | Two Ollama deletion tests added; fallback verifier passed 814 checks; app compilation, packaging, and bundle verification passed. |
 
 ## Submission checklist
 
