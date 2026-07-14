@@ -504,6 +504,22 @@ public struct CLIUpdateInfo: Hashable, Codable, Sendable {
     }
 }
 
+public enum ConversationMode: String, CaseIterable, Codable, Sendable, Identifiable {
+    case code
+    case work
+    case local
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .code: "Code"
+        case .work: "Work"
+        case .local: "Local"
+        }
+    }
+}
+
 public enum ChatBackend: Hashable, Codable, Sendable, Identifiable {
     case codex(model: String)
     case grok(model: String)
@@ -545,6 +561,57 @@ public enum ChatBackend: Hashable, Codable, Sendable, Identifiable {
             true
         case .codex, .grok, .openCode, .antigravity:
             false
+        }
+    }
+}
+
+/// Stable persisted identity for execution. Runtime ID names harness/client boundary,
+/// while provider and model IDs preserve user selection.
+public struct ExecutionRoute: Hashable, Codable, Sendable, Identifiable {
+    public let mode: ConversationMode
+    public let providerID: String
+    public let modelID: String?
+    public let runtimeID: String
+
+    public init(
+        mode: ConversationMode,
+        providerID: String,
+        modelID: String? = nil,
+        runtimeID: String
+    ) {
+        self.mode = mode
+        self.providerID = providerID
+        self.modelID = modelID
+        self.runtimeID = runtimeID
+    }
+
+    /// Compatibility spelling for callers that still call runtimes harnesses.
+    public var harnessID: String { runtimeID }
+
+    public var id: String {
+        [mode.rawValue, providerID, modelID ?? "", runtimeID].joined(separator: "\u{1f}")
+    }
+
+    /// Reconstruct old persisted sessions without remapping direct provider routes.
+    public static func legacy(for backend: ChatBackend, harnessID: String?) -> ExecutionRoute {
+        let runtime = { (fallback: String) in
+            let value = harnessID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return value.isEmpty ? fallback : value
+        }
+
+        switch backend {
+        case .codex(let model):
+            return ExecutionRoute(mode: .code, providerID: "codex", modelID: model, runtimeID: runtime("codex"))
+        case .grok(let model):
+            return ExecutionRoute(mode: .code, providerID: "grok", modelID: model, runtimeID: runtime("grok"))
+        case .openCode(let model):
+            return ExecutionRoute(mode: .code, providerID: "opencode", modelID: model, runtimeID: runtime("opencode"))
+        case .antigravity(let model):
+            return ExecutionRoute(mode: .code, providerID: "antigravity", modelID: model, runtimeID: runtime("antigravity"))
+        case .appleIntelligence:
+            return ExecutionRoute(mode: .local, providerID: "apple", modelID: nil, runtimeID: runtime("lattice"))
+        case .ollama(let model):
+            return ExecutionRoute(mode: .local, providerID: "ollama", modelID: model, runtimeID: runtime("lattice"))
         }
     }
 }
@@ -714,6 +781,8 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
     public var title: String
     public var messages: [ChatMessage]
     public var backend: ChatBackend
+    /// New route authority. `backend` and `harnessID` remain for legacy decoding and UI migration.
+    public var executionRoute: ExecutionRoute
     public var harnessID: String?
     public var reasoningEffort: ReasoningEffort?
     public var harnessThreadID: String?
@@ -737,6 +806,7 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         title: String,
         messages: [ChatMessage] = [],
         backend: ChatBackend,
+        executionRoute: ExecutionRoute? = nil,
         harnessID: String? = nil,
         reasoningEffort: ReasoningEffort? = nil,
         harnessThreadID: String? = nil,
@@ -754,6 +824,7 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         portableArchiveFingerprint: String? = nil
     ) {
         self.id = id; self.title = title; self.messages = messages; self.backend = backend
+        self.executionRoute = executionRoute ?? ExecutionRoute.legacy(for: backend, harnessID: harnessID)
         self.harnessID = harnessID
         self.reasoningEffort = reasoningEffort
         self.harnessThreadID = harnessThreadID; self.workspacePath = workspacePath; self.attachments = attachments
@@ -764,7 +835,7 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, messages, backend, harnessID, reasoningEffort, harnessThreadID, workspacePath, attachments, policy, privacyMode, intent, actions, queuedFollowUps, draft, isPinned, isStreaming, lastUpdated, portableArchiveFingerprint
+        case id, title, messages, backend, executionRoute, harnessID, reasoningEffort, harnessThreadID, workspacePath, attachments, policy, privacyMode, intent, actions, queuedFollowUps, draft, isPinned, isStreaming, lastUpdated, portableArchiveFingerprint
     }
 
     public init(from decoder: Decoder) throws {
@@ -774,6 +845,8 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         messages = try container.decodeIfPresent([ChatMessage].self, forKey: .messages) ?? []
         backend = try container.decode(ChatBackend.self, forKey: .backend)
         harnessID = try container.decodeIfPresent(String.self, forKey: .harnessID)
+        executionRoute = try container.decodeIfPresent(ExecutionRoute.self, forKey: .executionRoute)
+            ?? ExecutionRoute.legacy(for: backend, harnessID: harnessID)
         reasoningEffort = try container.decodeIfPresent(ReasoningEffort.self, forKey: .reasoningEffort)
         harnessThreadID = try container.decodeIfPresent(String.self, forKey: .harnessThreadID)
         workspacePath = try container.decodeIfPresent(String.self, forKey: .workspacePath)
@@ -796,6 +869,7 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         try container.encode(title, forKey: .title)
         try container.encode(messages, forKey: .messages)
         try container.encode(backend, forKey: .backend)
+        try container.encode(executionRoute, forKey: .executionRoute)
         try container.encodeIfPresent(harnessID, forKey: .harnessID)
         try container.encodeIfPresent(reasoningEffort, forKey: .reasoningEffort)
         try container.encodeIfPresent(harnessThreadID, forKey: .harnessThreadID)

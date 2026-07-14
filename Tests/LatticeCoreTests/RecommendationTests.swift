@@ -242,6 +242,30 @@ struct RecommendationTests {
         #expect(ExecutionRoutePolicy.compatibleHarnessIDs(for: "ollama") == ["lattice"])
         #expect(ExecutionRoutePolicy.compatibleHarnessIDs(for: "apple") == ["lattice"])
         #expect(ExecutionRoutePolicy.normalize(.init(engineID: "codex", harnessID: "lattice"), fallbackEngineID: "codex", fallbackHarnessID: "codex") == .init(engineID: "codex", harnessID: "codex"))
+
+        let declared: [(ConversationMode, String, String?, String)] = [
+            (.code, "codex", "gpt-5.5", "pi"),
+            (.code, "opencode", "openai/gpt-5.5", "pi"),
+            (.code, "grok", "grok-3", "grok"),
+            (.code, "antigravity", "gemini", "antigravity"),
+            (.work, "codex", "gpt-5.5", "hermes"),
+            (.work, "grok", "grok-3", "hermes"),
+            (.work, "opencode", "openai/gpt-5.5", "hermes"),
+            (.local, "apple", nil, "lattice"),
+            (.local, "ollama", "qwen3:8b", "lattice")
+        ]
+        for (mode, providerID, modelID, runtimeID) in declared {
+            #expect(ExecutionRouteResolver.resolve(mode: mode, providerID: providerID, modelID: modelID) == ExecutionRoute(mode: mode, providerID: providerID, modelID: modelID, runtimeID: runtimeID))
+        }
+        #expect(ExecutionRouteResolver.resolve(mode: .local, providerID: "codex", modelID: "gpt-5.5") == nil)
+        #expect(ExecutionRouteResolver.resolve(mode: .local, providerID: "apple", modelID: "unexpected") == nil)
+        let catalog = ExecutionRouteResolver.catalog(readiness: .validating)
+        #expect(catalog.entries.count == 9)
+        #expect(catalog.entries(for: .code).count == 4)
+        #expect(catalog.entries(for: .work).count == 3)
+        #expect(catalog.entries(for: .local).count == 2)
+        #expect(catalog.entries.allSatisfy { $0.readiness == .validating })
+        #expect(!ExecutionRouteReadiness.failed("offline").isRunnable)
     }
 
     @Test func antigravityCatalogUsesBoundedFakeExecutable() async throws {

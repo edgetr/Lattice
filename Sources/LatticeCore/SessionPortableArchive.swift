@@ -10,7 +10,7 @@ import CoreFoundation
 /// orchestration stay in the app target. Ordinary composer drafts are never exported.
 public enum SessionPortableArchive {
     public static let formatID = "lattice.session.archive"
-    public static let currentVersion = 1
+    public static let currentVersion = 2
     public static let jsonFileExtension = "lattice.json"
     public static let markdownFileExtension = "md"
     public static let jsonUTIDescription = "Lattice Session Archive"
@@ -197,6 +197,10 @@ public struct PortableChatPayload: Equatable, Sendable {
     public var attachments: [PortableAttachment]
     public var actions: [PortableAction]
     public var queuedFollowUps: [PortableQueuedFollowUp]
+    /// Present in v2. Nil only when reading a strict v1 archive.
+    public var mode: ConversationMode?
+    /// Present in v2. Carries route authority without provider session identity.
+    public var executionRoute: ExecutionRoute?
 
     public init(
         title: String,
@@ -212,7 +216,9 @@ public struct PortableChatPayload: Equatable, Sendable {
         messages: [PortableMessage],
         attachments: [PortableAttachment],
         actions: [PortableAction],
-        queuedFollowUps: [PortableQueuedFollowUp]
+        queuedFollowUps: [PortableQueuedFollowUp],
+        mode: ConversationMode? = nil,
+        executionRoute: ExecutionRoute? = nil
     ) {
         self.title = title
         self.isPinned = isPinned
@@ -228,6 +234,8 @@ public struct PortableChatPayload: Equatable, Sendable {
         self.attachments = attachments
         self.actions = actions
         self.queuedFollowUps = queuedFollowUps
+        self.mode = mode
+        self.executionRoute = executionRoute
     }
 }
 
@@ -437,14 +445,15 @@ public enum SessionPortableArchiveExporter {
             queued = []
         }
 
-        let (route, model) = backendParts(session.backend)
+        let (backendRoute, model) = backendParts(session.backend)
+        let executionRoute = session.executionRoute
         let chat = PortableChatPayload(
             title: session.title,
             isPinned: session.isPinned,
             lastUpdated: session.lastUpdated,
-            backendRoute: route,
+            backendRoute: backendRoute,
             backendModel: model,
-            harnessID: session.harnessID,
+            harnessID: executionRoute.runtimeID,
             harnessLabel: session.backend.harnessName,
             reasoningEffort: session.reasoningEffort?.rawValue,
             policy: session.policy.rawValue,
@@ -452,7 +461,9 @@ public enum SessionPortableArchiveExporter {
             messages: portableMessages,
             attachments: portableAttachments,
             actions: portableActions,
-            queuedFollowUps: queued
+            queuedFollowUps: queued,
+            mode: executionRoute.mode,
+            executionRoute: executionRoute
         )
         return PortableSessionDocument(
             exportedAt: options.exportedAt,
@@ -648,6 +659,20 @@ public enum SessionPortableArchiveExporter {
         if let harnessID = document.chat.harnessID { chat["harnessID"] = harnessID }
         if let harnessLabel = document.chat.harnessLabel { chat["harnessLabel"] = harnessLabel }
         if let reasoning = document.chat.reasoningEffort { chat["reasoningEffort"] = reasoning }
+        if let mode = document.chat.mode {
+            chat["mode"] = mode.rawValue
+        }
+        if let route = document.chat.executionRoute {
+            var routeObject: [String: Any] = [
+                "mode": route.mode.rawValue,
+                "providerID": route.providerID,
+                "runtimeID": route.runtimeID
+            ]
+            if let modelID = route.modelID {
+                routeObject["modelID"] = modelID
+            }
+            chat["executionRoute"] = routeObject
+        }
 
         return [
             "format": document.format,
@@ -716,12 +741,24 @@ public enum SessionPortableArchiveExporter {
 public enum SessionPortableArchiveFingerprint {
     /// Deterministic privacy-safe hash of normalized portable content (no source IDs, no export timestamp).
     public static func contentFingerprint(for document: PortableSessionDocument) -> String {
-        contentFingerprint(for: document.chat, includeQueuedFollowUps: document.includeQueuedFollowUps)
+        contentFingerprint(
+            for: document.chat,
+            includeQueuedFollowUps: document.includeQueuedFollowUps,
+            version: document.version
+        )
     }
 
     public static func contentFingerprint(for chat: PortableChatPayload, includeQueuedFollowUps: Bool) -> String {
+        contentFingerprint(for: chat, includeQueuedFollowUps: includeQueuedFollowUps, version: 1)
+    }
+
+    private static func contentFingerprint(
+        for chat: PortableChatPayload,
+        includeQueuedFollowUps: Bool,
+        version: Int
+    ) -> String {
         var lines: [String] = []
-        lines.append("v1")
+        lines.append(version >= 2 ? "v2" : "v1")
         lines.append(chat.title)
         lines.append(chat.isPinned ? "1" : "0")
         lines.append(ISO8601DateFormatter.portable.string(from: chat.lastUpdated))
@@ -732,6 +769,17 @@ public enum SessionPortableArchiveFingerprint {
         lines.append(chat.reasoningEffort ?? "")
         lines.append(chat.policy)
         lines.append(chat.privacyMode)
+        if version >= 2 {
+            lines.append(chat.mode?.rawValue ?? "")
+            if let route = chat.executionRoute {
+                lines.append(route.mode.rawValue)
+                lines.append(route.providerID)
+                lines.append(route.modelID ?? "")
+                lines.append(route.runtimeID)
+            } else {
+                lines.append(contentsOf: ["", "", "", ""])
+            }
+        }
         lines.append("messages:\(chat.messages.count)")
         for message in chat.messages {
             lines.append([
@@ -977,10 +1025,11 @@ public enum SessionPortableArchiveImporter {
         "format", "version", "exportedAt", "includeQueuedFollowUps", "chat"
     ]
 
-    private static let allowedChatKeys: Set<String> = [
+    private static let allowedV1ChatKeys: Set<String> = [
         "title", "isPinned", "lastUpdated", "backendRoute", "backendModel", "harnessID", "harnessLabel",
         "reasoningEffort", "policy", "privacyMode", "messages", "attachments", "actions", "queuedFollowUps"
     ]
+    private static let allowedV2ChatKeys: Set<String> = allowedV1ChatKeys.union(["mode", "executionRoute"])
 
     private static let allowedMessageKeys: Set<String> = ["role", "text", "date", "isPinned"]
     private static let allowedAttachmentKeys: Set<String> = ["name", "kind", "availability"]
@@ -988,8 +1037,10 @@ public enum SessionPortableArchiveImporter {
         "kind", "toolKind", "title", "detail", "status", "workspaceScoped", "createdAt", "updatedAt", "messageIndex"
     ]
     private static let allowedQueuedKeys: Set<String> = ["text", "date"]
+    private static let allowedExecutionRouteKeys: Set<String> = ["mode", "providerID", "modelID", "runtimeID"]
 
     private static func rejectSensitiveKeys(in root: [String: Any], path: String) throws {
+        let version = strictInteger(root["version"]) ?? 0
         for key in root.keys {
             if disallowedRootKeys.contains(key) {
                 throw SessionPortableArchive.ArchiveError.unknownSensitiveField(key)
@@ -1000,6 +1051,7 @@ public enum SessionPortableArchiveImporter {
             }
         }
         guard let chat = root["chat"] as? [String: Any] else { return }
+        let allowedChatKeys = version >= 2 ? allowedV2ChatKeys : allowedV1ChatKeys
         for key in chat.keys {
             if disallowedChatKeys.contains(key) || !allowedChatKeys.contains(key) {
                 throw SessionPortableArchive.ArchiveError.unknownSensitiveField(key)
@@ -1036,6 +1088,11 @@ public enum SessionPortableArchiveImporter {
                 }
             }
         }
+        if let route = chat["executionRoute"] as? [String: Any] {
+            for key in route.keys where !allowedExecutionRouteKeys.contains(key) {
+                throw SessionPortableArchive.ArchiveError.unknownSensitiveField("chat.executionRoute.\(key)")
+            }
+        }
         _ = path
     }
 
@@ -1049,8 +1106,8 @@ public enum SessionPortableArchiveImporter {
         guard let version = strictInteger(root["version"]) else {
             throw SessionPortableArchive.ArchiveError.missingField("version")
         }
-        guard version == SessionPortableArchive.currentVersion else {
-            // Reject unknown future versions safely; only v1 is accepted.
+        guard version == 1 || version == SessionPortableArchive.currentVersion else {
+            // Reject unknown future versions safely.
             throw SessionPortableArchive.ArchiveError.unsupportedVersion(version)
         }
         let exportedAt = try parseDate(root["exportedAt"], field: "exportedAt") ?? .distantPast
@@ -1058,7 +1115,7 @@ public enum SessionPortableArchiveImporter {
         guard let chatObject = root["chat"] as? [String: Any] else {
             throw SessionPortableArchive.ArchiveError.missingField("chat")
         }
-        let chat = try decodeChat(chatObject, includeQueuedFollowUps: includeQueued)
+        let chat = try decodeChat(chatObject, includeQueuedFollowUps: includeQueued, version: version)
         return PortableSessionDocument(
             format: format,
             version: version,
@@ -1068,7 +1125,11 @@ public enum SessionPortableArchiveImporter {
         )
     }
 
-    private static func decodeChat(_ object: [String: Any], includeQueuedFollowUps: Bool) throws -> PortableChatPayload {
+    private static func decodeChat(
+        _ object: [String: Any],
+        includeQueuedFollowUps: Bool,
+        version: Int
+    ) throws -> PortableChatPayload {
         let title = try requiredString(object["title"], field: "chat.title", limit: SessionPortableArchive.maxTitleLength)
         let isPinned = try optionalBool(object["isPinned"], field: "chat.isPinned") ?? false
         let lastUpdated = try parseDate(object["lastUpdated"], field: "chat.lastUpdated") ?? .distantPast
@@ -1076,7 +1137,7 @@ public enum SessionPortableArchiveImporter {
         try validateBackendRoute(backendRoute)
         let backendModel = try optionalString(object["backendModel"], field: "chat.backendModel", limit: SessionPortableArchive.maxModelLength)
         let harnessID = try optionalString(object["harnessID"], field: "chat.harnessID", limit: SessionPortableArchive.maxHarnessIDLength)
-        try validateHarnessID(harnessID, forBackendRoute: backendRoute)
+        try validateHarnessID(harnessID, forBackendRoute: backendRoute, version: version)
         let harnessLabel = try optionalString(object["harnessLabel"], field: "chat.harnessLabel", limit: 100)
         let reasoningEffort = try optionalString(object["reasoningEffort"], field: "chat.reasoningEffort", limit: 32)
         if let reasoningEffort {
@@ -1091,6 +1152,46 @@ public enum SessionPortableArchiveImporter {
         let privacyMode = try requiredString(object["privacyMode"], field: "chat.privacyMode", limit: 32)
         guard SessionPrivacyMode(rawValue: privacyMode) != nil else {
             throw SessionPortableArchive.ArchiveError.invalidEnum(field: "chat.privacyMode", value: privacyMode)
+        }
+
+        let mode: ConversationMode?
+        let executionRoute: ExecutionRoute?
+        if version >= 2 {
+            let modeValue = try requiredString(object["mode"], field: "chat.mode", limit: 32)
+            guard let decodedMode = ConversationMode(rawValue: modeValue) else {
+                throw SessionPortableArchive.ArchiveError.invalidEnum(field: "chat.mode", value: modeValue)
+            }
+            guard let routeObject = object["executionRoute"] as? [String: Any] else {
+                throw SessionPortableArchive.ArchiveError.missingField("chat.executionRoute")
+            }
+            let route = try decodeExecutionRoute(routeObject)
+            guard route.mode == decodedMode else {
+                throw SessionPortableArchive.ArchiveError.invalidField("chat.executionRoute.mode")
+            }
+            guard ExecutionRouteResolver.isDeclared(route) || ExecutionRouteResolver.isLegacyCompatible(route) else {
+                throw SessionPortableArchive.ArchiveError.invalidField("chat.executionRoute")
+            }
+            let expectedProviderID: String
+            switch backendRoute {
+            case "codex": expectedProviderID = "codex"
+            case "grok": expectedProviderID = "grok"
+            case "opencode": expectedProviderID = "opencode"
+            case "antigravity": expectedProviderID = "antigravity"
+            case "appleIntelligence": expectedProviderID = "apple"
+            case "ollama": expectedProviderID = "ollama"
+            default: expectedProviderID = ""
+            }
+            guard route.providerID == expectedProviderID else {
+                throw SessionPortableArchive.ArchiveError.invalidField("chat.executionRoute.providerID")
+            }
+            guard route.modelID == backendModel else {
+                throw SessionPortableArchive.ArchiveError.invalidField("chat.executionRoute.modelID")
+            }
+            mode = decodedMode
+            executionRoute = route
+        } else {
+            mode = nil
+            executionRoute = nil
         }
 
         let messageObjects = try optionalArray(object["messages"], field: "chat.messages")
@@ -1176,8 +1277,21 @@ public enum SessionPortableArchiveImporter {
             messages: messages,
             attachments: attachments,
             actions: actions,
-            queuedFollowUps: queued
+            queuedFollowUps: queued,
+            mode: mode,
+            executionRoute: executionRoute
         )
+    }
+
+    private static func decodeExecutionRoute(_ object: [String: Any]) throws -> ExecutionRoute {
+        let modeValue = try requiredString(object["mode"], field: "chat.executionRoute.mode", limit: 32)
+        guard let mode = ConversationMode(rawValue: modeValue) else {
+            throw SessionPortableArchive.ArchiveError.invalidEnum(field: "chat.executionRoute.mode", value: modeValue)
+        }
+        let providerID = try requiredString(object["providerID"], field: "chat.executionRoute.providerID", limit: SessionPortableArchive.maxHarnessIDLength)
+        let modelID = try optionalString(object["modelID"], field: "chat.executionRoute.modelID", limit: SessionPortableArchive.maxModelLength)
+        let runtimeID = try requiredString(object["runtimeID"], field: "chat.executionRoute.runtimeID", limit: SessionPortableArchive.maxHarnessIDLength)
+        return ExecutionRoute(mode: mode, providerID: providerID, modelID: modelID, runtimeID: runtimeID)
     }
 
     private static func decodeMessage(_ object: [String: Any], index: Int) throws -> PortableMessage {
@@ -1279,6 +1393,7 @@ public enum SessionPortableArchiveImporter {
 
         let chat = document.chat
         let backend = try backend(from: chat.backendRoute, model: chat.backendModel)
+        let executionRoute = chat.executionRoute ?? ExecutionRoute.legacy(for: backend, harnessID: chat.harnessID)
         let policy = ExecutionPolicy(rawValue: chat.policy) ?? .ask
         let privacy = SessionPrivacyMode(rawValue: chat.privacyMode) ?? .cloudAllowed
         let reasoning = chat.reasoningEffort.flatMap(ReasoningEffort.init(rawValue:))
@@ -1344,7 +1459,8 @@ public enum SessionPortableArchiveImporter {
             title: chat.title,
             messages: messages,
             backend: backend,
-            harnessID: chat.harnessID,
+            executionRoute: executionRoute,
+            harnessID: chat.executionRoute == nil ? chat.harnessID : executionRoute.runtimeID,
             reasoningEffort: reasoning,
             harnessThreadID: nil, // never restore provider thread IDs
             workspacePath: nil,   // not part of portable surface; avoids path leakage
@@ -1433,12 +1549,12 @@ public enum SessionPortableArchiveImporter {
         }
     }
 
-    private static func validateHarnessID(_ harnessID: String?, forBackendRoute route: String) throws {
+    private static func validateHarnessID(_ harnessID: String?, forBackendRoute route: String, version: Int) throws {
         guard let harnessID else { return }
         let allowed: Set<String>
         switch route {
-        case "codex": allowed = ["codex", "pi"]
-        case "grok": allowed = ["grok"]
+        case "codex": allowed = version >= 2 ? ["codex", "pi", "hermes"] : ["codex", "pi"]
+        case "grok": allowed = version >= 2 ? ["grok", "hermes"] : ["grok"]
         case "opencode": allowed = ["opencode", "pi", "hermes"]
         case "antigravity": allowed = ["antigravity"]
         case "appleIntelligence", "ollama": allowed = ["lattice"]
