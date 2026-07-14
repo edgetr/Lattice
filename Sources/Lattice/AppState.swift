@@ -367,6 +367,7 @@ final class AppState: ObservableObject {
     private var retryableRequests: [UUID: String] = [:]
     private var selfEditRunIDs: Set<UUID> = []
     private var activeRunIDs: [UUID: UUID] = [:]
+    private var inlineImagePayloadSuppression: Set<UUID> = []
     private var taskScheduler = AgentTaskScheduler(limits: .init(
         global: 4,
         perWorkspace: 2,
@@ -2202,6 +2203,7 @@ final class AppState: ObservableObject {
         sessions[index].messages.removeSubrange(sessions[index].messages.index(after: messageIndex)..<sessions[index].messages.endIndex)
         let survivingMessageIDs = Set(sessions[index].messages.map(\.id))
         SessionActionTrail.prune(in: &sessions[index].actions, keepingMessageIDs: survivingMessageIDs)
+        AssistantArtifactTrail.prune(in: &sessions[index].artifacts, keepingMessageIDs: survivingMessageIDs)
         sessions[index].messages.append(.init(role: .assistant, text: ""))
         sessions[index].harnessThreadID = nil
         sessions[index].lastUpdated = .now
@@ -2358,6 +2360,7 @@ final class AppState: ObservableObject {
             return
         }
         sessions[index].isStreaming = true
+        inlineImagePayloadSuppression.remove(id)
         sessions[index].lastUpdated = .now
         globalErrorMessage = nil
         let session = sessions[index]
@@ -2573,14 +2576,21 @@ final class AppState: ObservableObject {
         for snapshot in taskScheduler.snapshots where snapshot.state == .recoveryHeld {
             if let index = sessions.firstIndex(where: { $0.id == snapshot.request.sessionID }) {
                 sessions[index].isStreaming = false
-                if sessions[index].messages.last?.role == .assistant,
-                   sessions[index].messages.last?.text.isEmpty == true {
+                if shouldRemoveEmptyTrailingAssistant(from: sessions[index]) {
                     sessions[index].messages.removeLast()
                 }
             }
         }
         // Recovery-held work is intentionally not written back as executable queue metadata.
         persistSchedulerMetadata()
+    }
+
+    private func shouldRemoveEmptyTrailingAssistant(from session: LatticeSession) -> Bool {
+        guard let message = session.messages.last,
+              message.role == .assistant,
+              message.text.isEmpty,
+              session.isArtifactsLoaded else { return false }
+        return !session.artifacts.contains { $0.messageID == message.id }
     }
 
     private func normalizeSessionBackendBeforeRun(at index: Int) {
@@ -3020,9 +3030,10 @@ final class AppState: ObservableObject {
         let schedulerState = taskScheduler.snapshot(for: id)?.state
         if let request = submittedRequests[id] { retryableRequests[id] = request }
         activeRunIDs[id] = nil
+        inlineImagePayloadSuppression.remove(id)
         finishPendingActions(status: .cancelled, at: index)
         sessions[index].isStreaming = false
-        if sessions[index].messages.last?.role == .assistant, sessions[index].messages.last?.text.isEmpty == true {
+        if shouldRemoveEmptyTrailingAssistant(from: sessions[index]) {
             sessions[index].messages.removeLast()
         }
         reduceRunUI(.cancelled, for: id)
@@ -6625,7 +6636,18 @@ Lattice self-edit rules:
         case .assistantDelta(let delta):
             guard sessions[index].isStreaming,
                   sessions[index].messages.last?.role == .assistant else { return }
-            sessions[index].messages[sessions[index].messages.count - 1].text += delta
+            let messageIndex = sessions[index].messages.count - 1
+            let filtered = AssistantTranscriptMediaPolicy.appending(
+                delta,
+                to: sessions[index].messages[messageIndex].text,
+                isSuppressingPayload: inlineImagePayloadSuppression.contains(id)
+            )
+            sessions[index].messages[messageIndex].text = filtered.text
+            if filtered.isSuppressingPayload {
+                inlineImagePayloadSuppression.insert(id)
+            } else {
+                inlineImagePayloadSuppression.remove(id)
+            }
             sessions[index].lastUpdated = .now
             scheduleStreamingPersist()
         case .plan(let actionID, let title, let steps):
@@ -6852,8 +6874,24 @@ Lattice self-edit rules:
                 upsertSessionAction(action, at: index)
                 persist()
             }
+        case .artifact(let observation):
+            // Core binding only — UI presentation is owned by a separate integration pass.
+            guard sessions[index].isStreaming || sessions[index].isTranscriptLoaded,
+                  let messageID = sessions[index].messages.last(where: { $0.role == .assistant })?.id else { return }
+            if !sessions[index].isArtifactsLoaded {
+                do {
+                    try persistence.materializeArtifacts(in: &sessions[index])
+                } catch {
+                    setError("Could not load stored artifact metadata for this chat.", sessionID: id)
+                    return
+                }
+            }
+            AssistantArtifactTrail.upsert(observation.bound(to: messageID), in: &sessions[index].artifacts)
+            sessions[index].lastUpdated = .now
+            scheduleStreamingPersist()
         case .completed:
             activeRunIDs[id] = nil
+            inlineImagePayloadSuppression.remove(id)
             harnessPermissionNotices[id] = nil
             finishCompletedTurnActions(at: index)
             sessions[index].isStreaming = false
@@ -6871,6 +6909,7 @@ Lattice self-edit rules:
             scheduleIdleUnloadIfNeeded(for: backend)
         case .cancelled:
             activeRunIDs[id] = nil
+            inlineImagePayloadSuppression.remove(id)
             harnessPermissionNotices[id] = nil
             selfEditRunIDs.remove(id)
             finishPendingActions(status: .cancelled, at: index)
@@ -6884,6 +6923,7 @@ Lattice self-edit rules:
             scheduleIdleUnloadIfNeeded(for: backend)
         case .failed(let message):
             activeRunIDs[id] = nil
+            inlineImagePayloadSuppression.remove(id)
             harnessPermissionNotices[id] = nil
             selfEditRunIDs.remove(id)
             if let request = submittedRequests[id] { retryableRequests[id] = request }
@@ -6899,7 +6939,7 @@ Lattice self-edit rules:
             reduceRunUI(.failed(message), for: id)
             threadActivityLanes.apply(.failed(message), to: id)
             handleSchedulerAdmissions(taskScheduler.finish(id))
-            if sessions[index].messages.last?.text.isEmpty == true { sessions[index].messages.removeLast() }
+            if shouldRemoveEmptyTrailingAssistant(from: sessions[index]) { sessions[index].messages.removeLast() }
             persist()
             scheduleIdleUnloadIfNeeded(for: backend)
         }
@@ -7199,8 +7239,8 @@ Lattice self-edit rules:
             activeTranscriptHydrationRequest = nil
             persistence.writeGate.block()
             replacePersistenceRecoveryIssue(issue)
-            setError("This chat's stored transcript could not be loaded. The original files were left untouched for recovery.", sessionID: request.sessionID)
-        case .loaded(let request, let messages):
+            setError("This chat's stored conversation content could not be loaded. The original files were left untouched for recovery.", sessionID: request.sessionID)
+        case .loaded(let request, let content):
             guard let index = sessions.firstIndex(where: { $0.id == request.sessionID }) else { return }
             transcriptLoadingSessionID = nil
             activeTranscriptHydrationRequest = nil
@@ -7210,9 +7250,14 @@ Lattice self-edit rules:
                 selectedSessionID: selectedSessionID,
                 currentSession: sessions[index]
             ) else { return }
-            sessions[index].messages = messages
+            sessions[index].messages = content.messages
             sessions[index].isTranscriptLoaded = true
             sessions[index].isTranscriptDirty = false
+            if !sessions[index].isArtifactsDirty {
+                sessions[index].artifacts = content.artifacts
+                sessions[index].isArtifactsLoaded = true
+                sessions[index].isArtifactsDirty = false
+            }
             finishTranscriptAccess(sessionID: request.sessionID)
         }
     }
@@ -7223,7 +7268,7 @@ Lattice self-edit rules:
         _ = transcriptRenderWindows.activate(sessionID: sessionID, messageCount: sessions[index].messages.count)
 
         let protectedIDs = Set(sessions.lazy.filter {
-            $0.id == self.selectedSessionID || $0.isStreaming || $0.isTranscriptDirty || $0.transcriptStorage == nil
+            $0.id == self.selectedSessionID || $0.isStreaming || $0.isTranscriptDirty || $0.transcriptStorage == nil || $0.isArtifactsDirty || ($0.isArtifactsLoaded && !$0.artifacts.isEmpty && $0.artifactStorage == nil)
         }.map(\.id))
         for id in materializedTranscriptLRU.evictionCandidates(protectedIDs: protectedIDs) {
             guard let victimIndex = sessions.firstIndex(where: { $0.id == id }) else {
@@ -7233,6 +7278,10 @@ Lattice self-edit rules:
             sessions[victimIndex].messages = []
             sessions[victimIndex].isTranscriptLoaded = false
             sessions[victimIndex].isTranscriptDirty = false
+            if !sessions[victimIndex].isArtifactsDirty {
+                sessions[victimIndex].artifacts = []
+                sessions[victimIndex].isArtifactsLoaded = false
+            }
             transcriptRenderWindows.invalidate(sessionID: id)
             materializedTranscriptLRU.remove(id)
         }
@@ -7252,6 +7301,16 @@ Lattice self-edit rules:
                 messages: sessions[index].messages
             )
             sessions[index].isTranscriptDirty = false
+            guard sessions[index].isArtifactsLoaded else { continue }
+            if sessions[index].artifacts.isEmpty {
+                sessions[index].artifactStorage = nil
+            } else if let reference = try? SessionPersistence.artifactStorageReference(
+                sessionID: sessions[index].id,
+                artifacts: sessions[index].artifacts
+            ) {
+                sessions[index].artifactStorage = reference
+            }
+            sessions[index].isArtifactsDirty = false
         }
     }
 

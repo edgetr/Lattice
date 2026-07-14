@@ -10,14 +10,29 @@ public struct TranscriptHydrationRequest: Hashable, Sendable {
     }
 }
 
+public struct TranscriptHydrationContent: Sendable, Equatable {
+    public let messages: [ChatMessage]
+    public let artifacts: [AssistantArtifact]
+
+    public init(messages: [ChatMessage], artifacts: [AssistantArtifact] = []) {
+        self.messages = messages
+        self.artifacts = artifacts
+    }
+}
+
 public enum TranscriptHydrationLoadResult: Sendable {
-    case loaded([ChatMessage])
+    case loaded(TranscriptHydrationContent)
     case failed(DurableStoreIssue)
     case cancelled
+
+    /// Compatibility constructor for transcript-only loaders.
+    public static func loaded(_ messages: [ChatMessage]) -> TranscriptHydrationLoadResult {
+        .loaded(TranscriptHydrationContent(messages: messages, artifacts: []))
+    }
 }
 
 public enum TranscriptHydrationOutcome: Sendable {
-    case loaded(TranscriptHydrationRequest, [ChatMessage])
+    case loaded(TranscriptHydrationRequest, TranscriptHydrationContent)
     case failed(TranscriptHydrationRequest, DurableStoreIssue)
     case cancelled(TranscriptHydrationRequest)
 }
@@ -74,8 +89,8 @@ public actor TranscriptHydrationCoordinator {
         activeTask = nil
         activeRequest = nil
         switch result {
-        case .loaded(let messages):
-            return .loaded(request, messages)
+        case .loaded(let content):
+            return .loaded(request, content)
         case .failed(let issue):
             return .failed(request, issue)
         case .cancelled:

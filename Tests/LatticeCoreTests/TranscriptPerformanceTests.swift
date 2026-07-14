@@ -19,13 +19,13 @@ struct TranscriptPerformanceTests {
         let coordinator = TranscriptHydrationCoordinator()
 
         let outcome = await coordinator.hydrate(request) { store.hydrationResult(for: lazy) }
-        guard case .loaded(let loadedRequest, let loadedMessages) = outcome else {
+        guard case .loaded(let loadedRequest, let content) = outcome else {
             Issue.record("Very large transcript should hydrate successfully")
             return
         }
         #expect(loadedRequest == request)
-        #expect(loadedMessages.count == 50_000)
-        #expect(loadedMessages.last?.text.hasPrefix("large-message-49999-") == true)
+        #expect(content.messages.count == 50_000)
+        #expect(content.messages.last?.text.hasPrefix("large-message-49999-") == true)
     }
 
     @Test func rapidSwitchingAndCancellationRejectLateHydrationGenerations() async throws {
@@ -50,12 +50,12 @@ struct TranscriptPerformanceTests {
         await gate.finish(requests[1], text: "B")
         await gate.finish(requests[0], text: "A")
 
-        guard case .loaded(let winningRequest, let messages) = await third.value else {
+        guard case .loaded(let winningRequest, let content) = await third.value else {
             Issue.record("Newest generation should win")
             return
         }
         #expect(winningRequest == requests[2])
-        #expect(messages.map(\.text) == ["C"])
+        #expect(content.messages.map(\.text) == ["C"])
         guard case .cancelled(let firstRequest) = await first.value else {
             Issue.record("First generation should be cancelled")
             return

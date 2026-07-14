@@ -78,6 +78,11 @@ public struct SessionSearchIndex: Codable, Equatable, Sendable {
         metadata.messages = []
         metadata.transcriptStorage = nil
         metadata.isTranscriptLoaded = true
+        // Artifact sidecars are independently content-addressed. Do not let the same
+        // metadata appear different merely because its sidecar is loaded or lazy.
+        metadata.artifacts = []
+        metadata.artifactStorage = nil
+        metadata.isArtifactsLoaded = true
         return digest((try? JSONEncoder().encode(metadata)) ?? Data())
     }
 
