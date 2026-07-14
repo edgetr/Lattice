@@ -45,6 +45,11 @@ struct WorkspaceView: View {
         .sheet(isPresented: $state.showCommandPalette) {
             CommandPaletteView(state: state)
         }
+        .sheet(item: $state.pendingRuntimeConfirmation, onDismiss: {
+            if state.pendingRuntimeConfirmation != nil { state.cancelRuntimeAction() }
+        }) { request in
+            RuntimeConfirmationSheet(state: state, request: request)
+        }
         .alert("Delete chat?", isPresented: $state.showDeleteChatConfirmation) {
             Button("Cancel", role: .cancel) { state.cancelPendingChatDeletion() }
             Button("Delete", role: .destructive) { state.confirmPendingChatDeletion() }
@@ -90,7 +95,7 @@ struct WorkspaceView: View {
             Button("Cancel", role: .cancel) { state.cancelCLIInstall() }
             Button("Download and Install") { state.confirmCLIInstall() }
         } message: {
-            Text("Lattice will use the provider’s verified installer or package source, then check that the CLI is available before enabling it.")
+            Text("Lattice will use the provider-owned installer or package source shown by that provider. Availability is checked after installation; provenance and hash verification depend on the source.")
         }
         .alert(
             "Provider tools bypass Lattice's broker",
@@ -219,6 +224,86 @@ struct WorkspaceView: View {
         case .models: ModelsView(state: state)
         case .connections: ConnectionsView(state: state)
         case .extensions: ExtensionsView(state: state)
+        }
+    }
+}
+
+private struct RuntimeConfirmationSheet: View {
+    @ObservedObject var state: AppState
+    let request: RuntimeConfirmationRequest
+
+    private var descriptor: RuntimeInstallDescriptor { request.descriptor }
+    private var actionTitle: String {
+        switch request.action {
+        case .firstUseInstall: "Install"
+        case .update: "Reinstall Pin"
+        case .uninstall: "Remove"
+        case .rollback: "Roll Back"
+        case .cancel, .interruptUpdate: "Continue"
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 12) {
+                Image(systemName: request.runtime == .pi ? "terminal" : "shippingbox")
+                    .font(.title2)
+                    .frame(width: 34, height: 34)
+                    .background(Color.accentColor.opacity(0.12), in: Circle())
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(actionTitle) \(descriptor.displayName)").font(.title3.weight(.semibold))
+                    Text("Lattice runtime component").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
+                GridRow { Text("Version").foregroundStyle(.secondary); Text(descriptor.immutableVersion).textSelection(.enabled) }
+                GridRow { Text("Source").foregroundStyle(.secondary); Text(descriptor.source).textSelection(.enabled) }
+                GridRow {
+                    Text("Size").foregroundStyle(.secondary)
+                    Text(descriptor.estimatedSizeBytes.map {
+                        ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file)
+                    } ?? "Not reported upstream")
+                }
+                GridRow { Text("Verification").foregroundStyle(.secondary); Text(descriptor.verificationLabel) }
+                GridRow { Text("Profile").foregroundStyle(.secondary); Text(descriptor.profileDirectory).textSelection(.enabled) }
+            }
+            .font(.caption)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Permissions").font(.caption.weight(.semibold))
+                ForEach(descriptor.permissions.sorted(by: { $0.rawValue < $1.rawValue }), id: \.self) { permission in
+                    Label(permissionLabel(permission), systemImage: "checkmark.circle")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+
+            Text(request.action == .uninstall ? descriptor.uninstall : descriptor.rollback)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Button("Cancel", role: .cancel) { state.cancelRuntimeAction() }
+                Spacer()
+                Button(actionTitle, role: request.action == .uninstall ? .destructive : nil) {
+                    state.confirmRuntimeAction()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
+        .accessibilityElement(children: .contain)
+    }
+
+    private func permissionLabel(_ permission: RuntimeInstallPermission) -> String {
+        switch permission {
+        case .network: "Download from the listed source"
+        case .executeRuntime: "Execute the installed runtime"
+        case .writeLatticeProfile: "Write Lattice-owned profile files"
+        case .writeUserToolDirectory: "Write to the user tool directory"
+        case .readKeychainOpenCodeCredential: "Read the OpenCode key only for explicitly enabled routes"
         }
     }
 }

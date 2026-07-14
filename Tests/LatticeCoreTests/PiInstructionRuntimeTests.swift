@@ -164,6 +164,26 @@ struct PiInstructionRuntimeTests {
         #expect(PiRPCHarness.providerModel(for: workRoute) == nil)
     }
 
+    @Test func explicitOpenCodeValidationRequiresAndContainsCredentialOnlyInEnvironment() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let harness = PiRPCHarness(
+            executableURL: fixture.pi,
+            sandboxExecutableURL: fixture.sandbox,
+            applicationSupportDirectory: fixture.root.appendingPathComponent("support")
+        )
+
+        #expect(!(await harness.validateIsolatedAuthentication(
+            provider: "opencode",
+            model: "opencode-go/model"
+        )))
+        #expect(await harness.validateIsolatedAuthentication(
+            provider: "opencode",
+            model: "opencode-go/model",
+            openCodeAPIKey: "explicit-test-key"
+        ))
+    }
+
     @Test func explicitExtensionInjectsSystemPromptAndExtendsPermissionGate() throws {
         let fixture = try Fixture()
         defer { fixture.remove() }

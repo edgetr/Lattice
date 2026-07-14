@@ -134,6 +134,40 @@ public final class ACPHarness: @unchecked Sendable {
         hermesReadiness()
     }
 
+    /// User-triggered, bounded validation against Hermes-owned authentication
+    /// state inside Lattice's isolated profile. Lattice never reads auth.json.
+    public func validateHermesAuthentication(provider: String) async -> Bool {
+        guard profile == .hermes,
+              let executableURL,
+              let hermesProfile,
+              [LatticeHermesProvider.openAICodex.rawValue, LatticeHermesProvider.xAIOAuth.rawValue]
+                .contains(provider) else { return false }
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lattice-hermes-auth-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(
+                at: scratch,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            defer { try? FileManager.default.removeItem(at: scratch) }
+            let environment = try hermesProfile.launchEnvironment(temporaryDirectory: scratch)
+            let result = await BoundedSubprocess.run(.init(
+                executableURL: executableURL,
+                arguments: ["auth", "status", provider],
+                environment: environment,
+                deadline: 20,
+                maximumOutputBytes: 32_000
+            ))
+            guard result.isSuccess else { return false }
+            return LatticeHermesProfile.isLoggedInStatusOutput(
+                String(decoding: result.combinedOutput, as: UTF8.self)
+            )
+        } catch {
+            return false
+        }
+    }
+
     public func models(workspace: URL) async -> [HarnessModel] {
         await modelsResult(workspace: workspace).models
     }

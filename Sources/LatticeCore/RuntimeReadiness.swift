@@ -38,6 +38,15 @@ public enum RuntimePinTrust: String, Codable, Hashable, Sendable {
     case pinnedGitCommit
 }
 
+public enum RuntimeArtifactVerification {
+    public static func registryIntegrityMatches(reported: String, expected: String) -> Bool {
+        let normalized = reported
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+        return !expected.isEmpty && normalized == expected
+    }
+}
+
 /// First-use setup metadata. Version pins are intentional. Hash is absent when
 /// upstream does not publish a release artifact hash Lattice can verify honestly.
 public struct RuntimeInstallDescriptor: Equatable, Hashable, Codable, Sendable, Identifiable {
@@ -107,7 +116,7 @@ public struct RuntimeInstallDescriptor: Equatable, Hashable, Codable, Sendable, 
         registryIntegrity: "sha512-vcfD6tOk402isLl3Cm/qbn2O10TvgroMp1+/fEGM24ZdvETFCdOYv5VZ7m59EI5fPsjfSJh+CpQ5bhBrhfOg7g==",
         permissions: [.network, .executeRuntime, .writeLatticeProfile, .writeUserToolDirectory, .readKeychainOpenCodeCredential],
         profileDirectory: "HarnessRuntime/Pi",
-        rollback: "Reinstall previously recorded exact package version, then revalidate Pi profile.",
+        rollback: "Rollback requires previously recorded exact package and integrity metadata; otherwise Lattice fails closed.",
         uninstall: "Remove exact Pi package and delete only Lattice-owned Pi profile after confirmation."
     )
 
@@ -121,7 +130,7 @@ public struct RuntimeInstallDescriptor: Equatable, Hashable, Codable, Sendable, 
         pinnedSourceCommit: "b7751df34688835a108e0d630f3495fc11f3df79",
         permissions: [.network, .executeRuntime, .writeLatticeProfile, .writeUserToolDirectory, .readKeychainOpenCodeCredential],
         profileDirectory: "HermesWork",
-        rollback: "Reinstall previously recorded exact Hermes source tag, then revalidate Hermes profile.",
+        rollback: "Rollback requires a previously recorded exact Hermes source commit; otherwise Lattice fails closed.",
         uninstall: "Remove exact Hermes tool and delete only Lattice-owned Hermes profile after confirmation."
     )
 
@@ -176,6 +185,23 @@ public struct RuntimeLifecycleState: Equatable, Hashable, Codable, Sendable {
         self.detail = detail
         self.installedVersion = installedVersion
         self.previousVersion = previousVersion
+    }
+}
+
+public enum RuntimeLifecycleTransition {
+    public static func phaseAfterCancellation(from phase: RuntimeLifecyclePhase) -> RuntimeLifecyclePhase {
+        phase == .updating ? .updateInterrupted : .cancelled
+    }
+
+    public static func rollbackPhase(previousVersion: String?) -> RuntimeLifecyclePhase {
+        guard previousVersion?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else { return .failed }
+        return .rollingBack
+    }
+}
+
+public enum RuntimeOwnershipPolicy {
+    public static func canUninstall(_ runtime: LatticeRuntimeID, managedRuntimeIDs: Set<LatticeRuntimeID>) -> Bool {
+        managedRuntimeIDs.contains(runtime)
     }
 }
 
@@ -253,6 +279,13 @@ public enum OpenCodeCredentialPolicy {
 
     public static func allowsKeychainCredential(for route: ExecutionRoute) -> Bool {
         route.providerID == "opencode" && (route.runtimeID == "pi" || route.runtimeID == "hermes")
+    }
+
+    public static func allowsKeychainCredential(
+        for route: ExecutionRoute,
+        enabledModes: Set<ConversationMode>
+    ) -> Bool {
+        allowsKeychainCredential(for: route) && enabledModes.contains(route.mode)
     }
 
     public static func environmentKey(for route: ExecutionRoute) -> String? {

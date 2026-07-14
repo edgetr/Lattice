@@ -228,6 +228,14 @@ final class AppState: ObservableObject {
     @Published var openCodeLatestCLIVersion: String?
     @Published var openCodeAPIKeyDraft = ""
     @Published var openCodeAPIKeySaved = false
+    @Published private(set) var openCodeCredentialEnabledModes: Set<ConversationMode> = []
+    @Published private(set) var validatedPiCodexModels: Set<String> = []
+    @Published private(set) var validatedPiOpenCodeModels: Set<String> = []
+    @Published private(set) var validatedHermesOpenCodeModels: Set<String> = []
+    @Published private(set) var validatedHermesProviders: Set<String> = []
+    @Published var pendingRuntimeConfirmation: RuntimeConfirmationRequest?
+    @Published private(set) var runtimeLifecycleStates: [LatticeRuntimeID: RuntimeLifecycleState] = [:]
+    @Published private(set) var latticeManagedRuntimeIDs: Set<LatticeRuntimeID> = []
     @Published var disabledModelIDs: Set<String>
     @Published var expandedProviderModelIDs: Set<String> = []
     @Published var cliBusyProviders: Set<String> = []
@@ -299,6 +307,7 @@ final class AppState: ObservableObject {
     var pi = PiRPCHarness()
     var hermes = ACPHarness()
     private let executionCoordinator: any LatticeExecutionCoordinating
+    private var runtimeInstallTasks: [LatticeRuntimeID: Task<Void, Never>] = [:]
     let appleIntelligence = AppleIntelligenceClient()
     let ollama = OllamaClient()
     let modelInstaller = OllamaModelInstaller()
@@ -334,6 +343,8 @@ final class AppState: ObservableObject {
     private static let codeInstructionAddOnKey = "codeInstructionAddOn"
     private static let workInstructionAddOnKey = "workInstructionAddOn"
     private static let trustedWorkspacePathsKey = "trustedWorkspacePaths"
+    private static let openCodeCredentialModesKey = "openCodeCredentialEnabledModes"
+    private static let managedRuntimeIDsKey = "latticeManagedRuntimeIDs"
 
     private var executionRuntimes: LatticeExecutionRuntimes {
         LatticeExecutionRuntimes(
@@ -419,6 +430,14 @@ final class AppState: ObservableObject {
         codeInstructionAddOn = UserDefaults.standard.string(forKey: Self.codeInstructionAddOnKey) ?? ""
         workInstructionAddOn = UserDefaults.standard.string(forKey: Self.workInstructionAddOnKey) ?? ""
         trustedWorkspacePaths = Set(UserDefaults.standard.stringArray(forKey: Self.trustedWorkspacePathsKey) ?? [])
+        openCodeCredentialEnabledModes = Set(
+            (UserDefaults.standard.stringArray(forKey: Self.openCodeCredentialModesKey) ?? [])
+                .compactMap(ConversationMode.init(rawValue:))
+        )
+        latticeManagedRuntimeIDs = Set(
+            (UserDefaults.standard.stringArray(forKey: Self.managedRuntimeIDsKey) ?? [])
+                .compactMap(LatticeRuntimeID.init(rawValue:))
+        )
         let initialDefaultBackend = BackendAvailabilityPolicy.initialSelection(
             persisted: Self.loadDefaultBackend()
         )
@@ -2138,7 +2157,10 @@ final class AppState: ObservableObject {
         let hermesSystemIdentity = envelope.map {
             [$0.renderedSystemInstructions, trustedInstructions].filter { !$0.isEmpty }.joined(separator: "\n\n")
         }
-        let openCodeAPIKey = OpenCodeCredentialPolicy.allowsKeychainCredential(for: session.executionRoute)
+        let openCodeAPIKey = OpenCodeCredentialPolicy.allowsKeychainCredential(
+            for: session.executionRoute,
+            enabledModes: openCodeCredentialEnabledModes
+        )
             ? KeychainStore.read(account: OpenCodeCredentialPolicy.keychainAccount)
             : nil
         let appleTranscript: String? = session.backend == .appleIntelligence
@@ -2215,26 +2237,97 @@ final class AppState: ObservableObject {
     }
 
     private func canRunDeclaredRoute(_ route: ExecutionRoute) -> Bool {
+        routeReadiness(for: route).isRunnable
+    }
+
+    func routeReadiness(for route: ExecutionRoute) -> ExecutionRouteReadiness {
+        guard ExecutionRouteResolver.isDeclared(route) else {
+            return .failed("This route is available only for a legacy chat.")
+        }
+
+        let runtimePresent: Bool
+        let authenticationValidated: Bool
+        let modelValidated: Bool
+        let sandboxAvailable: Bool
+
         switch (route.mode, route.providerID, route.runtimeID) {
         case (.code, "codex", "pi"), (.code, "opencode", "pi"):
-            guard piInstalled, let providerModel = PiRPCHarness.providerModel(for: route) else { return false }
-            return piModelIDs.contains(providerModel.provider + "/" + providerModel.model)
+            runtimePresent = piInstalled
+            let providerModel = PiRPCHarness.providerModel(for: route)
+            modelValidated = providerModel.map { piModelIDs.contains($0.provider + "/" + $0.model) } ?? false
+            authenticationValidated = route.providerID == "codex"
+                ? route.modelID.map { validatedPiCodexModels.contains($0) } ?? false
+                : openCodeAPIKeySaved
+                    && openCodeCredentialEnabledModes.contains(.code)
+                    && (route.modelID.map { validatedPiOpenCodeModels.contains($0) } ?? false)
+            sandboxAvailable = FileManager.default.isExecutableFile(atPath: HarnessSandbox.systemExecutableURL.path)
         case (.code, "grok", "grok"):
-            guard let model = route.modelID else { return false }
-            return grokReady && ACPHarness.bestMatch(for: model, in: grokACPModels) != nil
+            runtimePresent = grok.isInstalled
+            authenticationValidated = grokAuthenticated
+            modelValidated = route.modelID.map { ACPHarness.bestMatch(for: $0, in: grokACPModels) != nil } ?? false
+            sandboxAvailable = FileManager.default.isExecutableFile(atPath: HarnessSandbox.systemExecutableURL.path)
         case (.code, "antigravity", "antigravity"):
-            guard let model = route.modelID else { return false }
-            return antigravityAuthenticated && visibleAntigravityModels.contains(where: { $0.id == model })
+            runtimePresent = antigravityInstalled
+            authenticationValidated = antigravityAuthenticated
+            modelValidated = route.modelID.map { model in visibleAntigravityModels.contains(where: { $0.id == model }) } ?? false
+            sandboxAvailable = FileManager.default.isExecutableFile(atPath: HarnessSandbox.systemExecutableURL.path)
         case (.work, _, "hermes"):
-            guard hermesInstalled, let model = route.modelID, hermesProvider(for: route) != nil else { return false }
-            return HermesACPHarness.exactMatch(for: model, in: hermesModels) != nil
+            runtimePresent = hermesInstalled
+            let provider = hermesProvider(for: route)
+            authenticationValidated = route.providerID == "opencode"
+                ? openCodeAPIKeySaved
+                    && openCodeCredentialEnabledModes.contains(.work)
+                    && (route.modelID.map { validatedHermesOpenCodeModels.contains($0) } ?? false)
+                : provider.map { validatedHermesProviders.contains($0) } ?? false
+            modelValidated = route.modelID.map { HermesACPHarness.exactMatch(for: $0, in: hermesModels) != nil } ?? false
+            sandboxAvailable = FileManager.default.isExecutableFile(atPath: HarnessSandbox.systemExecutableURL.path)
         case (.local, "apple", "lattice"):
-            return appleIntelligenceReady
+            runtimePresent = appleIntelligenceReady
+            authenticationValidated = true
+            modelValidated = appleIntelligenceReady
+            sandboxAvailable = true
         case (.local, "ollama", "lattice"):
-            guard let model = route.modelID else { return false }
-            return ollamaReady && ollamaCatalogStatus == .loaded && ollamaModels.contains(where: { $0.name == model })
+            runtimePresent = ollamaReady
+            authenticationValidated = true
+            modelValidated = route.modelID.map { model in
+                ollamaCatalogStatus == .loaded && ollamaModels.contains(where: { $0.name == model })
+            } ?? false
+            sandboxAvailable = true
         default:
-            return false
+            return .failed("The selected mode, provider, and runtime are incompatible.")
+        }
+
+        return RouteReadinessEvaluator.evaluate(
+            route: route,
+            requirements: RouteReadinessRequirements(
+                runtimePresent: runtimePresent,
+                authenticationValidated: authenticationValidated,
+                modelValidated: modelValidated,
+                sandboxAvailable: sandboxAvailable
+            ),
+            validating: cliBusyProviders.contains(route.runtimeID) || cliBusyProviders.contains("\(route.runtimeID)-\(route.providerID)")
+        ).readiness
+    }
+
+    func modeReadiness(_ mode: ConversationMode, providerID: String) -> ExecutionRouteReadiness {
+        let routes = composerModelOptions(for: mode)
+            .filter { $0.route.providerID == providerID && $0.route.modelID != nil }
+            .map(\.route)
+        let states = routes.map(routeReadiness(for:))
+        if states.contains(where: { $0.isRunnable }) { return .runnable }
+        if let state = states.first { return state }
+
+        switch (mode, providerID) {
+        case (.code, "codex"), (.code, "opencode"):
+            return piInstalled ? .authenticationRequired : .missingRuntime
+        case (.work, _):
+            return hermesInstalled ? .authenticationRequired : .missingRuntime
+        case (.code, "grok"):
+            return grok.isInstalled ? .authenticationRequired : .missingRuntime
+        case (.code, "antigravity"):
+            return antigravityInstalled ? .authenticationRequired : .missingRuntime
+        default:
+            return .failed("No compatible model was discovered.")
         }
     }
 
@@ -2923,10 +3016,12 @@ final class AppState: ObservableObject {
         let detectedVersion = await openCodeVersion
         let installedVersion = await openCodeInstalledVersion
         let latest = await openCodeLatest
-        let apiKeySaved = OpenCodeAuthBridge.hasGoCredential()
+        let apiKeySaved = KeychainStore.hasValue(account: OpenCodeCredentialPolicy.keychainAccount)
         guard canApplyCatalogRefresh(generation) else { return }
         openCodeAPIKeySaved = apiKeySaved
-        openCodeAuthenticated = auth || apiKeySaved
+        // Direct OpenCode authentication remains a compatibility route. A
+        // Lattice Keychain credential is separately consented for Pi/Hermes.
+        openCodeAuthenticated = auth
         openCodeACPModels = acpCatalog.models
         openCodeCatalogStatus = ProviderCatalogStatus.combined(catalog.status, acpCatalog.status)
         openCodeModels = catalog.models
@@ -2961,7 +3056,7 @@ final class AppState: ObservableObject {
         guard canApplyCatalogRefresh(generation) else { return }
         if pi.isInstalled != (executable != nil) { pi = PiRPCHarness(executableURL: executable) }
         async let piVersion = Self.commandOutput("pi", ["--version"])
-        async let piCatalog = Self.piModelCatalog()
+        async let piCatalog = pi.modelCatalog()
         async let piLatest = Self.latestCLIVersion(executableName: "pi", homebrewFormula: "pi", homebrewCask: nil, npmPackage: "@earendil-works/pi-coding-agent", pnpmPackage: "@earendil-works/pi-coding-agent", directPackage: "@earendil-works/pi-coding-agent")
         let version = await piVersion
         let catalog = await piCatalog
@@ -3129,23 +3224,36 @@ final class AppState: ObservableObject {
         }
     }
     func installPi() {
-        requestCLIInstall("pi")
+        requestRuntimeAction(.firstUseInstall, runtime: .pi)
     }
     private func performPiInstall() {
-        runCLIInstall(provider: "pi", progress: "Installing Pi…", executableName: "pi") {
-            guard let plan = CLIInstallResolver.packageInstallPlan(
-                npmPackage: "@earendil-works/pi-coding-agent",
-                pnpmPackage: "@earendil-works/pi-coding-agent",
-                npmAvailable: ExecutableDiscovery.locate("npm") != nil,
-                pnpmAvailable: ExecutableDiscovery.locate("pnpm") != nil
-            ) else {
-                return (-1, Data("Node.js with npm or pnpm is required for Pi installation from Lattice.".utf8))
+        runCLIInstall(provider: "pi", progress: "Installing Pi 0.80.6…", executableName: "pi") {
+            let reference = RuntimeInstallDescriptor.pi.installReference
+            if ExecutableDiscovery.locate("npm") != nil {
+                let integrity = await Self.runCommand("npm", ["view", reference, "dist.integrity", "--json"], deadline: 30)
+                let reported = String(decoding: integrity.output, as: UTF8.self)
+                guard integrity.status == 0,
+                      let expected = RuntimeInstallDescriptor.pi.registryIntegrity,
+                      RuntimeArtifactVerification.registryIntegrityMatches(reported: reported, expected: expected) else {
+                    return (-1, Data("Pi registry integrity did not match Lattice's pinned release metadata.".utf8))
+                }
+                return await Self.runCommand("npm", ["install", "-g", "--ignore-scripts", reference], deadline: 180)
             }
-            return await Self.runCommand(plan.executable, plan.arguments)
+            if ExecutableDiscovery.locate("pnpm") != nil {
+                let integrity = await Self.runCommand("pnpm", ["view", reference, "dist.integrity", "--json"], deadline: 30)
+                let reported = String(decoding: integrity.output, as: UTF8.self)
+                guard integrity.status == 0,
+                      let expected = RuntimeInstallDescriptor.pi.registryIntegrity,
+                      RuntimeArtifactVerification.registryIntegrityMatches(reported: reported, expected: expected) else {
+                    return (-1, Data("Pi registry integrity did not match Lattice's pinned release metadata.".utf8))
+                }
+                return await Self.runCommand("pnpm", ["add", "-g", "--ignore-scripts", reference], deadline: 180)
+            }
+            return (-1, Data("Node.js with npm or pnpm is required for the pinned Pi installation.".utf8))
         }
     }
     func installHermes() {
-        requestCLIInstall("hermes")
+        requestRuntimeAction(.firstUseInstall, runtime: .hermes)
     }
     func installAntigravity() {
         requestCLIInstall("antigravity")
@@ -3160,6 +3268,104 @@ final class AppState: ObservableObject {
         pendingCLIInstallProvider = nil
     }
 
+    func requestRuntimeAction(_ action: RuntimeLifecycleAction, runtime: LatticeRuntimeID) {
+        guard !cliBusyProviders.contains(runtime.rawValue) else { return }
+        pendingRuntimeConfirmation = RuntimeConfirmationRequest(runtime: runtime, action: action)
+        runtimeLifecycleStates[runtime] = RuntimeLifecycleState(
+            runtime: runtime,
+            phase: .awaitingConfirmation,
+            detail: "Waiting for confirmation.",
+            installedVersion: runtime == .pi ? piCLIVersion : hermesCLIInfo.currentVersion
+        )
+    }
+
+    func cancelRuntimeAction() {
+        guard let request = pendingRuntimeConfirmation else { return }
+        pendingRuntimeConfirmation = nil
+        runtimeLifecycleStates[request.runtime] = RuntimeLifecycleState(
+            runtime: request.runtime,
+            phase: .cancelled,
+            detail: "No changes were made.",
+            installedVersion: request.runtime == .pi ? piCLIVersion : hermesCLIInfo.currentVersion
+        )
+    }
+
+    func confirmRuntimeAction() {
+        guard let request = pendingRuntimeConfirmation else { return }
+        pendingRuntimeConfirmation = nil
+        switch request.action {
+        case .firstUseInstall, .update:
+            runtimeLifecycleStates[request.runtime] = RuntimeLifecycleState(
+                runtime: request.runtime,
+                phase: request.action == .update ? .updating : .installing,
+                detail: "Using the exact pinned source shown in the confirmation.",
+                installedVersion: request.runtime == .pi ? piCLIVersion : hermesCLIInfo.currentVersion
+            )
+            if request.runtime == .pi { performPiInstall() }
+            else { performHermesInstall() }
+        case .uninstall:
+            performRuntimeUninstall(request.runtime)
+        case .rollback:
+            runtimeLifecycleStates[request.runtime] = RuntimeLifecycleState(
+                runtime: request.runtime,
+                phase: .failed,
+                detail: "No previously installed Lattice runtime version is recorded for rollback.",
+                installedVersion: request.runtime == .pi ? piCLIVersion : hermesCLIInfo.currentVersion
+            )
+        case .cancel, .interruptUpdate:
+            cancelRuntimeAction()
+        }
+    }
+
+    private func performRuntimeUninstall(_ runtime: LatticeRuntimeID) {
+        guard RuntimeOwnershipPolicy.canUninstall(runtime, managedRuntimeIDs: latticeManagedRuntimeIDs) else {
+            runtimeLifecycleStates[runtime] = RuntimeLifecycleState(
+                runtime: runtime,
+                phase: .failed,
+                detail: "This runtime was not installed by Lattice, so Lattice will not remove it.",
+                installedVersion: runtime == .pi ? piCLIVersion : hermesCLIInfo.currentVersion
+            )
+            return
+        }
+        let provider = runtime.rawValue
+        guard beginCLIAction(provider: provider, progress: "Removing \(runtime.displayName)…", estimatedSeconds: 60) else { return }
+        runtimeLifecycleStates[runtime] = RuntimeLifecycleState(runtime: runtime, phase: .uninstalling)
+        Task {
+            let result: (status: Int32, output: Data)
+            switch runtime {
+            case .pi:
+                if ExecutableDiscovery.locate("npm") != nil {
+                    result = await Self.runCommand("npm", ["uninstall", "-g", "@earendil-works/pi-coding-agent"], deadline: 120)
+                } else if ExecutableDiscovery.locate("pnpm") != nil {
+                    result = await Self.runCommand("pnpm", ["remove", "-g", "@earendil-works/pi-coding-agent"], deadline: 120)
+                } else {
+                    result = (-1, Data("npm or pnpm is required to remove Pi.".utf8))
+                }
+            case .hermes:
+                result = ExecutableDiscovery.locate("uv") == nil
+                    ? (-1, Data("uv is required to remove the Lattice-installed Hermes tool.".utf8))
+                    : await Self.runCommand("uv", ["tool", "uninstall", "hermes-agent"], deadline: 120)
+            }
+            await refreshConnections(refreshProviderCatalogs: true)
+            let removed = ExecutableDiscovery.locate(runtime.executableName) == nil
+            let detail = removed
+                ? "Removed. Lattice-owned profile data remains available for rollback until you remove it manually."
+                : CLIActionStatusPolicy.failureMessage(prefix: "Removal incomplete", output: result.output)
+            runtimeLifecycleStates[runtime] = RuntimeLifecycleState(
+                runtime: runtime,
+                phase: removed ? .completed : .failed,
+                detail: detail,
+                installedVersion: removed ? nil : (runtime == .pi ? piCLIVersion : hermesCLIInfo.currentVersion)
+            )
+            if removed {
+                latticeManagedRuntimeIDs.remove(runtime)
+                UserDefaults.standard.set(latticeManagedRuntimeIDs.map(\.rawValue).sorted(), forKey: Self.managedRuntimeIDsKey)
+            }
+            cliActionMessages[provider] = detail
+            finishCLIAction(provider)
+        }
+    }
+
     func confirmCLIInstall() {
         guard let provider = pendingCLIInstallProvider else { return }
         pendingCLIInstallProvider = nil
@@ -3168,15 +3374,20 @@ final class AppState: ObservableObject {
         case "grok": performGrokInstall()
         case "opencode": performOpenCodeInstall()
         case "antigravity": performAntigravityInstall()
-        case "pi": performPiInstall()
-        case "hermes": performHermesInstall()
         default: break
         }
     }
 
     private func performHermesInstall() {
-        runCLIInstall(provider: "hermes", progress: "Installing Hermes…", executableName: "hermes") {
-            await Self.runRemoteInstallerScript("https://hermes-agent.nousresearch.com/install.sh")
+        runCLIInstall(provider: "hermes", progress: "Installing pinned Hermes…", executableName: "hermes") {
+            guard ExecutableDiscovery.locate("uv") != nil else {
+                return (-1, Data("uv is required to install the pinned Hermes source revision.".utf8))
+            }
+            return await Self.runCommand(
+                "uv",
+                ["tool", "install", "--force", RuntimeInstallDescriptor.hermes.installReference],
+                deadline: 300
+            )
         }
     }
 
@@ -3189,18 +3400,179 @@ final class AppState: ObservableObject {
         }
     }
     func connectHermes() {
-        guard hermesInstalled, !cliBusyProviders.contains("hermes") else { return }
-        guard beginCLIAction(provider: "hermes", progress: "Finish Hermes setup in your browser…") else { return }
-        Task {
-            let result = await Self.runCommand("hermes", ["setup", "--portal", "--non-interactive"])
-            await refreshConnections()
-            if hermesReady {
-                cliActionMessages["hermes"] = ""
-            } else {
-                cliActionMessages["hermes"] = CLIActionStatusPolicy.failureMessage(prefix: "Setup incomplete", output: result.output)
-            }
-            finishCLIAction("hermes")
+        openHermesAuthentication()
+    }
+
+    func openPiAuthentication() {
+        guard piInstalled, let executable = ExecutableDiscovery.locate("pi") else {
+            cliActionMessages["pi"] = "Install Pi before signing in."
+            return
         }
+        let profile = PiRPCHarness().sharedProfileDirectory
+        guard openRuntimeTerminal(
+            name: "pi-login",
+            executable: executable,
+            arguments: [],
+            environment: ["PI_CODING_AGENT_DIR": profile.path]
+        ) else {
+            cliActionMessages["pi"] = "Lattice could not open the isolated Pi login terminal."
+            return
+        }
+        cliActionMessages["pi"] = "In Pi, run /login and choose ChatGPT. Return here, then Validate."
+    }
+
+    func validatePiAuthentication(providerID: String) {
+        guard piInstalled, !cliBusyProviders.contains("pi-\(providerID)") else { return }
+        let candidates = piModelIDs.sorted().compactMap { identifier -> (provider: String, model: String)? in
+            if providerID == "codex", identifier.hasPrefix("openai-codex/") {
+                return ("codex", String(identifier.dropFirst("openai-codex/".count)))
+            }
+            if providerID == "opencode",
+               identifier.hasPrefix("opencode-go/") || identifier.hasPrefix("opencode-zen/") {
+                return ("opencode", identifier)
+            }
+            return nil
+        }
+        guard let candidate = candidates.first else {
+            cliActionMessages["pi"] = "Pi did not report a compatible \(providerID) model."
+            return
+        }
+        let actionID = "pi-\(providerID)"
+        guard beginCLIAction(provider: actionID, progress: "Validating Pi \(providerID)…", estimatedSeconds: 30) else { return }
+        Task {
+            let key = providerID == "opencode" && openCodeCredentialEnabledModes.contains(.code)
+                ? KeychainStore.read(account: OpenCodeCredentialPolicy.keychainAccount)
+                : nil
+            let valid = await pi.validateIsolatedAuthentication(
+                provider: candidate.provider,
+                model: candidate.model,
+                openCodeAPIKey: key
+            )
+            if valid {
+                if providerID == "codex" {
+                    validatedPiCodexModels = Set(candidates.map(\.model))
+                } else {
+                    validatedPiOpenCodeModels = Set(candidates.map(\.model))
+                }
+                cliActionMessages["pi"] = "Pi \(providerID) authentication validated."
+            } else {
+                if providerID == "codex" { validatedPiCodexModels.removeAll() }
+                else { validatedPiOpenCodeModels.removeAll() }
+                cliActionMessages["pi"] = "Pi could not validate \(providerID). Check the isolated login or enabled key, then try again."
+            }
+            finishCLIAction(actionID)
+        }
+    }
+
+    func openHermesAuthentication() {
+        guard hermesInstalled, let executable = ExecutableDiscovery.locate("hermes") else {
+            cliActionMessages["hermes"] = "Install Hermes before signing in."
+            return
+        }
+        let profile = LatticeHermesProfile().homeURL
+        guard openRuntimeTerminal(
+            name: "hermes-model",
+            executable: executable,
+            arguments: ["model"],
+            environment: ["HOME": profile.path, "HERMES_HOME": profile.path]
+        ) else {
+            cliActionMessages["hermes"] = "Lattice could not open the isolated Hermes model setup terminal."
+            return
+        }
+        cliActionMessages["hermes"] = "Choose and authenticate the Work provider in Hermes, then validate it here."
+    }
+
+    func validateHermesAuthentication(providerID: String) {
+        let provider: String
+        switch providerID {
+        case "codex": provider = LatticeHermesProvider.openAICodex.rawValue
+        case "grok": provider = LatticeHermesProvider.xAIOAuth.rawValue
+        default:
+            cliActionMessages["hermes"] = "OpenCode uses the explicitly enabled Keychain credential."
+            return
+        }
+        let actionID = "hermes-\(providerID)"
+        guard hermesInstalled,
+              beginCLIAction(provider: actionID, progress: "Validating Hermes \(providerID)…", estimatedSeconds: 20) else { return }
+        Task {
+            let valid = await hermes.validateHermesAuthentication(provider: provider)
+            if valid { validatedHermesProviders.insert(provider) }
+            else { validatedHermesProviders.remove(provider) }
+            cliActionMessages["hermes"] = valid
+                ? "Hermes \(providerID) authentication validated."
+                : "Hermes did not report an authenticated \(providerID) session in its isolated profile."
+            finishCLIAction(actionID)
+        }
+    }
+
+    func validateHermesOpenCodeAuthentication() {
+        let candidates = hermesModels.filter {
+            $0.id.hasPrefix("opencode-go:") || $0.id.hasPrefix("opencode-zen:")
+        }
+        guard hermesInstalled,
+              openCodeAPIKeySaved,
+              openCodeCredentialEnabledModes.contains(.work),
+              let candidate = candidates.first,
+              let route = ExecutionRouteResolver.resolve(
+                mode: .work,
+                providerID: "opencode",
+                modelID: candidate.id
+              ),
+              let provider = hermesProvider(for: route),
+              let key = KeychainStore.read(account: OpenCodeCredentialPolicy.keychainAccount),
+              beginCLIAction(provider: "hermes-opencode", progress: "Validating Hermes OpenCode…", estimatedSeconds: 30) else {
+            cliActionMessages["hermes"] = "Enable the saved OpenCode key for Work and discover a Hermes OpenCode model first."
+            return
+        }
+        Task {
+            let result = await hermes.modelsResult(
+                workspace: URL(fileURLWithPath: selectedWorkspacePath),
+                provider: provider,
+                model: candidate.id,
+                systemIdentity: LatticeProductInstructions.current,
+                opencodeAPIKey: key
+            )
+            let valid = result.status == .loaded
+                && HermesACPHarness.exactMatch(for: candidate.id, in: result.models) != nil
+            if valid { validatedHermesOpenCodeModels = Set(candidates.map(\.id)) }
+            else { validatedHermesOpenCodeModels.removeAll() }
+            cliActionMessages["hermes"] = valid
+                ? "Hermes OpenCode credential and model catalog validated for Work."
+                : "Hermes could not validate the OpenCode Work route."
+            finishCLIAction("hermes-opencode")
+        }
+    }
+
+    private func openRuntimeTerminal(
+        name: String,
+        executable: URL,
+        arguments: [String],
+        environment: [String: String]
+    ) -> Bool {
+        let directory = LatticeApplicationSupport.productRootURL()
+            .appendingPathComponent("RuntimeLaunchers", isDirectory: true)
+        let scriptURL = directory.appendingPathComponent("\(name).command")
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            let exports = environment.sorted(by: { $0.key < $1.key }).map { key, value in
+                "export \(key)=\(Self.shellQuote(value))"
+            }
+            let command = (["exec", Self.shellQuote(executable.path)] + arguments.map(Self.shellQuote)).joined(separator: " ")
+            let body = (["#!/bin/zsh", "set -eu"] + exports + [command, ""]).joined(separator: "\n")
+            try Data(body.utf8).write(to: scriptURL, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptURL.path)
+            return NSWorkspace.shared.open(scriptURL)
+        } catch {
+            return false
+        }
+    }
+
+    nonisolated private static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
     func installOllama() { NSWorkspace.shared.open(URL(string: "https://ollama.com/download/mac")!) }
     func openOllama() {
@@ -4675,9 +5047,7 @@ Lattice self-edit rules:
     }
 
     func updatePi() {
-        runCLIUpdate(provider: "pi", progress: "Updating Pi…", beforeVersion: piCLIVersion, versionAfterRefresh: { self.piCLIVersion }) {
-            await Self.runCommand("pi", ["update", "self"])
-        }
+        requestRuntimeAction(.update, runtime: .pi)
     }
 
     func checkHermesUpdate() {
@@ -4691,15 +5061,20 @@ Lattice self-edit rules:
     }
 
     func updateHermes() {
-        runCLIUpdate(provider: "hermes", progress: "Updating Hermes…", beforeVersion: hermesCLIInfo.currentVersion, versionAfterRefresh: { self.hermesCLIInfo.currentVersion }) {
-            await Self.runCommand("hermes", ["update", "--yes"])
-        }
+        requestRuntimeAction(.update, runtime: .hermes)
     }
 
     private func runCLIInstall(provider: String, progress: String, executableName: String, action: @escaping () async -> (status: Int32, output: Data)) {
         guard beginCLIAction(provider: provider, progress: progress, estimatedSeconds: 90) else { return }
-        Task {
+        let runtime = LatticeRuntimeID(rawValue: provider)
+        let wasUpdate = runtime.flatMap { runtimeLifecycleStates[$0]?.phase } == .updating
+        let previousVersion: String?
+        if runtime == .pi { previousVersion = piCLIVersion }
+        else if runtime == .hermes { previousVersion = hermesCLIInfo.currentVersion }
+        else { previousVersion = nil }
+        let task = Task {
             let result = await action()
+            let cancelled = Task.isCancelled
             await refreshConnections(refreshProviderCatalogs: provider == "opencode")
             cliActionMessages[provider] = CLIActionStatusPolicy.installMessage(
                 executableName: executableName,
@@ -4707,8 +5082,35 @@ Lattice self-edit rules:
                 output: result.output,
                 executableAvailableAfterRefresh: ExecutableDiscovery.locate(executableName) != nil
             )
+            if let runtime {
+                let available = ExecutableDiscovery.locate(executableName) != nil
+                if !cancelled, result.status == 0, available {
+                    latticeManagedRuntimeIDs.insert(runtime)
+                    UserDefaults.standard.set(latticeManagedRuntimeIDs.map(\.rawValue).sorted(), forKey: Self.managedRuntimeIDsKey)
+                }
+                runtimeLifecycleStates[runtime] = RuntimeLifecycleState(
+                    runtime: runtime,
+                    phase: cancelled ? (wasUpdate ? .updateInterrupted : .cancelled) : (available ? .completed : .failed),
+                    detail: cancelled ? "Runtime setup was cancelled and the child process was terminated." : cliActionMessages[provider],
+                    installedVersion: runtime == .pi ? piCLIVersion : hermesCLIInfo.currentVersion,
+                    previousVersion: wasUpdate ? previousVersion : nil
+                )
+                runtimeInstallTasks[runtime] = nil
+            }
             finishCLIAction(provider)
         }
+        if let runtime { runtimeInstallTasks[runtime] = task }
+    }
+
+    func cancelRunningRuntimeAction(_ runtime: LatticeRuntimeID) {
+        guard let task = runtimeInstallTasks[runtime] else { return }
+        runtimeLifecycleStates[runtime] = RuntimeLifecycleState(
+            runtime: runtime,
+            phase: .cancelling,
+            detail: "Stopping the runtime installer…",
+            installedVersion: runtime == .pi ? piCLIVersion : hermesCLIInfo.currentVersion
+        )
+        task.cancel()
     }
 
     private func runCLIUpdate(
@@ -5099,28 +5501,61 @@ Lattice self-edit rules:
     func saveOpenCodeAPIKey() {
         let value = openCodeAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return }
-        switch KeychainStore.saveResult(value, account: "opencode-go-api-key") {
+        switch KeychainStore.saveResult(value, account: OpenCodeCredentialPolicy.keychainAccount) {
         case .failure(let error):
             openCodeAPIKeySaved = false
             cliActionMessages["opencode"] = error.message
         case .success:
-            switch OpenCodeAuthBridge.syncGoAPIKeyFromKeychainResult() {
-            case .success:
-                openCodeAPIKeySaved = true
-                openCodeAPIKeyDraft = ""
-                cliActionMessages["opencode"] = "API key saved securely and synchronized with OpenCode."
-                Task { await refreshConnections(refreshProviderCatalogs: true) }
-            case .failure(let error):
-                // The Keychain copy remains safe; preserve the draft and report the provider-file issue.
-                openCodeAPIKeySaved = true
-                cliActionMessages["opencode"] = "Saved in Keychain, but OpenCode could not be updated: \(error.message)"
-            }
+            openCodeAPIKeySaved = true
+            openCodeAPIKeyDraft = ""
+            cliActionMessages["opencode"] = "API key saved in Keychain. Enable Code, Work, or both explicitly."
+            Task { await refreshConnections(refreshProviderCatalogs: true) }
         }
     }
+
+    func isOpenCodeCredentialEnabled(for mode: ConversationMode) -> Bool {
+        openCodeCredentialEnabledModes.contains(mode)
+    }
+
+    func setOpenCodeCredentialEnabled(_ enabled: Bool, for mode: ConversationMode) {
+        guard mode == .code || mode == .work else { return }
+        guard !enabled || openCodeAPIKeySaved else {
+            cliActionMessages["opencode"] = "Save the OpenCode key before enabling it for \(mode.displayName)."
+            return
+        }
+        if enabled { openCodeCredentialEnabledModes.insert(mode) }
+        else {
+            openCodeCredentialEnabledModes.remove(mode)
+            if mode == .code { validatedPiOpenCodeModels.removeAll() }
+            if mode == .work { validatedHermesOpenCodeModels.removeAll() }
+        }
+        UserDefaults.standard.set(
+            openCodeCredentialEnabledModes.map(\.rawValue).sorted(),
+            forKey: Self.openCodeCredentialModesKey
+        )
+        cliActionMessages["opencode"] = enabled
+            ? "OpenCode credential enabled for \(mode.displayName)."
+            : "OpenCode credential disabled for \(mode.displayName)."
+    }
+
+    /// Compatibility-only bridge for an existing direct OpenCode chat. New
+    /// Pi/Hermes routes receive the Keychain value through child environment.
+    func enableLegacyDirectOpenCodeCredential() {
+        switch OpenCodeAuthBridge.syncGoAPIKeyFromKeychainResult() {
+        case .success:
+            cliActionMessages["opencode"] = "Credential copied to OpenCode for legacy direct chats."
+        case .failure(let error):
+            cliActionMessages["opencode"] = error.message
+        }
+    }
+
     func clearOpenCodeAPIKey() {
-        KeychainStore.delete(account: "opencode-go-api-key")
-        OpenCodeAuthBridge.removeGoAPIKey()
+        KeychainStore.delete(account: OpenCodeCredentialPolicy.keychainAccount)
         openCodeAPIKeySaved = false
+        openCodeCredentialEnabledModes.removeAll()
+        validatedPiOpenCodeModels.removeAll()
+        validatedHermesOpenCodeModels.removeAll()
+        UserDefaults.standard.removeObject(forKey: Self.openCodeCredentialModesKey)
         openCodeAPIKeyDraft = ""
         Task { await refreshConnections() }
     }
@@ -5434,17 +5869,6 @@ Lattice self-edit rules:
     private func hermesMatch(for backend: ChatBackend) -> HarnessModel? {
         guard case .openCode(let model) = backend else { return nil }
         return HermesACPHarness.bestMatch(for: model, in: hermesModels)
-    }
-
-    private static func piModelCatalog() async -> Set<String> {
-        guard ExecutableDiscovery.locate("pi") != nil else { return [] }
-        let result = await runCommand("pi", ["--list-models"])
-        guard result.status == 0 else { return [] }
-        return Set(String(decoding: result.output, as: UTF8.self).split(separator: "\n").dropFirst().compactMap { line in
-            let columns = line.split(whereSeparator: \.isWhitespace)
-            guard columns.count >= 2 else { return nil }
-            return "\(columns[0])/\(columns[1])"
-        })
     }
 
     private func apply(_ event: AgentEvent, to id: UUID, runID: UUID) {

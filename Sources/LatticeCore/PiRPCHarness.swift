@@ -150,11 +150,20 @@ public final class PiRPCHarness: @unchecked Sendable {
     /// User-triggered, bounded auth validation. This deliberately performs a
     /// no-tools model request in the shared Lattice profile. It never reads
     /// auth.json and never exposes child output to logs or session state.
-    public func validateIsolatedAuthentication(provider: String, model: String) async -> Bool {
+    public func validateIsolatedAuthentication(
+        provider: String,
+        model: String,
+        openCodeAPIKey: String? = nil
+    ) async -> Bool {
         guard let executableURL,
               let providerModel = Self.mapProviderModel(provider: provider, model: model),
-              providerModel.provider == "openai-codex",
               let environment = try? profileEnvironment() else { return false }
+        guard providerModel.provider == "openai-codex" || providerModel.provider.hasPrefix("opencode") else { return false }
+        var childEnvironment = environment
+        if providerModel.provider.hasPrefix("opencode") {
+            guard let key = openCodeAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty else { return false }
+            childEnvironment["OPENCODE_API_KEY"] = key
+        }
         let result = await BoundedSubprocess.run(.init(
             executableURL: executableURL,
             arguments: [
@@ -165,7 +174,7 @@ public final class PiRPCHarness: @unchecked Sendable {
                 "--model", providerModel.model,
                 "Reply with OK."
             ],
-            environment: environment,
+            environment: childEnvironment,
             deadline: 30,
             maximumOutputBytes: 32_000
         ))

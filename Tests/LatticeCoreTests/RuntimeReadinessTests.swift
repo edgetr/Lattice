@@ -71,6 +71,26 @@ struct RuntimeReadinessTests {
         #expect(!hermes.hasPublishedHash)
     }
 
+    @Test func registryIntegrityMismatchFailsClosed() {
+        let expected = RuntimeInstallDescriptor.pi.registryIntegrity!
+        #expect(RuntimeArtifactVerification.registryIntegrityMatches(reported: "\"\(expected)\"\n", expected: expected))
+        #expect(!RuntimeArtifactVerification.registryIntegrityMatches(reported: "sha512-wrong", expected: expected))
+        #expect(!RuntimeArtifactVerification.registryIntegrityMatches(reported: expected, expected: ""))
+    }
+
+    @Test func cancellationAndRollbackTransitionsRemainTruthful() {
+        #expect(RuntimeLifecycleTransition.phaseAfterCancellation(from: .installing) == .cancelled)
+        #expect(RuntimeLifecycleTransition.phaseAfterCancellation(from: .updating) == .updateInterrupted)
+        #expect(RuntimeLifecycleTransition.rollbackPhase(previousVersion: nil) == .failed)
+        #expect(RuntimeLifecycleTransition.rollbackPhase(previousVersion: "0.79.3") == .rollingBack)
+    }
+
+    @Test func externalRuntimeCannotBeUninstalledByLattice() {
+        #expect(!RuntimeOwnershipPolicy.canUninstall(.pi, managedRuntimeIDs: []))
+        #expect(RuntimeOwnershipPolicy.canUninstall(.pi, managedRuntimeIDs: [.pi]))
+        #expect(!RuntimeOwnershipPolicy.canUninstall(.hermes, managedRuntimeIDs: [.pi]))
+    }
+
     @Test func OpenCodeKeychainCredentialIsLimitedToPiAndHermesAndUsesRuntimeEnvNames() {
         let pi = route
         let hermesGo = ExecutionRoute(mode: .work, providerID: "opencode", modelID: "opencode-go:model", runtimeID: "hermes")
@@ -81,6 +101,10 @@ struct RuntimeReadinessTests {
         #expect(OpenCodeCredentialPolicy.allowsKeychainCredential(for: hermesGo))
         #expect(OpenCodeCredentialPolicy.allowsKeychainCredential(for: hermesZen))
         #expect(!OpenCodeCredentialPolicy.allowsKeychainCredential(for: direct))
+        #expect(OpenCodeCredentialPolicy.allowsKeychainCredential(for: pi, enabledModes: [.code]))
+        #expect(!OpenCodeCredentialPolicy.allowsKeychainCredential(for: pi, enabledModes: [.work]))
+        #expect(OpenCodeCredentialPolicy.allowsKeychainCredential(for: hermesGo, enabledModes: [.work]))
+        #expect(!OpenCodeCredentialPolicy.allowsKeychainCredential(for: hermesGo, enabledModes: [.code]))
         #expect(OpenCodeCredentialPolicy.environmentKey(for: pi) == "OPENCODE_API_KEY")
         #expect(OpenCodeCredentialPolicy.environmentKey(for: hermesGo) == "OPENCODE_GO_API_KEY")
         #expect(OpenCodeCredentialPolicy.environmentKey(for: hermesZen) == "OPENCODE_ZEN_API_KEY")

@@ -64,7 +64,7 @@ struct InspectorView: View {
             }
 
             inspectorWarnings(for: session)
-            instructionEditor
+            instructionEditor(for: session.executionRoute.mode)
 
             InspectorOpaqueDisclosure(title: "Workspace", systemImage: "folder") {
                 Text(session.workspacePath ?? "No workspace selected")
@@ -158,19 +158,17 @@ struct InspectorView: View {
         }
     }
 
-    private var instructionEditor: some View {
-        InspectorOpaqueSection(title: "Mode instructions", systemImage: "text.quote") {
-            Text("Optional guidance add-on for selected mode. Maximum 8 KiB. Not for credentials.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            ModeInstructionEditor(mode: .code, text: Binding(
-                get: { state.codeInstructionAddOn },
-                set: { _ = state.setInstructionAddOn($0, for: .code) }
-            ))
-            ModeInstructionEditor(mode: .work, text: Binding(
-                get: { state.workInstructionAddOn },
-                set: { _ = state.setInstructionAddOn($0, for: .work) }
-            ))
+    @ViewBuilder private func instructionEditor(for mode: ConversationMode) -> some View {
+        if mode != .local {
+            InspectorOpaqueDisclosure(title: "\(mode.displayName) instructions", systemImage: "text.quote") {
+                Text("Optional guidance for every \(mode.displayName) chat. Maximum 8 KiB. Never put credentials here.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                ModeInstructionEditor(mode: mode, text: Binding(
+                    get: { mode == .code ? state.codeInstructionAddOn : state.workInstructionAddOn },
+                    set: { _ = state.setInstructionAddOn($0, for: mode) }
+                ))
+            }
         }
     }
 
@@ -793,15 +791,11 @@ struct ConnectionsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Text("Mode badges stay conservative until readiness worker reports auth, model, and sandbox validation for each route.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .padding(.bottom, 8)
             providerRow(
                 identity: .provider(.codex), name: "Codex", detail: "Code via Pi · Work via Hermes",
                 modes: [
-                    .init(title: "Code", runtime: "Pi", ready: codexCodeReady),
-                    .init(title: "Work", runtime: "Hermes", ready: codexWorkReady)
+                    .init(title: "Code", runtime: "Pi", readiness: state.modeReadiness(.code, providerID: "codex")),
+                    .init(title: "Work", runtime: "Hermes", readiness: state.modeReadiness(.work, providerID: "codex"))
                 ]
             ) {
                 codexActions
@@ -813,10 +807,10 @@ struct ConnectionsView: View {
                 ModelChecklist(providerID: "codex", models: state.codexModels, state: state)
             }
             providerRow(
-                identity: .provider(.grok), name: "Grok", detail: state.grokAuthenticated ? "Build connected · Work Hermes pending validation" : state.grokReadinessCopy.detail,
+                identity: .provider(.grok), name: "Grok", detail: "Code via Grok Build · Work via Hermes",
                 modes: [
-                    .init(title: "Code", runtime: "Build", ready: false),
-                    .init(title: "Work", runtime: "Hermes", ready: grokWorkReady)
+                    .init(title: "Code", runtime: "Build", readiness: state.modeReadiness(.code, providerID: "grok")),
+                    .init(title: "Work", runtime: "Hermes", readiness: state.modeReadiness(.work, providerID: "grok"))
                 ]
             ) {
                 grokActions
@@ -824,10 +818,10 @@ struct ConnectionsView: View {
                 ModelChecklist(providerID: "grok", models: state.grokModels, state: state)
             }
             providerRow(
-                identity: .provider(.opencode), name: "OpenCode", detail: state.openCodeAuthenticated ? "ACP connected · mode key policy pending" : state.openCodeReadinessCopy.detail,
+                identity: .provider(.opencode), name: "OpenCode", detail: "One Keychain credential · separate mode consent",
                 modes: [
-                    .init(title: "Code", runtime: "Pi", ready: openCodeCodeReady),
-                    .init(title: "Work", runtime: "Hermes", ready: openCodeWorkReady)
+                    .init(title: "Code", runtime: "Pi", readiness: state.modeReadiness(.code, providerID: "opencode")),
+                    .init(title: "Work", runtime: "Hermes", readiness: state.modeReadiness(.work, providerID: "opencode"))
                 ]
             ) {
                 openCodeActions
@@ -837,8 +831,8 @@ struct ConnectionsView: View {
             }
             providerRow(
                 identity: .systemImage("paperplane"), name: "Antigravity",
-                detail: state.antigravityAuthenticated ? "Connected · Code route pending validation" : (state.antigravityInstalled ? "Sign in required" : "Not installed"),
-                modes: [.init(title: "Code", runtime: "Antigravity", ready: false)]
+                detail: "Subscription-native Code runtime",
+                modes: [.init(title: "Code", runtime: "Antigravity", readiness: state.modeReadiness(.code, providerID: "antigravity"))]
             ) {
                 antigravityActions
             } content: {
@@ -850,52 +844,70 @@ struct ConnectionsView: View {
         .latticeGlass(cornerRadius: LatticeMetrics.surfaceRadius)
     }
 
-    private var codexCodeReady: Bool {
-        // AppState exposes Pi install/model discovery, not Pi-owned auth. Stay conservative.
-        false
-    }
-
-    private var codexWorkReady: Bool {
-        false
-    }
-
-    private var grokWorkReady: Bool {
-        false
-    }
-
-    private var openCodeCodeReady: Bool {
-        // No Pi-owned auth or mode-scoped key policy in current AppState.
-        false
-    }
-
-    private var openCodeWorkReady: Bool {
-        // No Hermes-owned OpenCode auth/key policy in current AppState.
-        false
-    }
-
     @ViewBuilder private var codexActions: some View {
-        if !state.codex.isInstalled {
-            CLIActionButton(title: "Install legacy CLI", provider: "codex", state: state) { state.installCodex() }
-        } else if CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: state.codexCLIVersion, latestVersion: state.codexLatestCLIVersion) {
-            CLIActionButton(title: "Update legacy CLI", provider: "codex", state: state) { state.updateCodex() }
+        Menu {
+            runtimeMenu(runtime: .pi, installed: state.piInstalled, update: state.updatePi, install: state.installPi)
+            if state.piInstalled {
+                Button("Sign in to Pi Codex…") { state.openPiAuthentication() }
+                Button("Validate Code") { state.validatePiAuthentication(providerID: "codex") }
+            }
+            Divider()
+            runtimeMenu(runtime: .hermes, installed: state.hermesInstalled, update: state.updateHermes, install: state.installHermes)
+            if state.hermesInstalled {
+                Button("Sign in to Hermes Codex…") { state.openHermesAuthentication() }
+                Button("Validate Work") { state.validateHermesAuthentication(providerID: "codex") }
+            }
+            Divider()
+            Button("Legacy Codex setup…") {
+                if state.codex.isInstalled { state.connectCodex() } else { state.installCodex() }
+            }
+        } label: {
+            Image(systemName: "ellipsis.circle").accessibilityLabel("Codex setup actions")
         }
-        runtimeAction(provider: "pi", installed: state.piInstalled, install: state.installPi, update: state.updatePi, version: state.piCLIVersion, latest: state.piLatestCLIVersion)
-        runtimeAction(provider: "hermes", installed: state.hermesInstalled, install: state.installHermes, update: state.updateHermes, version: state.hermesCLIInfo.currentVersion, latest: state.hermesCLIInfo.latestVersion)
+        .menuStyle(.borderlessButton)
     }
 
     @ViewBuilder private var grokActions: some View {
-        providerInstallOrUpdate(provider: "grok", installed: state.grok.isInstalled, authenticated: state.grokAuthenticated, install: state.installGrok, signIn: state.connectGrok, update: state.grokCLIInfo.updateAvailable == true ? state.updateGrok : state.checkGrokUpdate, version: state.grokCLIInfo.currentVersion, latest: state.grokCLIInfo.latestVersion)
-        runtimeAction(provider: "hermes", installed: state.hermesInstalled, install: state.installHermes, update: state.updateHermes, version: state.hermesCLIInfo.currentVersion, latest: state.hermesCLIInfo.latestVersion)
+        Menu {
+            if !state.grok.isInstalled { Button("Install Grok Build…") { state.installGrok() } }
+            else if !state.grokAuthenticated { Button("Sign in to Grok Build…") { state.connectGrok() } }
+            else { Button("Update Grok Build") { state.updateGrok() } }
+            Divider()
+            runtimeMenu(runtime: .hermes, installed: state.hermesInstalled, update: state.updateHermes, install: state.installHermes)
+            if state.hermesInstalled {
+                Button("Sign in to Hermes Grok…") { state.openHermesAuthentication() }
+                Button("Validate Work") { state.validateHermesAuthentication(providerID: "grok") }
+            }
+        } label: { Image(systemName: "ellipsis.circle").accessibilityLabel("Grok setup actions") }
+        .menuStyle(.borderlessButton)
     }
 
     @ViewBuilder private var openCodeActions: some View {
-        providerInstallOrUpdate(provider: "opencode", installed: state.openCode.isInstalled, authenticated: state.openCodeAuthenticated, install: state.installOpenCode, signIn: state.connectOpenCode, update: state.updateOpenCode, version: state.openCodeCLIVersion, latest: state.openCodeLatestCLIVersion)
-        runtimeAction(provider: "pi", installed: state.piInstalled, install: state.installPi, update: state.updatePi, version: state.piCLIVersion, latest: state.piLatestCLIVersion)
-        runtimeAction(provider: "hermes", installed: state.hermesInstalled, install: state.installHermes, update: state.updateHermes, version: state.hermesCLIInfo.currentVersion, latest: state.hermesCLIInfo.latestVersion)
+        Menu {
+            runtimeMenu(runtime: .pi, installed: state.piInstalled, update: state.updatePi, install: state.installPi)
+            if state.piInstalled { Button("Validate Code") { state.validatePiAuthentication(providerID: "opencode") } }
+            Divider()
+            runtimeMenu(runtime: .hermes, installed: state.hermesInstalled, update: state.updateHermes, install: state.installHermes)
+            if state.hermesInstalled { Button("Validate Work") { state.validateHermesOpenCodeAuthentication() } }
+            Divider()
+            Button("Enable legacy direct OpenCode") { state.enableLegacyDirectOpenCodeCredential() }
+                .disabled(!state.openCodeAPIKeySaved)
+        } label: { Image(systemName: "ellipsis.circle").accessibilityLabel("OpenCode setup actions") }
+        .menuStyle(.borderlessButton)
     }
 
     @ViewBuilder private var antigravityActions: some View {
         providerInstallOrUpdate(provider: "antigravity", installed: state.antigravityInstalled, authenticated: state.antigravityAuthenticated, install: state.installAntigravity, signIn: state.connectAntigravity, update: state.updateAntigravity, version: state.antigravityCLIVersion, latest: state.antigravityLatestCLIVersion)
+    }
+
+    @ViewBuilder private func runtimeMenu(
+        runtime: LatticeRuntimeID,
+        installed: Bool,
+        update: @escaping () -> Void,
+        install: @escaping () -> Void
+    ) -> some View {
+        if installed { Button("Reinstall pinned \(runtime.displayName)…", action: update) }
+        else { Button("Install \(runtime.displayName)…", action: install) }
     }
 
     private func providerInstallOrUpdate(provider: String, installed: Bool, authenticated: Bool, install: @escaping () -> Void, signIn: @escaping () -> Void, update: @escaping () -> Void, version: String?, latest: String?) -> some View {
@@ -931,17 +943,32 @@ struct ConnectionsView: View {
                     .foregroundStyle(state.openCodeAPIKeySaved ? .green : .secondary)
             }
             HStack(spacing: 10) {
-                Toggle("Code key enablement", isOn: .constant(false))
+                Toggle("Code", isOn: Binding(
+                    get: { state.isOpenCodeCredentialEnabled(for: .code) },
+                    set: { state.setOpenCodeCredentialEnabled($0, for: .code) }
+                ))
                     .toggleStyle(.checkbox)
-                    .disabled(true)
-                Toggle("Work key enablement", isOn: .constant(false))
+                    .disabled(!state.openCodeAPIKeySaved)
+                    .accessibilityHint("Allow Pi Code routes to receive this key through their child environment.")
+                Toggle("Work", isOn: Binding(
+                    get: { state.isOpenCodeCredentialEnabled(for: .work) },
+                    set: { state.setOpenCodeCredentialEnabled($0, for: .work) }
+                ))
                     .toggleStyle(.checkbox)
-                    .disabled(true)
+                    .disabled(!state.openCodeAPIKeySaved)
+                    .accessibilityHint("Allow Hermes Work routes to receive this key through their child environment.")
             }
             if state.openCodeAPIKeySaved {
-                Text("Mode-specific key policy pending readiness-worker integration. Current AppState applies saved key provider-wide; route badges stay not-ready.")
+                Text("Each mode validates independently. The key is injected only for an enabled OpenCode route and is never written to its arguments.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Button("Validate Code") { state.validatePiAuthentication(providerID: "opencode") }
+                        .disabled(!state.isOpenCodeCredentialEnabled(for: .code) || !state.piInstalled)
+                    Button("Validate Work") { state.validateHermesOpenCodeAuthentication() }
+                        .disabled(!state.isOpenCodeCredentialEnabled(for: .work) || !state.hermesInstalled)
+                }
+                .controlSize(.small)
             } else {
                 Text("Save key before enabling either mode. Key never appears in this UI.")
                     .font(.caption2)
@@ -1011,7 +1038,8 @@ struct ConnectionsView: View {
 private struct ModeReadiness: Identifiable {
     let title: String
     let runtime: String
-    let ready: Bool
+    let readiness: ExecutionRouteReadiness
+    var ready: Bool { readiness.isRunnable }
     var id: String { title }
 }
 
@@ -1031,7 +1059,8 @@ private struct ModeReadinessBadge: View {
         .overlay(Capsule().strokeBorder((mode.ready ? Color.green : Color.secondary).opacity(0.28)))
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(mode.title) mode, \(mode.runtime)")
-        .accessibilityValue(mode.ready ? "Ready" : "Not ready")
+        .accessibilityValue(mode.readiness.detail)
+        .help(mode.readiness.detail)
     }
 }
 
@@ -1077,6 +1106,10 @@ private struct RuntimeComponentRow: View {
     let provider: String
     @ObservedObject var state: AppState
 
+    private var runtime: LatticeRuntimeID { provider == "pi" ? .pi : .hermes }
+    private var descriptor: RuntimeInstallDescriptor { .firstUse(for: runtime) }
+    private var managedByLattice: Bool { state.latticeManagedRuntimeIDs.contains(runtime) }
+
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: icon).foregroundStyle(.secondary).frame(width: 22)
@@ -1084,26 +1117,35 @@ private struct RuntimeComponentRow: View {
                 Text(name).font(.body.weight(.semibold))
                 Text(installed ? "Installed · \(version ?? "version unknown")" : "Not installed")
                     .font(.caption).foregroundStyle(.secondary)
-                if installed {
-                    Text("Remove: readiness-worker integration pending")
+                Text("Lattice pin: \(descriptor.immutableVersion)")
+                    .font(.caption2).foregroundStyle(.secondary)
+                if installed, !managedByLattice {
+                    Text("External install · Lattice will not remove it")
                         .font(.caption2).foregroundStyle(.secondary)
+                }
+                if let lifecycle = state.runtimeLifecycleStates[runtime], let detail = lifecycle.detail {
+                    Text(detail).font(.caption2)
+                        .foregroundStyle(lifecycle.phase == .failed ? .orange : .secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             Spacer(minLength: 8)
             VStack(alignment: .trailing, spacing: 5) {
-                if installed {
-                    if CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: version, latestVersion: latest) {
-                        CLIActionButton(title: "Update", provider: provider, state: state) {
-                            if provider == "pi" { state.updatePi() } else { state.updateHermes() }
-                        }
-                    }
+                if state.isCLIBusy(provider) {
+                    ProgressView().controlSize(.small).accessibilityLabel("Runtime setup in progress")
+                    Button("Cancel", role: .cancel) { state.cancelRunningRuntimeAction(runtime) }
+                        .controlSize(.small)
+                } else if installed {
+                    Button("Reinstall Pin") {
+                        if provider == "pi" { state.updatePi() } else { state.updateHermes() }
+                    }.controlSize(.small)
                     Button("Diagnostics") { Task { await state.refreshConnections(refreshProviderCatalogs: true) } }
                         .controlSize(.small)
                         .help("Re-run runtime and model discovery")
-                    Button("Remove", role: .destructive) { }
+                    Button("Remove", role: .destructive) { state.requestRuntimeAction(.uninstall, runtime: runtime) }
                         .controlSize(.small)
-                        .disabled(true)
-                        .help("Enable when readiness worker exposes safe runtime removal")
+                        .disabled(!managedByLattice)
+                        .help("Remove the runtime after confirmation; Lattice-owned profile data is preserved")
                 } else {
                     CLIActionButton(title: "Install", provider: provider, state: state) {
                         if provider == "pi" { state.installPi() } else { state.installHermes() }
