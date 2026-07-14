@@ -265,6 +265,7 @@ final class AppState: ObservableObject {
     @Published private(set) var latticeManagedRuntimeIDs: Set<LatticeRuntimeID> = []
     @Published var disabledModelIDs: Set<String>
     @Published var expandedProviderModelIDs: Set<String> = []
+    @Published var providerModelDisclosureStates: [String: ProviderModelDisclosureState] = [:]
     @Published var cliBusyProviders: Set<String> = []
     @Published var cliActionMessages: [String: String] = [:]
     @Published private(set) var isRefreshingConnections = false
@@ -960,6 +961,19 @@ final class AppState: ObservableObject {
         if expanded { expandedProviderModelIDs.insert(providerID) }
         else { expandedProviderModelIDs.remove(providerID) }
     }
+    func providerModelDisclosureState(for providerID: String) -> ProviderModelDisclosureState {
+        providerModelDisclosureStates[providerID] ?? ProviderModelDisclosureState()
+    }
+    func setProviderModelDisclosureExpanded(_ providerID: String, expanded: Bool) {
+        var disclosure = providerModelDisclosureState(for: providerID)
+        disclosure.isExpanded = expanded
+        providerModelDisclosureStates[providerID] = disclosure
+    }
+    func setProviderModelSearchQuery(_ providerID: String, query: String) {
+        var disclosure = providerModelDisclosureState(for: providerID)
+        disclosure.query = query
+        providerModelDisclosureStates[providerID] = disclosure
+    }
     var runnableGrokModels: [ProviderModel] { visibleGrokModels.filter { ACPHarness.bestMatch(for: $0.id, in: grokACPModels) != nil } }
     var runnableOpenCodeModels: [ProviderModel] { visibleOpenCodeModels.filter { ACPHarness.bestMatch(for: $0.id, in: openCodeACPModels) != nil } }
     var localModelIdleUnloadLabel: String { localModelIdleUnloadMinutes == 0 ? "Off" : "\(localModelIdleUnloadMinutes)m" }
@@ -1467,9 +1481,31 @@ final class AppState: ObservableObject {
 
     func isModelEnabled(_ id: String) -> Bool { !disabledModelIDs.contains(id) }
     func setModelEnabled(_ id: String, enabled: Bool) {
-        if enabled { disabledModelIDs.remove(id) } else { disabledModelIDs.insert(id) }
+        let components = id.split(separator: ":", maxSplits: 1).map(String.init)
+        guard components.count == 2 else { return }
+        disabledModelIDs = ProviderModelConfigurationPolicy.updatedDisabledModelIDs(
+            disabledModelIDs,
+            providerID: components[0],
+            modelID: components[1],
+            enabled: enabled
+        )
         UserDefaults.standard.set(Array(disabledModelIDs).sorted(), forKey: "disabledModelIDs")
         normalizeBackendsAfterCatalogRefresh()
+    }
+
+    func selectedModelIDs(for providerID: String) -> Set<String> {
+        let candidates = sessions.map(\.backend) + [defaultBackend, composerSelectionBackend].compactMap { $0 }
+        return Set(candidates.compactMap { backend in
+            switch (providerID, backend) {
+            case ("codex", .codex(let model)),
+                 ("grok", .grok(let model)),
+                 ("opencode", .openCode(let model)),
+                 ("antigravity", .antigravity(let model)):
+                return model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : model
+            default:
+                return nil
+            }
+        })
     }
 
     func newSession() {

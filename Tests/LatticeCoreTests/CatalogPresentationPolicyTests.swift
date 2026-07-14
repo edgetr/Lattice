@@ -56,6 +56,75 @@ struct CatalogPresentationPolicyTests {
         #expect(CatalogProgressiveDisclosure.modelVisibilitySectionTitle(modelCount: 5) == "Model visibility (5)")
     }
 
+    @Test func providerModelFilteringMatchesNamesIdentifiersAndAllTerms() {
+        let items = ProviderModelConfigurationPolicy.items(
+            providerID: "codex",
+            discoveredModels: [
+                ProviderModel(id: "openai/gpt-fast", name: "GPT Fast", description: "Low latency"),
+                ProviderModel(id: "openai/gpt-deep", name: "GPT Deep", description: "Long reasoning")
+            ],
+            disabledModelIDs: [],
+            selectedModelIDs: []
+        )
+        #expect(ProviderModelConfigurationPolicy.filtered(items, query: "fast").map(\.id) == ["openai/gpt-fast"])
+        #expect(ProviderModelConfigurationPolicy.filtered(items, query: "openai deep").map(\.id) == ["openai/gpt-deep"])
+        #expect(ProviderModelConfigurationPolicy.filtered(items, query: "low latency").map(\.id) == ["openai/gpt-fast"])
+        #expect(ProviderModelConfigurationPolicy.filtered(items, query: "missing").isEmpty)
+    }
+
+    @Test func providerModelDisclosureStartsCollapsedAndPreservesSearch() {
+        var disclosure = ProviderModelDisclosureState()
+        #expect(!disclosure.isExpanded)
+        disclosure.isExpanded = true
+        disclosure.query = "gpt"
+        disclosure.isExpanded = false
+        #expect(disclosure.query == "gpt")
+        #expect(!disclosure.isExpanded)
+    }
+
+    @Test func selectedUnavailableModelsRemainVisibleWithoutBecomingDefaults() {
+        let items = ProviderModelConfigurationPolicy.items(
+            providerID: "codex",
+            discoveredModels: [ProviderModel(id: "current", name: "Current")],
+            disabledModelIDs: ["codex:retired"],
+            selectedModelIDs: ["retired"]
+        )
+        let retired = items.first { $0.id == "retired" }
+        #expect(retired?.isSelected == true)
+        #expect(retired?.isDiscovered == false)
+        #expect(retired?.isEnabled == false)
+        #expect(ProviderModelConfigurationPolicy.providerDefault(in: items) == nil)
+    }
+
+    @Test func providerReportedDefaultIsHonestAndPreferencesArePreserved() {
+        let items = ProviderModelConfigurationPolicy.items(
+            providerID: "codex",
+            discoveredModels: [
+                ProviderModel(id: "first", name: "First"),
+                ProviderModel(id: "reported", name: "Reported", isDefault: true)
+            ],
+            disabledModelIDs: [],
+            selectedModelIDs: []
+        )
+        #expect(ProviderModelConfigurationPolicy.providerDefault(in: items)?.id == "reported")
+
+        let existing: Set<String> = ["grok:kept", "codex:temporarily-missing"]
+        let disabled = ProviderModelConfigurationPolicy.updatedDisabledModelIDs(
+            existing,
+            providerID: "codex",
+            modelID: "reported",
+            enabled: false
+        )
+        #expect(disabled == existing.union(["codex:reported"]))
+        let restored = ProviderModelConfigurationPolicy.updatedDisabledModelIDs(
+            disabled,
+            providerID: "codex",
+            modelID: "reported",
+            enabled: true
+        )
+        #expect(restored == existing)
+    }
+
     @Test func emptyStatesUseExistingActionTitlesOnly() {
         let extensions = CatalogEmptyStatePolicy.copy(for: .extensions)
         #expect(extensions.primaryActionTitle == "Open Folder")

@@ -183,6 +183,30 @@ struct CoreVerification {
         expect(LatticeCommandPaletteSelection.executableSelection(selectedID: "models", in: selectionPaletteItems)?.id == "models", "Palette executes enabled selection")
         let filteredPalette = LatticeCommandPaletteMatcher.filtered(selectionPaletteItems, query: "models")
         expect(LatticeCommandPaletteSelection.clampedSelection(selectedID: "new-chat", in: filteredPalette) == "models", "Palette filter clamps to enabled visible row")
+        let configuredModels = ProviderModelConfigurationPolicy.items(
+            providerID: "codex",
+            discoveredModels: [
+                ProviderModel(id: "gpt-fast", name: "Fast", description: "Low latency"),
+                ProviderModel(id: "gpt-default", name: "Default", isDefault: true)
+            ],
+            disabledModelIDs: ["codex:retired"],
+            selectedModelIDs: ["retired"]
+        )
+        expect(ProviderModelConfigurationPolicy.providerDefault(in: configuredModels)?.id == "gpt-default", "Model configuration uses only provider-reported default metadata")
+        expect(ProviderModelConfigurationPolicy.filtered(configuredModels, query: "low latency").map(\.id) == ["gpt-fast"], "Model configuration filters names, identifiers, and details")
+        expect(configuredModels.first(where: { $0.id == "retired" }).map { $0.isSelected && !$0.isDiscovered && !$0.isEnabled } == true, "Selected unavailable models and their visibility preference remain explicit")
+        let preservedModelPreferences = ProviderModelConfigurationPolicy.updatedDisabledModelIDs(
+            ["grok:kept", "codex:temporarily-missing"],
+            providerID: "codex",
+            modelID: "gpt-default",
+            enabled: false
+        )
+        expect(preservedModelPreferences == ["grok:kept", "codex:temporarily-missing", "codex:gpt-default"], "Changing one model preserves unrelated and unavailable preferences")
+        var modelDisclosure = ProviderModelDisclosureState()
+        modelDisclosure.isExpanded = true
+        modelDisclosure.query = "gpt"
+        modelDisclosure.isExpanded = false
+        expect(!modelDisclosure.isExpanded && modelDisclosure.query == "gpt", "Model disclosure starts independently and preserves its search through collapse")
         expect(ExecutionRoutePolicy.compatibleHarnessIDs(for: "antigravity") == ["antigravity"], "Antigravity exposes its direct CLI harness route")
         let antigravityModels = [ProviderModel(id: "Gemini 3.5 Flash (High)", name: "Gemini 3.5 Flash (High)", isDefault: true)]
         let antigravitySnapshot = BackendAvailabilitySnapshot(antigravityModels: antigravityModels, antigravityReady: true)

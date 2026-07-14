@@ -854,7 +854,7 @@ struct ConnectionsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                ModelChecklist(providerID: "codex", models: state.codexModels, state: state)
+                ModelChecklist(providerID: "codex", modeNames: ["Code", "Work"], models: state.codexModels, state: state)
                 CLIActionMessage(provider: "codex", state: state)
             }
             providerRow(
@@ -881,7 +881,7 @@ struct ConnectionsView: View {
             ) {
                 grokActions
             } content: {
-                ModelChecklist(providerID: "grok", models: state.grokModels, state: state)
+                ModelChecklist(providerID: "grok", modeNames: ["Code", "Work"], models: state.grokModels, state: state)
                 CLIActionMessage(provider: "grok", state: state)
             }
             providerRow(
@@ -894,7 +894,7 @@ struct ConnectionsView: View {
                 openCodeActions
             } content: {
                 openCodeKeyControls
-                ModelChecklist(providerID: "opencode", models: state.openCodeModels, state: state)
+                ModelChecklist(providerID: "opencode", modeNames: ["Code", "Work"], models: state.openCodeModels, state: state)
                 CLIActionMessage(provider: "opencode", state: state)
             }
             providerRow(
@@ -911,7 +911,7 @@ struct ConnectionsView: View {
             ) {
                 antigravityActions
             } content: {
-                ModelChecklist(providerID: "antigravity", models: state.antigravityModels, state: state)
+                ModelChecklist(providerID: "antigravity", modeNames: ["Code"], models: state.antigravityModels, state: state)
                 CLIActionMessage(provider: "antigravity", state: state)
             }
         }
@@ -1779,28 +1779,85 @@ struct MetadataNote: View {
 
 struct ModelChecklist: View {
     let providerID: String
+    let modeNames: [String]
     let models: [ProviderModel]
     @ObservedObject var state: AppState
-    private let columns = [GridItem(.adaptive(minimum: 210), spacing: 8, alignment: .leading)]
+
+    private var disclosure: ProviderModelDisclosureState {
+        state.providerModelDisclosureState(for: providerID)
+    }
+
+    private var items: [ProviderModelConfigurationItem] {
+        ProviderModelConfigurationPolicy.items(
+            providerID: providerID,
+            discoveredModels: models,
+            disabledModelIDs: state.disabledModelIDs,
+            selectedModelIDs: state.selectedModelIDs(for: providerID)
+        )
+    }
+
+    private var filteredItems: [ProviderModelConfigurationItem] {
+        ProviderModelConfigurationPolicy.filtered(items, query: disclosure.query)
+    }
+
+    private var providerDefault: ProviderModelConfigurationItem? {
+        ProviderModelConfigurationPolicy.providerDefault(in: items)
+    }
+
+    private var modeSummary: String { modeNames.joined(separator: " and ") }
 
     var body: some View {
-        if !models.isEmpty {
+        if !items.isEmpty {
             VStack(alignment: .leading, spacing: 9) {
-                Text("Models").font(.caption).fontWeight(.semibold).foregroundStyle(.secondary)
-                LazyVGrid(columns: columns, alignment: .leading, spacing: 7) {
-                    ForEach(models) { model in
-                        Toggle(isOn: Binding(get: { state.isModelEnabled("\(providerID):\(model.id)") }, set: { state.setModelEnabled("\(providerID):\(model.id)", enabled: $0) })) {
-                            Text(model.name)
-                                .font(.callout)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .help(model.name)
+                Text("Model visibility")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text("Enablement controls which models appear for \(modeSummary). Route readiness still depends on each runtime, sign-in, and current validation shown above.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let providerDefault {
+                    modelVisibilityRow(providerDefault, role: "Provider default")
+                        .padding(10)
+                        .background(.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
+                } else {
+                    Text("No default was reported by the provider. Choose visibility in All models.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                DisclosureGroup(isExpanded: Binding(
+                    get: { disclosure.isExpanded },
+                    set: { state.setProviderModelDisclosureExpanded(providerID, expanded: $0) }
+                )) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        if items.count >= ProviderModelConfigurationPolicy.searchThreshold {
+                            TextField("Search model name or identifier", text: Binding(
+                                get: { disclosure.query },
+                                set: { state.setProviderModelSearchQuery(providerID, query: $0) }
+                            ))
+                                .textFieldStyle(.roundedBorder)
+                                .accessibilityLabel("Search all \(providerID) models")
                         }
-                        .toggleStyle(.checkbox)
-                        .controlSize(.small)
-                        .padding(.vertical, 6)
-                        .contentShape(Rectangle())
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        if filteredItems.isEmpty {
+                            Text("No models match “\(disclosure.query)”.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .padding(.vertical, 6)
+                        } else {
+                            LazyVStack(alignment: .leading, spacing: 4) {
+                                ForEach(filteredItems) { item in
+                                    modelVisibilityRow(item, role: item.isProviderDefault ? "Provider default" : nil)
+                                }
+                            }
+                        }
                     }
+                    .padding(.top, 8)
+                } label: {
+                    Text("All models (\(items.count))")
+                        .font(.callout.weight(.medium))
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1811,6 +1868,47 @@ struct ModelChecklist: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityElement(children: .combine)
         }
+    }
+
+    @ViewBuilder
+    private func modelVisibilityRow(_ item: ProviderModelConfigurationItem, role: String?) -> some View {
+        Toggle(
+            isOn: Binding(
+                get: { state.isModelEnabled("\(providerID):\(item.id)") },
+                set: { state.setModelEnabled("\(providerID):\(item.id)", enabled: $0) }
+            )
+        ) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.name)
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                let statuses = [role, item.isSelected ? "Selected" : nil, item.isDiscovered ? nil : "Currently unavailable"].compactMap { $0 }
+                if !statuses.isEmpty {
+                    Text(statuses.joined(separator: " · "))
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(item.isDiscovered ? Color.secondary : Color.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text(item.id)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .toggleStyle(.checkbox)
+        .controlSize(.small)
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityLabel("\(item.name) model")
+        .accessibilityValue(item.isEnabled ? "Enabled" : "Hidden")
+        .accessibilityHint(item.isDiscovered
+            ? "Exact identifier: \(item.id). Changes model visibility only, not route readiness."
+            : "Exact identifier: \(item.id). This selected model is not in the current discovered catalog; the preference is preserved.")
+        .help(item.isDiscovered
+            ? "\(item.id) · visibility does not guarantee route readiness"
+            : "\(item.id) · selected but not currently discovered")
     }
 }
 

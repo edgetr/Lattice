@@ -141,6 +141,134 @@ public enum CatalogProgressiveDisclosure: Sendable {
     public static func recommendationDetailsTitle() -> String { "Fit details" }
 }
 
+// MARK: - Provider model configuration
+
+/// Presentation-ready model visibility data. A selected model can remain here after it
+/// disappears from the latest runtime catalog so the user's exact route is never hidden.
+public struct ProviderModelConfigurationItem: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let name: String
+    public let detail: String
+    public let isProviderDefault: Bool
+    public let isDiscovered: Bool
+    public let isEnabled: Bool
+    public let isSelected: Bool
+
+    public init(
+        id: String,
+        name: String,
+        detail: String = "",
+        isProviderDefault: Bool,
+        isDiscovered: Bool,
+        isEnabled: Bool,
+        isSelected: Bool
+    ) {
+        self.id = id
+        self.name = name
+        self.detail = detail
+        self.isProviderDefault = isProviderDefault
+        self.isDiscovered = isDiscovered
+        self.isEnabled = isEnabled
+        self.isSelected = isSelected
+    }
+}
+
+/// View-model state for the explicit All models disclosure. Search text survives a
+/// collapse/re-expand cycle, avoiding a surprising loss of keyboard-entered context.
+public struct ProviderModelDisclosureState: Equatable, Sendable {
+    public var isExpanded: Bool
+    public var query: String
+
+    public init(isExpanded: Bool = false, query: String = "") {
+        self.isExpanded = isExpanded
+        self.query = query
+    }
+}
+
+public enum ProviderModelConfigurationPolicy: Sendable {
+    public static let searchThreshold = 8
+
+    public static func items(
+        providerID: String,
+        discoveredModels: [ProviderModel],
+        disabledModelIDs: Set<String>,
+        selectedModelIDs: Set<String>
+    ) -> [ProviderModelConfigurationItem] {
+        let selected = Set(selectedModelIDs.compactMap(normalizedIdentifier))
+        let discoveredIDs = Set(discoveredModels.map(\.id))
+        let discoveredItems = discoveredModels.map { model in
+            let preferenceID = preferenceID(providerID: providerID, modelID: model.id)
+            return ProviderModelConfigurationItem(
+                id: model.id,
+                name: model.name,
+                detail: model.description,
+                isProviderDefault: model.isDefault,
+                isDiscovered: true,
+                isEnabled: !disabledModelIDs.contains(preferenceID),
+                isSelected: selected.contains(model.id)
+            )
+        }
+        let unavailableSelections = selected
+            .subtracting(discoveredIDs)
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+            .map { modelID in
+                ProviderModelConfigurationItem(
+                    id: modelID,
+                    name: modelID,
+                    isProviderDefault: false,
+                    isDiscovered: false,
+                    isEnabled: !disabledModelIDs.contains(preferenceID(providerID: providerID, modelID: modelID)),
+                    isSelected: true
+                )
+            }
+        return discoveredItems + unavailableSelections
+    }
+
+    /// Only provider-reported metadata can establish a default. Ordering is not treated
+    /// as a recommendation here, even if another execution fallback uses the first item.
+    public static func providerDefault(in items: [ProviderModelConfigurationItem]) -> ProviderModelConfigurationItem? {
+        items.first { $0.isDiscovered && $0.isProviderDefault }
+    }
+
+    public static func filtered(
+        _ items: [ProviderModelConfigurationItem],
+        query: String
+    ) -> [ProviderModelConfigurationItem] {
+        let terms = query
+            .split(whereSeparator: \.isWhitespace)
+            .map { $0.lowercased() }
+        guard !terms.isEmpty else { return items }
+        return items.filter { item in
+            let haystack = "\(item.name) \(item.id) \(item.detail)".lowercased()
+            return terms.allSatisfy(haystack.contains)
+        }
+    }
+
+    /// Changes one model preference without rebuilding the set, preserving choices for
+    /// other providers and models that are temporarily absent from discovery.
+    public static func updatedDisabledModelIDs(
+        _ disabledModelIDs: Set<String>,
+        providerID: String,
+        modelID: String,
+        enabled: Bool
+    ) -> Set<String> {
+        var result = disabledModelIDs
+        let id = preferenceID(providerID: providerID, modelID: modelID)
+        if enabled { result.remove(id) }
+        else { result.insert(id) }
+        return result
+    }
+
+    public static func preferenceID(providerID: String, modelID: String) -> String {
+        "\(providerID):\(modelID)"
+    }
+
+    private static func normalizedIdentifier(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
 // MARK: - Empty states (existing actions only)
 
 public enum CatalogEmptyStateKind: String, Sendable, Equatable {
