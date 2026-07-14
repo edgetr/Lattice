@@ -298,6 +298,28 @@ struct CoreVerification {
         try! store.save([queuedSession])
         expect(store.load().first?.queuedFollowUps == [queuedFollowUp], "Queued follow-ups round trip with the session")
 
+        let longMessages = (0..<350).map { ChatMessage(role: $0.isMultiple(of: 2) ? .user : .assistant, text: "lazy-message-\($0)") }
+        let longSession = LatticeSession(title: "Long chat", messages: longMessages, backend: .codex(model: "gpt-5.4"))
+        try! store.save([longSession])
+        if case .loaded(let lazySnapshot) = store.loadLazyResult(), var lazySession = lazySnapshot.sessions.first {
+            expect(lazySession.messages.isEmpty && !lazySession.isTranscriptLoaded, "Lazy session load leaves transcript bytes on disk")
+            expect(lazySession.totalMessageCount == 350, "Lazy session metadata preserves exact message count")
+            expect(lazySession.lastMessagePreview == "lazy-message-349", "Lazy session metadata preserves bounded list preview")
+            expect(lazySnapshot.searchIndex.candidateSessionIDs(for: "message-349", allSessionIDs: [longSession.id]) == [longSession.id], "Hashed index finds transcript without eager decode")
+            try! store.materializeTranscript(in: &lazySession)
+            expect(lazySession.messages == longMessages && !lazySession.isTranscriptDirty, "Selected transcript materializes exactly and remains clean")
+        } else {
+            expect(false, "Lazy split session store loads")
+        }
+        let indexBytes = try! Data(contentsOf: store.searchIndexURL)
+        expect(!String(decoding: indexBytes, as: UTF8.self).contains("lazy-message-349"), "Derived search index does not duplicate plaintext transcript")
+        var renderWindows = TranscriptRenderWindowCache(pageSize: 50, maximumThreadCount: 2, maximumVisibleMessageCount: 100)
+        expect(renderWindows.activate(sessionID: longSession.id, messageCount: 350).range == 300..<350, "Render cache starts with bounded tail page")
+        expect(renderWindows.loadEarlier(sessionID: longSession.id, messageCount: 350).range == 250..<350, "Render cache pages backward deterministically")
+        let anotherWindowID = UUID()
+        _ = renderWindows.activate(sessionID: anotherWindowID, messageCount: 350)
+        expect(renderWindows.cachedVisibleMessageCount <= 100, "Render cache enforces aggregate visible-message bound")
+
         // Durable store recovery: missing vs corrupt vs unreadable, backup/reset, write gate.
         let recoveryRoot = FileManager.default.temporaryDirectory.appendingPathComponent("recovery-\(UUID().uuidString)", isDirectory: true)
         try! FileManager.default.createDirectory(at: recoveryRoot, withIntermediateDirectories: true)

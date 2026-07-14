@@ -808,10 +808,36 @@ public struct SessionAction: Identifiable, Hashable, Codable, Sendable {
     }
 }
 
+public struct SessionTranscriptStorage: Hashable, Codable, Sendable {
+    public let fileName: String
+    public let messageCount: Int
+    public let contentFingerprint: String
+    public let lastMessagePreview: String?
+
+    public init(fileName: String, messageCount: Int, contentFingerprint: String, lastMessagePreview: String? = nil) {
+        self.fileName = fileName
+        self.messageCount = messageCount
+        self.contentFingerprint = contentFingerprint
+        self.lastMessagePreview = lastMessagePreview
+    }
+}
+
 public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
     public let id: UUID
     public var title: String
-    public var messages: [ChatMessage]
+    public var messages: [ChatMessage] {
+        didSet {
+            if isTranscriptLoaded { isTranscriptDirty = true }
+        }
+    }
+    /// Durable pointer used by the split transcript store. `messages` remains the canonical
+    /// in-memory transcript whenever `isTranscriptLoaded` is true.
+    public var transcriptStorage: SessionTranscriptStorage?
+    /// Runtime-only materialization state. It is intentionally excluded from Codable so a
+    /// metadata decode never mistakes an empty placeholder for a user-deleted transcript.
+    public var isTranscriptLoaded: Bool
+    /// Runtime-only mutation marker used to avoid hashing or saving clean transcripts on switch.
+    public var isTranscriptDirty: Bool
     public var backend: ChatBackend
     /// New route authority. `backend` and `harnessID` remain for legacy decoding and UI migration.
     public var executionRoute: ExecutionRoute
@@ -837,6 +863,9 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         id: UUID = UUID(),
         title: String,
         messages: [ChatMessage] = [],
+        transcriptStorage: SessionTranscriptStorage? = nil,
+        isTranscriptLoaded: Bool = true,
+        isTranscriptDirty: Bool = false,
         backend: ChatBackend,
         executionRoute: ExecutionRoute? = nil,
         harnessID: String? = nil,
@@ -855,7 +884,10 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         lastUpdated: Date = .now,
         portableArchiveFingerprint: String? = nil
     ) {
-        self.id = id; self.title = title; self.messages = messages; self.backend = backend
+        self.id = id; self.title = title; self.messages = messages
+        self.transcriptStorage = transcriptStorage; self.isTranscriptLoaded = isTranscriptLoaded
+        self.isTranscriptDirty = isTranscriptDirty
+        self.backend = backend
         self.executionRoute = executionRoute ?? ExecutionRoute.legacy(for: backend, harnessID: harnessID)
         self.harnessID = harnessID
         self.reasoningEffort = reasoningEffort
@@ -867,7 +899,7 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, messages, backend, executionRoute, harnessID, reasoningEffort, harnessThreadID, workspacePath, attachments, policy, privacyMode, intent, actions, queuedFollowUps, draft, isPinned, isStreaming, lastUpdated, portableArchiveFingerprint
+        case id, title, messages, transcriptStorage, backend, executionRoute, harnessID, reasoningEffort, harnessThreadID, workspacePath, attachments, policy, privacyMode, intent, actions, queuedFollowUps, draft, isPinned, isStreaming, lastUpdated, portableArchiveFingerprint
     }
 
     public init(from decoder: Decoder) throws {
@@ -875,6 +907,9 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         id = try container.decode(UUID.self, forKey: .id)
         title = try container.decode(String.self, forKey: .title)
         messages = try container.decodeIfPresent([ChatMessage].self, forKey: .messages) ?? []
+        transcriptStorage = try container.decodeIfPresent(SessionTranscriptStorage.self, forKey: .transcriptStorage)
+        isTranscriptLoaded = transcriptStorage == nil
+        isTranscriptDirty = false
         backend = try container.decode(ChatBackend.self, forKey: .backend)
         harnessID = try container.decodeIfPresent(String.self, forKey: .harnessID)
         executionRoute = try container.decodeIfPresent(ExecutionRoute.self, forKey: .executionRoute)
@@ -900,6 +935,7 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         try container.encode(id, forKey: .id)
         try container.encode(title, forKey: .title)
         try container.encode(messages, forKey: .messages)
+        try container.encodeIfPresent(transcriptStorage, forKey: .transcriptStorage)
         try container.encode(backend, forKey: .backend)
         try container.encode(executionRoute, forKey: .executionRoute)
         try container.encodeIfPresent(harnessID, forKey: .harnessID)
@@ -917,5 +953,15 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         try container.encode(isStreaming, forKey: .isStreaming)
         try container.encode(lastUpdated, forKey: .lastUpdated)
         try container.encodeIfPresent(portableArchiveFingerprint, forKey: .portableArchiveFingerprint)
+    }
+}
+
+public extension LatticeSession {
+    var totalMessageCount: Int {
+        isTranscriptLoaded ? messages.count : transcriptStorage?.messageCount ?? messages.count
+    }
+
+    var lastMessagePreview: String? {
+        isTranscriptLoaded ? messages.last?.text : transcriptStorage?.lastMessagePreview
     }
 }

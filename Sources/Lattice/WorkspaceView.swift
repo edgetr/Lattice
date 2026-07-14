@@ -419,7 +419,7 @@ struct SidebarView: View {
 struct SessionListView: View {
     @ObservedObject var state: AppState
     var filtered: [LatticeSession] {
-        LatticeSessionListOrdering.sorted(state.sessions.filter { $0.matchesSearch(state.searchText) })
+        state.filteredSessions
     }
 
     var body: some View {
@@ -580,8 +580,8 @@ struct SessionRow: View {
     }
 
     private var metadata: String {
-        if let last = session.messages.last, !last.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return last.text.replacingOccurrences(of: "\n", with: " ")
+        if let preview = session.lastMessagePreview, !preview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return preview.replacingOccurrences(of: "\n", with: " ")
         }
         return "\(session.executionRoute.mode.displayName) · \(session.backend.displayName)"
     }
@@ -632,7 +632,7 @@ struct ProjectsView: View {
     }
 
     private var messageCount: Int {
-        relatedSessions.reduce(0) { $0 + $1.messages.count }
+        relatedSessions.reduce(0) { $0 + $1.totalMessageCount }
     }
 
     private var activeActionCount: Int {
@@ -900,7 +900,7 @@ struct ProjectsView: View {
 
     private func activityDetail(for session: LatticeSession) -> String {
         var parts: [String] = []
-        parts.append("\(session.messages.count) message\(session.messages.count == 1 ? "" : "s")")
+        parts.append("\(session.totalMessageCount) message\(session.totalMessageCount == 1 ? "" : "s")")
         if session.isStreaming {
             parts.append("streaming")
         }
@@ -908,8 +908,8 @@ struct ProjectsView: View {
         if !liveActions.isEmpty {
             let titles = liveActions.prefix(2).map(\.title).joined(separator: ", ")
             parts.append("\(liveActions.count) active: \(titles)")
-        } else if let last = session.messages.last, !last.text.isEmpty {
-            let preview = last.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if let lastPreview = session.lastMessagePreview, !lastPreview.isEmpty {
+            let preview = lastPreview.trimmingCharacters(in: .whitespacesAndNewlines)
             let clipped = preview.count > 120 ? String(preview.prefix(117)) + "…" : preview
             if !clipped.isEmpty {
                 parts.append(clipped)
@@ -1005,7 +1005,7 @@ struct ProjectsView: View {
     }
 
     private func workspaceSessionMetadata(for session: LatticeSession) -> String {
-        var parts = ["\(session.messages.count) messages", relativeUpdated(session.lastUpdated)]
+        var parts = ["\(session.totalMessageCount) messages", relativeUpdated(session.lastUpdated)]
         if !session.actions.isEmpty {
             parts.append("\(session.actions.count) actions")
         }
@@ -1013,7 +1013,7 @@ struct ProjectsView: View {
     }
 
     private func workspaceSessionAccessibilityValue(_ session: LatticeSession) -> String {
-        var parts = ["\(session.messages.count) messages", relativeUpdated(session.lastUpdated)]
+        var parts = ["\(session.totalMessageCount) messages", relativeUpdated(session.lastUpdated)]
         if session.isStreaming { parts.append("streaming") }
         if session.isPinned { parts.append("pinned") }
         return parts.joined(separator: ", ")

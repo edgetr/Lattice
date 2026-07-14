@@ -35,7 +35,23 @@ struct ConversationView: View {
                             ZStack(alignment: .bottom) {
                                 ScrollView {
                                     LazyVStack(alignment: .leading, spacing: 22) {
-                                        ForEach(session.messages) { message in
+                                        let hiddenEarlierCount = state.hiddenEarlierMessageCount(for: session)
+                                        if hiddenEarlierCount > 0 {
+                                            Button {
+                                                state.loadEarlierMessages(for: session.id)
+                                            } label: {
+                                                Label(
+                                                    "Load Earlier Messages",
+                                                    systemImage: "arrow.up.to.line"
+                                                )
+                                            }
+                                            .buttonStyle(.borderless)
+                                            .frame(maxWidth: .infinity)
+                                            .accessibilityLabel("Load earlier messages")
+                                            .accessibilityValue("\(hiddenEarlierCount) earlier messages")
+                                            .help("Show up to \(min(100, hiddenEarlierCount)) earlier messages")
+                                        }
+                                        ForEach(state.visibleMessages(for: session)) { message in
                                             MessageRow(
                                                 message: message,
                                                 availableWidth: messageRowWidth,

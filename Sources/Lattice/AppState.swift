@@ -118,6 +118,8 @@ final class AppState: ObservableObject {
     @Published var selectedSessionID: UUID? {
         didSet {
             guard oldValue != selectedSessionID else { return }
+            applyComposerSessionSelection(from: oldValue, to: selectedSessionID)
+            prepareTranscriptSelection(selectedID: selectedSessionID)
             if selectedSessionID != nil {
                 isTransientNewChat = false
                 composerSelectionMode = selectedSession?.executionRoute.mode
@@ -126,7 +128,6 @@ final class AppState: ObservableObject {
                 composerSelectionMode = nil
                 composerSelectionBackend = nil
             }
-            applyComposerSessionSelection(from: oldValue, to: selectedSessionID)
         }
     }
     @Published var sessions: [LatticeSession]
@@ -323,6 +324,10 @@ final class AppState: ObservableObject {
     let policyEngine = DeterministicPolicyEngine()
     private let persistence = SessionPersistence()
     private let sessionSaveCoordinator: SessionSaveCoordinator
+    private var sessionSearchIndex = SessionSearchIndex()
+    private var transcriptRenderWindows = TranscriptRenderWindowCache()
+    private var materializedTranscriptLRU: [UUID] = []
+    private static let maximumMaterializedTranscriptCount = 3
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     private var localModelIdleUnloadTask: Task<Void, Never>?
     private var extensionDirectorySource: DispatchSourceFileSystemObject?
@@ -405,12 +410,14 @@ final class AppState: ObservableObject {
         var migratedSessions = false
         var sessionStoreInRecovery = false
 
-        switch persistence.loadResult() {
+        switch persistence.loadLazyResult() {
         case .missing:
             loadedSessions = []
-        case .loaded(let decoded):
-            loadedSessions = decoded
-            for index in loadedSessions.indices where loadedSessions[index].workspacePath == "/" || (loadedSessions[index].workspacePath == NSHomeDirectory() && loadedSessions[index].messages.isEmpty) || (Self.isImplicitDeveloperWorkspace(loadedSessions[index].workspacePath) && loadedSessions[index].messages.isEmpty) {
+        case .loaded(let snapshot):
+            loadedSessions = snapshot.sessions
+            sessionSearchIndex = snapshot.searchIndex
+            migratedSessions = snapshot.usesLegacyMonolithicStore
+            for index in loadedSessions.indices where loadedSessions[index].workspacePath == "/" || (loadedSessions[index].workspacePath == NSHomeDirectory() && loadedSessions[index].totalMessageCount == 0) || (Self.isImplicitDeveloperWorkspace(loadedSessions[index].workspacePath) && loadedSessions[index].totalMessageCount == 0) {
                 loadedSessions[index].workspacePath = cwd; migratedSessions = true
             }
             for index in loadedSessions.indices where loadedSessions[index].intent == nil && Self.isLegacySelfEditSession(loadedSessions[index]) {
@@ -450,6 +457,17 @@ final class AppState: ObservableObject {
         selectedRouteEngineID = Self.engineID(for: initialDefaultBackend)
         selectedRouteHarnessID = Self.defaultHarnessID(for: initialDefaultBackend)
         selectedSessionID = LatticeSessionListOrdering.sorted(sessions).first?.id
+        if let selectedSessionID,
+           let index = sessions.firstIndex(where: { $0.id == selectedSessionID }) {
+            do {
+                try persistence.materializeTranscript(in: &sessions[index])
+                materializedTranscriptLRU = [selectedSessionID]
+            } catch {
+                let issue = persistence.issueForTranscriptError(error)
+                recoveryIssues.append(issue)
+                persistence.writeGate.block()
+            }
+        }
         composerSelectionMode = selectedSession?.executionRoute.mode
         composerSelectionBackend = selectedSession?.backend
         // Property observers do not run for assignments made during initialization, so load the
@@ -559,6 +577,36 @@ final class AppState: ObservableObject {
         return sessions.first { $0.id == id }
     }
 
+    var filteredSessions: [LatticeSession] {
+        let allIDs = Set(sessions.map(\.id))
+        var candidates = sessionSearchIndex.candidateSessionIDs(for: searchText, allSessionIDs: allIDs)
+        // Loaded transcripts may have unsaved edits/appends. Exact matching overrides the
+        // persisted derived index so search never lags behind the canonical in-memory session.
+        for session in sessions where session.isTranscriptLoaded {
+            if session.matchesSearch(searchText) {
+                candidates.insert(session.id)
+            } else {
+                candidates.remove(session.id)
+            }
+        }
+        return LatticeSessionListOrdering.sorted(sessions.filter { candidates.contains($0.id) })
+    }
+
+    func visibleMessages(for session: LatticeSession) -> [ChatMessage] {
+        let window = transcriptRenderWindows.activate(sessionID: session.id, messageCount: session.messages.count)
+        return Array(session.messages[window.range])
+    }
+
+    func hiddenEarlierMessageCount(for session: LatticeSession) -> Int {
+        transcriptRenderWindows.window(for: session.id, messageCount: session.messages.count).hiddenEarlierCount
+    }
+
+    func loadEarlierMessages(for sessionID: UUID) {
+        guard let session = sessions.first(where: { $0.id == sessionID }) else { return }
+        _ = transcriptRenderWindows.loadEarlier(sessionID: sessionID, messageCount: session.messages.count)
+        objectWillChange.send()
+    }
+
     var canNavigateSessionList: Bool {
         navigableSessions.count > 1
     }
@@ -581,7 +629,7 @@ final class AppState: ObservableObject {
     }
 
     private var navigableSessions: [LatticeSession] {
-        LatticeSessionListOrdering.sorted(sessions.filter { $0.matchesSearch(searchText) })
+        filteredSessions
     }
 
     var selectedSessionUsesLegacyDirectOpenCode: Bool {
@@ -1480,8 +1528,15 @@ final class AppState: ObservableObject {
     /// Runs NSSavePanel after the export options sheet confirms format/queued inclusion.
     func confirmExportChatOptions() {
         guard let id = exportChatSessionID,
-              let session = sessions.first(where: { $0.id == id }) else {
+              var session = sessions.first(where: { $0.id == id }) else {
             cancelExportChatSheet()
+            return
+        }
+        do {
+            try persistence.materializeTranscript(in: &session)
+        } catch {
+            cancelExportChatSheet()
+            presentImportError("Export failed because the stored transcript could not be loaded. Existing chats were not changed.")
             return
         }
         let format = exportChatFormat
@@ -6457,7 +6512,7 @@ Lattice self-edit rules:
         var loadedSessions = loaded
         var migratedSessions = false
         let cwd = selectedWorkspacePath
-        for index in loadedSessions.indices where loadedSessions[index].workspacePath == "/" || (loadedSessions[index].workspacePath == NSHomeDirectory() && loadedSessions[index].messages.isEmpty) || (Self.isImplicitDeveloperWorkspace(loadedSessions[index].workspacePath) && loadedSessions[index].messages.isEmpty) {
+        for index in loadedSessions.indices where loadedSessions[index].workspacePath == "/" || (loadedSessions[index].workspacePath == NSHomeDirectory() && loadedSessions[index].totalMessageCount == 0) || (Self.isImplicitDeveloperWorkspace(loadedSessions[index].workspacePath) && loadedSessions[index].totalMessageCount == 0) {
             loadedSessions[index].workspacePath = cwd
             migratedSessions = true
         }
@@ -6494,12 +6549,75 @@ Lattice self-edit rules:
 
     /// Immediate durable write at a safe boundary. Cancels/absorbs any pending debounced draft write.
     private func persist() {
+        refreshSearchIndexForLoadedSessions()
         // Coordinator enforces the load-recovery write gate and reports real save failures.
         _ = sessionSaveCoordinator.saveNow(sessions)
         // Keep published failure in sync for synchronous MainActor paths (observer may be async).
         sessionSaveFailure = sessionSaveCoordinator.currentFailure
         if sessionSaveFailure == nil {
             expandedSessionSaveFailureDetails = false
+            synchronizeTranscriptReferencesAfterSuccessfulSave()
+        }
+    }
+
+    private func prepareTranscriptSelection(selectedID: UUID?) {
+        guard let selectedID,
+              let selectedIndex = sessions.firstIndex(where: { $0.id == selectedID }) else { return }
+        do {
+            try persistence.materializeTranscript(in: &sessions[selectedIndex])
+        } catch {
+            let issue = persistence.issueForTranscriptError(error)
+            persistence.writeGate.block()
+            replacePersistenceRecoveryIssue(issue)
+            setError("This chat's stored transcript could not be loaded. The original files were left untouched for recovery.", sessionID: selectedID)
+            return
+        }
+
+        materializedTranscriptLRU.removeAll { $0 == selectedID }
+        materializedTranscriptLRU.append(selectedID)
+        _ = transcriptRenderWindows.activate(sessionID: selectedID, messageCount: sessions[selectedIndex].messages.count)
+
+        let evictable = materializedTranscriptLRU.filter { id in
+            id != selectedID
+                && sessions.first(where: { $0.id == id })?.isStreaming != true
+                && sessions.first(where: { $0.id == id })?.transcriptStorage != nil
+        }
+        let excess = max(0, materializedTranscriptLRU.count - Self.maximumMaterializedTranscriptCount)
+        guard excess > 0, !evictable.isEmpty else { return }
+
+        let victims = Array(evictable.prefix(excess))
+        let hasDirtyTranscript = victims.contains { id in
+            sessions.first(where: { $0.id == id })?.isTranscriptDirty != false
+        }
+        if hasDirtyTranscript {
+            // Failed saves keep dirty transcript data resident. The common clean-switch path does
+            // no synchronous I/O, so navigating among long chats stays responsive.
+            persist()
+            guard sessionSaveFailure == nil else { return }
+        }
+        for id in victims {
+            guard let index = sessions.firstIndex(where: { $0.id == id }) else { continue }
+            sessions[index].messages = []
+            sessions[index].isTranscriptLoaded = false
+            sessions[index].isTranscriptDirty = false
+            materializedTranscriptLRU.removeAll { $0 == id }
+        }
+    }
+
+    private func refreshSearchIndexForLoadedSessions() {
+        sessionSearchIndex.retainValidEntries(for: sessions)
+        for session in sessions where session.isTranscriptLoaded {
+            sessionSearchIndex.update(session: session)
+        }
+    }
+
+    private func synchronizeTranscriptReferencesAfterSuccessfulSave() {
+        for index in sessions.indices where sessions[index].isTranscriptLoaded {
+            sessions[index].transcriptStorage = try? SessionPersistence.storageReference(
+                sessionID: sessions[index].id,
+                messages: sessions[index].messages
+            )
+            sessions[index].isTranscriptDirty = false
         }
     }
 
