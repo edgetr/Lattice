@@ -2,11 +2,17 @@ import Foundation
 
 /// Accessibility value for chat-list rows.
 public enum SessionListAccessibilityPolicy: Sendable {
-    public static func value(for session: LatticeSession) -> String {
+    public static func value(for session: LatticeSession, activity: ThreadActivityLane = ThreadActivityLane()) -> String {
         let messageCount = session.totalMessageCount
         let messagePart = "\(messageCount) message\(messageCount == 1 ? "" : "s")"
-        let streamingPart = session.isStreaming ? "Streaming" : "Idle"
+        let activityPart = activity.status == .idle
+            ? (session.isStreaming ? "Streaming" : "Idle")
+            : activity.status.label
         let pinnedPart = session.isPinned ? "Pinned" : "Not pinned"
-        return [messagePart, streamingPart, pinnedPart].joined(separator: ", ")
+        var parts = [messagePart, activityPart, pinnedPart]
+        if activity.queuedCount > 0 { parts.append("\(activity.queuedCount) queued") }
+        if activity.hasUnreadActivity { parts.append("Unread activity") }
+        if activity.requiresAttention { parts.append("Needs attention") }
+        return parts.joined(separator: ", ")
     }
 }

@@ -3214,6 +3214,25 @@ struct CoreVerification {
             expect(false, "Unknown Antigravity events retain metadata without payload values")
         }
 
+        let selectedLaneID = UUID()
+        let backgroundLaneID = UUID()
+        var laneStore = ThreadActivityLaneStore(selectedSessionID: selectedLaneID)
+        laneStore.apply(.started, to: selectedLaneID)
+        laneStore.apply(.started, to: backgroundLaneID)
+        laneStore.apply(.approvalRequested, to: backgroundLaneID)
+        laneStore.apply(.completed, to: selectedLaneID)
+        expect(laneStore.lane(for: selectedLaneID).status == .completed, "Selected thread completion is independently visible")
+        expect(!laneStore.lane(for: selectedLaneID).hasUnreadActivity, "Selected thread completion is not marked unread")
+        expect(laneStore.lane(for: backgroundLaneID).status == .waitingForApproval, "Background approval wait remains independent")
+        expect(laneStore.lane(for: backgroundLaneID).requiresAttention && laneStore.lane(for: backgroundLaneID).hasUnreadActivity, "Background approval wait marks attention and unread")
+        laneStore.select(backgroundLaneID)
+        expect(!laneStore.lane(for: backgroundLaneID).hasUnreadActivity && laneStore.lane(for: backgroundLaneID).requiresAttention, "Selection clears unread without dismissing approval attention")
+        laneStore.apply(.cancelled, to: backgroundLaneID)
+        expect(laneStore.lane(for: backgroundLaneID).status == .cancelled, "Cancellation changes only its target lane")
+        expect(laneStore.lane(for: selectedLaneID).status == .completed, "Cancellation preserves another thread terminal state")
+        laneStore.apply(.queued(2), to: selectedLaneID)
+        expect(laneStore.lane(for: selectedLaneID).queuedCount == 2, "Queued follow-ups are counted per thread")
+
         print("Core verification passed: \(checks) checks")
     }
 }

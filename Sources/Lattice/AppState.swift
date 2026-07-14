@@ -128,6 +128,7 @@ final class AppState: ObservableObject {
                 composerSelectionMode = nil
                 composerSelectionBackend = nil
             }
+            threadActivityLanes.select(selectedSessionID)
         }
     }
     @Published var sessions: [LatticeSession]
@@ -338,6 +339,7 @@ final class AppState: ObservableObject {
     private var selfEditRunIDs: Set<UUID> = []
     private var activeRunIDs: [UUID: UUID] = [:]
     @Published private var runUIStates: [UUID: RunUIState] = [:]
+    @Published private(set) var threadActivityLanes = ThreadActivityLaneStore()
     @Published private var globalErrorMessage: String?
     /// Deliberately in-memory: provider tool bypass consent expires when Lattice exits.
     private var acknowledgedUnsafeProviderRouteKeys: Set<String> = []
@@ -468,6 +470,7 @@ final class AppState: ObservableObject {
                 persistence.writeGate.block()
             }
         }
+        rebuildThreadActivityLanes()
         composerSelectionMode = selectedSession?.executionRoute.mode
         composerSelectionBackend = selectedSession?.backend
         // Property observers do not run for assignments made during initialization, so load the
@@ -1023,6 +1026,20 @@ final class AppState: ObservableObject {
     func visibleComposerState(for sessionID: UUID) -> MorphingControlState {
         runUIStates[sessionID]?.composerState ?? .expanded
     }
+    func threadActivityLane(for sessionID: UUID) -> ThreadActivityLane {
+        threadActivityLanes.lane(for: sessionID)
+    }
+
+    func focusThreadAttention(_ sessionID: UUID) {
+        selectedSection = .conversations
+        selectedSessionID = sessionID
+        threadActivityLanes.apply(.attentionHandled, to: sessionID)
+    }
+
+    func cancelThreadActivity(_ sessionID: UUID) {
+        stop(sessionID: sessionID)
+    }
+
     func setVisibleComposerState(_ state: MorphingControlState, for sessionID: UUID?) {
         guard let sessionID else { return }
         reduceRunUI(.setComposerState(state), for: sessionID)
@@ -1469,6 +1486,7 @@ final class AppState: ObservableObject {
             selfEditPreviews = updated
         }
         sessions.removeAll { $0.id == id }
+        threadActivityLanes.remove(id)
         submittedRequests[id] = nil
         retryableRequests[id] = nil
         providerSessionHealth[id] = nil
@@ -1634,6 +1652,9 @@ final class AppState: ObservableObject {
         sessions = commit.sessions
         // Show the imported chat without starting a provider run or auto-sending queued content.
         selectedSessionID = commit.importedSessionID
+        if let imported = sessions.first(where: { $0.id == commit.importedSessionID }), !imported.queuedFollowUps.isEmpty {
+            threadActivityLanes.apply(.queued(imported.queuedFollowUps.count), to: imported.id)
+        }
         selectedSection = .conversations
         clearError()
 
@@ -1645,10 +1666,12 @@ final class AppState: ObservableObject {
             sessionSaveFailure = sessionSaveCoordinator.currentFailure
         case .blockedByWriteGate:
             sessions = previousSessions
+            threadActivityLanes.remove(commit.importedSessionID)
             selectedSessionID = previousSelected
             presentImportError("Chat store recovery is active, so import was cancelled. Existing chats were not changed.")
         case .failed(let failure), .coalescedFailure(let failure):
             sessions = previousSessions
+            threadActivityLanes.remove(commit.importedSessionID)
             selectedSessionID = previousSelected
             sessionSaveFailure = failure
             presentImportError("Could not save the imported chat (\(failure.kind.displayName)). Existing chats were not changed. \(failure.summary)")
@@ -2051,6 +2074,7 @@ final class AppState: ObservableObject {
               let index = sessions.firstIndex(where: { $0.id == id }),
               sessions[index].isStreaming else { return }
         sessions[index].queuedFollowUps.append(.init(text: text))
+        threadActivityLanes.apply(.queued(sessions[index].queuedFollowUps.count), to: id)
         sessions[index].lastUpdated = .now
         clearError()
         persist()
@@ -2065,6 +2089,7 @@ final class AppState: ObservableObject {
               let index = sessions.firstIndex(where: { $0.id == id }),
               let queuedIndex = sessions[index].queuedFollowUps.firstIndex(where: { $0.id == queuedID }) else { return }
         sessions[index].queuedFollowUps.remove(at: queuedIndex)
+        threadActivityLanes.apply(.queued(sessions[index].queuedFollowUps.count), to: id)
         sessions[index].lastUpdated = .now
         persist()
     }
@@ -2075,6 +2100,7 @@ final class AppState: ObservableObject {
               !sessions[index].isStreaming,
               let queuedIndex = sessions[index].queuedFollowUps.firstIndex(where: { $0.id == queuedID }) else { return }
         let followUp = sessions[index].queuedFollowUps.remove(at: queuedIndex)
+        threadActivityLanes.apply(.queued(sessions[index].queuedFollowUps.count), to: id)
         guard let submission = prepareSubmission(followUp.text) else {
             sessions[index].lastUpdated = .now
             persist()
@@ -2083,6 +2109,7 @@ final class AppState: ObservableObject {
         if !startPreparedSubmission(submission, for: id, at: index) {
             if let refreshedIndex = sessions.firstIndex(where: { $0.id == id }) {
                 sessions[refreshedIndex].queuedFollowUps.insert(followUp, at: min(queuedIndex, sessions[refreshedIndex].queuedFollowUps.count))
+                threadActivityLanes.apply(.queued(sessions[refreshedIndex].queuedFollowUps.count), to: id)
                 sessions[refreshedIndex].lastUpdated = .now
                 persist()
             }
@@ -2095,6 +2122,7 @@ final class AppState: ObservableObject {
               !sessions[index].isStreaming,
               let followUp = sessions[index].queuedFollowUps.first else { return false }
         sessions[index].queuedFollowUps.removeFirst()
+        threadActivityLanes.apply(.queued(sessions[index].queuedFollowUps.count), to: id)
         guard let submission = prepareSubmission(followUp.text) else {
             sessions[index].lastUpdated = .now
             persist()
@@ -2105,6 +2133,7 @@ final class AppState: ObservableObject {
         }
         if let refreshedIndex = sessions.firstIndex(where: { $0.id == id }) {
             sessions[refreshedIndex].queuedFollowUps.insert(followUp, at: 0)
+            threadActivityLanes.apply(.queued(sessions[refreshedIndex].queuedFollowUps.count), to: id)
             sessions[refreshedIndex].lastUpdated = .now
             persist()
         }
@@ -2177,6 +2206,7 @@ final class AppState: ObservableObject {
         sessions[index].isStreaming = true
         sessions[index].lastUpdated = .now
         globalErrorMessage = nil
+        threadActivityLanes.apply(.started, to: id)
         reduceRunUI(.started, for: id)
         persist()
 
@@ -2731,6 +2761,7 @@ final class AppState: ObservableObject {
             sessions[index].messages.removeLast()
         }
         reduceRunUI(.cancelled, for: id)
+        threadActivityLanes.apply(.cancelled, to: id)
         harnessPermissionNotices[id] = nil
         providerSessionHealth[id] = nil
         persist()
@@ -2814,6 +2845,7 @@ final class AppState: ObservableObject {
             )
         ], sessionID: notice.sessionID)
         reduceRunUI(.permissionResolved, for: notice.sessionID)
+        threadActivityLanes.apply(.approvalResolved, to: notice.sessionID)
     }
 
     private func forwardHarnessPermission(_ notice: HarnessPermissionNotice, optionID: String?) -> Bool {
@@ -6160,6 +6192,7 @@ Lattice self-edit rules:
                     sessions[index].isStreaming = false
                     activeRunIDs[id] = nil
                     reduceRunUI(.failed("The provider rejected Lattice's automatic permission decision."), for: id)
+                    threadActivityLanes.apply(.failed("The provider rejected Lattice's automatic permission decision."), to: id)
                     cancelHarnessProcess(for: sessions[index], sessionID: id)
                     persist()
                     return
@@ -6175,6 +6208,7 @@ Lattice self-edit rules:
                 updateSessionAction(id: request.id, status: allowed ? .allowed : .denied, at: index)
                 setActivity([.init(icon: allowed ? "checkmark.shield" : "xmark.shield", title: allowed ? "Allowed by \(sessions[index].policy.rawValue.capitalized) mode" : "Blocked by policy", detail: request.title)], sessionID: id)
                 reduceRunUI(.permissionResolved, for: id)
+                threadActivityLanes.apply(.approvalResolved, to: id)
             case .denyFailClosed(let reason):
                 let cancellationForwarded = forwardHarnessPermission(notice, optionID: nil)
                 harnessPermissionNotices[id] = nil
@@ -6189,12 +6223,14 @@ Lattice self-edit rules:
                 sessions[index].isStreaming = false
                 activeRunIDs[id] = nil
                 reduceRunUI(.failed("Blocked by Lattice policy: \(reason)"), for: id)
+                threadActivityLanes.apply(.failed("Blocked by Lattice policy: \(reason)"), to: id)
                 cancelHarnessProcess(for: sessions[index], sessionID: id)
                 persist()
             case .requestUser:
                 harnessPermissionNotices[id] = notice
                 setActivity([.init(icon: "hand.raised.fill", title: request.title, detail: "Waiting for your decision")], sessionID: id)
                 reduceRunUI(.permissionRequested, for: id)
+                threadActivityLanes.apply(.approvalRequested, to: id)
             }
         case .permissionDecided(let decision):
             if harnessPermissionNotices[id]?.request.id == decision.requestID {
@@ -6283,6 +6319,7 @@ Lattice self-edit rules:
             finishCompletedTurnActions(at: index)
             sessions[index].isStreaming = false
             reduceRunUI(.completed, for: id)
+            threadActivityLanes.apply(.completed, to: id)
             let request = submittedRequests[id]
             if selfEditRunIDs.remove(id) != nil {
                 _ = prepareGeneratedExtensionPreview(at: index, request: request)
@@ -6301,6 +6338,7 @@ Lattice self-edit rules:
             if let request = submittedRequests[id] { retryableRequests[id] = request }
             submittedRequests[id] = nil
             reduceRunUI(.cancelled, for: id)
+            threadActivityLanes.apply(.cancelled, to: id)
             persist()
             scheduleIdleUnloadIfNeeded(for: backend)
         case .failed(let message):
@@ -6318,6 +6356,7 @@ Lattice self-edit rules:
             )
             sessions[index].isStreaming = false
             reduceRunUI(.failed(message), for: id)
+            threadActivityLanes.apply(.failed(message), to: id)
             if sessions[index].messages.last?.text.isEmpty == true { sessions[index].messages.removeLast() }
             persist()
             scheduleIdleUnloadIfNeeded(for: backend)
@@ -6424,6 +6463,7 @@ Lattice self-edit rules:
                 sessions = []
                 resetAllConversationScrollState()
                 selectedSessionID = nil
+                rebuildThreadActivityLanes()
                 persistenceRecoveryStatusMessage = "Session store is missing. Lattice will start without saved chats."
             case .loaded(let loaded):
                 // Unblock before migration autosave inside applyRecoveredSessions.
@@ -6491,6 +6531,7 @@ Lattice self-edit rules:
                 sessions = []
                 resetAllConversationScrollState()
                 selectedSessionID = nil
+                rebuildThreadActivityLanes()
             case LatticeExtensionJobStore.storeID:
                 resolvePersistenceRecovery(storeID: issue.storeID, gate: extensionJobStore.writeGate)
                 selfEditJobs = []
@@ -6523,6 +6564,7 @@ Lattice self-edit rules:
         resetAllConversationScrollState()
         sessions = loadedSessions
         selectedSessionID = LatticeSessionListOrdering.sorted(sessions).first?.id
+        rebuildThreadActivityLanes()
         if let first = sessions.first, let path = first.workspacePath, !Self.isImplicitDeveloperWorkspace(path) {
             selectedWorkspacePath = path
         }
@@ -6537,6 +6579,14 @@ Lattice self-edit rules:
         gate.unblock()
         persistenceRecoveryIssues.removeAll { $0.storeID == storeID }
         expandedPersistenceRecoveryDetailIDs.remove(storeID)
+    }
+
+    private func rebuildThreadActivityLanes() {
+        var rebuilt = ThreadActivityLaneStore(selectedSessionID: selectedSessionID)
+        for session in sessions where !session.queuedFollowUps.isEmpty {
+            rebuilt.apply(.queued(session.queuedFollowUps.count), to: session.id)
+        }
+        threadActivityLanes = rebuilt
     }
 
     private func replacePersistenceRecoveryIssue(_ issue: DurableStoreIssue) {

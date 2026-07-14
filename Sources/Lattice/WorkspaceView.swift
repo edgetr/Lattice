@@ -465,15 +465,19 @@ struct SessionListView: View {
             } else {
                 List(selection: $state.selectedSessionID) {
                     ForEach(filtered) { session in
+                        let lane = state.threadActivityLane(for: session.id)
                         SessionRow(
                             session: session,
-                            selected: state.selectedSessionID == session.id
+                            selected: state.selectedSessionID == session.id,
+                            activityLane: lane,
+                            onCancel: { state.cancelThreadActivity(session.id) },
+                            onAttention: { state.focusThreadAttention(session.id) }
                         )
                         .tag(session.id)
                         .accessibilityIdentifier(LatticeAccessibilityID.sessionRow(session.id))
                         .accessibilityElement(children: .contain)
                         .accessibilityLabel(session.title)
-                        .accessibilityValue(SessionListAccessibilityPolicy.value(for: session))
+                        .accessibilityValue(SessionListAccessibilityPolicy.value(for: session, activity: lane))
                         .contextMenu { sessionContextMenu(for: session) }
                     }
                 }
@@ -547,6 +551,9 @@ struct SessionListView: View {
 struct SessionRow: View {
     let session: LatticeSession
     let selected: Bool
+    let activityLane: ThreadActivityLane
+    let onCancel: () -> Void
+    let onAttention: () -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -563,9 +570,10 @@ struct SessionRow: View {
                         .lineLimit(1)
                         .accessibilityHidden(true)
                     Spacer(minLength: 4)
-                    if session.isStreaming {
-                        ProgressView()
-                            .controlSize(.mini)
+                    if activityLane.hasUnreadActivity {
+                        Circle()
+                            .fill(Color.accentColor)
+                            .frame(width: 7, height: 7)
                             .accessibilityHidden(true)
                     }
                 }
@@ -574,6 +582,35 @@ struct SessionRow: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
+                if activityLane.status != .idle {
+                    HStack(spacing: 6) {
+                        Image(systemName: activityLane.status.latticeSystemImage)
+                            .foregroundStyle(statusColor)
+                        Text(statusText)
+                            .lineLimit(1)
+                        Spacer(minLength: 2)
+                        if activityLane.status.canCancel {
+                            Button(action: onCancel) {
+                                Image(systemName: "stop.fill")
+                            }
+                            .buttonStyle(.borderless)
+                            .accessibilityLabel("Cancel activity for \(session.title)")
+                            .help("Cancel this chat only")
+                        }
+                        if activityLane.requiresAttention {
+                            Button(action: onAttention) {
+                                Image(systemName: "arrow.right.circle")
+                            }
+                            .buttonStyle(.borderless)
+                            .accessibilityLabel("Review activity for \(session.title)")
+                            .help("Review this chat")
+                        }
+                    }
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(statusText)
+                }
             }
         }
         .padding(.vertical, 4)
@@ -584,6 +621,38 @@ struct SessionRow: View {
             return preview.replacingOccurrences(of: "\n", with: " ")
         }
         return "\(session.executionRoute.mode.displayName) · \(session.backend.displayName)"
+    }
+
+    private var statusText: String {
+        var value = activityLane.status.label
+        if activityLane.queuedCount > 0 {
+            value += " · \(activityLane.queuedCount) queued"
+        }
+        return value
+    }
+
+    private var statusColor: Color {
+        switch activityLane.status {
+        case .waitingForApproval, .queued: .orange
+        case .failed: .red
+        case .completed: .green
+        case .running: .blue
+        case .idle, .cancelled: .secondary
+        }
+    }
+}
+
+private extension ThreadActivityStatus {
+    var latticeSystemImage: String {
+        switch self {
+        case .idle: "circle"
+        case .queued: "clock"
+        case .running: "waveform"
+        case .waitingForApproval: "hand.raised.fill"
+        case .failed: "exclamationmark.triangle.fill"
+        case .completed: "checkmark.circle.fill"
+        case .cancelled: "stop.circle"
+        }
     }
 }
 

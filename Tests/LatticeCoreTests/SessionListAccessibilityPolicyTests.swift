@@ -20,4 +20,19 @@ struct SessionListAccessibilityPolicyTests {
 
         #expect(SessionListAccessibilityPolicy.value(for: session) == "0 messages, Idle, Not pinned")
     }
+
+    @Test func laneValueAnnouncesQueueUnreadAndAttention() {
+        let session = LatticeSession(title: "Background chat", backend: .codex(model: "gpt-5"))
+        let lane = ThreadActivityLane(
+            status: .waitingForApproval,
+            queuedCount: 2,
+            hasUnreadActivity: true,
+            requiresAttention: true
+        )
+
+        #expect(
+            SessionListAccessibilityPolicy.value(for: session, activity: lane)
+                == "0 messages, Waiting for approval, Not pinned, 2 queued, Unread activity, Needs attention"
+        )
+    }
 }
