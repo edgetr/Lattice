@@ -235,6 +235,7 @@ final class AppState: ObservableObject {
     @Published var codexAuthenticated = false
     @Published var codexCatalogStatus: ProviderCatalogStatus = .unknown
     @Published private(set) var codexProtocolUnavailableReason: String?
+    @Published private(set) var codexImageInputProtocolSupport: InputCapabilitySupport = .unknown
     @Published var codexModels: [ProviderModel] = []
     @Published var codexUsage: ProviderUsage?
     @Published var codexCLIVersion: String?
@@ -2165,6 +2166,12 @@ final class AppState: ObservableObject {
             overlayControlState = .expanded
             return false
         }
+        if let reason = attachmentUnavailableReason(for: sessions[index]) {
+            setError(reason, sessionID: id)
+            composerState = .expanded
+            overlayControlState = .expanded
+            return false
+        }
         guard ensureUnsafeProviderRouteAcknowledged(for: sessions[index]) else { return false }
         markConversationOutgoingAction(for: id)
         if submission.startsSelfEdit {
@@ -2491,6 +2498,8 @@ final class AppState: ObservableObject {
                 legacyHarnessID: harnessID,
                 backend: session.backend,
                 prompt: prompt,
+                attachments: session.attachments,
+                imageInputCapability: imageInputCapability(for: session),
                 threadID: routeThreadID,
                 workspace: workspace,
                 reasoningEffort: reasoningEffort,
@@ -3274,10 +3283,14 @@ final class AppState: ObservableObject {
         panel.canChooseFiles = true; panel.canChooseDirectories = true; panel.allowsMultipleSelection = true
         panel.prompt = "Add"
         guard panel.runModal() == .OK else { composerState = .expanded; overlayControlState = .expanded; overlayMode = .prompt; return }
-        addAttachments(panel.urls)
+        addAttachments(panel.urls, source: .picker)
     }
 
     func addAttachments(_ urls: [URL]) {
+        addAttachments(urls, source: .drop)
+    }
+
+    func addAttachments(_ urls: [URL], source: ContextAttachmentSource) {
         guard let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }) else {
             composerState = .expanded; overlayControlState = .expanded; overlayMode = .prompt
             return
@@ -3285,9 +3298,9 @@ final class AppState: ObservableObject {
         let existing = Set(sessions[index].attachments.map(\.path))
         let additions = urls
             .filter(\.isFileURL)
-            .map { $0.standardizedFileURL.path }
-            .filter { !existing.contains($0) }
-            .map { ContextAttachment(path: $0) }
+            .map(\.standardizedFileURL)
+            .filter { !existing.contains($0.path) }
+            .map { ContextAttachment.inspecting(url: $0, source: source) }
         sessions[index].attachments.append(contentsOf: additions)
         composerState = .expanded; overlayControlState = .expanded; overlayMode = .prompt
         persist()
@@ -3547,6 +3560,11 @@ final class AppState: ObservableObject {
         codexAuthenticated = auth
         codexCatalogStatus = snapshot.catalogStatus
         codexProtocolUnavailableReason = snapshot.unavailableReason
+        switch snapshot.capabilities.imageInput {
+        case .supported: codexImageInputProtocolSupport = .supported
+        case .unsupported: codexImageInputProtocolSupport = .unsupported
+        case .unknown: codexImageInputProtocolSupport = .unknown
+        }
         codexModels = snapshot.models
         codexReady = ProviderReadinessSnapshot(installed: codex.isInstalled, authenticated: auth, catalogStatus: snapshot.catalogStatus, runnableModelCount: visibleCodexModels.count).isRunnable
         codexUsage = snapshot.usage
@@ -4444,7 +4462,8 @@ final class AppState: ObservableObject {
 
     private func backendAdditionalContext(for session: LatticeSession, submittedText: String, forceSelfEdit: Bool = false) -> String {
         let isExtensionSelfEdit = forceSelfEdit || isExtensionSelfEditThread(session, submittedText: submittedText)
-        let liveAttachmentPaths = session.attachments.filter { !$0.isMissing }.map(\.path)
+        // Images cross the typed execution boundary; never downgrade them to a path claim in prompt text.
+        let liveAttachmentPaths = session.attachments.filter { !$0.isMissing && !$0.isImage }.map(\.path)
         let attachmentContext = liveAttachmentPaths.isEmpty
             ? ""
             : "\n\nAttached paths:\n" + liveAttachmentPaths.joined(separator: "\n")
@@ -4460,6 +4479,24 @@ final class AppState: ObservableObject {
         return taskContext
             + selfEditContext(for: submittedText, isExtensionSelfEdit: isExtensionSelfEdit, sessionID: session.id)
             + attachmentContext
+    }
+
+    private func imageInputCapability(for session: LatticeSession) -> ImageInputCapability {
+        let model = session.executionRoute.modelID.flatMap { modelID in
+            codexModels.first { $0.id == modelID }
+        }
+        return ImageInputCapability.resolve(
+            route: session.executionRoute,
+            model: model,
+            protocolSupport: session.executionRoute.runtimeID == "codex" ? codexImageInputProtocolSupport : .unsupported
+        )
+    }
+
+    private func attachmentUnavailableReason(for session: LatticeSession) -> String? {
+        ExecutionInputAttachmentPolicy.unavailableReason(
+            attachments: session.attachments,
+            capability: imageInputCapability(for: session)
+        )
     }
 
     private static func selfEditTitle(for prompt: String) -> String {

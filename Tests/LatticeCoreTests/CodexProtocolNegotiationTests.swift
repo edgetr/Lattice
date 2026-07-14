@@ -21,6 +21,45 @@ struct CodexProtocolNegotiationTests {
         #expect(!events.contains { if case .failed = $0 { return true }; return false })
     }
 
+    @Test func localImageFixtureUsesSchemaShapeWithoutChangingPromptText() async throws {
+        let fixture = try Fixture(body: """
+        IFS= read -r initialize
+        printf '%s\\n' '{"id":1,"result":{"userAgent":"codex-test","protocolVersion":2}}'
+        IFS= read -r initialized
+        IFS= read -r thread
+        printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1"},"approvalPolicy":"on-request","sandbox":{"type":"readOnly"}}}'
+        IFS= read -r turn
+        printf '%s' "$turn" > "$(dirname "$0")/turn.json"
+        printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1"}}}'
+        printf '%s\\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"completed"}}}'
+        """)
+        defer { fixture.remove() }
+        let imageURL = fixture.root.appendingPathComponent("shot.png")
+        try Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).write(to: imageURL)
+        let attachment = ContextAttachment.inspecting(url: imageURL, source: .screenshot)
+
+        let events = await collect(CodexExecHarness(executableURL: fixture.executable).stream(
+            prompt: "Describe this image",
+            sessionID: UUID(),
+            threadID: nil,
+            workspace: fixture.root,
+            model: "test-model",
+            attachments: [attachment],
+            imageInputCapability: .init(support: .supported)
+        ))
+
+        #expect(events.contains(.completed))
+        let data = try Data(contentsOf: fixture.root.appendingPathComponent("turn.json"))
+        let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let params = try #require(object["params"] as? [String: Any])
+        let input = try #require(params["input"] as? [[String: Any]])
+        #expect(input.count == 2)
+        #expect(input[0]["text"] as? String == "Describe this image")
+        #expect(input[0]["text"] as? String != "Attached paths:\n\(imageURL.path)")
+        #expect(input[1]["type"] as? String == "localImage")
+        #expect(input[1]["path"] as? String == imageURL.path)
+    }
+
     @Test func optionalProbeDowngradesWithoutInventingCapabilities() async throws {
         let fixture = try Fixture(body: """
         IFS= read -r initialize
@@ -43,6 +82,28 @@ struct CodexProtocolNegotiationTests {
         #expect(snapshot.capabilities.providerTools == .unsupported)
         #expect(snapshot.capabilities.usage == .unsupported)
         #expect(snapshot.capabilities.threadResume == .unknown)
+        #expect(snapshot.capabilities.imageInput == .unknown)
+    }
+
+    @Test func discoveryPreservesPerModelInputModalities() async throws {
+        let fixture = try Fixture(body: """
+        IFS= read -r initialize
+        printf '%s\\n' '{"id":0,"result":{"userAgent":"codex-test","protocolVersion":2}}'
+        IFS= read -r initialized
+        IFS= read -r models
+        IFS= read -r tools
+        IFS= read -r usage
+        printf '%s\\n' '{"id":1,"result":{"data":[{"model":"vision","displayName":"Vision","inputModalities":["text","image"]},{"model":"text","displayName":"Text","inputModalities":["text"]}]}}'
+        printf '%s\\n' '{"id":2,"error":{"code":-32601,"message":"unknown method"}}'
+        printf '%s\\n' '{"id":3,"error":{"code":-32601,"message":"unknown method"}}'
+        """)
+        defer { fixture.remove() }
+
+        let snapshot = await CodexExecHarness(executableURL: fixture.executable).providerSnapshot()
+
+        #expect(snapshot.capabilities.imageInput == .supported)
+        #expect(snapshot.models.first(where: { $0.id == "vision" })?.inputModalities == [.text, .image])
+        #expect(snapshot.models.first(where: { $0.id == "text" })?.inputModalities == [.text])
     }
 
     @Test func malformedHandshakeFailsThenFreshProcessRecovers() async throws {

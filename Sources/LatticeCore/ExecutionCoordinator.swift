@@ -5,11 +5,13 @@ public struct ExecutionRequest: Equatable, Sendable {
     public let sessionID: UUID
     public let route: ExecutionRoute
     public let prompt: String
+    public let attachments: [ContextAttachment]
 
-    public init(sessionID: UUID, route: ExecutionRoute, prompt: String) {
+    public init(sessionID: UUID, route: ExecutionRoute, prompt: String, attachments: [ContextAttachment] = []) {
         self.sessionID = sessionID
         self.route = route
         self.prompt = prompt
+        self.attachments = attachments
     }
 }
 

@@ -1414,7 +1414,13 @@ public enum SessionPortableArchiveImporter {
         let attachments: [ContextAttachment] = chat.attachments.map { portable in
             let name = sanitizeImportedAttachmentName(portable.name)
             let token = "\(SessionPortableArchive.missingAttachmentScheme):///\(name)"
-            return ContextAttachment(id: freshID(), path: token, isMissing: true)
+            return ContextAttachment(
+                id: freshID(),
+                path: token,
+                isMissing: true,
+                kind: portable.kind == "image" ? .image : .file,
+                source: .imported
+            )
         }
 
         var actions: [SessionAction] = []

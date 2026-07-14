@@ -18,6 +18,8 @@ struct LatticeExecutionLaunch {
     let legacyHarnessID: String
     let backend: ChatBackend
     let prompt: String
+    let attachments: [ContextAttachment]
+    let imageInputCapability: ImageInputCapability
     let threadID: String?
     let workspace: URL
     let reasoningEffort: ReasoningEffort?
@@ -129,7 +131,9 @@ final class DefaultLatticeExecutionCoordinator: LatticeExecutionCoordinating {
                 reasoningEffort: launch.reasoningEffort,
                 policy: launch.policy,
                 workspaceWrite: launch.workspaceWrite,
-                developerInstructions: launch.developerInstructions
+                developerInstructions: launch.developerInstructions,
+                attachments: launch.attachments,
+                imageInputCapability: launch.imageInputCapability
             )
         case .grok(let model):
             return runtimes.grok.stream(
