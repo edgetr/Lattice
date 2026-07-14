@@ -12,12 +12,18 @@ public enum SessionTranscriptMutation {
         }
 
         let retainedMessages = Array(session.messages[session.messages.startIndex...messageIndex])
+        let keptIDs = Set(retainedMessages.map(\.id))
         var retainedActions = session.actions
-        SessionActionTrail.prune(in: &retainedActions, keepingMessageIDs: Set(retainedMessages.map(\.id)))
+        SessionActionTrail.prune(in: &retainedActions, keepingMessageIDs: keptIDs)
+        var retainedArtifacts = session.artifacts
+        AssistantArtifactTrail.prune(in: &retainedArtifacts, keepingMessageIDs: keptIDs)
         // Branch starts with an empty ordinary draft (does not copy the source chat's unsent text).
         return LatticeSession(
             title: branchTitle(for: session.title),
             messages: retainedMessages,
+            artifacts: retainedArtifacts,
+            isArtifactsLoaded: true,
+            isArtifactsDirty: true,
             backend: session.backend,
             harnessID: session.harnessID,
             reasoningEffort: session.reasoningEffort,
@@ -48,7 +54,9 @@ public enum SessionTranscriptMutation {
         }
 
         session.messages.removeSubrange(messageIndex..<session.messages.endIndex)
-        SessionActionTrail.prune(in: &session.actions, keepingMessageIDs: Set(session.messages.map(\.id)))
+        let keptIDs = Set(session.messages.map(\.id))
+        SessionActionTrail.prune(in: &session.actions, keepingMessageIDs: keptIDs)
+        AssistantArtifactTrail.prune(in: &session.artifacts, keepingMessageIDs: keptIDs)
         session.harnessThreadID = nil
         session.lastUpdated = date
 

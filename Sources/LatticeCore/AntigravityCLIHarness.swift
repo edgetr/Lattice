@@ -235,7 +235,12 @@ public final class AntigravityCLIHarness: @unchecked Sendable {
         processRegistry.cancel(sessionID: sessionID).process?.cancel()
     }
 
-    public static func structuredEvent(from data: Data, workspace: URL) -> [AgentEvent] {
+    public static func structuredEvent(
+        from data: Data,
+        workspace: URL,
+        applicationSupportRoot: URL = LatticeApplicationSupport.productRootURL(),
+        imageProbe: AssistantImageArtifactPolicy.FileProbe = .default
+    ) -> [AgentEvent] {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return [HarnessToolEventDecoder.malformedEvent(provider: "Antigravity", byteCount: data.count)]
         }
@@ -289,7 +294,23 @@ public final class AntigravityCLIHarness: @unchecked Sendable {
                     HarnessToolEventDecoder.diagnostic(provider: "Antigravity", object: object, reason: "Tool result has unsupported status.")
                 ]
             }
-            return [.toolProgress(id: HarnessToolEventDecoder.stableID(for: "antigravity:\(externalID)"), fraction: 1, detail: detail)]
+            var events: [AgentEvent] = [
+                .toolProgress(id: HarnessToolEventDecoder.stableID(for: "antigravity:\(externalID)"), fraction: 1, detail: detail)
+            ]
+            // Only when the envelope already exposes an explicit typed image path field.
+            // No Markdown parsing and no recursive path discovery.
+            if status == "success",
+               let artifactEvent = StructuredAssistantArtifactDecoder.toolResultArtifactEvent(
+                   from: object,
+                   provider: "Antigravity",
+                   eventID: externalID,
+                   workspace: workspace,
+                   applicationSupportRoot: applicationSupportRoot,
+                   probe: imageProbe
+               ) {
+                events.append(artifactEvent)
+            }
+            return events
         case "error":
             return [HarnessToolEventDecoder.diagnostic(provider: "Antigravity", object: object, reason: "Provider reported a structured error.")]
         case "result":

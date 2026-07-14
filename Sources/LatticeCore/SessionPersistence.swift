@@ -17,6 +17,7 @@ public struct SessionPersistence: Sendable {
     public static let storeName = "Chat sessions"
     public static let fileName = "sessions.json"
     public static let transcriptDirectoryName = "session-transcripts"
+    public static let artifactDirectoryName = "session-artifacts"
     public static let searchIndexFileName = "sessions.search-index.json"
 
     public let fileURL: URL
@@ -25,6 +26,9 @@ public struct SessionPersistence: Sendable {
 
     public var transcriptDirectoryURL: URL {
         fileURL.deletingLastPathComponent().appendingPathComponent(Self.transcriptDirectoryName, isDirectory: true)
+    }
+    public var artifactDirectoryURL: URL {
+        fileURL.deletingLastPathComponent().appendingPathComponent(Self.artifactDirectoryName, isDirectory: true)
     }
     public var searchIndexURL: URL {
         fileURL.deletingLastPathComponent().appendingPathComponent(Self.searchIndexFileName)
@@ -114,10 +118,12 @@ public struct SessionPersistence: Sendable {
                 for index in sessions.indices {
                     try materializeTranscript(in: &sessions[index])
                     sessions[index].transcriptStorage = nil
+                    try materializeArtifacts(in: &sessions[index])
+                    sessions[index].artifactStorage = nil
                 }
                 return .loaded(Self.restoreRuntimeState(sessions))
             } catch {
-                return .failed(issue(for: error, path: transcriptPath(from: error) ?? transcriptDirectoryURL.path))
+                return .failed(issue(for: error, path: transcriptPath(from: error) ?? artifactPath(from: error) ?? transcriptDirectoryURL.path))
             }
         }
     }
@@ -155,15 +161,60 @@ public struct SessionPersistence: Sendable {
         }
     }
 
-    /// Evidence-rich transcript read used by asynchronous selection hydration.
+    /// Lazy materialization for the split artifact metadata store. Metadata only — never copies image bytes.
+    public func materializeArtifacts(in session: inout LatticeSession) throws {
+        guard !session.isArtifactsLoaded else { return }
+        guard let storage = session.artifactStorage else {
+            session.artifacts = []
+            session.isArtifactsLoaded = true
+            session.isArtifactsDirty = false
+            return
+        }
+        let expectedPrefix = session.id.uuidString.lowercased() + "-"
+        guard storage.fileName == URL(fileURLWithPath: storage.fileName).lastPathComponent,
+              storage.fileName.hasPrefix(expectedPrefix),
+              storage.fileName.hasSuffix(".json") else {
+            throw SessionArtifactStoreError.invalidReference(storage.fileName)
+        }
+        let url = artifactDirectoryURL.appendingPathComponent(storage.fileName)
+        do {
+            let data = try io.readDataUpTo(url, DurableStoreRecovery.maximumStoreByteCount)
+            guard DurableStoreRecovery.contentFingerprint(for: data) == storage.contentFingerprint else {
+                throw SessionArtifactStoreError.fingerprintMismatch(url.path)
+            }
+            let artifacts = try JSONDecoder().decode([AssistantArtifact].self, from: data)
+            guard artifacts.count == storage.artifactCount else {
+                throw SessionArtifactStoreError.countMismatch(url.path)
+            }
+            session.artifacts = artifacts
+            session.isArtifactsLoaded = true
+            session.isArtifactsDirty = false
+        } catch let error as SessionArtifactStoreError {
+            throw error
+        } catch {
+            throw SessionArtifactStoreError.unreadable(url.path, String(reflecting: error))
+        }
+    }
+
+    /// Evidence-rich transcript + artifact metadata read used by asynchronous selection hydration.
     public func hydrationResult(for session: LatticeSession) -> TranscriptHydrationLoadResult {
         var materialized = session
         do {
             try materializeTranscript(in: &materialized)
-            return .loaded(materialized.messages)
+            try materializeArtifacts(in: &materialized)
+            return .loaded(TranscriptHydrationContent(
+                messages: materialized.messages,
+                artifacts: materialized.artifacts
+            ))
         } catch {
             return .failed(issueForTranscriptError(error))
         }
+    }
+
+    /// Materialize transcript and artifact sidecars for selection hydration.
+    public func materializeSessionContent(in session: inout LatticeSession) throws {
+        try materializeTranscript(in: &session)
+        try materializeArtifacts(in: &session)
     }
 
     public static func storageReference(sessionID: UUID, messages: [ChatMessage]) throws -> SessionTranscriptStorage {
@@ -179,10 +230,23 @@ public struct SessionPersistence: Sendable {
         )
     }
 
+    public static func artifactStorageReference(sessionID: UUID, artifacts: [AssistantArtifact]) throws -> SessionArtifactStorage {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(artifacts)
+        let fingerprint = DurableStoreRecovery.contentFingerprint(for: data)
+        return SessionArtifactStorage(
+            fileName: "\(sessionID.uuidString.lowercased())-\(fingerprint.prefix(16)).json",
+            artifactCount: artifacts.count,
+            contentFingerprint: fingerprint
+        )
+    }
+
     public func save(_ sessions: [LatticeSession]) throws {
         try DurableStoreRecovery.enforceWritable(gate: writeGate, storeName: Self.storeName)
         try io.createDirectory(fileURL.deletingLastPathComponent())
         try io.createDirectory(transcriptDirectoryURL)
+        try io.createDirectory(artifactDirectoryURL)
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -214,6 +278,26 @@ public struct SessionPersistence: Sendable {
             } else if stored.transcriptStorage == nil {
                 throw SessionTranscriptStoreError.unloadedWithoutReference(session.id)
             }
+            if session.isArtifactsLoaded, !session.artifacts.isEmpty {
+                let artifactEncoder = JSONEncoder()
+                artifactEncoder.outputFormatting = [.sortedKeys]
+                let data = try artifactEncoder.encode(session.artifacts)
+                let fingerprint = DurableStoreRecovery.contentFingerprint(for: data)
+                let reference = SessionArtifactStorage(
+                    fileName: "\(session.id.uuidString.lowercased())-\(fingerprint.prefix(16)).json",
+                    artifactCount: session.artifacts.count,
+                    contentFingerprint: fingerprint
+                )
+                let artifactURL = artifactDirectoryURL.appendingPathComponent(reference.fileName)
+                if !io.fileExists(artifactURL.path) {
+                    try io.writeDataAtomically(data, artifactURL)
+                }
+                stored.artifactStorage = reference
+            } else if session.isArtifactsLoaded {
+                stored.artifactStorage = nil
+            } else if stored.artifactStorage == nil, !session.artifacts.isEmpty {
+                throw SessionArtifactStoreError.unloadedWithoutReference(session.id)
+            }
             if !searchIndex.containsValidEntry(for: stored) {
                 var materialized = stored
                 try materializeTranscript(in: &materialized)
@@ -221,6 +305,8 @@ public struct SessionPersistence: Sendable {
             }
             stored.messages = []
             stored.isTranscriptLoaded = false
+            stored.artifacts = []
+            stored.isArtifactsLoaded = false
             storedSessions.append(stored)
         }
 
@@ -228,6 +314,7 @@ public struct SessionPersistence: Sendable {
         try io.writeDataAtomically(try encoder.encode(searchIndex), searchIndexURL)
         try io.writeDataAtomically(try encoder.encode(storedSessions), fileURL)
         removeOrphanedTranscripts(keeping: Set(storedSessions.compactMap { $0.transcriptStorage?.fileName }))
+        removeOrphanedArtifacts(keeping: Set(storedSessions.compactMap { $0.artifactStorage?.fileName }))
     }
 
     public static func restoreRuntimeState(_ sessions: [LatticeSession]) -> [LatticeSession] {
@@ -259,37 +346,72 @@ public struct SessionPersistence: Sendable {
         guard let urls = try? FileManager.default.contentsOfDirectory(
             at: transcriptDirectoryURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
         ) else { return }
-        for url in urls where !fileNames.contains(url.lastPathComponent) {
+        for url in urls where url.pathExtension == "json" && !fileNames.contains(url.lastPathComponent) {
+            try? io.removeItem(url)
+        }
+    }
+
+    /// Removes only artifact sidecars that are no longer referenced. Never deletes image files
+    /// outside this directory — artifacts are metadata pointers only.
+    private func removeOrphanedArtifacts(keeping fileNames: Set<String>) {
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: artifactDirectoryURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+        ) else { return }
+        for url in urls where url.pathExtension == "json" && !fileNames.contains(url.lastPathComponent) {
             try? io.removeItem(url)
         }
     }
 
     public func issueForTranscriptError(_ error: Error) -> DurableStoreIssue {
-        issue(for: error, path: transcriptPath(from: error) ?? transcriptDirectoryURL.path)
+        if error is SessionArtifactStoreError {
+            return issue(for: error, path: artifactPath(from: error) ?? artifactDirectoryURL.path)
+        }
+        return issue(for: error, path: transcriptPath(from: error) ?? transcriptDirectoryURL.path)
     }
 
     private func issue(for error: Error, path: String) -> DurableStoreIssue {
         let kind: DurableStoreIssueKind
-        switch error as? SessionTranscriptStoreError {
-        case .fingerprintMismatch,
-             .countMismatch,
-             .invalidReference:
-            kind = .corrupt
-        default:
+        if let transcriptError = error as? SessionTranscriptStoreError {
+            switch transcriptError {
+            case .fingerprintMismatch, .countMismatch, .invalidReference:
+                kind = .corrupt
+            default:
+                kind = .unreadable
+            }
+        } else if let artifactError = error as? SessionArtifactStoreError {
+            switch artifactError {
+            case .fingerprintMismatch, .countMismatch, .invalidReference:
+                kind = .corrupt
+            default:
+                kind = .unreadable
+            }
+        } else {
             kind = .unreadable
         }
+        let summary = error is SessionArtifactStoreError
+            ? "A durable chat artifact metadata store could not be loaded."
+            : "A durable chat transcript could not be loaded."
         return DurableStoreIssue(
             storeID: Self.storeID,
             storeName: Self.storeName,
             filePath: path,
             kind: kind,
-            summary: "A durable chat transcript could not be loaded.",
+            summary: summary,
             technicalDetails: "Path: \(path)\nError: \(String(reflecting: error))"
         )
     }
 
     private func transcriptPath(from error: Error) -> String? {
         switch error as? SessionTranscriptStoreError {
+        case .fingerprintMismatch(let path), .countMismatch(let path), .unreadable(let path, _):
+            return path
+        default:
+            return nil
+        }
+    }
+
+    private func artifactPath(from error: Error) -> String? {
+        switch error as? SessionArtifactStoreError {
         case .fingerprintMismatch(let path), .countMismatch(let path), .unreadable(let path, _):
             return path
         default:
@@ -314,6 +436,24 @@ public enum SessionTranscriptStoreError: Error, LocalizedError, Sendable {
         case .unloadedWithoutReference(let id): "Session \(id) is unloaded without durable transcript storage."
         case .indexRebuildIncomplete: "The derived session search index could not be rebuilt completely."
         case .invalidReference(let value): "Transcript storage reference is invalid: \(value)"
+        }
+    }
+}
+
+public enum SessionArtifactStoreError: Error, LocalizedError, Sendable {
+    case fingerprintMismatch(String)
+    case countMismatch(String)
+    case unreadable(String, String)
+    case unloadedWithoutReference(UUID)
+    case invalidReference(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .fingerprintMismatch(let path): "Artifact metadata fingerprint does not match: \(path)"
+        case .countMismatch(let path): "Artifact metadata count does not match: \(path)"
+        case .unreadable(let path, let detail): "Artifact metadata is unreadable at \(path): \(detail)"
+        case .unloadedWithoutReference(let id): "Session \(id) has unloaded artifacts without durable storage."
+        case .invalidReference(let value): "Artifact storage reference is invalid: \(value)"
         }
     }
 }

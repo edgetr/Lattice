@@ -117,7 +117,9 @@ public enum LatticeContinuationPolicy {
         guard !session.isStreaming,
               let message = session.messages.last,
               message.role == .assistant else { return false }
-        return !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let hasText = !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let hasArtifact = session.isArtifactsLoaded && session.artifacts.contains { $0.messageID == message.id }
+        return hasText || hasArtifact
     }
 }
 
@@ -408,6 +410,8 @@ public enum AgentEvent: Sendable, Equatable {
     case metric(name: String, value: Double, unit: String)
     case harnessActivity(HarnessActivityEvent)
     case providerDiagnostic(ProviderEventDiagnostic)
+    /// Typed assistant media artifact (metadata + authorized local path only; never bytes/base64).
+    case artifact(AssistantArtifactObservation)
     case completed
     case cancelled
     case failed(String)
@@ -1168,6 +1172,18 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
     public var isTranscriptLoaded: Bool
     /// Runtime-only mutation marker used to avoid hashing or saving clean transcripts on switch.
     public var isTranscriptDirty: Bool
+    /// Durable assistant media artifacts (metadata only). Stored in a split sidecar when present.
+    public var artifacts: [AssistantArtifact] {
+        didSet {
+            if isArtifactsLoaded { isArtifactsDirty = true }
+        }
+    }
+    /// Durable pointer used by the split artifact metadata store.
+    public var artifactStorage: SessionArtifactStorage?
+    /// Runtime-only materialization state for artifact metadata.
+    public var isArtifactsLoaded: Bool
+    /// Runtime-only mutation marker for artifact metadata.
+    public var isArtifactsDirty: Bool
     public var backend: ChatBackend
     /// New route authority. `backend` and `harnessID` remain for legacy decoding and UI migration.
     public var executionRoute: ExecutionRoute
@@ -1196,6 +1212,10 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         transcriptStorage: SessionTranscriptStorage? = nil,
         isTranscriptLoaded: Bool = true,
         isTranscriptDirty: Bool = false,
+        artifacts: [AssistantArtifact] = [],
+        artifactStorage: SessionArtifactStorage? = nil,
+        isArtifactsLoaded: Bool = true,
+        isArtifactsDirty: Bool = false,
         backend: ChatBackend,
         executionRoute: ExecutionRoute? = nil,
         harnessID: String? = nil,
@@ -1217,6 +1237,10 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         self.id = id; self.title = title; self.messages = messages
         self.transcriptStorage = transcriptStorage; self.isTranscriptLoaded = isTranscriptLoaded
         self.isTranscriptDirty = isTranscriptDirty
+        self.artifacts = artifacts
+        self.artifactStorage = artifactStorage
+        self.isArtifactsLoaded = isArtifactsLoaded
+        self.isArtifactsDirty = isArtifactsDirty
         self.backend = backend
         self.executionRoute = executionRoute ?? ExecutionRoute.legacy(for: backend, harnessID: harnessID)
         self.harnessID = harnessID
@@ -1229,7 +1253,7 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, messages, transcriptStorage, backend, executionRoute, harnessID, reasoningEffort, harnessThreadID, workspacePath, attachments, policy, privacyMode, intent, actions, queuedFollowUps, draft, isPinned, isStreaming, lastUpdated, portableArchiveFingerprint
+        case id, title, messages, transcriptStorage, artifacts, artifactStorage, backend, executionRoute, harnessID, reasoningEffort, harnessThreadID, workspacePath, attachments, policy, privacyMode, intent, actions, queuedFollowUps, draft, isPinned, isStreaming, lastUpdated, portableArchiveFingerprint
     }
 
     public init(from decoder: Decoder) throws {
@@ -1240,6 +1264,19 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         transcriptStorage = try container.decodeIfPresent(SessionTranscriptStorage.self, forKey: .transcriptStorage)
         isTranscriptLoaded = transcriptStorage == nil
         isTranscriptDirty = false
+        // Prefer split artifact store. Inline `artifacts` is accepted only for transitional
+        // payloads; legacy manifests without either field hydrate as empty/loaded.
+        let decodedArtifactStorage = try container.decodeIfPresent(SessionArtifactStorage.self, forKey: .artifactStorage)
+        let inlineArtifacts = try container.decodeIfPresent([AssistantArtifact].self, forKey: .artifacts) ?? []
+        artifactStorage = decodedArtifactStorage
+        if decodedArtifactStorage != nil {
+            artifacts = []
+            isArtifactsLoaded = false
+        } else {
+            artifacts = inlineArtifacts
+            isArtifactsLoaded = true
+        }
+        isArtifactsDirty = false
         backend = try container.decode(ChatBackend.self, forKey: .backend)
         harnessID = try container.decodeIfPresent(String.self, forKey: .harnessID)
         executionRoute = try container.decodeIfPresent(ExecutionRoute.self, forKey: .executionRoute)
@@ -1266,6 +1303,13 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         try container.encode(title, forKey: .title)
         try container.encode(messages, forKey: .messages)
         try container.encodeIfPresent(transcriptStorage, forKey: .transcriptStorage)
+        // Prefer split store reference. Inline artifacts only when loaded without a split reference
+        // (tests/legacy transitional encoding); production save clears them after writing the sidecar.
+        if let artifactStorage {
+            try container.encode(artifactStorage, forKey: .artifactStorage)
+        } else if !artifacts.isEmpty {
+            try container.encode(artifacts, forKey: .artifacts)
+        }
         try container.encode(backend, forKey: .backend)
         try container.encode(executionRoute, forKey: .executionRoute)
         try container.encodeIfPresent(harnessID, forKey: .harnessID)

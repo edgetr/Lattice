@@ -688,7 +688,12 @@ public final class CodexExecHarness: @unchecked Sendable {
         return nil
     }
 
-    public static func appServerEvent(from object: [String: Any], workspace: URL) -> AgentEvent? {
+    public static func appServerEvent(
+        from object: [String: Any],
+        workspace: URL,
+        applicationSupportRoot: URL = LatticeApplicationSupport.productRootURL(),
+        imageProbe: AssistantImageArtifactPolicy.FileProbe = .default
+    ) -> AgentEvent? {
         guard let method = object["method"] as? String else { return HarnessToolEventDecoder.diagnostic(provider: "Codex", object: object, reason: "App-server event is missing method.") }
         guard let params = object["params"] as? [String: Any] else { return method == "item/reasoning/textDelta" ? nil : HarnessToolEventDecoder.diagnostic(provider: "Codex", object: object, reason: "App-server event is missing params.") }
         if method == "item/agentMessage/delta" {
@@ -757,6 +762,60 @@ public final class CodexExecHarness: @unchecked Sendable {
         case "webSearch":
             if completed { return terminalToolProgress(id: id, status: item["status"]) }
             return .toolRequested(.init(id: id, kind: .network, title: "Search the web", detail: item["query"] as? String ?? "", workspaceScoped: false, reversible: true))
+        case "imageView":
+            // Schema: ImageViewThreadItem requires id + path. Project only on completion.
+            guard completed else { return nil }
+            guard let path = item["path"] as? String else {
+                return HarnessToolEventDecoder.diagnostic(
+                    provider: "Codex",
+                    object: ["type": type],
+                    reason: "imageView item is missing path."
+                )
+            }
+            return StructuredAssistantArtifactDecoder.artifactEvent(
+                path: path,
+                provider: "Codex",
+                origin: .codexImageView,
+                eventID: externalID,
+                workspace: workspace,
+                applicationSupportRoot: applicationSupportRoot,
+                probe: imageProbe,
+                artifactID: HarnessToolEventDecoder.stableID(for: "codex:artifact:imageView:\(externalID)")
+            )
+        case "imageGeneration":
+            // Schema: ImageGenerationThreadItem has required result/status and optional savedPath.
+            // Never treat `result` as a file path and never decode base64 from it.
+            guard completed else { return nil }
+            let status = (item["status"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard status == "completed" else {
+                if status == "failed" || status == "cancelled" || status == "canceled" {
+                    return terminalToolProgress(id: id, status: item["status"])
+                }
+                return HarnessToolEventDecoder.diagnostic(
+                    provider: "Codex",
+                    object: ["type": type, "status": status ?? "missing"],
+                    reason: "imageGeneration completed with an unsupported status."
+                )
+            }
+            guard let savedPath = item["savedPath"] as? String,
+                  !savedPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                // Successful generation without a saved path is not a durable local artifact.
+                return HarnessToolEventDecoder.diagnostic(
+                    provider: "Codex",
+                    object: ["type": type, "status": "completed"],
+                    reason: "imageGeneration completed without a savedPath."
+                )
+            }
+            return StructuredAssistantArtifactDecoder.artifactEvent(
+                path: savedPath,
+                provider: "Codex",
+                origin: .codexImageGeneration,
+                eventID: externalID,
+                workspace: workspace,
+                applicationSupportRoot: applicationSupportRoot,
+                probe: imageProbe,
+                artifactID: HarnessToolEventDecoder.stableID(for: "codex:artifact:imageGeneration:\(externalID)")
+            )
         default:
             return HarnessToolEventDecoder.diagnostic(provider: "Codex", object: item, reason: "Unsupported item event.")
         }

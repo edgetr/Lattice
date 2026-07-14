@@ -457,8 +457,8 @@ struct CoreVerification {
                 let request = TranscriptHydrationRequest(sessionID: lazySession.id, storage: storage)
                 let coordinator = TranscriptHydrationCoordinator()
                 let outcome = await coordinator.hydrate(request) { store.hydrationResult(for: hydrationSession) }
-                if case .loaded(let loadedRequest, let messages) = outcome {
-                    expect(loadedRequest == request && messages == longMessages, "Asynchronous transcript hydration preserves exact content")
+                if case .loaded(let loadedRequest, let content) = outcome {
+                    expect(loadedRequest == request && content.messages == longMessages, "Asynchronous transcript hydration preserves exact content")
                 } else {
                     expect(false, "Asynchronous transcript hydration preserves exact content")
                 }
@@ -1329,6 +1329,169 @@ struct CoreVerification {
                 "Codex plan updates preserve typed step status"
             )
         } else { expect(false, "Codex plan updates are projected") }
+
+        // Durable assistant image artifacts (metadata only; no base64 in transcript or records).
+        let oneByOnePNG = Data([
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
+            0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41,
+            0x54, 0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
+            0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
+            0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
+            0x44, 0xAE, 0x42, 0x60, 0x82
+        ])
+        let artifactRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let artifactWorkspace = artifactRoot.appendingPathComponent("workspace", isDirectory: true)
+        let artifactAppSupport = artifactRoot.appendingPathComponent("Application Support/Lattice", isDirectory: true)
+        try! FileManager.default.createDirectory(at: artifactWorkspace, withIntermediateDirectories: true)
+        try! FileManager.default.createDirectory(at: artifactAppSupport, withIntermediateDirectories: true)
+        let workspacePNG = artifactWorkspace.appendingPathComponent("view.png")
+        let generatedPNG = artifactAppSupport.appendingPathComponent("gen.png")
+        try! oneByOnePNG.write(to: workspacePNG)
+        try! oneByOnePNG.write(to: generatedPNG)
+        if case .accepted(let image) = AssistantImageArtifactPolicy.validate(path: workspacePNG.path, workspace: artifactWorkspace, applicationSupportRoot: artifactAppSupport) {
+            expect(image.status == .available && image.mimeType == "image/png" && image.pixelWidth == 1, "Workspace PNG validates by signature")
+        } else { expect(false, "Workspace PNG validates by signature") }
+        if case .rejected = AssistantImageArtifactPolicy.validate(path: "https://example.com/x.png", workspace: artifactWorkspace, applicationSupportRoot: artifactAppSupport) {
+            expect(true, "URL schemes are rejected for image artifacts")
+        } else { expect(false, "URL schemes are rejected for image artifacts") }
+        if case .rejected = AssistantImageArtifactPolicy.validate(path: "data:image/png;base64,AAAA", workspace: artifactWorkspace, applicationSupportRoot: artifactAppSupport) {
+            expect(true, "data: payloads are rejected for image artifacts")
+        } else { expect(false, "data: payloads are rejected for image artifacts") }
+        let missingPNG = artifactWorkspace.appendingPathComponent("later.png")
+        if case .accepted(let missing) = AssistantImageArtifactPolicy.validate(path: missingPNG.path, workspace: artifactWorkspace, applicationSupportRoot: artifactAppSupport) {
+            expect(missing.status == .missing, "Authorized missing image paths become .missing")
+        } else { expect(false, "Authorized missing image paths become .missing") }
+        try! oneByOnePNG.write(to: missingPNG)
+        if case .accepted(let recovered) = AssistantImageArtifactPolicy.validate(path: missingPNG.path, workspace: artifactWorkspace, applicationSupportRoot: artifactAppSupport) {
+            expect(recovered.status == .available, "Missing image paths revalidate when the file appears")
+        } else { expect(false, "Missing image paths revalidate when the file appears") }
+        let inlineImagePart1 = AssistantTranscriptMediaPolicy.appending("image: data:image/png;base", to: "", isSuppressingPayload: false)
+        let inlineImagePart2 = AssistantTranscriptMediaPolicy.appending("64,iVBORw0KGgo", to: inlineImagePart1.text, isSuppressingPayload: inlineImagePart1.isSuppressingPayload)
+        let inlineImagePart3 = AssistantTranscriptMediaPolicy.appending("==. retained", to: inlineImagePart2.text, isSuppressingPayload: inlineImagePart2.isSuppressingPayload)
+        expect(
+            inlineImagePart3.text == "image: [Inline image data omitted]. retained"
+                && !inlineImagePart3.text.contains("iVBOR")
+                && !inlineImagePart3.isSuppressingPayload,
+            "Streaming inline image base64 never enters transcript prose"
+        )
+        let codexImageView: [String: Any] = [
+            "method": "item/completed",
+            "params": ["item": ["type": "imageView", "id": "view-1", "path": workspacePNG.path]]
+        ]
+        if case .artifact(let observation)? = CodexExecHarness.appServerEvent(from: codexImageView, workspace: artifactWorkspace, applicationSupportRoot: artifactAppSupport) {
+            expect(observation.provenance.origin == .codexImageView && observation.mimeType == "image/png", "Codex imageView decodes a validated artifact")
+        } else { expect(false, "Codex imageView decodes a validated artifact") }
+        let codexImageGeneration: [String: Any] = [
+            "method": "item/completed",
+            "params": ["item": [
+                "type": "imageGeneration",
+                "id": "gen-1",
+                "status": "completed",
+                "result": "IGNORED_BASE64_OR_BLOB",
+                "savedPath": generatedPNG.path
+            ]]
+        ]
+        let generationEvent = CodexExecHarness.appServerEvent(from: codexImageGeneration, workspace: artifactWorkspace, applicationSupportRoot: artifactAppSupport)
+        if case .artifact(let generated)? = generationEvent {
+            expect(
+                generated.provenance.origin == .codexImageGeneration
+                    && generated.canonicalPath.hasSuffix("/gen.png")
+                    && generated.status == .available,
+                "Codex imageGeneration uses savedPath only"
+            )
+        } else if case .providerDiagnostic(let diagnostic)? = generationEvent {
+            expect(false, "Codex imageGeneration uses savedPath only (diagnostic: \(diagnostic.reason))")
+        } else {
+            expect(false, "Codex imageGeneration uses savedPath only (unexpected: \(String(describing: generationEvent)))")
+        }
+        let unsafeImageView: [String: Any] = [
+            "method": "item/completed",
+            "params": ["item": ["type": "imageView", "id": "bad", "path": "https://cdn.example/x.png"]]
+        ]
+        if case .providerDiagnostic(let diagnostic)? = CodexExecHarness.appServerEvent(from: unsafeImageView, workspace: artifactWorkspace, applicationSupportRoot: artifactAppSupport) {
+            expect(!diagnostic.detail.contains("cdn.example") && diagnostic.reason.contains("rejected"), "Unsafe Codex image paths become metadata-only diagnostics")
+        } else { expect(false, "Unsafe Codex image paths become metadata-only diagnostics") }
+        expect(StructuredAssistantArtifactDecoder.explicitImagePath(in: ["nested": ["imagePath": workspacePNG.path]]) == nil, "Shared decoder does not recurse nested path discovery")
+        let toolResultEnvelope: [String: Any] = [
+            "type": "tool_result",
+            "tool_id": "tool-artifact-1",
+            "status": "success",
+            "imagePath": workspacePNG.path
+        ]
+        let antigravityArtifactEvents = AntigravityCLIHarness.structuredEvent(
+            from: try! JSONSerialization.data(withJSONObject: toolResultEnvelope),
+            workspace: artifactWorkspace,
+            applicationSupportRoot: artifactAppSupport
+        )
+        expect(antigravityArtifactEvents.contains {
+            if case .artifact(let artifact) = $0 { return artifact.provenance.origin == .structuredToolResult }
+            return false
+        }, "Antigravity tool_result emits artifact only for explicit imagePath")
+        let assistantForArtifact = ChatMessage(role: .assistant, text: "diagram ready")
+        let durableArtifact = AssistantArtifact(
+            messageID: assistantForArtifact.id,
+            status: .available,
+            displayName: "view.png",
+            mimeType: "image/png",
+            byteCount: oneByOnePNG.count,
+            pixelWidth: 1,
+            pixelHeight: 1,
+            canonicalPath: workspacePNG.path,
+            provenance: .init(provider: "Codex", origin: .codexImageView, eventID: "view-1")
+        )
+        let artifactSession = LatticeSession(
+            title: "Artifacts",
+            messages: [.init(role: .user, text: "draw"), assistantForArtifact],
+            artifacts: [durableArtifact],
+            backend: .codex(model: "gpt-5.4")
+        )
+        let artifactStore = SessionPersistence(fileURL: artifactRoot.appendingPathComponent("sessions.json"))
+        try! artifactStore.save([artifactSession])
+        if case .loaded(let lazyArtifactLoad) = artifactStore.loadLazyResult(), var lazyArtifactSession = lazyArtifactLoad.sessions.first {
+            expect(lazyArtifactSession.messages.isEmpty && lazyArtifactSession.artifacts.isEmpty, "Artifact split store leaves metadata off the manifest payload")
+            expect(lazyArtifactSession.artifactStorage?.artifactCount == 1, "Artifact storage reference is retained on the session manifest")
+            try! artifactStore.materializeSessionContent(in: &lazyArtifactSession)
+            expect(lazyArtifactSession.artifacts.count == 1 && lazyArtifactSession.artifacts[0].canonicalPath == workspacePNG.path, "Artifact metadata hydrates from the split store")
+            let transcriptBytes = try! Data(contentsOf: artifactStore.transcriptDirectoryURL.appendingPathComponent(lazyArtifactSession.transcriptStorage!.fileName))
+            expect(!String(decoding: transcriptBytes, as: UTF8.self).contains("view.png"), "Transcript sidecar does not carry artifact path metadata")
+            let artifactBytes = try! Data(contentsOf: artifactStore.artifactDirectoryURL.appendingPathComponent(lazyArtifactSession.artifactStorage!.fileName))
+            expect(!artifactBytes.contains(oneByOnePNG) && !String(decoding: artifactBytes, as: UTF8.self).contains(oneByOnePNG.base64EncodedString()), "Artifact sidecar never stores image bytes or base64")
+        } else { expect(false, "Artifact split store loads") }
+        let textOnlyArtifactStore = SessionPersistence(fileURL: artifactRoot.appendingPathComponent("text-only-sessions.json"))
+        try! textOnlyArtifactStore.save([LatticeSession(title: "Text only", messages: [.init(role: .assistant, text: "done")], backend: .codex(model: "gpt-5.4"))])
+        if case .loaded(let textOnlyLazy) = textOnlyArtifactStore.loadLazyResult() {
+            expect(textOnlyLazy.sessions.first?.artifactStorage == nil, "Text-only chats do not create empty artifact sidecars")
+        } else { expect(false, "Text-only chats do not create empty artifact sidecars") }
+        let artifactSecondAssistant = ChatMessage(role: .assistant, text: "second")
+        let secondArtifact = AssistantArtifact(
+            messageID: artifactSecondAssistant.id,
+            status: .available,
+            displayName: "gone.png",
+            mimeType: "image/png",
+            byteCount: 10,
+            canonicalPath: "/tmp/gone.png",
+            provenance: .init(provider: "Codex", origin: .codexImageGeneration)
+        )
+        var pruneSession = LatticeSession(
+            title: "Prune",
+            messages: [.init(role: .user, text: "a"), assistantForArtifact, .init(role: .user, text: "b"), artifactSecondAssistant],
+            artifacts: [durableArtifact, secondArtifact],
+            backend: .codex(model: "gpt-5.4")
+        )
+        expect(SessionTranscriptMutation.deleteMessageAndFollowing(messageID: pruneSession.messages[2].id, in: &pruneSession), "Delete truncates transcript for artifact ownership test")
+        expect(pruneSession.artifacts.map { $0.id } == [durableArtifact.id], "Delete prunes artifacts for removed messages")
+        let artifactBranch = SessionTranscriptMutation.branchFromMessage(messageID: pruneSession.messages[0].id, in: pruneSession)
+        expect(artifactBranch?.artifacts.isEmpty == true, "Branch prunes artifacts not owned by retained messages")
+        var legacyArtifactObject = try! JSONSerialization.jsonObject(with: JSONEncoder().encode(LatticeSession(title: "LegacyArtifacts", backend: .codex(model: "gpt-5.4")))) as! [String: Any]
+        legacyArtifactObject["artifacts"] = nil
+        legacyArtifactObject["artifactStorage"] = nil
+        if let legacyDecoded = try? JSONDecoder().decode(LatticeSession.self, from: JSONSerialization.data(withJSONObject: legacyArtifactObject)) {
+            expect(legacyDecoded.artifacts.isEmpty && legacyDecoded.isArtifactsLoaded && legacyDecoded.artifactStorage == nil, "Legacy sessions without artifacts decode as empty loaded metadata")
+        } else { expect(false, "Legacy sessions without artifacts decode as empty loaded metadata") }
+        try? FileManager.default.removeItem(at: artifactRoot)
 
         let reasoningAction = SessionAction(messageID: responseMessage.id, kind: .reasoning, title: "Reasoning summary", detail: "Inspect", status: .running)
         var reasoningActions = [reasoningAction]

@@ -54,8 +54,14 @@ struct ConversationView: View {
                                             .help("Show up to \(min(100, hiddenEarlierCount)) earlier messages")
                                         }
                                         ForEach(state.visibleMessages(for: session)) { message in
+                                            let messageArtifacts = AssistantArtifactTrail.artifacts(
+                                                for: message.id,
+                                                in: session.artifacts
+                                            )
                                             MessageRow(
                                                 message: message,
+                                                artifacts: messageArtifacts,
+                                                isSessionStreaming: session.isStreaming,
                                                 availableWidth: messageRowWidth,
                                                 state: state
                                             )
@@ -1095,6 +1101,8 @@ struct ReasoningMenu: View {
 
 struct MessageRow: View {
     let message: ChatMessage
+    let artifacts: [AssistantArtifact]
+    let isSessionStreaming: Bool
     let availableWidth: CGFloat
     @ObservedObject var state: AppState
 
@@ -1105,6 +1113,10 @@ struct MessageRow: View {
     /// Session route for provenance — read live from session state, never duplicated onto the message.
     private var routeSession: LatticeSession? {
         state.selectedSession
+    }
+
+    private var hasVisibleContent: Bool {
+        !message.text.isEmpty || !artifacts.isEmpty
     }
 
     var body: some View {
@@ -1126,7 +1138,7 @@ struct MessageRow: View {
             MessageTimestampPresentationPolicy.accessibilityMetadata(
                 role: message.role,
                 date: message.date,
-                isGenerating: message.role == .assistant && message.text.isEmpty
+                isGenerating: message.role == .assistant && !hasVisibleContent && isSessionStreaming
             )
         )
     }
@@ -1166,7 +1178,7 @@ struct MessageRow: View {
     private func assistantLayout(compactActions: Bool) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Group {
-                if message.text.isEmpty {
+                if !hasVisibleContent && isSessionStreaming {
                     ProgressView()
                         .controlSize(.small)
                         .padding(.vertical, 5)
@@ -1180,9 +1192,20 @@ struct MessageRow: View {
                                 sessionHarnessID: session.harnessID
                             )
                         }
-                        MessageContentView(text: message.text, isUser: false)
-                            .foregroundStyle(message.role == .system ? .secondary : .primary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                        if !message.text.isEmpty {
+                            MessageContentView(text: message.text, isUser: false)
+                                .foregroundStyle(message.role == .system ? .secondary : .primary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        ForEach(artifacts) { artifact in
+                            AssistantArtifactCard(
+                                artifact: artifact,
+                                workspace: URL(
+                                    fileURLWithPath: routeSession?.workspacePath ?? state.selectedWorkspacePath,
+                                    isDirectory: true
+                                )
+                            )
+                        }
                         MessageTimestampCaption(date: message.date)
                     }
                 }
@@ -1190,7 +1213,7 @@ struct MessageRow: View {
             // Flexible fill — no minWidth floor that can force one-character wrapping.
             .frame(maxWidth: .infinity, alignment: .leading)
             .layoutPriority(1)
-            if !message.text.isEmpty {
+            if hasVisibleContent {
                 MessageActionControls(
                     message: message,
                     state: state,
