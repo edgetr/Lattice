@@ -132,6 +132,7 @@ final class AppState: ObservableObject {
         }
     }
     @Published var sessions: [LatticeSession]
+    @Published private(set) var transcriptLoadingSessionID: UUID?
     /// Shared composer text bound by workspace and overlay. Ordinary text syncs to the selected session's durable `draft`; edit text does not.
     @Published var draft = "" {
         didSet {
@@ -332,8 +333,10 @@ final class AppState: ObservableObject {
     private let sessionSaveCoordinator: SessionSaveCoordinator
     private var sessionSearchIndex = SessionSearchIndex()
     private var transcriptRenderWindows = TranscriptRenderWindowCache()
-    private var materializedTranscriptLRU: [UUID] = []
-    private static let maximumMaterializedTranscriptCount = 3
+    private let transcriptHydrationCoordinator = TranscriptHydrationCoordinator()
+    private var transcriptHydrationTask: Task<Void, Never>?
+    private var activeTranscriptHydrationRequest: TranscriptHydrationRequest?
+    private var materializedTranscriptLRU = TranscriptHydrationLRU(maximumCount: 3)
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     private var localModelIdleUnloadTask: Task<Void, Never>?
     private var extensionDirectorySource: DispatchSourceFileSystemObject?
@@ -466,17 +469,6 @@ final class AppState: ObservableObject {
         selectedRouteEngineID = Self.engineID(for: initialDefaultBackend)
         selectedRouteHarnessID = Self.defaultHarnessID(for: initialDefaultBackend)
         selectedSessionID = LatticeSessionListOrdering.sorted(sessions).first?.id
-        if let selectedSessionID,
-           let index = sessions.firstIndex(where: { $0.id == selectedSessionID }) {
-            do {
-                try persistence.materializeTranscript(in: &sessions[index])
-                materializedTranscriptLRU = [selectedSessionID]
-            } catch {
-                let issue = persistence.issueForTranscriptError(error)
-                recoveryIssues.append(issue)
-                persistence.writeGate.block()
-            }
-        }
         rebuildThreadActivityLanes()
         composerSelectionMode = selectedSession?.executionRoute.mode
         composerSelectionBackend = selectedSession?.backend
@@ -539,6 +531,7 @@ final class AppState: ObservableObject {
         startExtensionMonitoring()
         startResourceMonitoring()
         requestAutomaticConnectionRefresh(refreshProviderCatalogs: false)
+        prepareTranscriptSelection(selectedID: selectedSessionID)
     }
 
     /// Crash-safe termination flush: sync the selected session's ordinary draft, then write the latest snapshot.
@@ -586,6 +579,10 @@ final class AppState: ObservableObject {
     var selectedSession: LatticeSession? {
         guard let id = selectedSessionID else { return nil }
         return sessions.first { $0.id == id }
+    }
+
+    var isSelectedTranscriptLoading: Bool {
+        selectedSessionID != nil && transcriptLoadingSessionID == selectedSessionID
     }
 
     var filteredSessions: [LatticeSession] {
@@ -969,6 +966,7 @@ final class AppState: ObservableObject {
     var canSendDraft: Bool {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return false }
+        guard !isSelectedTranscriptLoading else { return false }
         if !isSelectedSessionRouteLocked {
             guard let mode = composerSelectionMode,
                   let backend = composerSelectionBackend,
@@ -994,6 +992,9 @@ final class AppState: ObservableObject {
     }
     var composerSubmitDisabledHelp: String? {
         guard !canSendDraft else { return nil }
+        if isSelectedTranscriptLoading {
+            return "Wait for this chat's transcript to finish loading"
+        }
         if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return selectedSession?.isStreaming == true
                 ? "Type a follow-up to queue"
@@ -6877,46 +6878,87 @@ Lattice self-edit rules:
     }
 
     private func prepareTranscriptSelection(selectedID: UUID?) {
+        let previousRequest = activeTranscriptHydrationRequest
+        transcriptHydrationTask?.cancel()
+        transcriptHydrationTask = nil
+        activeTranscriptHydrationRequest = nil
+        transcriptLoadingSessionID = nil
+        if let previousRequest {
+            Task { await transcriptHydrationCoordinator.cancel(previousRequest) }
+        }
+
         guard let selectedID,
-              let selectedIndex = sessions.firstIndex(where: { $0.id == selectedID }) else { return }
-        do {
-            try persistence.materializeTranscript(in: &sessions[selectedIndex])
-        } catch {
-            let issue = persistence.issueForTranscriptError(error)
-            persistence.writeGate.block()
-            replacePersistenceRecoveryIssue(issue)
-            setError("This chat's stored transcript could not be loaded. The original files were left untouched for recovery.", sessionID: selectedID)
+              let selectedIndex = sessions.firstIndex(where: { $0.id == selectedID }) else {
             return
         }
-
-        materializedTranscriptLRU.removeAll { $0 == selectedID }
-        materializedTranscriptLRU.append(selectedID)
-        _ = transcriptRenderWindows.activate(sessionID: selectedID, messageCount: sessions[selectedIndex].messages.count)
-
-        let evictable = materializedTranscriptLRU.filter { id in
-            id != selectedID
-                && sessions.first(where: { $0.id == id })?.isStreaming != true
-                && sessions.first(where: { $0.id == id })?.transcriptStorage != nil
+        if sessions[selectedIndex].isTranscriptLoaded {
+            finishTranscriptAccess(sessionID: selectedID)
+            return
         }
-        let excess = max(0, materializedTranscriptLRU.count - Self.maximumMaterializedTranscriptCount)
-        guard excess > 0, !evictable.isEmpty else { return }
+        guard let storage = sessions[selectedIndex].transcriptStorage else { return }
 
-        let victims = Array(evictable.prefix(excess))
-        let hasDirtyTranscript = victims.contains { id in
-            sessions.first(where: { $0.id == id })?.isTranscriptDirty != false
+        let snapshot = sessions[selectedIndex]
+        let persistence = persistence
+        let request = TranscriptHydrationRequest(sessionID: selectedID, storage: storage)
+        activeTranscriptHydrationRequest = request
+        transcriptLoadingSessionID = selectedID
+        transcriptHydrationTask = Task { [weak self] in
+            guard let self else { return }
+            let outcome = await transcriptHydrationCoordinator.hydrate(request) {
+                persistence.hydrationResult(for: snapshot)
+            }
+            guard !Task.isCancelled else { return }
+            applyTranscriptHydrationOutcome(outcome)
         }
-        if hasDirtyTranscript {
-            // Failed saves keep dirty transcript data resident. The common clean-switch path does
-            // no synchronous I/O, so navigating among long chats stays responsive.
-            persist()
-            guard sessionSaveFailure == nil else { return }
-        }
-        for id in victims {
-            guard let index = sessions.firstIndex(where: { $0.id == id }) else { continue }
-            sessions[index].messages = []
-            sessions[index].isTranscriptLoaded = false
+    }
+
+    private func applyTranscriptHydrationOutcome(_ outcome: TranscriptHydrationOutcome) {
+        switch outcome {
+        case .cancelled:
+            return
+        case .failed(let request, let issue):
+            guard selectedSessionID == request.sessionID,
+                  sessions.first(where: { $0.id == request.sessionID })?.transcriptStorage == request.storage else { return }
+            transcriptLoadingSessionID = nil
+            activeTranscriptHydrationRequest = nil
+            persistence.writeGate.block()
+            replacePersistenceRecoveryIssue(issue)
+            setError("This chat's stored transcript could not be loaded. The original files were left untouched for recovery.", sessionID: request.sessionID)
+        case .loaded(let request, let messages):
+            guard let index = sessions.firstIndex(where: { $0.id == request.sessionID }) else { return }
+            transcriptLoadingSessionID = nil
+            activeTranscriptHydrationRequest = nil
+            // A live or dirty in-memory transcript always wins over a late disk result.
+            guard TranscriptHydrationApplyPolicy.shouldApply(
+                request: request,
+                selectedSessionID: selectedSessionID,
+                currentSession: sessions[index]
+            ) else { return }
+            sessions[index].messages = messages
+            sessions[index].isTranscriptLoaded = true
             sessions[index].isTranscriptDirty = false
-            materializedTranscriptLRU.removeAll { $0 == id }
+            finishTranscriptAccess(sessionID: request.sessionID)
+        }
+    }
+
+    private func finishTranscriptAccess(sessionID: UUID) {
+        guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
+        materializedTranscriptLRU.recordAccess(sessionID)
+        _ = transcriptRenderWindows.activate(sessionID: sessionID, messageCount: sessions[index].messages.count)
+
+        let protectedIDs = Set(sessions.lazy.filter {
+            $0.id == self.selectedSessionID || $0.isStreaming || $0.isTranscriptDirty || $0.transcriptStorage == nil
+        }.map(\.id))
+        for id in materializedTranscriptLRU.evictionCandidates(protectedIDs: protectedIDs) {
+            guard let victimIndex = sessions.firstIndex(where: { $0.id == id }) else {
+                materializedTranscriptLRU.remove(id)
+                continue
+            }
+            sessions[victimIndex].messages = []
+            sessions[victimIndex].isTranscriptLoaded = false
+            sessions[victimIndex].isTranscriptDirty = false
+            transcriptRenderWindows.invalidate(sessionID: id)
+            materializedTranscriptLRU.remove(id)
         }
     }
 

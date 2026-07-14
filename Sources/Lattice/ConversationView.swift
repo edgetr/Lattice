@@ -17,7 +17,9 @@ struct ConversationView: View {
     var body: some View {
         VStack(spacing: 0) {
             if let session = state.selectedSession {
-                if session.messages.isEmpty {
+                if state.isSelectedTranscriptLoading {
+                    TranscriptLoadingView()
+                } else if session.messages.isEmpty {
                     EmptyConversationView(state: state)
                 } else {
                     ScrollViewReader { proxy in
@@ -329,6 +331,31 @@ struct ConversationView: View {
                 withTransaction(transaction, scroll)
             }
         }
+    }
+}
+
+private struct TranscriptLoadingView: View {
+    var body: some View {
+        VStack(spacing: 18) {
+            ProgressView()
+                .controlSize(.small)
+            VStack(alignment: .leading, spacing: 12) {
+                ForEach([0.92, 0.72, 0.84], id: \.self) { width in
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(.secondary.opacity(0.12))
+                        .frame(maxWidth: 560 * width, minHeight: 44, maxHeight: 44)
+                }
+            }
+            .frame(maxWidth: 560, alignment: .leading)
+            Text("Loading conversation…")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(28)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Loading conversation transcript")
+        .accessibilityIdentifier("lattice.conversation.loading")
     }
 }
 

@@ -68,6 +68,31 @@ struct SessionPersistenceTests {
         #expect(!leaveBEmpty.clearsEditState)
     }
 
+    @Test func composerSessionDraftTracksRapidSelectionIndependentlyOfTranscriptHydration() {
+        let chats = (0..<3).map { _ in UUID() }
+        var stored = [chats[0]: "A saved", chats[1]: "B saved", chats[2]: "C saved"]
+        var selected = chats[0]
+        var composer = stored[selected] ?? ""
+
+        for next in [chats[1], chats[2]] {
+            let transition = ComposerSessionDraftTransition.selecting(
+                from: selected,
+                to: next,
+                composerText: composer + " edited",
+                edit: nil,
+                storedDraftForNext: stored[next] ?? ""
+            )
+            stored[selected] = transition.previousSessionDraft
+            selected = next
+            composer = transition.composerDraft
+        }
+
+        #expect(selected == chats[2])
+        #expect(composer == "C saved")
+        #expect(stored[chats[0]] == "A saved edited")
+        #expect(stored[chats[1]] == "B saved edited")
+    }
+
     @Test func composerSessionDraftTransitionCancelsEditWithoutLeakingEditText() {
         let chatA = UUID()
         let chatB = UUID()

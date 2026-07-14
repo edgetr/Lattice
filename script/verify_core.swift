@@ -359,6 +359,24 @@ struct CoreVerification {
             expect(lazySession.totalMessageCount == 350, "Lazy session metadata preserves exact message count")
             expect(lazySession.lastMessagePreview == "lazy-message-349", "Lazy session metadata preserves bounded list preview")
             expect(lazySnapshot.searchIndex.candidateSessionIDs(for: "message-349", allSessionIDs: [longSession.id]) == [longSession.id], "Hashed index finds transcript without eager decode")
+            if let storage = lazySession.transcriptStorage {
+                let hydrationSession = lazySession
+                let request = TranscriptHydrationRequest(sessionID: lazySession.id, storage: storage)
+                let coordinator = TranscriptHydrationCoordinator()
+                let outcome = await coordinator.hydrate(request) { store.hydrationResult(for: hydrationSession) }
+                if case .loaded(let loadedRequest, let messages) = outcome {
+                    expect(loadedRequest == request && messages == longMessages, "Asynchronous transcript hydration preserves exact content")
+                } else {
+                    expect(false, "Asynchronous transcript hydration preserves exact content")
+                }
+                expect(TranscriptHydrationApplyPolicy.shouldApply(request: request, selectedSessionID: lazySession.id, currentSession: lazySession), "Clean selected transcript accepts current hydration generation")
+                var hydrationLRU = TranscriptHydrationLRU(maximumCount: 2)
+                let cachedIDs = [UUID(), UUID(), UUID()]
+                cachedIDs.forEach { hydrationLRU.recordAccess($0) }
+                expect(hydrationLRU.evictionCandidates(protectedIDs: [cachedIDs[0]]) == [cachedIDs[1]], "Hydration LRU evicts the oldest disposable transcript")
+            } else {
+                expect(false, "Lazy transcript retains durable hydration reference")
+            }
             try! store.materializeTranscript(in: &lazySession)
             expect(lazySession.messages == longMessages && !lazySession.isTranscriptDirty, "Selected transcript materializes exactly and remains clean")
         } else {

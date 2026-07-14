@@ -155,6 +155,17 @@ public struct SessionPersistence: Sendable {
         }
     }
 
+    /// Evidence-rich transcript read used by asynchronous selection hydration.
+    public func hydrationResult(for session: LatticeSession) -> TranscriptHydrationLoadResult {
+        var materialized = session
+        do {
+            try materializeTranscript(in: &materialized)
+            return .loaded(materialized.messages)
+        } catch {
+            return .failed(issueForTranscriptError(error))
+        }
+    }
+
     public static func storageReference(sessionID: UUID, messages: [ChatMessage]) throws -> SessionTranscriptStorage {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]

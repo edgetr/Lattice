@@ -4,6 +4,89 @@ import Testing
 
 @Suite("Lazy transcript performance and recovery")
 struct TranscriptPerformanceTests {
+    @Test func veryLargeTranscriptHydratesOffSelectionCoordinatorExactly() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SessionPersistence(fileURL: root.appendingPathComponent("sessions.json"))
+        let messages = (0..<50_000).map {
+            ChatMessage(role: $0.isMultiple(of: 2) ? .user : .assistant, text: "large-message-\($0)-" + String(repeating: "x", count: 80))
+        }
+        let session = LatticeSession(title: "Very large", messages: messages, backend: .codex(model: "gpt-5.4"))
+        try store.save([session])
+        let lazy = try #require(loaded(store.loadLazyResult())?.sessions.first)
+        let storage = try #require(lazy.transcriptStorage)
+        let request = TranscriptHydrationRequest(sessionID: lazy.id, storage: storage)
+        let coordinator = TranscriptHydrationCoordinator()
+
+        let outcome = await coordinator.hydrate(request) { store.hydrationResult(for: lazy) }
+        guard case .loaded(let loadedRequest, let loadedMessages) = outcome else {
+            Issue.record("Very large transcript should hydrate successfully")
+            return
+        }
+        #expect(loadedRequest == request)
+        #expect(loadedMessages.count == 50_000)
+        #expect(loadedMessages.last?.text.hasPrefix("large-message-49999-") == true)
+    }
+
+    @Test func rapidSwitchingAndCancellationRejectLateHydrationGenerations() async throws {
+        let requests = (0..<3).map { index -> TranscriptHydrationRequest in
+            let id = UUID()
+            return TranscriptHydrationRequest(
+                sessionID: id,
+                storage: SessionTranscriptStorage(fileName: "\(id.uuidString.lowercased())-\(index).json", messageCount: 1, contentFingerprint: "fingerprint-\(index)")
+            )
+        }
+        let gate = HydrationGate()
+        let coordinator = TranscriptHydrationCoordinator()
+
+        let first = Task { await coordinator.hydrate(requests[0]) { await gate.load(requests[0]) } }
+        await gate.waitUntilStarted(requests[0])
+        let second = Task { await coordinator.hydrate(requests[1]) { await gate.load(requests[1]) } }
+        await gate.waitUntilStarted(requests[1])
+        let third = Task { await coordinator.hydrate(requests[2]) { await gate.load(requests[2]) } }
+        await gate.waitUntilStarted(requests[2])
+
+        await gate.finish(requests[2], text: "C")
+        await gate.finish(requests[1], text: "B")
+        await gate.finish(requests[0], text: "A")
+
+        guard case .loaded(let winningRequest, let messages) = await third.value else {
+            Issue.record("Newest generation should win")
+            return
+        }
+        #expect(winningRequest == requests[2])
+        #expect(messages.map(\.text) == ["C"])
+        guard case .cancelled(let firstRequest) = await first.value else {
+            Issue.record("First generation should be cancelled")
+            return
+        }
+        guard case .cancelled(let secondRequest) = await second.value else {
+            Issue.record("Second generation should be cancelled")
+            return
+        }
+        #expect(firstRequest == requests[0])
+        #expect(secondRequest == requests[1])
+    }
+
+    @Test func explicitCancellationDropsCompletedDiskResult() async throws {
+        let id = UUID()
+        let request = TranscriptHydrationRequest(
+            sessionID: id,
+            storage: SessionTranscriptStorage(fileName: "\(id.uuidString.lowercased())-cancel.json", messageCount: 1, contentFingerprint: "cancel")
+        )
+        let gate = HydrationGate()
+        let coordinator = TranscriptHydrationCoordinator()
+        let hydration = Task { await coordinator.hydrate(request) { await gate.load(request) } }
+        await gate.waitUntilStarted(request)
+        await coordinator.cancel()
+        await gate.finish(request, text: "too late")
+        guard case .cancelled(let cancelledRequest) = await hydration.value else {
+            Issue.record("Cancelled hydration must not return loaded content")
+            return
+        }
+        #expect(cancelledRequest == request)
+    }
+
     @Test func lazyLoadDoesNotReadAnyTranscriptUntilMaterialized() throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -106,6 +189,57 @@ struct TranscriptPerformanceTests {
         #expect(try Data(contentsOf: transcriptURL) == corrupt)
     }
 
+    @Test func asynchronousMissingAndCorruptTranscriptFailuresStayTruthful() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SessionPersistence(fileURL: root.appendingPathComponent("sessions.json"))
+        let sessions = ["Missing", "Corrupt"].map {
+            LatticeSession(title: $0, messages: [.init(role: .user, text: $0)], backend: .codex(model: "gpt-5.4"))
+        }
+        try store.save(sessions)
+        let lazy = try #require(loaded(store.loadLazyResult()))
+        let missing = try #require(lazy.sessions.first(where: { $0.title == "Missing" }))
+        let corrupt = try #require(lazy.sessions.first(where: { $0.title == "Corrupt" }))
+        try FileManager.default.removeItem(at: store.transcriptDirectoryURL.appendingPathComponent(try #require(missing.transcriptStorage).fileName))
+        let corruptURL = store.transcriptDirectoryURL.appendingPathComponent(try #require(corrupt.transcriptStorage).fileName)
+        let corruptBytes = Data("[]".utf8)
+        try corruptBytes.write(to: corruptURL, options: .atomic)
+        let coordinator = TranscriptHydrationCoordinator()
+
+        for session in [missing, corrupt] {
+            let request = TranscriptHydrationRequest(sessionID: session.id, storage: try #require(session.transcriptStorage))
+            let outcome = await coordinator.hydrate(request) { store.hydrationResult(for: session) }
+            guard case .failed(let failedRequest, let issue) = outcome else {
+                Issue.record("Missing/corrupt transcript must fail observably")
+                continue
+            }
+            #expect(failedRequest == request)
+            #expect(issue.kind == (session.id == corrupt.id ? .corrupt : .unreadable))
+        }
+        #expect(try Data(contentsOf: corruptURL) == corruptBytes)
+    }
+
+    @Test func hydrationLRUEvictsOldestCleanEntriesAndProtectsDirtyInMemoryContent() throws {
+        var lru = TranscriptHydrationLRU(maximumCount: 3)
+        let ids = (0..<5).map { _ in UUID() }
+        ids.forEach { lru.recordAccess($0) }
+        #expect(lru.evictionCandidates(protectedIDs: [ids[0]]) == [ids[1], ids[2]])
+        lru.recordAccess(ids[1])
+        #expect(lru.orderedSessionIDs.last == ids[1])
+
+        let storage = SessionTranscriptStorage(fileName: "\(ids[4].uuidString.lowercased())-safe.json", messageCount: 1, contentFingerprint: "safe")
+        let request = TranscriptHydrationRequest(sessionID: ids[4], storage: storage)
+        var unloaded = LatticeSession(title: "Unloaded", transcriptStorage: storage, isTranscriptLoaded: false, backend: .codex(model: "gpt-5.4"))
+        #expect(TranscriptHydrationApplyPolicy.shouldApply(request: request, selectedSessionID: ids[4], currentSession: unloaded))
+        unloaded.messages = [.init(role: .user, text: "unsaved in-memory edit")]
+        #expect(!TranscriptHydrationApplyPolicy.shouldApply(request: request, selectedSessionID: ids[4], currentSession: unloaded))
+        unloaded.messages = []
+        unloaded.isTranscriptDirty = true
+        #expect(!TranscriptHydrationApplyPolicy.shouldApply(request: request, selectedSessionID: ids[4], currentSession: unloaded))
+        unloaded.isTranscriptDirty = false
+        #expect(!TranscriptHydrationApplyPolicy.shouldApply(request: request, selectedSessionID: ids[3], currentSession: unloaded))
+    }
+
     @Test func legacyMonolithicStoreMigratesOnSaveWithoutChangingConversation() throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -193,6 +327,26 @@ struct TranscriptPerformanceTests {
 
         func record(_ url: URL) {
             lock.lock(); paths.append(url.path); lock.unlock()
+        }
+    }
+
+    private actor HydrationGate {
+        private var continuations: [TranscriptHydrationRequest: CheckedContinuation<TranscriptHydrationLoadResult, Never>] = [:]
+        private var started: Set<TranscriptHydrationRequest> = []
+
+        func load(_ request: TranscriptHydrationRequest) async -> TranscriptHydrationLoadResult {
+            started.insert(request)
+            return await withCheckedContinuation { continuation in
+                continuations[request] = continuation
+            }
+        }
+
+        func waitUntilStarted(_ request: TranscriptHydrationRequest) async {
+            while !started.contains(request) { await Task.yield() }
+        }
+
+        func finish(_ request: TranscriptHydrationRequest, text: String) {
+            continuations.removeValue(forKey: request)?.resume(returning: .loaded([ChatMessage(role: .assistant, text: text)]))
         }
     }
 }
