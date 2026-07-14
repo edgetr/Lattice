@@ -162,6 +162,7 @@ final class DefaultLatticeExecutionCoordinator: LatticeExecutionCoordinating {
             return runtimes.antigravity.stream(
                 prompt: launch.prompt,
                 sessionID: launch.sessionID,
+                threadID: launch.threadID,
                 workspace: launch.workspace,
                 model: model,
                 policy: launch.policy

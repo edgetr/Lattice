@@ -52,7 +52,7 @@ public enum SessionActionTrail {
         var count = 0
         for index in actions.indices where actions[index].messageID == messageID {
             switch (actions[index].kind, actions[index].status) {
-            case (.tool, .running), (.plan, .running), (.reasoning, .running):
+            case (.tool, .running), (.plan, .running), (.reasoning, .running), (.harness, .running):
                 actions[index].status = .completed
             case (.approval, .waiting):
                 actions[index].status = .cancelled

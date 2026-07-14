@@ -249,6 +249,8 @@ final class AppState: ObservableObject {
     @Published var pendingCLIInstallProvider: String?
     @Published var antigravityInstalled = false
     @Published var antigravityAuthenticated = false
+    @Published var antigravityCatalogStatus: ProviderCatalogStatus = .unknown
+    @Published var antigravityProtocolSupport: AntigravityCLIProtocol = .transcript(reason: "Not checked.")
     @Published var antigravityModels: [ProviderModel] = []
     @Published var antigravityCLIVersion: String?
     @Published var antigravityLatestCLIVersion: String?
@@ -2398,9 +2400,15 @@ final class AppState: ObservableObject {
 
     private var antigravityReadinessDetail: String {
         guard antigravityInstalled else { return "Not installed" }
+        switch antigravityCatalogStatus {
+        case .unknown: return "Provider health not checked"
+        case .loading: return "Checking provider health"
+        case .failed: return "Provider model catalog unavailable"
+        case .empty: return "No models reported"
+        case .loaded: break
+        }
         guard antigravityAuthenticated else { return "Sign in required" }
-        guard !antigravityModels.isEmpty else { return "No models reported" }
-        return "Connected"
+        return antigravityProtocolSupport.isStructured ? "Connected · structured events" : "Connected · transcript events only"
     }
 
     private func codeRouteReadinessDetail(providerID: String) -> String {
@@ -2986,6 +2994,7 @@ final class AppState: ObservableObject {
             codex: codexCatalogStatus,
             grok: grokCatalogStatus,
             openCode: openCodeCatalogStatus,
+            antigravity: antigravityCatalogStatus,
             hermes: hermesCatalogStatus,
             ollama: ollamaCatalogStatus
         )
@@ -2996,6 +3005,7 @@ final class AppState: ObservableObject {
                     if codexCatalogStatus == .loading { codexCatalogStatus = previousCatalogStatuses.codex }
                     if grokCatalogStatus == .loading { grokCatalogStatus = previousCatalogStatuses.grok }
                     if openCodeCatalogStatus == .loading { openCodeCatalogStatus = previousCatalogStatuses.openCode }
+                    if antigravityCatalogStatus == .loading { antigravityCatalogStatus = previousCatalogStatuses.antigravity }
                     if hermesCatalogStatus == .loading { hermesCatalogStatus = previousCatalogStatuses.hermes }
                     if ollamaCatalogStatus == .loading,
                        localModelRefreshGeneration.isCurrent(localGeneration) {
@@ -3108,18 +3118,24 @@ final class AppState: ObservableObject {
         if antigravity.isInstalled != (executable != nil) {
             antigravity = AntigravityCLIHarness(executableURL: executable)
         }
+        antigravityCatalogStatus = .loading
         async let antigravityVersion = Self.commandOutput("agy", ["--version"])
         async let antigravityLatest = Self.latestCLIVersion(executableName: "agy", homebrewFormula: nil, homebrewCask: "antigravity-cli", npmPackage: nil, pnpmPackage: nil, directPackage: "@google/antigravity-cli")
-        async let antigravityCatalog = antigravity.models()
+        async let antigravityProtocol = antigravity.protocolSupport()
+        async let antigravityCatalog = antigravity.modelsResult()
         let version = await antigravityVersion
         let latest = await antigravityLatest
-        let models = await antigravityCatalog
+        let protocolSupport = await antigravityProtocol
+        let catalog = await antigravityCatalog
+        let models = catalog.models
         // A successful provider-owned catalog command is the authentication
         // probe. Never read Antigravity's OAuth token file in Lattice.
         let authenticated = executable != nil && !models.isEmpty
         guard canApplyCatalogRefresh(generation) else { return }
         antigravityInstalled = executable != nil
         antigravityAuthenticated = authenticated
+        antigravityCatalogStatus = catalog.status
+        antigravityProtocolSupport = protocolSupport
         antigravityModels = models
         antigravityCLIVersion = CLIVersionDisplayPolicy.normalizedVersion(version)
         antigravityLatestCLIVersion = latest
@@ -6170,6 +6186,33 @@ Lattice self-edit rules:
                 detail: cancellation.detail ?? cancellation.reason.rawValue
             ), sessionID: id)
         case .metric: break
+        case .harnessActivity(let activity):
+            let icon: String = switch activity.status {
+            case .running: "terminal"
+            case .completed: "checkmark.circle"
+            case .failed: "xmark.octagon"
+            case .cancelled: "stop.circle"
+            case .degraded, .unsupported: "exclamationmark.triangle"
+            }
+            upsertActivity(.init(icon: icon, title: activity.title, detail: activity.detail), sessionID: id)
+            if let messageID = sessions[index].messages.last(where: { $0.role == .assistant })?.id {
+                let status: SessionAction.Status = switch activity.status {
+                case .running: .running
+                case .completed: .completed
+                case .failed: .failed
+                case .cancelled: .cancelled
+                case .degraded, .unsupported: .completed
+                }
+                upsertSessionAction(.init(
+                    id: activity.id,
+                    messageID: messageID,
+                    kind: .harness,
+                    title: activity.title,
+                    detail: activity.detail,
+                    status: status
+                ), at: index)
+                persist()
+            }
         case .providerDiagnostic(let diagnostic):
             upsertActivity(.init(icon: "exclamationmark.triangle", title: diagnostic.title, detail: diagnostic.detail), sessionID: id)
             if let action = ProviderDiagnosticRetentionPolicy.action(

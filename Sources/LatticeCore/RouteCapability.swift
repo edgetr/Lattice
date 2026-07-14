@@ -96,7 +96,7 @@ public enum RouteConnectionCaption: Sendable {
         case "grok", "opencode", "hermes", "pi":
             "Lattice write containment · provider-owned tools"
         case "antigravity":
-            "Provider sandbox option · transcript route"
+            "Provider sandbox option · runtime-probed events"
         default:
             nil
         }
@@ -417,14 +417,14 @@ public struct RouteCapability: Equatable, Sendable {
                 networkRestriction: unrestrictedNetwork(owner: "Antigravity"),
                 credentialReadProtection: noCredentialProtection(owner: "Antigravity provider tools"),
                 structuredEvents: RouteCapabilityDetail(
-                    assurance: .absent,
-                    summary: "Transcript only",
-                    detail: "Antigravity streams transcript text; it does not expose structured tool events on this route."
+                    assurance: .unknown,
+                    summary: "Runtime-probed",
+                    detail: "Lattice uses structured Antigravity events only when the installed CLI explicitly advertises stream-json; otherwise this route reports degraded transcript output."
                 ),
                 providerSessionResume: RouteCapabilityDetail(
-                    assurance: .absent,
-                    summary: "No provider session resume",
-                    detail: "Antigravity print mode does not resume a provider-owned interactive session."
+                    assurance: .unknown,
+                    summary: "Runtime-probed",
+                    detail: "Lattice resumes only a provider session ID received from a declared structured init event. Transcript output is never scraped for session identity."
                 ),
                 cancellation: RouteCapabilityDetail(
                     assurance: .present,
@@ -458,14 +458,14 @@ public struct RouteCapability: Equatable, Sendable {
                 networkRestriction: unrestrictedNetwork(owner: "Antigravity"),
                 credentialReadProtection: noCredentialProtection(owner: "Antigravity provider tools"),
                 structuredEvents: RouteCapabilityDetail(
-                    assurance: .absent,
-                    summary: "Transcript only",
-                    detail: "Antigravity streams transcript text; it does not expose structured tool events on this route."
+                    assurance: .unknown,
+                    summary: "Runtime-probed",
+                    detail: "Lattice uses structured Antigravity events only when the installed CLI explicitly advertises stream-json; otherwise this route reports degraded transcript output."
                 ),
                 providerSessionResume: RouteCapabilityDetail(
-                    assurance: .absent,
-                    summary: "No provider session resume",
-                    detail: "Antigravity print mode does not resume a provider-owned interactive session."
+                    assurance: .unknown,
+                    summary: "Runtime-probed",
+                    detail: "Lattice resumes only a provider session ID received from a declared structured init event. Transcript output is never scraped for session identity."
                 ),
                 cancellation: RouteCapabilityDetail(
                     assurance: .present,

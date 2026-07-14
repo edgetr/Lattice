@@ -167,8 +167,9 @@ struct RouteCapabilityTests {
         #expect(capability.brokerMediation == .notMediated)
         #expect(capability.writeContainmentKind == .providerDeclaredSandbox)
         #expect(capability.approvalBehaviorKind == .planOnly)
-        #expect(capability.structuredEvents.assurance == .absent)
-        #expect(capability.structuredEvents.summary.localizedCaseInsensitiveContains("transcript"))
+        #expect(capability.structuredEvents.assurance == .unknown)
+        #expect(capability.structuredEvents.summary.localizedCaseInsensitiveContains("runtime"))
+        #expect(capability.providerSessionResume.detail.localizedCaseInsensitiveContains("never scraped"))
         #expect(capability.approvalBehavior.summary.localizedCaseInsensitiveContains("plan"))
         #expect(capability.warnings.contains(where: { $0.localizedCaseInsensitiveContains("independently verify") }))
     }
@@ -178,7 +179,7 @@ struct RouteCapabilityTests {
         #expect(capability.brokerMediation == .notMediated)
         #expect(capability.writeContainmentKind == .providerDeclaredSandbox)
         #expect(capability.approvalBehaviorKind == .disabled)
-        #expect(capability.structuredEvents.assurance == .absent)
+        #expect(capability.structuredEvents.assurance == .unknown)
         #expect(capability.approvalBehavior.summary.localizedCaseInsensitiveContains("disabled") ||
                 capability.approvalBehavior.detail.localizedCaseInsensitiveContains("dangerously-skip-permissions"))
         #expect(capability.warnings.contains(where: { $0.localizedCaseInsensitiveContains("permissions") }))

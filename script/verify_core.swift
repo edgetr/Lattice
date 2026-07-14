@@ -241,7 +241,7 @@ struct CoreVerification {
         expect(piAsk.fileReadRestriction.assurance == .absent && piAsk.networkRestriction.assurance == .absent, "Pi does not claim read/network restriction")
         let antigravityAsk = RouteCapability.resolve(harnessID: "antigravity", policy: .ask)
         expect(antigravityAsk.approvalBehaviorKind == .planOnly && antigravityAsk.writeContainmentKind == .providerDeclaredSandbox, "Antigravity Ask is plan-only with provider-declared sandbox")
-        expect(antigravityAsk.structuredEvents.assurance == .absent, "Antigravity transcript route does not claim structured tool events")
+        expect(antigravityAsk.structuredEvents.assurance == .unknown, "Antigravity structured event support remains runtime-probed")
         let antigravityYolo = RouteCapability.resolve(harnessID: "antigravity", policy: .yolo)
         expect(antigravityYolo.approvalBehaviorKind == .disabled, "Antigravity YOLO disables provider permissions")
         let latticeLocal = RouteCapability.resolve(harnessID: "lattice", policy: .smart)
@@ -250,7 +250,7 @@ struct CoreVerification {
         expect(unknownRoute.brokerMediation == .notMediated && unknownRoute.writeContainment.assurance == .unknown, "Unknown harness falls back conservatively")
         expect(RouteConnectionCaption.caption(forHarnessID: "codex") == "Provider-owned tools · policy-dependent sandbox", "Codex Connections caption is policy-agnostic")
         expect(RouteConnectionCaption.caption(forHarnessID: "grok") == "Lattice write containment · provider-owned tools", "ACP Connections caption is truthful and invariant")
-        expect(RouteConnectionCaption.caption(forHarnessID: "antigravity") == "Provider sandbox option · transcript route", "Antigravity Connections caption is truthful and invariant")
+        expect(RouteConnectionCaption.caption(forHarnessID: "antigravity") == "Provider sandbox option · runtime-probed events", "Antigravity Connections caption is truthful and invariant")
         let privacyBody = LatticeSettingsCopy.privacySecurityBody
         expect(privacyBody.localizedCaseInsensitiveContains("LocalToolBroker") && privacyBody.localizedCaseInsensitiveContains("route- and policy-dependent"), "Privacy copy discloses unbrokered provider tools and non-universal containment")
         expect(!privacyBody.localizedCaseInsensitiveContains("tool writes are limited to the selected workspace"), "Privacy copy no longer claims universal workspace write limits")
@@ -3156,6 +3156,41 @@ struct CoreVerification {
         )
         expect(redactedCLIMessage.contains("[REDACTED]"), "CLI failure summaries redact credential-shaped output")
         expect(!redactedCLIMessage.contains("abcdefghijklmnop"), "CLI failure summaries do not expose token material")
+        let redactedHarnessDetail = CLIActionStatusPolicy.redactedDetail("$ curl -H 'Authorization: Bearer abcdefghijklmnop'")
+        expect(redactedHarnessDetail.contains("[REDACTED]") && !redactedHarnessDetail.contains("abcdefghijklmnop"), "Harness activity details redact credential-shaped command arguments")
+
+        expect(
+            AntigravityCLIProtocol.detect(helpOutput: "--print --conversation")
+                == .transcript(reason: "This Antigravity CLI does not advertise stream-json output."),
+            "Antigravity protocol detection keeps transcript-only runtimes degraded"
+        )
+        expect(
+            AntigravityCLIProtocol.detect(helpOutput: "--output-format text|json|stream-json") == .streamJSON,
+            "Antigravity protocol detection enables an explicitly advertised JSONL surface"
+        )
+        let antigravityWorkspace = URL(fileURLWithPath: "/tmp/Lattice-Antigravity")
+        let antigravityInit = AntigravityCLIHarness.structuredEvent(
+            from: Data(#"{"type":"init","session_id":"provider-session"}"#.utf8),
+            workspace: antigravityWorkspace
+        )
+        expect(antigravityInit == [.harnessSessionStarted("provider-session")], "Antigravity structured init exposes the provider session boundary")
+        let antigravityTool = AntigravityCLIHarness.structuredEvent(
+            from: Data(#"{"type":"tool_use","tool_id":"tool-1","tool_name":"run_command","parameters":{"command":"swift test"}}"#.utf8),
+            workspace: antigravityWorkspace
+        )
+        if case .toolRequested(let request)? = antigravityTool.first {
+            expect(request.kind == .command && request.detail == "$ swift test", "Antigravity structured tool calls expose bounded command metadata")
+        } else {
+            expect(false, "Antigravity structured tool calls expose bounded command metadata")
+        }
+        let antigravityMalformed = AntigravityCLIHarness.structuredEvent(from: Data("not-json".utf8), workspace: antigravityWorkspace)
+        expect(antigravityMalformed.contains(where: { if case .providerDiagnostic = $0 { return true }; return false }), "Malformed Antigravity JSONL becomes an observable diagnostic")
+        let antigravityUnknown = AntigravityCLIHarness.structuredEvent(from: Data(#"{"type":"invented","secret":"not surfaced"}"#.utf8), workspace: antigravityWorkspace)
+        if case .providerDiagnostic(let diagnostic)? = antigravityUnknown.first {
+            expect(diagnostic.eventType == "invented" && !diagnostic.detail.contains("not surfaced"), "Unknown Antigravity events retain metadata without payload values")
+        } else {
+            expect(false, "Unknown Antigravity events retain metadata without payload values")
+        }
 
         print("Core verification passed: \(checks) checks")
     }

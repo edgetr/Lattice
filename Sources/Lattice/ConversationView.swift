@@ -1353,6 +1353,7 @@ private struct SessionActionDetailRow: View {
         case .approval: return action.status == .waiting ? "hand.raised.fill" : "checkmark.shield"
         case .plan: return "list.bullet.clipboard"
         case .reasoning: return "brain"
+        case .harness: return "terminal"
         case .diagnostic: return "exclamationmark.triangle"
         case .tool: break
         }

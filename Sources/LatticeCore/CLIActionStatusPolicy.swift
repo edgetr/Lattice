@@ -86,6 +86,10 @@ public enum CLIActionStatusPolicy {
         return "\(prefix): \(String(sanitizeFailureDetail(String(text.prefix(maximumSanitizationInputLength))).prefix(maximumFailureDetailLength)))"
     }
 
+    public static func redactedDetail(_ text: String, limit: Int = 600) -> String {
+        String(sanitizeFailureDetail(String(text.prefix(maximumSanitizationInputLength))).prefix(max(0, limit)))
+    }
+
     private static func sanitizeFailureDetail(_ text: String) -> String {
         var sanitized = text
         for (patternSource, replacement) in redactionPatterns {

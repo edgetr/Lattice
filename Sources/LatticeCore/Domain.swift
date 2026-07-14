@@ -305,6 +305,31 @@ public struct ProviderEventDiagnostic: Hashable, Sendable {
     }
 }
 
+public struct HarnessActivityEvent: Hashable, Sendable {
+    public enum Status: String, Hashable, Sendable {
+        case running
+        case completed
+        case failed
+        case cancelled
+        case degraded
+        case unsupported
+    }
+
+    public let id: UUID
+    public let provider: String
+    public let title: String
+    public let detail: String
+    public let status: Status
+
+    public init(id: UUID, provider: String, title: String, detail: String, status: Status) {
+        self.id = id
+        self.provider = String(provider.prefix(80))
+        self.title = String(title.prefix(160))
+        self.detail = String(detail.prefix(600))
+        self.status = status
+    }
+}
+
 public enum AgentEvent: Sendable, Equatable {
     case sessionStarted(UUID)
     case harnessSessionStarted(String)
@@ -323,6 +348,7 @@ public enum AgentEvent: Sendable, Equatable {
     /// Supplies the reason before the legacy terminal `cancelled` marker.
     case runCancelled(AgentCancellation)
     case metric(name: String, value: Double, unit: String)
+    case harnessActivity(HarnessActivityEvent)
     case providerDiagnostic(ProviderEventDiagnostic)
     case completed
     case cancelled
@@ -740,7 +766,7 @@ public struct ApprovalProvenance: Hashable, Codable, Sendable {
 }
 
 public struct SessionAction: Identifiable, Hashable, Codable, Sendable {
-    public enum Kind: String, Codable, Sendable { case tool, approval, plan, reasoning, diagnostic }
+    public enum Kind: String, Codable, Sendable { case tool, approval, plan, reasoning, harness, diagnostic }
     public enum Status: String, Codable, Sendable { case running, waiting, completed, failed, allowed, denied, cancelled, interrupted }
 
     public let id: UUID
