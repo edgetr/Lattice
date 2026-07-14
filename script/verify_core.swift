@@ -761,6 +761,8 @@ struct CoreVerification {
         expect(LatticeAppCommandCatalog.suggestions(for: "self-edit").isEmpty, "Slash command catalog requires slash prefix")
         expect(CommandSuggestionLayoutPolicy.height(resultCount: 0) == 0, "Empty slash suggestions reserve no height")
         expect(CommandSuggestionLayoutPolicy.height(resultCount: 100) == 378, "Large slash catalogs use a bounded viewport")
+        expect(OllamaClient.deleteTimeout > 0, "Local model deletion has a bounded request timeout")
+        expect(OllamaModelDeletionResult.deleted == .deleted, "Local model deletion result represents confirmed success")
         let templateCommand = LatticePromptTemplate(invocation: "/brief", title: "Brief", detail: "Make concise", prompt: "Make this concise.").command
         expect(LatticeAppCommandCatalog.suggestions(for: "/b", commands: LatticeAppCommandCatalog.all + [templateCommand]).first?.invocation == "/brief", "Extension prompt template appears in slash suggestions")
         expect(LatticeAppCommandCatalog.completion(for: "/b", commands: LatticeAppCommandCatalog.all + [templateCommand])?.replacementText == "Make this concise.", "Extension prompt template inserts prompt text")

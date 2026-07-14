@@ -173,6 +173,9 @@ final class AppState: ObservableObject {
     @Published var selectedWorkspacePath: String
     @Published var installingModelTag: String?
     @Published var installStatus: String?
+    @Published var showDeleteLocalModelConfirmation = false
+    @Published var pendingDeleteLocalModelName: String?
+    @Published private(set) var deletingLocalModelName: String?
     @Published var localModelIdleUnloadMinutes: Int
     @Published var localModelStatus: String?
     @Published var codexReady = false
@@ -4688,6 +4691,54 @@ Lattice self-edit rules:
     }
 
     func cancelModelInstall() { modelInstaller.cancel() }
+
+    func canDeleteLocalModel(named model: String) -> Bool {
+        ollamaReady
+            && ollamaCatalogStatus == .loaded
+            && ollamaModels.contains(where: { $0.name == model })
+            && installingModelTag == nil
+            && deletingLocalModelName == nil
+            && !sessions.contains(where: { session in
+                session.isStreaming && session.backend == .ollama(model: model)
+            })
+    }
+
+    func requestDeleteLocalModel(named model: String) {
+        guard canDeleteLocalModel(named: model) else {
+            localModelStatus = "This model cannot be deleted while it is unavailable, refreshing, or running a response."
+            return
+        }
+        pendingDeleteLocalModelName = model
+        showDeleteLocalModelConfirmation = true
+    }
+
+    func cancelPendingLocalModelDeletion() {
+        showDeleteLocalModelConfirmation = false
+        pendingDeleteLocalModelName = nil
+    }
+
+    func confirmPendingLocalModelDeletion() {
+        guard let model = pendingDeleteLocalModelName, canDeleteLocalModel(named: model) else {
+            cancelPendingLocalModelDeletion()
+            return
+        }
+        showDeleteLocalModelConfirmation = false
+        pendingDeleteLocalModelName = nil
+        deletingLocalModelName = model
+        localModelStatus = "Deleting \(model)…"
+        Task {
+            await ollama.unload(model: model)
+            let result = await ollama.deleteModel(named: model)
+            deletingLocalModelName = nil
+            switch result {
+            case .deleted:
+                localModelStatus = "Deleted \(model). Existing chats keep their history, but cannot run this route until the model is installed again."
+                await refreshLocalModels()
+            case .failed(let message):
+                localModelStatus = message
+            }
+        }
+    }
 
     private func validBackend(_ backend: ChatBackend) -> ChatBackend {
         BackendAvailabilityPolicy.normalize(backend, using: BackendAvailabilitySnapshot(

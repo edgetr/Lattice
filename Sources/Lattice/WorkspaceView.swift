@@ -74,6 +74,12 @@ struct WorkspaceView: View {
                 Text("This removes this generated skill from Lattice’s managed Skills folder. Extensions that own their own skills can recreate them when applied again.")
             }
         }
+        .alert("Delete local model?", isPresented: $state.showDeleteLocalModelConfirmation) {
+            Button("Cancel", role: .cancel) { state.cancelPendingLocalModelDeletion() }
+            Button("Delete", role: .destructive) { state.confirmPendingLocalModelDeletion() }
+        } message: {
+            Text("This removes \(state.pendingDeleteLocalModelName ?? "the model") from Ollama on this Mac. Existing chat history remains, but that route will be unavailable until reinstalled.")
+        }
         .alert(
             "Download \(state.pendingCLIInstallProvider.map(Self.cliDisplayName) ?? "CLI")?",
             isPresented: Binding(

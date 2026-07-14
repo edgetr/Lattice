@@ -12,6 +12,11 @@ public struct OllamaModel: Identifiable, Hashable, Codable, Sendable {
     }
 }
 
+public enum OllamaModelDeletionResult: Equatable, Sendable {
+    case deleted
+    case failed(String)
+}
+
 // MARK: - Transport
 
 /// Minimal HTTP surface for Ollama so production uses `URLSession` and tests inject deterministic behavior.
@@ -63,6 +68,7 @@ public final class OllamaClient: @unchecked Sendable {
     public static let tagsTimeout: TimeInterval = 10
     public static let detailTimeout: TimeInterval = 10
     public static let unloadTimeout: TimeInterval = 10
+    public static let deleteTimeout: TimeInterval = 15
     /// Chat streams can run for a long time; this bounds connection establishment / stall only.
     public static let chatTimeout: TimeInterval = 600
 
@@ -319,6 +325,33 @@ public final class OllamaClient: @unchecked Sendable {
     public func unloadActive() async {
         let model = lock.withLock { activeModel }
         if let model { await unload(model: model) }
+    }
+
+    /// Deletes an installed model through Ollama's bounded local API. Response
+    /// bodies are intentionally not surfaced because they are not trusted UI copy.
+    public func deleteModel(named model: String) async -> OllamaModelDeletionResult {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let url = endpoint("/api/delete") else {
+            return .failed("Choose an installed local model to delete.")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = Self.deleteTimeout
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["model": trimmed])
+        do {
+            let (_, response) = try await transport.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                return .failed("Ollama returned an invalid response while deleting the model.")
+            }
+            guard (200..<300).contains(http.statusCode) else {
+                return .failed("Ollama could not delete the model (HTTP \(http.statusCode)).")
+            }
+            lock.withLock { if activeModel == trimmed { activeModel = nil } }
+            return .deleted
+        } catch {
+            return .failed("Ollama could not delete the model. Make sure it is running, then try again.")
+        }
     }
 
     // MARK: - Internals

@@ -206,10 +206,17 @@ struct ModelsView: View {
                                         Text(ByteCountFormatter.string(fromByteCount: model.size, countStyle: .file)).font(.caption).foregroundStyle(.secondary)
                                     }
                                     Spacer(minLength: 8)
-                                    Button("Start Chat") { state.startNewChat(with: backend) }
-                                        .disabled(!runnable)
-                                        .accessibilityHint(runnable ? "Start a new chat with \(model.name)." : (state.backendUnavailableMessage(for: backend) ?? "This local model is unavailable."))
-                                        .help(runnable ? "Start a new chat with \(model.name)." : (state.backendUnavailableMessage(for: backend) ?? "This local model is unavailable."))
+                                    VStack(alignment: .trailing, spacing: 6) {
+                                        Button("Start Chat") { state.startNewChat(with: backend) }
+                                            .disabled(!runnable)
+                                            .accessibilityHint(runnable ? "Start a new chat with \(model.name)." : (state.backendUnavailableMessage(for: backend) ?? "This local model is unavailable."))
+                                            .help(runnable ? "Start a new chat with \(model.name)." : (state.backendUnavailableMessage(for: backend) ?? "This local model is unavailable."))
+                                        Button("Delete", role: .destructive) { state.requestDeleteLocalModel(named: model.name) }
+                                            .buttonStyle(.link)
+                                            .disabled(!state.canDeleteLocalModel(named: model.name))
+                                            .accessibilityHint("Remove \(model.name) from Ollama on this Mac.")
+                                            .help(state.canDeleteLocalModel(named: model.name) ? "Delete \(model.name) from this Mac" : "A model can be deleted after Ollama finishes refreshing or running it")
+                                    }
                                 }
                                 .padding(LatticeMetrics.cardPadding)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -221,6 +228,14 @@ struct ModelsView: View {
 
                 if !state.ollamaReady || state.ollamaCatalogStatus != .loaded {
                     ollamaStatusCard
+                }
+
+                if let status = state.localModelStatus {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(status.hasPrefix("Deleted ") ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityAddTraits(.updatesFrequently)
                 }
 
                 VStack(alignment: .leading, spacing: 10) {

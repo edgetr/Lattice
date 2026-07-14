@@ -83,6 +83,24 @@ struct OllamaClientTests {
         #expect(events == [.cancelled])
     }
 
+    @Test func deleteUsesBoundedOllamaDeleteRequest() async {
+        let transport = DeleteFixtureTransport(statusCode: 200)
+        let result = await OllamaClient(transport: transport).deleteModel(named: "qwen:7b")
+        let request = await transport.capturedRequest
+
+        #expect(result == .deleted)
+        #expect(request?.url?.path == "/api/delete")
+        #expect(request?.httpMethod == "DELETE")
+        #expect(request?.timeoutInterval == OllamaClient.deleteTimeout)
+        let body = request?.httpBody.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: String] }
+        #expect(body?["model"] == "qwen:7b")
+    }
+
+    @Test func deleteFailureIsTruthfulAndDoesNotClaimSuccess() async {
+        let result = await OllamaClient(transport: DeleteFixtureTransport(statusCode: 409)).deleteModel(named: "busy")
+        #expect(result == .failed("Ollama could not delete the model (HTTP 409)."))
+    }
+
     private func collectEvents(from transport: any OllamaTransport) async -> [AgentEvent] {
         let client = OllamaClient(transport: transport)
         var events: [AgentEvent] = []
@@ -94,6 +112,22 @@ struct OllamaClientTests {
             events.append(event)
         }
         return events
+    }
+}
+
+private actor DeleteFixtureTransport: OllamaTransport {
+    let statusCode: Int
+    private(set) var capturedRequest: URLRequest?
+
+    init(statusCode: Int) { self.statusCode = statusCode }
+
+    func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+        capturedRequest = request
+        return (Data(), HTTPURLResponse(url: request.url!, statusCode: statusCode, httpVersion: nil, headerFields: nil)!)
+    }
+
+    func streamLines(for request: URLRequest) async throws -> (AsyncThrowingStream<String, Error>, URLResponse) {
+        fatalError("Delete fixture does not implement streaming requests")
     }
 }
 
