@@ -191,6 +191,17 @@ struct HermesACPHarnessTests {
         #expect(environment["XAI_API_KEY"] == nil)
         #expect(environment["CODEX_AUTH_TOKEN"] == nil)
         #expect(environment["AUTH_TOKEN"] == nil)
+
+        let zenRoute = LatticeHermesWorkRoute(provider: "opencode-zen", model: "opencode-zen:free")
+        let zenEnvironment = try profile.launchEnvironment(
+            base: base,
+            temporaryDirectory: scratch,
+            route: zenRoute,
+            opencodeAPIKey: "opencode-test-key"
+        )
+        #expect(zenEnvironment["OPENCODE_ZEN_API_KEY"] == "opencode-test-key")
+        #expect(zenEnvironment["OPENCODE_GO_API_KEY"] == nil)
+        #expect(zenEnvironment["OPENCODE_API_KEY"] == nil)
     }
 
     private func verifyWorkRouteAndReadinessFailClosed() throws {

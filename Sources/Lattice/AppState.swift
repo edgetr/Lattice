@@ -2138,8 +2138,8 @@ final class AppState: ObservableObject {
         let hermesSystemIdentity = envelope.map {
             [$0.renderedSystemInstructions, trustedInstructions].filter { !$0.isEmpty }.joined(separator: "\n\n")
         }
-        let openCodeAPIKey = session.executionRoute.providerID == "opencode"
-            ? KeychainStore.read(account: "opencode-go-api-key")
+        let openCodeAPIKey = OpenCodeCredentialPolicy.allowsKeychainCredential(for: session.executionRoute)
+            ? KeychainStore.read(account: OpenCodeCredentialPolicy.keychainAccount)
             : nil
         let appleTranscript: String? = session.backend == .appleIntelligence
             ? LatticeBackendMessageBuilder.transcript(session: session, submittedText: submittedText, additionalContext: additionalContext, contextPlan: contextPlan)

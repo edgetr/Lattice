@@ -50,7 +50,7 @@ public enum ExecutionRoutePolicy {
     }
 }
 
-public enum ExecutionRouteReadiness: Equatable, Codable, Sendable {
+public enum ExecutionRouteReadiness: Equatable, Hashable, Codable, Sendable {
     case loading
     case missingRuntime
     case authenticationRequired

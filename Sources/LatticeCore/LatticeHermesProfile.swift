@@ -20,7 +20,7 @@ public enum LatticeHermesProfileError: LocalizedError, Equatable, Sendable {
         case .invalidModel(let model):
             "Hermes Work model contains unsupported control characters: \(model)."
         case .credentialInjectionNotAllowed:
-            "Only OPENCODE_API_KEY may be injected, and only for an OpenCode route."
+            "Only the provider-specific OpenCode key may be injected, and only for an OpenCode Work route."
         case .invalidHome(let path):
             "Hermes profile home is not a directory: \(path)."
         case .writeFailed(let detail):
@@ -70,6 +70,14 @@ public struct LatticeHermesWorkRoute: Equatable, Hashable, Sendable {
 
     public var isOpenCodeRoute: Bool {
         LatticeHermesProvider(rawValue: provider)?.isOpenCode == true
+    }
+
+    public var openCodeCredentialEnvironmentKey: String? {
+        switch LatticeHermesProvider(rawValue: provider) {
+        case .openCodeGo: "OPENCODE_GO_API_KEY"
+        case .openCodeZen: "OPENCODE_ZEN_API_KEY"
+        default: nil
+        }
     }
 
     public func validate() throws {
@@ -167,6 +175,18 @@ public final class LatticeHermesProfile: @unchecked Sendable {
     public static let soulFileName = "SOUL.md"
     public static let workToolPolicy = LatticeHermesWorkToolPolicy()
 
+    /// Conservative parser for `hermes auth status` output. Only explicit
+    /// logged-in/authenticated wording can pass; file contents are irrelevant.
+    public static func isLoggedInStatusOutput(_ output: String) -> Bool {
+        let status = output.lowercased()
+        let loggedOutMarkers = [
+            "not logged in", "logged out", "not authenticated", "unauthenticated",
+            "no credentials", "no credential", "missing credentials"
+        ]
+        guard !loggedOutMarkers.contains(where: status.contains) else { return false }
+        return ["logged in", "authenticated", "signed in"].contains(where: status.contains)
+    }
+
     public let homeURL: URL
     public let hermesHomeURL: URL
     public let configURL: URL
@@ -240,15 +260,16 @@ public final class LatticeHermesProfile: @unchecked Sendable {
     }
 
     /// Build child-process env from a non-secret allowlist. Parent provider
-    /// credentials never cross this boundary. `OPENCODE_API_KEY` is the sole
-    /// opt-in secret, and only reaches OpenCode routes.
+    /// credentials never cross this boundary. One selected OpenCode key may
+    /// cross only as the provider-specific environment name required by Hermes.
     public func launchEnvironment(
         base: [String: String] = ProcessInfo.processInfo.environment,
         temporaryDirectory: URL,
         route: LatticeHermesWorkRoute? = nil,
         opencodeAPIKey: String? = nil
     ) throws -> [String: String] {
-        if let opencodeAPIKey, !opencodeAPIKey.isEmpty,
+        if let opencodeAPIKey,
+           !opencodeAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            route?.isOpenCodeRoute != true {
             throw LatticeHermesProfileError.credentialInjectionNotAllowed
         }
@@ -266,10 +287,24 @@ public final class LatticeHermesProfile: @unchecked Sendable {
         environment["TMPDIR"] = temporaryDirectory.path.hasSuffix("/")
             ? temporaryDirectory.path
             : temporaryDirectory.path + "/"
-        if let route, route.isOpenCodeRoute, let opencodeAPIKey, !opencodeAPIKey.isEmpty {
-            environment["OPENCODE_API_KEY"] = opencodeAPIKey
+        if let route,
+           let environmentKey = route.openCodeCredentialEnvironmentKey,
+           let opencodeAPIKey = opencodeAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !opencodeAPIKey.isEmpty {
+            environment[environmentKey] = opencodeAPIKey
         }
         return environment
+    }
+
+    public static func redactedEnvironment(_ environment: [String: String]) -> [String: String] {
+        environment.mapValues { value in
+            value
+        }.reduce(into: [String: String]()) { result, entry in
+            let key = entry.key.uppercased()
+            result[entry.key] = key.contains("API_KEY") || key.contains("TOKEN") || key.contains("SECRET") || key.contains("PASSWORD") || key.contains("AUTH")
+                ? "<redacted>"
+                : entry.value
+        }
     }
 
     public static func configurationYAML(for route: LatticeHermesWorkRoute) -> String {

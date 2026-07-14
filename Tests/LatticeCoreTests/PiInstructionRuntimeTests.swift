@@ -142,6 +142,19 @@ struct PiInstructionRuntimeTests {
         #expect(plan.instructionEnvelope.trustedWorkspaceInstructionNames == ["AGENTS.md", "CLAUDE.md"])
     }
 
+    @Test func profileIsSharedWhileSessionDirectoriesStayDistinct() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let harness = PiRPCHarness(executableURL: fixture.pi, sandboxExecutableURL: fixture.sandbox, applicationSupportDirectory: fixture.root.appendingPathComponent("support"))
+        let first = try harness.makeLaunchPlan(sessionID: UUID(), workspace: fixture.workspace, provider: "codex", model: "gpt")
+        let second = try harness.makeLaunchPlan(sessionID: UUID(), workspace: fixture.workspace, provider: "codex", model: "gpt")
+
+        #expect(first.agentDirectory == second.agentDirectory)
+        #expect(first.sessionDirectory != second.sessionDirectory)
+        #expect(first.environment["PI_CODING_AGENT_DIR"] == first.agentDirectory.path)
+        #expect(first.environment["PI_CODING_AGENT_DIR"] != first.sessionDirectory.path)
+    }
+
     @Test func providerMappingKeepsCodeCodexAndOpenCodeOnPi() {
         #expect(PiRPCHarness.mapProviderModel(provider: "codex", model: "gpt-test") == .init(provider: "openai-codex", model: "gpt-test"))
         #expect(PiRPCHarness.mapProviderModel(provider: "opencode", model: "opencode-go/model") == .init(provider: "opencode-go", model: "model"))

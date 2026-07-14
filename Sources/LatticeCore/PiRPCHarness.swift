@@ -115,6 +115,63 @@ public final class PiRPCHarness: @unchecked Sendable {
 
     public var isInstalled: Bool { executableURL != nil }
 
+    /// Shared private profile for Pi provider login/config state. Transcript
+    /// and scratch directories remain per Lattice session.
+    public var sharedProfileDirectory: URL {
+        productRootURL().appendingPathComponent("HarnessRuntime/Pi", isDirectory: true)
+    }
+
+    public func profileEnvironment() throws -> [String: String] {
+        try Self.createPrivateDirectory(sharedProfileDirectory)
+        var environment = Self.safeChildEnvironment(from: ProcessInfo.processInfo.environment)
+        environment["PI_CODING_AGENT_DIR"] = sharedProfileDirectory.path
+        return environment
+    }
+
+    /// Bounded probe using same isolated profile as Code runs. Ambient ~/.pi
+    /// state and inherited credential-shaped environment stay out.
+    public func modelCatalog() async -> Set<String> {
+        guard let executableURL, let environment = try? profileEnvironment() else { return [] }
+        let result = await BoundedSubprocess.run(.init(
+            executableURL: executableURL,
+            arguments: ["--list-models"],
+            environment: environment,
+            deadline: 30,
+            maximumOutputBytes: BoundedSubprocessRequest.defaultMaximumOutputBytes
+        ))
+        guard result.isSuccess else { return [] }
+        return Set(String(decoding: result.combinedOutput, as: UTF8.self).split(separator: "\n").dropFirst().compactMap { line in
+            let columns = line.split(whereSeparator: \.isWhitespace)
+            guard columns.count >= 2 else { return nil }
+            return "\(columns[0])/\(columns[1])"
+        })
+    }
+
+    /// User-triggered, bounded auth validation. This deliberately performs a
+    /// no-tools model request in the shared Lattice profile. It never reads
+    /// auth.json and never exposes child output to logs or session state.
+    public func validateIsolatedAuthentication(provider: String, model: String) async -> Bool {
+        guard let executableURL,
+              let providerModel = Self.mapProviderModel(provider: provider, model: model),
+              providerModel.provider == "openai-codex",
+              let environment = try? profileEnvironment() else { return false }
+        let result = await BoundedSubprocess.run(.init(
+            executableURL: executableURL,
+            arguments: [
+                "--print",
+                "--no-session",
+                "--no-tools",
+                "--provider", providerModel.provider,
+                "--model", providerModel.model,
+                "Reply with OK."
+            ],
+            environment: environment,
+            deadline: 30,
+            maximumOutputBytes: 32_000
+        ))
+        return result.isSuccess
+    }
+
     public static func mapProviderModel(provider: String, model: String) -> PiProviderModel? {
         let rawProvider = provider.trimmingCharacters(in: .whitespacesAndNewlines)
         let rawModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -156,7 +213,7 @@ public final class PiRPCHarness: @unchecked Sendable {
                 redactNext = false
                 return "<redacted>"
             }
-            if ["--api-key", "OPENCODE_API_KEY"].contains(argument) {
+            if ["--api-key", "OPENCODE_API_KEY", "OPENCODE_GO_API_KEY", "OPENCODE_ZEN_API_KEY"].contains(argument) {
                 redactNext = true
                 return argument
             }
@@ -203,8 +260,7 @@ public final class PiRPCHarness: @unchecked Sendable {
         let sessionKey = sessionID.uuidString.lowercased()
         let sessionDirectory = productRootURL()
             .appendingPathComponent("HarnessSessions/Pi/\(sessionKey)", isDirectory: true)
-        let agentDirectory = productRootURL()
-            .appendingPathComponent("HarnessRuntime/Pi/\(sessionKey)", isDirectory: true)
+        let agentDirectory = sharedProfileDirectory
         let scratchDirectory = productRootURL()
             .appendingPathComponent("HarnessScratch/Pi/\(sessionKey)/\(UUID().uuidString.lowercased())", isDirectory: true)
         var retainScratchDirectory = false
@@ -700,7 +756,9 @@ public final class PiRPCHarness: @unchecked Sendable {
             "PI_CODING_AGENT_DIR",
             "PI_CODING_AGENT_SESSION_DIR",
             "TMPDIR",
-            "OPENCODE_API_KEY"
+            "OPENCODE_API_KEY",
+            "OPENCODE_GO_API_KEY",
+            "OPENCODE_ZEN_API_KEY"
         ])
         for (name, value) in overrides {
             guard allowed.contains(name), !reserved.contains(name) else {
