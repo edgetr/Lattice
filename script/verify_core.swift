@@ -1065,6 +1065,115 @@ struct CoreVerification {
         expect(!installerTrust.isAuthenticated && RemoteInstallerScriptPolicy.executionMessage(for: installerTrust) != nil, "Installer hash failure blocks execution")
         let interrupted = SessionPersistence.restoreRuntimeState([LatticeSession(title: "interrupted", backend: .codex(model: "gpt"), actions: [SessionAction(messageID: UUID(), kind: .tool, title: "running", detail: "", status: .running)], isStreaming: true)])
         expect(interrupted.first?.isStreaming == false && interrupted.first?.actions.first?.status == .interrupted, "Interrupted session state restores fail-closed")
+        // Work-mode projection foundation: typed payload migration, ranking, restore reconciliation,
+        // and portable archive exclusion (native suite not executed in fallback mode).
+        let workMessageID = UUID(uuidString: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")!
+        let workApprovalID = UUID(uuidString: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")!
+        let workTaskID = UUID(uuidString: "cccccccc-cccc-cccc-cccc-cccccccccccc")!
+        let workArtifactID = UUID(uuidString: "dddddddd-dddd-dddd-dddd-dddddddddddd")!
+        let workLegacyObject: [String: Any] = [
+            "id": workTaskID.uuidString,
+            "messageID": workMessageID.uuidString,
+            "kind": "plan",
+            "title": "Legacy step",
+            "detail": "",
+            "status": "waiting",
+            "workspaceScoped": false,
+            "createdAt": Date(timeIntervalSince1970: 1_700_000_000).timeIntervalSinceReferenceDate,
+            "updatedAt": Date(timeIntervalSince1970: 1_700_000_000).timeIntervalSinceReferenceDate
+        ]
+        let workLegacyDecoded = try! JSONDecoder().decode(SessionAction.self, from: try! JSONSerialization.data(withJSONObject: workLegacyObject))
+        expect(workLegacyDecoded.work == nil, "Legacy SessionAction JSON migrates without work payload")
+        let workApproval = SessionAction(
+            id: workApprovalID,
+            messageID: workMessageID,
+            kind: .approval,
+            title: "Allow",
+            detail: "path",
+            status: .waiting,
+            work: SessionWorkSemantics(kind: .approval, ownership: .providerBound)
+        )
+        let workTask = SessionAction(
+            id: workTaskID,
+            messageID: workMessageID,
+            kind: .plan,
+            title: "Confirm",
+            detail: "",
+            status: .waiting,
+            work: SessionWorkSemantics(kind: .taskStep, ownership: .userOwned, stepKey: "t1", taskMark: .unchecked)
+        )
+        let workArtifact = SessionAction(
+            id: workArtifactID,
+            messageID: workMessageID,
+            kind: .tool,
+            title: "Report",
+            detail: "/secret/must-not-infer",
+            status: .completed,
+            work: SessionWorkSemantics(kind: .artifact, ownership: .userOwned, artifactLocator: "out/report.md")
+        )
+        let workRoundTrip = try! JSONDecoder().decode(SessionAction.self, from: try! JSONEncoder().encode(workTask))
+        expect(workRoundTrip.work == workTask.work, "Work semantics round-trip through SessionAction JSON")
+        let workLive = WorkProjection.project(
+            mode: .work,
+            actions: [workArtifact, workTask, workApproval],
+            liveApprovalIDs: [workApprovalID]
+        )
+        expect(workLive.depth == .rich && workLive.actionable?.id == workApprovalID && workLive.actionable?.kind == .liveApproval, "Work projection ranks live approval first")
+        let workNoLive = WorkProjection.project(mode: .work, actions: [workArtifact, workTask, workApproval])
+        expect(workNoLive.actionable?.id == workTaskID && workNoLive.actionable?.allowsMarkConfirm == true, "Without live IDs, user-owned task is actionable and markable")
+        expect(WorkProjection.project(mode: .code, actions: [workApproval], liveApprovalIDs: [workApprovalID]).actionable == nil, "Code mode stays concise")
+        expect(WorkProjection.project(mode: .local, actions: [workApproval], liveApprovalIDs: [workApprovalID]).depth == .collapsed, "Local mode is not expanded")
+        expect(WorkProjection.canMarkOrConfirm(workTask) && !WorkProjection.canMarkOrConfirm(workApproval), "Mark/confirm only for user-owned task steps")
+        let workRestored = SessionPersistence.restoreRuntimeState([
+            LatticeSession(
+                title: "work-restore",
+                backend: .openCode(model: "m"),
+                executionRoute: ExecutionRoute(mode: .work, providerID: "opencode", modelID: "m", runtimeID: "hermes"),
+                actions: [workApproval, workTask, workArtifact],
+                isStreaming: true
+            )
+        ])
+        expect(workRestored.first?.isStreaming == false, "Work restore clears streaming")
+        expect(workRestored.first?.actions.first(where: { $0.id == workApprovalID })?.status == .interrupted, "Restored provider approval is interrupted")
+        expect(workRestored.first?.actions.first(where: { $0.id == workTaskID })?.status == .waiting, "Restored user-owned pending task is preserved")
+        expect(workRestored.first?.actions.first(where: { $0.id == workArtifactID })?.status == .completed, "Terminal artifact status is preserved")
+        let workAfterRestore = WorkProjection.project(mode: .work, actions: workRestored.first?.actions ?? [])
+        expect(workAfterRestore.actionable?.kind != .liveApproval && workAfterRestore.actionable?.kind != .liveQuestion, "Restored approvals/questions are never actionable without live IDs")
+        var completedTurnWork = [workTask, workApproval]
+        _ = SessionActionTrail.finishCompletedTurn(for: workMessageID, in: &completedTurnWork, at: Date(timeIntervalSince1970: 1_700_000_010))
+        expect(completedTurnWork.first(where: { $0.id == workTaskID })?.status == .interrupted, "Pending plan work is explicit interrupted after turn completion")
+        expect(completedTurnWork.first(where: { $0.id == workApprovalID })?.status == .cancelled, "Pending approval is cancelled after turn completion")
+        let workQuestion = SessionAction(
+            messageID: workMessageID,
+            kind: .harness,
+            title: "Choose format",
+            detail: "PDF or Markdown",
+            status: .waiting,
+            work: SessionWorkSemantics(kind: .question, ownership: .userOwned)
+        )
+        let workAnswerID = UUID(uuidString: "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")!
+        let answeredWorkQuestion = WorkProjection.applyingAnswer(messageID: workAnswerID, to: workQuestion)
+        expect(answeredWorkQuestion?.status == .completed && answeredWorkQuestion?.work?.resolutionMessageID == workAnswerID, "User-owned question records one durable answer link")
+        expect(answeredWorkQuestion.flatMap { WorkProjection.applyingAnswer(messageID: UUID(), to: $0) } == nil, "Answered work question cannot be answered twice")
+        let workCopy = WorkItemPresentationPolicy.presentation(
+            for: WorkProjection.project(mode: .work, actions: [workApproval], liveApprovalIDs: [workApprovalID]).actionable!,
+            action: workApproval
+        )
+        expect(workCopy.accessibilityLabel.contains("Approval required") && workCopy.status == "Waiting for your decision", "Work request accessibility copy names status")
+        let workRoot = URL(fileURLWithPath: "/tmp")
+        expect(WorkArtifactAccessPolicy.canOpen(locator: "Lattice/Deliverables/report.pdf", workspace: workRoot) && !WorkArtifactAccessPolicy.canOpen(locator: "/Applications/Unsafe.app", workspace: workRoot), "Artifact policy opens only safe workspace documents")
+        expect(WorkDockLayoutPolicy.actionLayout(forAvailableWidth: 360) == .stacked && WorkDockLayoutPolicy.actionLayout(forAvailableWidth: 760) == .horizontal, "Work dock layout responds at compact widths")
+        let workPortable = try! SessionPortableArchiveExporter.exportData(
+            from: LatticeSession(
+                title: "portable-work",
+                messages: [ChatMessage(id: workMessageID, role: .assistant, text: "done", date: Date(timeIntervalSince1970: 1_700_000_000))],
+                backend: .openCode(model: "m"),
+                actions: [workTask, workArtifact]
+            ),
+            options: .init(includeQueuedFollowUps: false, format: .jsonArchive, exportedAt: Date(timeIntervalSince1970: 1_700_000_000))
+        )
+        let workPortableText = String(decoding: workPortable, as: UTF8.self)
+        expect(!workPortableText.contains("out/report.md") && !workPortableText.contains("\"work\""), "Portable archives omit work payload and artifact locators")
         let hermesRoot = FileManager.default.temporaryDirectory.appendingPathComponent("lattice-hermes-verifier-\(UUID().uuidString)")
         let hermesProfile = LatticeHermesProfile(hermesHome: hermesRoot.appendingPathComponent("profile"))
         let hermesScratch = hermesRoot.appendingPathComponent("scratch")
@@ -1211,8 +1320,14 @@ struct CoreVerification {
                 "plan": [["step": "Inspect", "status": "completed"], ["step": "Verify", "status": "inProgress"]]
             ]
         ]
-        if case .plan(_, let title, let steps)? = CodexExecHarness.appServerEvent(from: codexPlanUpdate, workspace: codexWorkspace) {
-            expect(title == "Plan" && steps == ["Update the chat surface", "Completed — Inspect", "In progress — Verify"], "Codex plan updates are projected")
+        if case .plan(_, let title, let explanation, let steps)? = CodexExecHarness.appServerEvent(from: codexPlanUpdate, workspace: codexWorkspace) {
+            expect(
+                title == "Plan"
+                    && explanation == "Update the chat surface"
+                    && steps.map(\.title) == ["Inspect", "Verify"]
+                    && steps.map(\.status) == [.completed, .inProgress],
+                "Codex plan updates preserve typed step status"
+            )
         } else { expect(false, "Codex plan updates are projected") }
 
         let reasoningAction = SessionAction(messageID: responseMessage.id, kind: .reasoning, title: "Reasoning summary", detail: "Inspect", status: .running)

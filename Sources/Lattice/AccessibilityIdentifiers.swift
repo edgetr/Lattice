@@ -27,6 +27,11 @@ enum LatticeAccessibilityID {
     static let activityTool = "lattice.activity.tool"
     static let activityApproval = "lattice.activity.approval"
     static let permissionNotice = "lattice.permission.notice"
+    static let workDock = "lattice.work.dock"
+    static let workLog = "lattice.work.log"
+    static let workItemPrefix = "lattice.work.item."
+    static let workPrimaryActionPrefix = "lattice.work.primary."
+    static let workOriginJumpPrefix = "lattice.work.jump."
     static let brandingTitle = "lattice.branding.title"
     static let companionMark = "lattice.companion-mark"
 
@@ -35,4 +40,7 @@ enum LatticeAccessibilityID {
     static func recoveryRetry(_ storeID: String) -> String { recoveryRetryPrefix + storeID }
     static func recoveryReset(_ storeID: String) -> String { recoveryResetPrefix + storeID }
     static func commandPaletteItem(_ id: String) -> String { commandPaletteItemPrefix + id }
+    static func workItem(_ id: UUID) -> String { workItemPrefix + id.uuidString.lowercased() }
+    static func workPrimaryAction(_ id: UUID) -> String { workPrimaryActionPrefix + id.uuidString.lowercased() }
+    static func workOriginJump(_ id: UUID) -> String { workOriginJumpPrefix + id.uuidString.lowercased() }
 }
