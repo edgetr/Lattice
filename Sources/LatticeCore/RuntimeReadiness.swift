@@ -362,3 +362,97 @@ public extension ExecutionRouteReadiness {
         }
     }
 }
+
+public enum HarnessReadinessAuthenticationAction: Equatable, Sendable {
+    case signIn
+    case configureCredential
+    case enableCredential
+    case validate
+}
+
+public enum HarnessReadinessActionKind: Equatable, Sendable {
+    case stateOnly
+    case setupRuntime
+    case signIn
+    case configureCredential
+    case enableCredential
+    case validate
+    case diagnostics
+}
+
+/// Resolves compact readiness into plain state copy or one precise recovery
+/// action. Presentation supplies the operation while Core owns semantics.
+public struct HarnessReadinessActionResolution: Equatable, Sendable {
+    public let kind: HarnessReadinessActionKind
+    public let title: String
+    public let accessibilityLabel: String
+    public let accessibilityHint: String
+    public let isInteractive: Bool
+    public let isEnabled: Bool
+
+    public init(kind: HarnessReadinessActionKind, title: String, accessibilityLabel: String, accessibilityHint: String, isInteractive: Bool, isEnabled: Bool) {
+        self.kind = kind
+        self.title = title
+        self.accessibilityLabel = accessibilityLabel
+        self.accessibilityHint = accessibilityHint
+        self.isInteractive = isInteractive
+        self.isEnabled = isEnabled
+    }
+}
+
+public enum HarnessReadinessActionPolicy: Sendable {
+    public static func resolve(
+        readiness: ExecutionRouteReadiness,
+        modeName: String,
+        runtimeName: String,
+        authenticationAction: HarnessReadinessAuthenticationAction = .signIn,
+        actionAvailable: Bool = true
+    ) -> HarnessReadinessActionResolution {
+        let mode = normalized(modeName, fallback: "Mode")
+        let runtime = normalized(runtimeName, fallback: "runtime")
+
+        switch readiness {
+        case .runnable:
+            return stateOnly(title: "\(mode) ready", label: "\(mode) mode through \(runtime), ready", hint: readiness.detail)
+        case .loading, .validating:
+            return stateOnly(title: "\(mode) checking", label: "\(mode) mode through \(runtime), checking", hint: readiness.detail)
+        case .missingRuntime:
+            return action(kind: .setupRuntime, title: "Set Up \(mode)", label: "Set up \(mode) mode through \(runtime)", hint: "Open the safe \(runtime) setup flow for \(mode) mode.", available: actionAvailable)
+        case .authenticationRequired:
+            let values: (HarnessReadinessActionKind, String, String)
+            switch authenticationAction {
+            case .signIn:
+                values = (.signIn, "Sign In to \(mode)", "Start \(runtime) sign-in only after you activate this button.")
+            case .configureCredential:
+                values = (.configureCredential, "Set Up \(mode)", "Move to the credential setup required for \(mode) mode.")
+            case .enableCredential:
+                values = (.enableCredential, "Enable \(mode)", "Allow the saved credential to be used by \(mode) mode.")
+            case .validate:
+                values = (.validate, "Check \(mode)", "Check the current \(mode) setup through \(runtime).")
+            }
+            return action(kind: values.0, title: values.1, label: "\(values.1) through \(runtime)", hint: values.2, available: actionAvailable)
+        case .failed(let detail):
+            return action(kind: .diagnostics, title: "Diagnose \(mode)", label: "Diagnose \(mode) mode through \(runtime)", hint: "Run safe connection diagnostics. \(detail)", available: actionAvailable)
+        }
+    }
+
+    private static func action(kind: HarnessReadinessActionKind, title: String, label: String, hint: String, available: Bool) -> HarnessReadinessActionResolution {
+        HarnessReadinessActionResolution(
+            kind: kind,
+            title: title,
+            accessibilityLabel: label,
+            accessibilityHint: available ? hint : "Wait for the current connection action to finish.",
+            isInteractive: true,
+            isEnabled: available
+        )
+    }
+
+    private static func stateOnly(title: String, label: String, hint: String) -> HarnessReadinessActionResolution {
+        HarnessReadinessActionResolution(kind: .stateOnly, title: title, accessibilityLabel: label, accessibilityHint: hint, isInteractive: false, isEnabled: false)
+    }
+
+    private static func normalized(_ value: String, fallback: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? fallback : trimmed
+    }
+}

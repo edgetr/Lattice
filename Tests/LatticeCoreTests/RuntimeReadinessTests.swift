@@ -191,4 +191,41 @@ struct RuntimeReadinessTests {
         #expect(ExecutionRouteReadiness.runnable.conciseStatus == "ready")
         #expect(ExecutionRouteReadiness.failed("offline").conciseStatus == "unavailable")
     }
+
+    @Test func readinessActionsResolveToExactRecoveryFlows() {
+        let setup = HarnessReadinessActionPolicy.resolve(readiness: .missingRuntime, modeName: "Code", runtimeName: "Pi")
+        #expect(setup.kind == .setupRuntime)
+        #expect(setup.title == "Set Up Code")
+        #expect(setup.isInteractive && setup.isEnabled)
+
+        let signIn = HarnessReadinessActionPolicy.resolve(readiness: .authenticationRequired, modeName: "Work", runtimeName: "Hermes")
+        #expect(signIn.kind == .signIn)
+        #expect(signIn.title == "Sign In to Work")
+        #expect(signIn.accessibilityHint.contains("only after"))
+
+        let credential = HarnessReadinessActionPolicy.resolve(readiness: .authenticationRequired, modeName: "Code", runtimeName: "Pi", authenticationAction: .validate)
+        #expect(credential.kind == .validate)
+        #expect(credential.title == "Check Code")
+    }
+
+    @Test func readyAndLoadingReadinessRemainNonInteractiveState() {
+        let ready = HarnessReadinessActionPolicy.resolve(readiness: .runnable, modeName: "Code", runtimeName: "Pi")
+        #expect(ready.kind == .stateOnly)
+        #expect(ready.title == "Code ready")
+        #expect(!ready.isInteractive && !ready.isEnabled)
+
+        let loading = HarnessReadinessActionPolicy.resolve(readiness: .validating, modeName: "Work", runtimeName: "Hermes")
+        #expect(loading.kind == .stateOnly)
+        #expect(loading.title == "Work checking")
+        #expect(!loading.isInteractive && !loading.isEnabled)
+    }
+
+    @Test func failureOffersDiagnosticsAndBusyActionRejectsDuplicateActivation() {
+        let failure = HarnessReadinessActionPolicy.resolve(readiness: .failed("Model check failed."), modeName: "Work", runtimeName: "Hermes", actionAvailable: false)
+        #expect(failure.kind == .diagnostics)
+        #expect(failure.title == "Diagnose Work")
+        #expect(failure.isInteractive)
+        #expect(!failure.isEnabled)
+        #expect(failure.accessibilityHint.contains("Wait"))
+    }
 }

@@ -775,6 +775,7 @@ private struct ModelsCatalogNotice: View {
 struct ConnectionsView: View {
     @ObservedObject var state: AppState
     @AppStorage("lattice.connections.runtimeComponentsExpanded") private var runtimeComponentsExpanded = false
+    @FocusState private var openCodeKeyFocused: Bool
 
     private var ollamaConnectionReady: Bool {
         state.ollamaReady && state.ollamaCatalogStatus == .loaded
@@ -827,8 +828,24 @@ struct ConnectionsView: View {
             providerRow(
                 identity: .provider(.codex), name: "Codex", detail: "Code uses Pi · Work uses Hermes",
                 modes: [
-                    .init(title: "Code", runtime: "Pi", readiness: state.modeReadiness(.code, providerID: "codex")),
-                    .init(title: "Work", runtime: "Hermes", readiness: state.modeReadiness(.work, providerID: "codex"))
+                    readinessMode(title: "Code", runtime: "Pi", readiness: state.modeReadiness(.code, providerID: "codex"), authenticationAction: runtimeAuthenticationAction(message: state.cliActionMessages["pi"])) { kind in
+                        switch kind {
+                        case .setupRuntime: state.installPi()
+                        case .signIn: state.openPiAuthentication()
+                        case .validate: state.validatePiAuthentication(providerID: "codex")
+                        case .diagnostics: state.requestConnectionRefresh(diagnosticsRuntime: .pi)
+                        default: break
+                        }
+                    },
+                    readinessMode(title: "Work", runtime: "Hermes", readiness: state.modeReadiness(.work, providerID: "codex"), authenticationAction: runtimeAuthenticationAction(message: state.cliActionMessages["hermes"])) { kind in
+                        switch kind {
+                        case .setupRuntime: state.installHermes()
+                        case .signIn: state.openHermesAuthentication()
+                        case .validate: state.validateHermesAuthentication(providerID: "codex")
+                        case .diagnostics: state.requestConnectionRefresh(diagnosticsRuntime: .hermes)
+                        default: break
+                        }
+                    }
                 ]
             ) {
                 codexActions
@@ -843,8 +860,23 @@ struct ConnectionsView: View {
             providerRow(
                 identity: .provider(.grok), name: "Grok", detail: "Code uses Grok Build · Work uses Hermes",
                 modes: [
-                    .init(title: "Code", runtime: "Build", readiness: state.modeReadiness(.code, providerID: "grok")),
-                    .init(title: "Work", runtime: "Hermes", readiness: state.modeReadiness(.work, providerID: "grok"))
+                    readinessMode(title: "Code", runtime: "Grok Build", readiness: state.modeReadiness(.code, providerID: "grok")) { kind in
+                        switch kind {
+                        case .setupRuntime: state.installGrok()
+                        case .signIn: state.connectGrok()
+                        case .diagnostics: state.requestConnectionRefresh()
+                        default: break
+                        }
+                    },
+                    readinessMode(title: "Work", runtime: "Hermes", readiness: state.modeReadiness(.work, providerID: "grok"), authenticationAction: runtimeAuthenticationAction(message: state.cliActionMessages["hermes"])) { kind in
+                        switch kind {
+                        case .setupRuntime: state.installHermes()
+                        case .signIn: state.openHermesAuthentication()
+                        case .validate: state.validateHermesAuthentication(providerID: "grok")
+                        case .diagnostics: state.requestConnectionRefresh(diagnosticsRuntime: .hermes)
+                        default: break
+                        }
+                    }
                 ]
             ) {
                 grokActions
@@ -855,8 +887,8 @@ struct ConnectionsView: View {
             providerRow(
                 identity: .provider(.opencode), name: "OpenCode", detail: "One Keychain credential · separate mode consent",
                 modes: [
-                    .init(title: "Code", runtime: "Pi", readiness: state.modeReadiness(.code, providerID: "opencode")),
-                    .init(title: "Work", runtime: "Hermes", readiness: state.modeReadiness(.work, providerID: "opencode"))
+                    openCodeReadinessMode(.code, title: "Code", runtime: "Pi"),
+                    openCodeReadinessMode(.work, title: "Work", runtime: "Hermes")
                 ]
             ) {
                 openCodeActions
@@ -868,7 +900,14 @@ struct ConnectionsView: View {
             providerRow(
                 identity: .systemImage("paperplane"), name: "Antigravity",
                 detail: "Code uses the Antigravity runtime",
-                modes: [.init(title: "Code", runtime: "Antigravity", readiness: state.modeReadiness(.code, providerID: "antigravity"))]
+                modes: [readinessMode(title: "Code", runtime: "Antigravity", readiness: state.modeReadiness(.code, providerID: "antigravity")) { kind in
+                    switch kind {
+                    case .setupRuntime: state.installAntigravity()
+                    case .signIn: state.connectAntigravity()
+                    case .diagnostics: state.requestConnectionRefresh()
+                    default: break
+                    }
+                }]
             ) {
                 antigravityActions
             } content: {
@@ -880,102 +919,26 @@ struct ConnectionsView: View {
     }
 
     @ViewBuilder private var codexActions: some View {
-        Menu {
-            runtimeMenu(runtime: .pi, installed: state.piInstalled, installedVersion: state.piCLIVersion, update: state.updatePi, install: state.installPi)
-            if state.piInstalled {
-                Button("Sign in to Pi Codex…") { state.openPiAuthentication() }
-                Button("Check Code") { state.validatePiAuthentication(providerID: "codex") }
-            }
-            Divider()
-            runtimeMenu(runtime: .hermes, installed: state.hermesInstalled, installedVersion: state.hermesCLIInfo.currentVersion, update: state.updateHermes, install: state.installHermes)
-            if state.hermesInstalled {
-                Button("Sign in to Hermes Codex…") { state.openHermesAuthentication() }
-                Button("Check Work") { state.validateHermesAuthentication(providerID: "codex") }
-            }
-            Divider()
-            Button("Set Up Legacy Codex…") {
-                if state.codex.isInstalled { state.connectCodex() } else { state.installCodex() }
-            }
-        } label: {
-            Image(systemName: "ellipsis.circle").accessibilityLabel("Codex connection actions")
-        }
-        .menuStyle(.borderlessButton)
-        .disabled(!state.canRequestConnectionRefresh)
-        .help(state.connectionRefreshDisabledReason ?? "Codex setup actions")
+        EmptyView()
     }
 
     @ViewBuilder private var grokActions: some View {
-        Menu {
-            if !state.grok.isInstalled { Button("Install Grok Build…") { state.installGrok() } }
-            else if !state.grokAuthenticated { Button("Sign in to Grok Build…") { state.connectGrok() } }
-            else { Button("Update Grok Build") { state.updateGrok() } }
-            Divider()
-            runtimeMenu(runtime: .hermes, installed: state.hermesInstalled, installedVersion: state.hermesCLIInfo.currentVersion, update: state.updateHermes, install: state.installHermes)
-            if state.hermesInstalled {
-                Button("Sign in to Hermes Grok…") { state.openHermesAuthentication() }
-                Button("Check Work") { state.validateHermesAuthentication(providerID: "grok") }
-            }
-        } label: { Image(systemName: "ellipsis.circle").accessibilityLabel("Grok connection actions") }
-        .menuStyle(.borderlessButton)
-        .disabled(!state.canRequestConnectionRefresh)
-        .help(state.connectionRefreshDisabledReason ?? "Grok setup actions")
+        providerUpdateAction(provider: "grok", title: "Update Build", installed: state.grok.isInstalled, authenticated: state.grokAuthenticated, version: state.grokCLIInfo.currentVersion, latest: state.grokCLIInfo.latestVersion, update: state.updateGrok)
     }
 
     @ViewBuilder private var openCodeActions: some View {
-        Menu {
-            runtimeMenu(runtime: .pi, installed: state.piInstalled, installedVersion: state.piCLIVersion, update: state.updatePi, install: state.installPi)
-            if state.piInstalled { Button("Check Code") { state.validatePiAuthentication(providerID: "opencode") } }
-            Divider()
-            runtimeMenu(runtime: .hermes, installed: state.hermesInstalled, installedVersion: state.hermesCLIInfo.currentVersion, update: state.updateHermes, install: state.installHermes)
-            if state.hermesInstalled { Button("Check Work") { state.validateHermesOpenCodeAuthentication() } }
-        } label: { Image(systemName: "ellipsis.circle").accessibilityLabel("OpenCode connection actions") }
-        .menuStyle(.borderlessButton)
-        .disabled(!state.canRequestConnectionRefresh)
-        .help(state.connectionRefreshDisabledReason ?? "OpenCode setup actions")
+        EmptyView()
     }
 
     @ViewBuilder private var antigravityActions: some View {
-        providerInstallOrUpdate(provider: "antigravity", installed: state.antigravityInstalled, authenticated: state.antigravityAuthenticated, install: state.installAntigravity, signIn: state.connectAntigravity, update: state.updateAntigravity, version: state.antigravityCLIVersion, latest: state.antigravityLatestCLIVersion)
+        providerUpdateAction(provider: "antigravity", title: "Update", installed: state.antigravityInstalled, authenticated: state.antigravityAuthenticated, version: state.antigravityCLIVersion, latest: state.antigravityLatestCLIVersion, update: state.updateAntigravity)
     }
 
-    @ViewBuilder private func runtimeMenu(
-        runtime: LatticeRuntimeID,
-        installed: Bool,
-        installedVersion: String?,
-        update: @escaping () -> Void,
-        install: @escaping () -> Void
-    ) -> some View {
-        if installed {
-            let title = RuntimeLifecyclePresentationPolicy.actionTitle(
-                for: .update,
-                installedVersion: installedVersion,
-                targetVersion: RuntimeInstallDescriptor.firstUse(for: runtime).immutableVersion
-            )
-            Button("\(title) \(runtime.displayName)…", action: update)
-        }
-        else { Button("Install \(runtime.displayName)…", action: install) }
-    }
-
-    private func providerInstallOrUpdate(provider: String, installed: Bool, authenticated: Bool, install: @escaping () -> Void, signIn: @escaping () -> Void, update: @escaping () -> Void, version: String?, latest: String?) -> some View {
-        Group {
-            if !installed {
-                CLIActionButton(title: "Install", provider: provider, state: state, isEnabled: state.canRequestConnectionRefresh, action: install)
-            } else if !authenticated {
-                CLIActionButton(title: "Sign in", provider: provider, state: state, isEnabled: state.canRequestConnectionRefresh, action: signIn)
-            } else if CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: version, latestVersion: latest) {
-                CLIActionButton(title: "Update", provider: provider, state: state, isEnabled: state.canRequestConnectionRefresh, action: update)
-            }
-        }
-        .disabled(!state.canRequestConnectionRefresh)
-    }
-
-    private func runtimeAction(provider: String, installed: Bool, install: @escaping () -> Void, update: @escaping () -> Void, version: String?, latest: String?) -> some View {
-        Group {
-            if !installed {
-                CLIActionButton(title: "Set up \(provider.capitalized)", provider: provider, state: state, action: install)
-            } else if CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: version, latestVersion: latest) {
-                CLIActionButton(title: "Update \(provider.capitalized)", provider: provider, state: state, action: update)
-            }
+    @ViewBuilder private func providerUpdateAction(provider: String, title: String, installed: Bool, authenticated: Bool, version: String?, latest: String?, update: @escaping () -> Void) -> some View {
+        if installed, authenticated, CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: version, latestVersion: latest) {
+            CLIActionButton(title: title, provider: provider, state: state, isEnabled: state.canRequestConnectionRefresh, action: update)
+                .disabled(!state.canRequestConnectionRefresh)
+                .accessibilityHint(state.connectionRefreshDisabledReason ?? "Update the installed provider CLI.")
         }
     }
 
@@ -1033,6 +996,9 @@ struct ConnectionsView: View {
                 HStack(spacing: 8) {
                     SecureField("Paste API key", text: $state.openCodeAPIKeyDraft)
                         .textFieldStyle(.roundedBorder)
+                        .focused($openCodeKeyFocused)
+                        .accessibilityLabel("OpenCode API key")
+                        .accessibilityHint("Paste a key to save securely in macOS Keychain.")
                     Button("Save") { state.saveOpenCodeAPIKey() }
                         .disabled(state.openCodeAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         .help(state.openCodeAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Paste an API key before saving" : "Save the key in macOS Keychain")
@@ -1104,6 +1070,68 @@ struct ConnectionsView: View {
     private func providerRow<Actions: View, Content: View>(identity: ConnectionIdentity, name: String, detail: String, modes: [ModeReadiness], @ViewBuilder actions: () -> Actions, @ViewBuilder content: () -> Content) -> some View {
         ProviderConnectionRow(identity: identity, name: name, detail: detail, modes: modes, actions: actions, content: content)
     }
+
+    private func readinessMode(
+        title: String,
+        runtime: String,
+        readiness: ExecutionRouteReadiness,
+        authenticationAction: HarnessReadinessAuthenticationAction = .signIn,
+        perform: @escaping (HarnessReadinessActionKind) -> Void
+    ) -> ModeReadiness {
+        let resolution = HarnessReadinessActionPolicy.resolve(
+            readiness: readiness,
+            modeName: title,
+            runtimeName: runtime,
+            authenticationAction: authenticationAction,
+            actionAvailable: state.canRequestConnectionRefresh
+        )
+        return ModeReadiness(title: title, runtime: runtime, readiness: readiness, resolution: resolution) {
+            guard resolution.isEnabled else { return }
+            perform(resolution.kind)
+        }
+    }
+
+    private func openCodeReadinessMode(_ mode: ConversationMode, title: String, runtime: String) -> ModeReadiness {
+        let authenticationAction: HarnessReadinessAuthenticationAction
+        if !state.openCodeAPIKeySaved {
+            authenticationAction = .configureCredential
+        } else if !state.isOpenCodeCredentialEnabled(for: mode) {
+            authenticationAction = .enableCredential
+        } else {
+            authenticationAction = .validate
+        }
+
+        return readinessMode(
+            title: title,
+            runtime: runtime,
+            readiness: state.modeReadiness(mode, providerID: "opencode"),
+            authenticationAction: authenticationAction
+        ) { kind in
+            switch kind {
+            case .setupRuntime:
+                if mode == .code { state.installPi() } else { state.installHermes() }
+            case .configureCredential:
+                openCodeKeyFocused = true
+            case .enableCredential:
+                state.setOpenCodeCredentialEnabled(true, for: mode)
+            case .validate:
+                if mode == .code { state.validatePiAuthentication(providerID: "opencode") }
+                else { state.validateHermesOpenCodeAuthentication() }
+            case .diagnostics:
+                state.requestConnectionRefresh(diagnosticsRuntime: mode == .code ? .pi : .hermes)
+            default:
+                break
+            }
+        }
+    }
+
+    private func runtimeAuthenticationAction(message: String?) -> HarnessReadinessAuthenticationAction {
+        let message = message?.lowercased() ?? ""
+        let validationIsNext = message.contains("choose check")
+            || message.contains("could not verify")
+            || message.contains("did not report an authenticated")
+        return validationIsNext ? .validate : .signIn
+    }
 }
 
 private struct ControlActionFeedback: View {
@@ -1136,6 +1164,8 @@ private struct ModeReadiness: Identifiable {
     let title: String
     let runtime: String
     let readiness: ExecutionRouteReadiness
+    let resolution: HarnessReadinessActionResolution
+    let action: () -> Void
     var ready: Bool { readiness.isRunnable }
     var id: String { title }
 }
@@ -1144,16 +1174,34 @@ private struct ModeReadinessBadge: View {
     let mode: ModeReadiness
 
     var body: some View {
-        Label("\(mode.title) \(mode.readiness.conciseStatus)", systemImage: statusImage)
-        .font(.caption.weight(.medium))
-        .foregroundStyle(foregroundColor)
-        .padding(.horizontal, 7)
-        .padding(.vertical, 4)
-        .background(accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(mode.title) mode through \(mode.runtime), \(mode.readiness.conciseStatus)")
-        .accessibilityValue(mode.readiness.detail)
-        .help(mode.readiness.detail)
+        if mode.resolution.isInteractive {
+            Button(mode.resolution.title, action: mode.action)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(!mode.resolution.isEnabled)
+                .accessibilityLabel(mode.resolution.accessibilityLabel)
+                .accessibilityHint(mode.resolution.accessibilityHint)
+                .help(mode.resolution.accessibilityHint)
+        } else {
+            HStack(spacing: 4) {
+                if mode.readiness == .loading || mode.readiness == .validating {
+                    ProgressView().controlSize(.mini).accessibilityHidden(true)
+                } else {
+                    Image(systemName: "checkmark.circle.fill").accessibilityHidden(true)
+                }
+                Text(mode.resolution.title)
+            }
+            .font(.caption.weight(.medium))
+            .foregroundStyle(foregroundColor)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(mode.resolution.accessibilityLabel)
+            .accessibilityValue(mode.readiness.detail)
+            .accessibilityHint(mode.resolution.accessibilityHint)
+            .help(mode.readiness.detail)
+        }
     }
 
     private var accentColor: Color {
