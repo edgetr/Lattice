@@ -9,7 +9,7 @@ struct LatticeApp: App {
 
     var body: some Scene {
         WindowGroup("Lattice", id: "workspace") {
-            WorkspaceRootView(state: delegate.state)
+            WorkspaceRootView(state: delegate.state, layoutStore: delegate.layoutStore)
         }
         .defaultSize(width: 1240, height: 800)
         .commands {
@@ -71,10 +71,12 @@ struct LatticeApp: App {
 
 struct WorkspaceRootView: View {
     @ObservedObject var state: AppState
+    let layoutStore: WorkspaceLayoutStore
     @Environment(\.openWindow) private var openWindow
+    @SceneStorage("lattice.workspace.window-key") private var windowKey = UUID().uuidString
 
     var body: some View {
-        WorkspaceView(state: state)
+        PersistedWorkspaceRootView(state: state, layoutStore: layoutStore, windowKey: windowKey)
             .frame(minWidth: 900, minHeight: 620)
             .background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea())
             .preferredColorScheme(nil)
@@ -97,9 +99,46 @@ struct WorkspaceRootView: View {
     }
 }
 
+private struct PersistedWorkspaceRootView: View {
+    @ObservedObject var state: AppState
+    @StateObject private var layout: WorkspaceWindowLayout
+
+    init(state: AppState, layoutStore: WorkspaceLayoutStore, windowKey: String) {
+        self.state = state
+        _layout = StateObject(wrappedValue: WorkspaceWindowLayout(key: windowKey, store: layoutStore))
+    }
+
+    var body: some View {
+        WorkspaceView(state: state, layout: layout)
+            .background(WorkspaceWindowReader(onResolve: layout.attach))
+            .onChange(of: state.selectedSection) { _, section in
+                guard layout.isKeyWindow else { return }
+                layout.selectedSection = section
+            }
+            .onChange(of: state.showInspector) { _, visible in
+                guard layout.isKeyWindow else { return }
+                layout.showInspector = visible
+            }
+            .onChange(of: layout.selectedSection) { _, section in
+                guard layout.isKeyWindow else { return }
+                state.selectedSection = section
+            }
+            .onChange(of: layout.showInspector) { _, visible in
+                guard layout.isKeyWindow else { return }
+                state.showInspector = visible
+            }
+            .onChange(of: layout.keyActivationSequence) { _, _ in
+                state.selectedSection = layout.selectedSection
+                state.showInspector = layout.showInspector
+            }
+            .onDisappear { layout.flush() }
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let state = AppState()
+    let layoutStore = WorkspaceLayoutStore()
     lazy var overlay = OverlayPanelController(state: state)
     private var isTerminatingDuplicateInstance = false
     private var ownsSingleInstanceLock = false
@@ -138,10 +177,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidResignActive(_ notification: Notification) {
         guard !isTerminatingDuplicateInstance else { return }
         _ = state.flushPersistenceForLifecycleBoundary()
+        layoutStore.flush()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !isTerminatingDuplicateInstance else { return .terminateNow }
+        layoutStore.flush()
         switch state.flushPersistenceForLifecycleBoundary() {
         case .saved, .blockedByWriteGate:
             didFlushForTermination = true

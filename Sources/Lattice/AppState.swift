@@ -13,6 +13,25 @@ enum WorkspaceSection: String, CaseIterable, Identifiable {
     case connections = "Connections"
     case extensions = "Extensions & Skills"
     var id: Self { self }
+    var persistenceID: String {
+        switch self {
+        case .conversations: "conversations"
+        case .projects: "projects"
+        case .models: "models"
+        case .connections: "connections"
+        case .extensions: "extensions"
+        }
+    }
+    init?(persistenceID: String) {
+        switch persistenceID {
+        case "conversations": self = .conversations
+        case "projects": self = .projects
+        case "models": self = .models
+        case "connections": self = .connections
+        case "extensions": self = .extensions
+        default: return nil
+        }
+    }
     var displayName: String { self == .projects ? "Workspace" : rawValue }
     var icon: String {
         switch self {

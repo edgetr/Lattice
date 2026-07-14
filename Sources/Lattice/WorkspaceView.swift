@@ -4,6 +4,7 @@ import LatticeCore
 
 struct WorkspaceView: View {
     @ObservedObject var state: AppState
+    @ObservedObject var layout: WorkspaceWindowLayout
 
     var body: some View {
         AnyView(
@@ -15,19 +16,19 @@ struct WorkspaceView: View {
                 }
             }
             .onPreferenceChange(WorkspaceWidthPreferenceKey.self) { width in
-                state.noteWorkspaceWidth(width)
+                layout.noteWorkspaceWidth(width)
             }
-            .onChange(of: state.columnVisibility) { _, newValue in
-                state.noteColumnVisibilityChanged(to: newValue)
+            .onChange(of: layout.columnVisibility) { _, newValue in
+                layout.noteColumnVisibilityChanged(newValue)
             }
         )
-        .onChange(of: state.selectedSection) { _, section in
+        .onChange(of: layout.selectedSection) { _, section in
             noteSelectedSectionChanged(section)
         }
         .accessibilityIdentifier(LatticeAccessibilityID.workspaceRoot)
         .toolbar {
             ToolbarItemGroup {
-                if state.selectedSection == .conversations {
+                if layout.selectedSection == .conversations {
                     Button { state.newSession() } label: { Label("New chat", systemImage: "square.and.pencil") }
                     Button { state.openCommandPalette() } label: { Label("Commands", systemImage: "command") }
                         .accessibilityIdentifier(LatticeAccessibilityID.toolbarCommands)
@@ -35,7 +36,7 @@ struct WorkspaceView: View {
                         .accessibilityIdentifier(LatticeAccessibilityID.toolbarOverlay)
                         .disabled(state.showOverlayAction == nil)
                         .help(state.showOverlayAction == nil ? "Overlay is not ready" : "Show Lattice overlay")
-                    Button { state.showInspector.toggle() } label: { Label("Inspector", systemImage: "sidebar.trailing") }
+                    Button { layout.showInspector.toggle() } label: { Label("Inspector", systemImage: "sidebar.trailing") }
                 } else {
                     Button { state.openCommandPalette() } label: { Label("Commands", systemImage: "command") }
                         .accessibilityIdentifier(LatticeAccessibilityID.toolbarCommands)
@@ -201,14 +202,14 @@ struct WorkspaceView: View {
 
     private func noteSelectedSectionChanged(_ section: WorkspaceSection) {
         guard section == .conversations else { return }
-        state.applyAdaptiveColumnVisibilityIfNeeded()
+        layout.applyAdaptiveColumnVisibilityIfNeeded()
     }
 
     @ViewBuilder private var workspaceLayout: some View {
-        if state.selectedSection == .conversations {
-            ConversationWorkspaceLayout(state: state)
+        if layout.selectedSection == .conversations {
+            ConversationWorkspaceLayout(state: state, layout: layout)
         } else {
-            SectionWorkspaceLayout(state: state, detail: sectionDetail)
+            SectionWorkspaceLayout(state: state, layout: layout, detail: sectionDetail)
         }
     }
 
@@ -225,7 +226,7 @@ struct WorkspaceView: View {
     }
 
     @ViewBuilder private var sectionDetail: some View {
-        switch state.selectedSection {
+        switch layout.selectedSection {
         case .conversations: EmptyView()
         case .projects: ProjectsView(state: state)
         case .models: ModelsView(state: state)
@@ -315,27 +316,30 @@ private struct RuntimeConfirmationSheet: View {
 
 private struct ConversationWorkspaceLayout: View {
     @ObservedObject var state: AppState
-    @AppStorage("lattice.sidebar.expanded") private var sidebarExpanded = true
+    @ObservedObject var layout: WorkspaceWindowLayout
 
     var body: some View {
-        NavigationSplitView(columnVisibility: $state.columnVisibility) {
-            SidebarView(state: state)
+        NavigationSplitView(columnVisibility: $layout.columnVisibility) {
+            SidebarView(layout: layout)
                 .navigationSplitViewColumnWidth(
-                    min: sidebarExpanded ? 170 : 56,
-                    ideal: sidebarExpanded ? 190 : 56,
-                    max: sidebarExpanded ? 220 : 56
+                    min: layout.sidebarExpanded ? 170 : 56,
+                    ideal: layout.sidebarExpanded ? min(max(layout.sidebarWidth, 170), 220) : 56,
+                    max: layout.sidebarExpanded ? 220 : 56
                 )
+                .reportWorkspaceWidth(layout.measureSidebar)
         } content: {
             SessionListView(state: state)
-                .navigationSplitViewColumnWidth(min: 220, ideal: 280, max: 340)
+                .navigationSplitViewColumnWidth(min: 220, ideal: min(max(layout.primarySplitWidth, 220), 340), max: 340)
+                .reportWorkspaceWidth(layout.measurePrimarySplit)
         } detail: {
             if state.isOverlayVisible {
                 Color.clear
             } else {
                 ConversationView(state: state)
-                    .inspector(isPresented: $state.showInspector) {
+                    .inspector(isPresented: $layout.showInspector) {
                         InspectorView(state: state)
-                            .inspectorColumnWidth(min: 300, ideal: 350, max: 420)
+                            .inspectorColumnWidth(min: 300, ideal: min(max(layout.inspectorWidth, 300), 420), max: 420)
+                            .reportWorkspaceWidth(layout.measureInspector)
                     }
             }
         }
@@ -346,17 +350,18 @@ private struct ConversationWorkspaceLayout: View {
 
 private struct SectionWorkspaceLayout<Detail: View>: View {
     @ObservedObject var state: AppState
+    @ObservedObject var layout: WorkspaceWindowLayout
     let detail: Detail
-    @AppStorage("lattice.sidebar.expanded") private var sidebarExpanded = true
 
     var body: some View {
-        NavigationSplitView {
-            SidebarView(state: state)
+        NavigationSplitView(columnVisibility: $layout.columnVisibility) {
+            SidebarView(layout: layout)
                 .navigationSplitViewColumnWidth(
-                    min: sidebarExpanded ? 170 : 56,
-                    ideal: sidebarExpanded ? 190 : 56,
-                    max: sidebarExpanded ? 220 : 56
+                    min: layout.sidebarExpanded ? 170 : 56,
+                    ideal: layout.sidebarExpanded ? min(max(layout.sidebarWidth, 170), 220) : 56,
+                    max: layout.sidebarExpanded ? 220 : 56
                 )
+                .reportWorkspaceWidth(layout.measureSidebar)
         } detail: {
             detail
         }
@@ -371,9 +376,10 @@ private struct WorkspaceWidthPreferenceKey: PreferenceKey {
 }
 
 struct SidebarView: View {
-    @ObservedObject var state: AppState
-    @AppStorage("lattice.sidebar.expanded") private var isExpanded = true
+    @ObservedObject var layout: WorkspaceWindowLayout
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var isExpanded: Bool { layout.sidebarExpanded }
 
     var body: some View {
         VStack(spacing: 8) {
@@ -385,7 +391,7 @@ struct SidebarView: View {
                 }
                 Spacer()
                 Button {
-                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.16)) { isExpanded.toggle() }
+                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.16)) { layout.sidebarExpanded.toggle() }
                 } label: {
                     Image(systemName: isExpanded ? "sidebar.left" : "sidebar.right")
                 }
@@ -396,7 +402,7 @@ struct SidebarView: View {
             .padding(.horizontal, isExpanded ? 12 : 8)
             .padding(.top, 8)
 
-            List(selection: $state.selectedSection) {
+            List(selection: $layout.selectedSection) {
                 ForEach(WorkspaceSection.allCases) { section in
                     Group {
                         if isExpanded {

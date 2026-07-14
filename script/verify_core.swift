@@ -59,6 +59,34 @@ struct CoreVerification {
         recoveredScheduler.recover(.init(entries: [scheduledRequest(UUID(), priority: .high)]))
         expect(recoveredScheduler.snapshots.allSatisfy { $0.state == .recoveryHeld }, "Recovered queue metadata is held and never automatically replayed")
 
+        let layoutScreen = WorkspaceWindowFrame(x: 0, y: 0, width: 1440, height: 900)
+        let defaultLayout = WorkspaceLayoutStatePolicy.restoredState(
+            for: "main",
+            in: WorkspaceLayoutArchive(),
+            visibleScreens: [layoutScreen]
+        )
+        expect(defaultLayout.selectedPage == "conversations" && defaultLayout.windowFrame == nil, "Workspace layout starts from safe non-sensitive defaults")
+        let legacyLayout = Data(#"{"schemaVersion":1,"selectedPage":"models","sidebarVisible":false,"sidebarWidth":205,"inspectorVisible":true,"inspectorWidth":370,"primarySplitWidth":310,"windowFrame":null,"windowIsMaximized":false}"#.utf8)
+        let migratedLayout = WorkspaceLayoutStatePolicy.decodeArchive(legacyLayout)
+        expect(migratedLayout.windows["main"]?.selectedPage == "models" && migratedLayout.windows["main"]?.sidebarVisibility == "doubleColumn", "Legacy workspace layout migrates into the keyed archive")
+        var keyedLayouts = WorkspaceLayoutArchive()
+        keyedLayouts = WorkspaceLayoutStatePolicy.updating(keyedLayouts, key: "one", state: .init(selectedPage: "projects"))
+        keyedLayouts = WorkspaceLayoutStatePolicy.updating(keyedLayouts, key: "two", state: .init(selectedPage: "connections"))
+        let roundTrippedLayouts = WorkspaceLayoutStatePolicy.decodeArchive(WorkspaceLayoutStatePolicy.encodeArchive(keyedLayouts))
+        expect(roundTrippedLayouts.windows["one"]?.selectedPage == "projects" && roundTrippedLayouts.windows["two"]?.selectedPage == "connections", "Workspace layout keys remain isolated across persistence")
+        let clampedLayout = WorkspaceLayoutStatePolicy.clamped(
+            WorkspaceLayoutState(
+                sidebarWidth: -1,
+                inspectorVisible: true,
+                inspectorWidth: 9_000,
+                primarySplitSizes: [1],
+                windowFrame: .init(x: 3_000, y: -900, width: 2_000, height: 1_200)
+            ),
+            visibleScreens: [layoutScreen],
+            availableContentWidth: 1_000
+        )
+        expect(clampedLayout.windowFrame == layoutScreen && !clampedLayout.inspectorVisible && clampedLayout.primarySplitSizes == [220], "Workspace frames and split sizes clamp to current usable geometry")
+
         let transportRoundTrip = await BoundedSubprocess.performOffCooperativeExecutor {
             let transport = BoundedProcessTransport(request: .init(
                 executableURL: URL(fileURLWithPath: "/bin/sh"),
