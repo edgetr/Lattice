@@ -298,6 +298,7 @@ final class AppState: ObservableObject {
     var antigravity = AntigravityCLIHarness()
     var pi = PiRPCHarness()
     var hermes = ACPHarness()
+    private let executionCoordinator: any LatticeExecutionCoordinating
     let appleIntelligence = AppleIntelligenceClient()
     let ollama = OllamaClient()
     let modelInstaller = OllamaModelInstaller()
@@ -334,6 +335,19 @@ final class AppState: ObservableObject {
     private static let workInstructionAddOnKey = "workInstructionAddOn"
     private static let trustedWorkspacePathsKey = "trustedWorkspacePaths"
 
+    private var executionRuntimes: LatticeExecutionRuntimes {
+        LatticeExecutionRuntimes(
+            codex: codex,
+            grok: grokACP,
+            openCode: openCodeACP,
+            antigravity: antigravity,
+            pi: pi,
+            hermes: hermes,
+            appleIntelligence: appleIntelligence,
+            ollama: ollama
+        )
+    }
+
     var needsPersistenceRecovery: Bool { !persistenceRecoveryIssues.isEmpty }
 
     var needsSessionSaveFailureAttention: Bool { sessionSaveFailure != nil }
@@ -363,7 +377,8 @@ final class AppState: ObservableObject {
         openWorkspaceAction?()
     }
 
-    init() {
+    init(executionCoordinator: (any LatticeExecutionCoordinating)? = nil) {
+        self.executionCoordinator = executionCoordinator ?? DefaultLatticeExecutionCoordinator()
         sessionSaveCoordinator = SessionSaveCoordinator(persistence: persistence)
         LatticeApplicationSupport.migrateLegacyProductDataIfNeeded()
         LatticeApplicationSupport.migrateLegacyUserDefaultsIfNeeded()
@@ -1984,13 +1999,6 @@ final class AppState: ObservableObject {
         return false
     }
 
-    private func failedAgentStream(_ message: String) -> AsyncStream<AgentEvent> {
-        AsyncStream { continuation in
-            continuation.yield(.failed(message))
-            continuation.finish()
-        }
-    }
-
     private func workspaceInstructionsAreTrusted(for workspace: URL) -> Bool {
         guard let canonical = try? HarnessSandbox.canonicalDirectory(workspace).path else { return false }
         return trustedWorkspacePaths.contains(canonical)
@@ -2123,88 +2131,51 @@ final class AppState: ObservableObject {
             Task { for await event in failedStream { apply(event, to: id, runID: runID) } }
             return
         }
-        if ExecutionRouteResolver.isDeclared(session.executionRoute), session.executionRoute.runtimeID == "pi" {
-            do {
-                guard let model = session.executionRoute.modelID else { throw LatticeInstructionEnvelopeError.invalidIdentity }
-                let envelope = try instructionEnvelope(for: session, workspace: workspace, allowFileModification: !isExtensionSelfEdit)
-                let openCodeAPIKey = session.executionRoute.providerID == "opencode" ? KeychainStore.read(account: "opencode-go-api-key") : nil
-                stream = pi.stream(
-                    prompt: prompt,
-                    sessionID: id,
-                    threadID: routeThreadID,
-                    workspace: workspace,
-                    provider: session.executionRoute.providerID,
-                    model: model,
-                    reasoningEffort: reasoningEffort,
-                    allowFileModification: !isExtensionSelfEdit,
-                    mode: .code,
-                    workspaceInstructionsTrusted: envelope.workspaceInstructionsTrusted,
-                    instructionEnvelope: envelope,
-                    openCodeAPIKey: openCodeAPIKey
-                )
-            } catch {
-                stream = failedAgentStream(error.localizedDescription)
-            }
-        } else if ExecutionRouteResolver.isDeclared(session.executionRoute), session.executionRoute.runtimeID == "hermes" {
-            do {
-                guard let provider = hermesProvider(for: session.executionRoute),
-                      let model = session.executionRoute.modelID else { throw LatticeHermesProfileError.invalidProvider(session.executionRoute.providerID) }
-                let envelope = try instructionEnvelope(for: session, workspace: workspace, allowFileModification: !isExtensionSelfEdit)
-                let workspaceInstructions = trustedWorkspaceInstructionText(for: workspace, names: envelope.trustedWorkspaceInstructionNames)
-                let systemIdentity = [envelope.renderedSystemInstructions, workspaceInstructions].filter { !$0.isEmpty }.joined(separator: "\n\n")
-                let openCodeAPIKey = session.executionRoute.providerID == "opencode" ? KeychainStore.read(account: "opencode-go-api-key") : nil
-                stream = hermes.stream(
-                    prompt: prompt,
-                    sessionID: id,
-                    threadID: routeThreadID,
-                    workspace: workspace,
-                    provider: provider,
-                    model: model,
-                    systemIdentity: systemIdentity,
-                    opencodeAPIKey: openCodeAPIKey,
-                    allowFileModification: !isExtensionSelfEdit,
-                    recoveryPrompt: recoveryPrompt,
-                    recoveryUsesVisibleTranscriptHandoff: recoveryUsesVisibleTranscriptHandoff,
-                    recoveryDeliveryIssue: recoveryDeliveryIssue
-                )
-            } catch {
-                stream = failedAgentStream(error.localizedDescription)
-            }
-        } else if harnessID == "pi", let piRoute = piRoute(for: session.backend) {
-            stream = pi.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, provider: piRoute.provider, model: piRoute.model, reasoningEffort: reasoningEffort, allowFileModification: !isExtensionSelfEdit)
-        } else if harnessID == "hermes" {
-            stream = hermes.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: session.backend.displayName, allowFileModification: !isExtensionSelfEdit, recoveryPrompt: recoveryPrompt, recoveryUsesVisibleTranscriptHandoff: recoveryUsesVisibleTranscriptHandoff, recoveryDeliveryIssue: recoveryDeliveryIssue)
-        } else { switch session.backend {
-        case .codex(let model):
-            stream = codex.stream(
-                prompt: prompt,
-                sessionID: id,
-                threadID: routeThreadID,
-                workspace: workspace,
-                model: model,
-                reasoningEffort: reasoningEffort,
-                policy: isExtensionSelfEdit
-                    ? SelfEditProviderLaunchPolicy.codexExecutionPolicy
-                    : session.policy,
-                workspaceWrite: isExtensionSelfEdit
-                    ? SelfEditProviderLaunchPolicy.codexWorkspaceWrite
-                    : false
-            )
-        case .grok(let model):
-            stream = grokACP.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: model, allowFileModification: !isExtensionSelfEdit, recoveryPrompt: recoveryPrompt, recoveryUsesVisibleTranscriptHandoff: recoveryUsesVisibleTranscriptHandoff, recoveryDeliveryIssue: recoveryDeliveryIssue)
-        case .openCode(let model):
-            stream = openCodeACP.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: model, allowFileModification: !isExtensionSelfEdit, recoveryPrompt: recoveryPrompt, recoveryUsesVisibleTranscriptHandoff: recoveryUsesVisibleTranscriptHandoff, recoveryDeliveryIssue: recoveryDeliveryIssue)
-        case .appleIntelligence:
-            let transcript = LatticeBackendMessageBuilder.transcript(session: session, submittedText: submittedText, additionalContext: additionalContext, contextPlan: contextPlan)
-            stream = appleIntelligence.stream(prompt: transcript, sessionID: id)
-        case .antigravity(let model):
-            stream = antigravity.stream(prompt: prompt, sessionID: id, workspace: workspace, model: model, policy: isExtensionSelfEdit ? .ask : session.policy)
-        case .ollama(let model):
+        let envelope = try? instructionEnvelope(for: session, workspace: workspace, allowFileModification: !isExtensionSelfEdit)
+        let trustedInstructions = envelope.map {
+            trustedWorkspaceInstructionText(for: workspace, names: $0.trustedWorkspaceInstructionNames)
+        } ?? ""
+        let hermesSystemIdentity = envelope.map {
+            [$0.renderedSystemInstructions, trustedInstructions].filter { !$0.isEmpty }.joined(separator: "\n\n")
+        }
+        let openCodeAPIKey = session.executionRoute.providerID == "opencode"
+            ? KeychainStore.read(account: "opencode-go-api-key")
+            : nil
+        let appleTranscript: String? = session.backend == .appleIntelligence
+            ? LatticeBackendMessageBuilder.transcript(session: session, submittedText: submittedText, additionalContext: additionalContext, contextPlan: contextPlan)
+            : nil
+        let ollamaMessages: [ChatMessage]? = {
+            guard case .ollama(let model) = session.backend else { return nil }
             cancelLocalModelIdleUnload()
             localModelStatus = "Loaded \(model)"
-            let messages = LatticeBackendMessageBuilder.structuredMessages(session: session, submittedText: submittedText, additionalContext: additionalContext, contextPlan: contextPlan)
-            stream = ollama.stream(messages: messages, model: model, sessionID: id, keepAliveSeconds: localModelIdleUnloadMinutes * 60)
-        } }
+            return LatticeBackendMessageBuilder.structuredMessages(session: session, submittedText: submittedText, additionalContext: additionalContext, contextPlan: contextPlan)
+        }()
+        stream = executionCoordinator.stream(
+            LatticeExecutionLaunch(
+                sessionID: id,
+                route: session.executionRoute,
+                legacyHarnessID: harnessID,
+                backend: session.backend,
+                prompt: prompt,
+                threadID: routeThreadID,
+                workspace: workspace,
+                reasoningEffort: reasoningEffort,
+                policy: isExtensionSelfEdit ? .ask : session.policy,
+                allowFileModification: !isExtensionSelfEdit,
+                workspaceWrite: isExtensionSelfEdit ? SelfEditProviderLaunchPolicy.codexWorkspaceWrite : false,
+                recoveryPrompt: recoveryPrompt,
+                recoveryUsesVisibleTranscriptHandoff: recoveryUsesVisibleTranscriptHandoff,
+                recoveryDeliveryIssue: recoveryDeliveryIssue,
+                instructionEnvelope: envelope,
+                hermesProvider: hermesProvider(for: session.executionRoute),
+                hermesSystemIdentity: hermesSystemIdentity,
+                openCodeAPIKey: openCodeAPIKey,
+                appleTranscript: appleTranscript,
+                ollamaMessages: ollamaMessages,
+                localModelKeepAliveSeconds: localModelIdleUnloadMinutes * 60
+            ),
+            runtimes: executionRuntimes
+        )
         let runID = UUID()
         activeRunIDs[id] = runID
         Task { for await event in stream { apply(event, to: id, runID: runID) } }
@@ -2544,17 +2515,13 @@ final class AppState: ObservableObject {
     }
 
     private func cancelHarnessProcess(for session: LatticeSession, sessionID id: UUID) {
-        let harnessID = effectiveHarnessID(for: session)
-        if harnessID == "pi" { pi.cancel(sessionID: id); return }
-        if harnessID == "hermes" { hermes.cancel(sessionID: id); return }
-        switch session.backend {
-        case .codex: codex.cancel(sessionID: id)
-        case .grok: grokACP.cancel(sessionID: id)
-        case .openCode: openCodeACP.cancel(sessionID: id)
-        case .appleIntelligence: appleIntelligence.cancel(sessionID: id)
-        case .antigravity: antigravity.cancel(sessionID: id)
-        case .ollama: ollama.cancel(sessionID: id)
-        }
+        executionCoordinator.cancel(
+            sessionID: id,
+            route: session.executionRoute,
+            legacyHarnessID: effectiveHarnessID(for: session),
+            backend: session.backend,
+            runtimes: executionRuntimes
+        )
     }
 
     func harnessPermissionNotice(for sessionID: UUID) -> HarnessPermissionNotice? {
