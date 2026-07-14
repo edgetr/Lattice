@@ -105,7 +105,7 @@ struct HermesACPHarnessTests {
         #expect(!HermesACPHarness.isStaleSessionRejection(["result": [:]]))
     }
 
-    @Test func recoveryRequiresDeliverableVisibleTranscriptHandoff() {
+    @Test func recoveryRequiresDeliverableVisibleTranscriptHandoff() throws {
         #expect(HermesACPHarness.validatedRecoveryPrompt(
             "Visible transcript",
             usesVisibleTranscriptHandoff: true,
@@ -126,6 +126,118 @@ struct HermesACPHarnessTests {
             usesVisibleTranscriptHandoff: true,
             deliveryIssue: "over context limit"
         ) == nil)
+        try verifyWorkProfileCreatesOnlyPrivateLatticeState()
+        try verifyWorkEnvironmentRedactsInheritedCredentials()
+        try verifyWorkRouteAndReadinessFailClosed()
+        verifyWorkModelMatchingUsesExactIDOnly()
+        try verifyInstalledHermesIsNotAuthenticated()
+    }
+
+    private func verifyWorkProfileCreatesOnlyPrivateLatticeState() throws {
+        let root = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let profile = LatticeHermesProfile(hermesHome: root.appendingPathComponent("hermes-home", isDirectory: true))
+        let route = LatticeHermesWorkRoute(provider: "openai-codex", model: "openai-codex:gpt-5.5")
+
+        try profile.configure(systemIdentity: "Lattice Work identity", route: route)
+
+        #expect(String(data: try Data(contentsOf: profile.soulURL), encoding: .utf8) == "Lattice Work identity")
+        let config = try String(contentsOf: profile.configURL, encoding: .utf8)
+        #expect(config.contains("provider: \"openai-codex\""))
+        #expect(config.contains("default: \"openai-codex:gpt-5.5\""))
+        for tool in ["browser", "computer_use", "web", "file", "terminal", "messaging", "cronjob", "credentials", "secrets", "financial"] {
+            #expect(config.contains("- \"\(tool)\""))
+        }
+        #expect(!config.contains("OPENCODE_API_KEY"))
+        #expect(!config.contains("auth.json"))
+        #expect(!config.contains("state.db"))
+
+        let names = try FileManager.default.contentsOfDirectory(atPath: profile.homeURL.path)
+        #expect(Set(names) == [LatticeHermesProfile.configFileName, LatticeHermesProfile.soulFileName])
+        #expect(permissions(of: profile.homeURL) == 0o700)
+        #expect(permissions(of: profile.configURL) == 0o600)
+        #expect(permissions(of: profile.soulURL) == 0o600)
+    }
+
+    private func verifyWorkEnvironmentRedactsInheritedCredentials() throws {
+        let root = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let profile = LatticeHermesProfile(hermesHome: root.appendingPathComponent("hermes-home", isDirectory: true))
+        let scratch = root.appendingPathComponent("scratch", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        let base = [
+            "PATH": "/usr/bin",
+            "OPENAI_API_KEY": "parent-secret",
+            "XAI_API_KEY": "parent-secret",
+            "CODEX_AUTH_TOKEN": "parent-secret",
+            "AUTH_TOKEN": "parent-secret",
+            "HERMES_HOME": "/user/home/.hermes"
+        ]
+        let route = LatticeHermesWorkRoute(provider: "opencode-go", model: "opencode-go:deepseek-v4")
+        let environment = try profile.launchEnvironment(
+            base: base,
+            temporaryDirectory: scratch,
+            route: route,
+            opencodeAPIKey: "opencode-test-key"
+        )
+
+        #expect(environment["PATH"] == "/usr/bin")
+        #expect(environment["HERMES_HOME"] == profile.homeURL.path)
+        #expect(environment["HOME"] == profile.homeURL.path)
+        #expect(environment["TMPDIR"] == scratch.path + "/")
+        #expect(environment["OPENCODE_API_KEY"] == "opencode-test-key")
+        #expect(environment["OPENAI_API_KEY"] == nil)
+        #expect(environment["XAI_API_KEY"] == nil)
+        #expect(environment["CODEX_AUTH_TOKEN"] == nil)
+        #expect(environment["AUTH_TOKEN"] == nil)
+    }
+
+    private func verifyWorkRouteAndReadinessFailClosed() throws {
+        let root = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let profile = LatticeHermesProfile(hermesHome: root.appendingPathComponent("hermes-home", isDirectory: true))
+        let invalid = LatticeHermesWorkRoute(provider: "openrouter", model: "gpt-5.5")
+        #expect(!invalid.isValid)
+        #expect(throws: LatticeHermesProfileError.invalidProvider("openrouter")) {
+            try invalid.validate()
+        }
+
+        let route = LatticeHermesWorkRoute(provider: "xai-oauth", model: "xai-oauth:grok-4")
+        try profile.configure(systemIdentity: "Work", route: route)
+        let readiness = profile.readiness(runtimePresent: true, auth: .unknown, catalog: .unknown)
+        #expect(readiness.runtimePresent)
+        #expect(readiness.profileConfigured)
+        #expect(readiness.auth == .unknown)
+        #expect(readiness.catalog == .unknown)
+        #expect(!readiness.isAuthenticated)
+        #expect(!readiness.isReady)
+        #expect(profile.readiness(runtimePresent: true, auth: .validated, catalog: .validated).isReady)
+    }
+
+    private func verifyWorkModelMatchingUsesExactIDOnly() {
+        let models = [
+            HarnessModel(id: "opencode-go:deepseek-v4", name: "DeepSeek V4"),
+            HarnessModel(id: "opencode-go:minimax-m3", name: "MiniMax M3")
+        ]
+        #expect(HermesACPHarness.exactMatch(for: "opencode-go:deepseek-v4", in: models)?.id == "opencode-go:deepseek-v4")
+        #expect(HermesACPHarness.exactMatch(for: "deepseek-v4", in: models) == nil)
+        #expect(HermesACPHarness.exactMatch(for: "DeepSeek V4", in: models) == nil)
+    }
+
+    private func verifyInstalledHermesIsNotAuthenticated() throws {
+        let root = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let profile = LatticeHermesProfile(hermesHome: root.appendingPathComponent("hermes-home", isDirectory: true))
+        let executable = root.appendingPathComponent("hermes")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let harness = HermesACPHarness(executableURL: executable, hermesProfile: profile, sandboxExecutableURL: nil)
+        let readiness = harness.hermesReadiness()
+        #expect(readiness.runtimePresent)
+        #expect(!readiness.profileConfigured)
+        #expect(readiness.auth == .unknown)
+        #expect(!readiness.isAuthenticated)
+        #expect(!readiness.isReady)
     }
 
     private func makeWorkspace() throws -> URL {
@@ -138,5 +250,10 @@ struct HermesACPHarnessTests {
     private func permission(toolCall: [String: Any], workspace: URL) -> ToolRequest? {
         let object: [String: Any] = ["method": "session/request_permission", "params": ["toolCall": toolCall, "options": [["optionId": "allow_once", "name": "Allow once", "kind": "allow_once"]]]]
         return HermesACPHarness.permissionRequest(from: object, workspace: workspace)?.toolRequest
+    }
+
+    private func permissions(of url: URL) -> Int {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return (attributes?[.posixPermissions] as? NSNumber)?.intValue ?? -1
     }
 }

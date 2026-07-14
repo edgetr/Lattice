@@ -40,11 +40,18 @@ public final class ACPHarness: @unchecked Sendable {
             }
         }
 
-        func arguments(workspace: URL) -> [String] {
+        func arguments(workspace: URL, hermesRoute: LatticeHermesWorkRoute? = nil) -> [String] {
             switch self {
-            case .hermes: ["acp"]
-            case .grok: ["agent", "--no-leader", "stdio"]
-            case .openCode: ["acp", "--pure", "--cwd", workspace.path]
+            case .hermes:
+                guard let hermesRoute else { return ["acp"] }
+                return [
+                    "--provider", hermesRoute.provider,
+                    "--model", hermesRoute.model,
+                    "--toolsets", LatticeHermesProfile.workToolPolicy.enabledToolsets.joined(separator: ","),
+                    "acp"
+                ]
+            case .grok: return ["agent", "--no-leader", "stdio"]
+            case .openCode: return ["acp", "--pure", "--cwd", workspace.path]
             }
         }
     }
@@ -86,6 +93,7 @@ public final class ACPHarness: @unchecked Sendable {
     private let executableURL: URL?
     private let sandboxExecutableURL: URL?
     private let profile: Profile
+    private let hermesProfile: LatticeHermesProfile?
     private let permissionTimeoutNanoseconds: UInt64
     private let lock = NSLock()
     private let processRegistry = InteractiveProcessRegistry()
@@ -95,21 +103,73 @@ public final class ACPHarness: @unchecked Sendable {
         profile: Profile = .hermes,
         executableURL: URL? = nil,
         sandboxExecutableURL: URL? = HarnessSandbox.systemExecutableURL,
-        permissionTimeout: TimeInterval = 120
+        permissionTimeout: TimeInterval = 120,
+        hermesProfile: LatticeHermesProfile? = nil
     ) {
         self.profile = profile
         self.executableURL = executableURL ?? ExecutableDiscovery.locate(profile.executableName)
         self.sandboxExecutableURL = sandboxExecutableURL
+        self.hermesProfile = profile == .hermes ? (hermesProfile ?? LatticeHermesProfile()) : hermesProfile
         self.permissionTimeoutNanoseconds = PermissionTimeout.nanoseconds(for: permissionTimeout)
     }
 
     public var isInstalled: Bool { executableURL != nil }
+
+    public func hermesReadiness(
+        auth: LatticeHermesReadinessState = .unknown,
+        catalog: LatticeHermesReadinessState = .unknown
+    ) -> LatticeHermesReadiness {
+        guard profile == .hermes, let hermesProfile else {
+            return LatticeHermesReadiness(
+                runtimePresent: false,
+                profileConfigured: false,
+                auth: .unknown,
+                catalog: .unknown
+            )
+        }
+        return hermesProfile.readiness(runtimePresent: isInstalled, auth: auth, catalog: catalog)
+    }
+
+    public var profileReadiness: LatticeHermesReadiness {
+        hermesReadiness()
+    }
 
     public func models(workspace: URL) async -> [HarnessModel] {
         await modelsResult(workspace: workspace).models
     }
 
     public func modelsResult(workspace: URL) async -> ProviderCatalogResult<HarnessModel> {
+        await modelsResult(
+            workspace: workspace,
+            hermesRoute: nil,
+            systemIdentity: nil,
+            opencodeAPIKey: nil
+        )
+    }
+
+    /// Catalog probe for a configured Hermes Work route. Inputs are explicit so
+    /// tests can use a temporary profile and verify the exact child launch.
+    public func modelsResult(
+        workspace: URL,
+        provider: String,
+        model: String,
+        systemIdentity: String,
+        opencodeAPIKey: String? = nil
+    ) async -> ProviderCatalogResult<HarnessModel> {
+        await modelsResult(
+            workspace: workspace,
+            hermesRoute: LatticeHermesWorkRoute(provider: provider, model: model),
+            systemIdentity: systemIdentity,
+            opencodeAPIKey: opencodeAPIKey
+        )
+    }
+
+    private func modelsResult(
+        workspace: URL,
+        hermesRoute: LatticeHermesWorkRoute?,
+        systemIdentity: String?,
+        opencodeAPIKey: String?
+    ) async -> ProviderCatalogResult<HarnessModel> {
         guard let executableURL else { return .unknown() }
         let scratchDirectory = scratchDirectory(for: UUID())
         defer { try? FileManager.default.removeItem(at: scratchDirectory) }
@@ -120,10 +180,16 @@ public final class ACPHarness: @unchecked Sendable {
                 executableURL: executableURL,
                 sandboxExecutableURL: sandboxExecutableURL,
                 workspace: canonicalWorkspace,
-                scratchDirectory: scratchDirectory
+                scratchDirectory: scratchDirectory,
+                hermesRoute: hermesRoute,
+                systemIdentity: systemIdentity,
+                opencodeAPIKey: opencodeAPIKey
             )
-            var environment = ProcessInfo.processInfo.environment
-            environment["TMPDIR"] = scratchDirectory.path + "/"
+            let environment = try launchEnvironment(
+                scratchDirectory: scratchDirectory,
+                hermesRoute: hermesRoute,
+                opencodeAPIKey: opencodeAPIKey
+            )
             var stdinData = Data()
             stdinData.append(contentsOf: try Self.serialized(Self.initializeRequest(id: 1)))
             stdinData.append(contentsOf: try Self.serialized(Self.sessionRequest(id: 2, method: "session/new", workspace: canonicalWorkspace, threadID: nil)))
@@ -157,6 +223,69 @@ public final class ACPHarness: @unchecked Sendable {
         recoveryUsesVisibleTranscriptHandoff: Bool = false,
         recoveryDeliveryIssue: String? = nil
     ) -> AsyncStream<AgentEvent> {
+        stream(
+            prompt: prompt,
+            sessionID: sessionID,
+            threadID: threadID,
+            workspace: workspace,
+            requestedModel: requestedModel,
+            hermesRoute: nil,
+            systemIdentity: nil,
+            opencodeAPIKey: nil,
+            allowFileModification: allowFileModification,
+            recoveryPrompt: recoveryPrompt,
+            recoveryUsesVisibleTranscriptHandoff: recoveryUsesVisibleTranscriptHandoff,
+            recoveryDeliveryIssue: recoveryDeliveryIssue
+        )
+    }
+
+    /// Start one Hermes Work ACP run with caller-owned identity and route.
+    /// Provider/model values pass to Hermes unchanged. No `--yolo` or hook
+    /// acceptance flag is ever added by this harness.
+    public func stream(
+        prompt: String,
+        sessionID: UUID,
+        threadID: String?,
+        workspace: URL,
+        provider: String,
+        model: String,
+        systemIdentity: String,
+        opencodeAPIKey: String? = nil,
+        allowFileModification: Bool = true,
+        recoveryPrompt: String? = nil,
+        recoveryUsesVisibleTranscriptHandoff: Bool = false,
+        recoveryDeliveryIssue: String? = nil
+    ) -> AsyncStream<AgentEvent> {
+        stream(
+            prompt: prompt,
+            sessionID: sessionID,
+            threadID: threadID,
+            workspace: workspace,
+            requestedModel: model,
+            hermesRoute: LatticeHermesWorkRoute(provider: provider, model: model),
+            systemIdentity: systemIdentity,
+            opencodeAPIKey: opencodeAPIKey,
+            allowFileModification: allowFileModification,
+            recoveryPrompt: recoveryPrompt,
+            recoveryUsesVisibleTranscriptHandoff: recoveryUsesVisibleTranscriptHandoff,
+            recoveryDeliveryIssue: recoveryDeliveryIssue
+        )
+    }
+
+    private func stream(
+        prompt: String,
+        sessionID: UUID,
+        threadID: String?,
+        workspace: URL,
+        requestedModel: String,
+        hermesRoute: LatticeHermesWorkRoute?,
+        systemIdentity: String?,
+        opencodeAPIKey: String?,
+        allowFileModification: Bool,
+        recoveryPrompt: String?,
+        recoveryUsesVisibleTranscriptHandoff: Bool,
+        recoveryDeliveryIssue: String?
+    ) -> AsyncStream<AgentEvent> {
         AsyncStream { continuation in
             let start = processRegistry.beginStart(for: sessionID)
             let task = Task.detached(priority: .userInitiated) { [self] in
@@ -175,10 +304,16 @@ public final class ACPHarness: @unchecked Sendable {
                         sandboxExecutableURL: sandboxExecutableURL,
                         workspace: canonicalWorkspace,
                         scratchDirectory: scratchDirectory,
-                        allowFileModification: allowFileModification
+                        allowFileModification: allowFileModification,
+                        hermesRoute: hermesRoute,
+                        systemIdentity: systemIdentity,
+                        opencodeAPIKey: opencodeAPIKey
                     )
-                    var environment = ProcessInfo.processInfo.environment
-                    environment["TMPDIR"] = scratchDirectory.path + "/"
+                    let environment = try launchEnvironment(
+                        scratchDirectory: scratchDirectory,
+                        hermesRoute: hermesRoute,
+                        opencodeAPIKey: opencodeAPIKey
+                    )
                     let runningTransport = BoundedProcessTransport(request: .init(
                         executableURL: launch.executableURL,
                         arguments: launch.arguments,
@@ -252,7 +387,10 @@ public final class ACPHarness: @unchecked Sendable {
                     }
 
                     let models = Self.models(from: sessionResponse)
-                    guard let matched = Self.bestMatch(for: requestedModel, in: models) else {
+                    let matched = hermesRoute == nil
+                        ? Self.bestMatch(for: requestedModel, in: models)
+                        : Self.exactMatch(for: requestedModel, in: models)
+                    guard let matched else {
                         throw HarnessError.message("\(profile.displayName) does not expose \(requestedModel) through its configured provider.")
                     }
                     let current = Self.currentModelID(from: result)
@@ -344,6 +482,12 @@ public final class ACPHarness: @unchecked Sendable {
         return models.first { modelKey($0.name) == requested || modelKey($0.id) == requested }
     }
 
+    /// Strict Work-route lookup. IDs must match exactly; display names and leaf
+    /// model names are never accepted for a new Hermes Work run.
+    public static func exactMatch(for requestedModel: String, in models: [HarnessModel]) -> HarnessModel? {
+        models.first { $0.id == requestedModel }
+    }
+
     public static func modelKey(_ value: String) -> String {
         let leaf = value.split(separator: "/").last.map(String.init) ?? value
         return leaf.split(separator: ":").last.map(String.init)?.lowercased() ?? leaf.lowercased()
@@ -354,26 +498,63 @@ public final class ACPHarness: @unchecked Sendable {
         sandboxExecutableURL: URL?,
         workspace: URL,
         scratchDirectory: URL,
-        allowFileModification: Bool = true
+        allowFileModification: Bool = true,
+        hermesRoute: LatticeHermesWorkRoute? = nil,
+        systemIdentity: String? = nil,
+        opencodeAPIKey: String? = nil
     ) throws -> HarnessSandbox.LaunchConfiguration {
+        if profile == .hermes {
+            guard let hermesProfile else {
+                throw LatticeHermesProfileError.invalidHome("missing Lattice Hermes profile")
+            }
+            if let hermesRoute {
+                guard let systemIdentity else {
+                    throw LatticeHermesProfileError.emptySystemIdentity
+                }
+                try hermesProfile.configure(
+                    systemIdentity: systemIdentity,
+                    route: hermesRoute,
+                    opencodeAPIKey: opencodeAPIKey
+                )
+            } else {
+                try hermesProfile.ensureHome()
+            }
+        }
         let runtimeDirectories = runtimeDirectoryCandidates().filter {
             var isDirectory: ObjCBool = false
             return FileManager.default.fileExists(atPath: $0.path, isDirectory: &isDirectory) && isDirectory.boolValue
         }
         return try HarnessSandbox.writeRestrictedLaunch(
             command: executableURL,
-            arguments: profile.arguments(workspace: workspace),
+            arguments: profile.arguments(workspace: workspace, hermesRoute: hermesRoute),
             writableDirectories: (allowFileModification ? [workspace] : []) + [scratchDirectory] + runtimeDirectories,
             writablePaths: runtimeFileCandidates(),
             sandboxExecutableURL: sandboxExecutableURL
         )
     }
 
-    private static func hermesHome() -> URL {
-        if let override = ProcessInfo.processInfo.environment["HERMES_HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines), !override.isEmpty {
-            return URL(fileURLWithPath: NSString(string: override).expandingTildeInPath, isDirectory: true)
+    private func launchEnvironment(
+        scratchDirectory: URL,
+        hermesRoute: LatticeHermesWorkRoute?,
+        opencodeAPIKey: String?
+    ) throws -> [String: String] {
+        if profile == .hermes {
+            guard let hermesProfile else {
+                throw LatticeHermesProfileError.invalidHome("missing Lattice Hermes profile")
+            }
+            return try hermesProfile.launchEnvironment(
+                temporaryDirectory: scratchDirectory,
+                route: hermesRoute,
+                opencodeAPIKey: opencodeAPIKey
+            )
         }
-        return URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".hermes", isDirectory: true)
+        var environment = ProcessInfo.processInfo.environment
+        environment["TMPDIR"] = scratchDirectory.path + "/"
+        return environment
+    }
+
+    private func hermesHome() -> URL {
+        hermesProfile?.homeURL ?? LatticeHermesProfile().homeURL
     }
 
     private func runtimeDirectoryCandidates() -> [URL] {
@@ -392,10 +573,10 @@ public final class ACPHarness: @unchecked Sendable {
                 home.appendingPathComponent(".local/state/opencode", isDirectory: true)
             ]
         case .hermes:
-            let home = Self.hermesHome()
-            return ["logs", "sessions", "checkpoints", "cache", "audio_cache", "image_cache", "browser_screenshots", "sandboxes"].map {
-                home.appendingPathComponent($0, isDirectory: true)
-            }
+            // Hermes owns runtime state below this Lattice-owned HERMES_HOME.
+            // The directory itself is the only writable runtime root needed;
+            // Hermes may create its own sessions/logs/cache children.
+            return [hermesHome()]
         }
     }
 
@@ -422,17 +603,21 @@ public final class ACPHarness: @unchecked Sendable {
                 cache.appendingPathComponent("version")
             ]
         case .hermes:
-            let home = Self.hermesHome()
+            let home = hermesHome()
             return [
-                "state.db", "state.db-wal", "state.db-shm", "state.db-journal",
-                ".skills_prompt_snapshot.json", ".update_check", "auth.lock",
-                "kanban.db", "kanban.db-wal", "kanban.db-shm", "kanban.db-journal"
+                LatticeHermesProfile.configFileName,
+                LatticeHermesProfile.soulFileName,
+                "state.db", "state.db-wal", "state.db-shm", "state.db-journal"
             ].map { home.appendingPathComponent($0) }
         }
     }
 
     private func scratchDirectory(for sessionID: UUID) -> URL {
-        LatticeApplicationSupport.migrateLegacyProductDataIfNeeded()
+        // Hermes Work must not trigger broad legacy-tree migration: that could
+        // copy provider auth/session material into a new process boundary.
+        if profile != .hermes {
+            LatticeApplicationSupport.migrateLegacyProductDataIfNeeded()
+        }
         return LatticeApplicationSupport.productRootURL().appendingPathComponent("HarnessScratch/\(profile.displayName)/\(sessionID.uuidString.lowercased())", isDirectory: true)
     }
 
