@@ -248,6 +248,36 @@ struct CoreVerification {
         expect(latticeLocal.executionOwner == .noDelegatedTools && latticeLocal.brokerMediation == .notApplicable, "Local lattice routes have no delegated tools and are not broker-mediated")
         let unknownRoute = RouteCapability.resolve(harnessID: "mystery-agent", policy: .ask)
         expect(unknownRoute.brokerMediation == .notMediated && unknownRoute.writeContainment.assurance == .unknown, "Unknown harness falls back conservatively")
+        let livePiRoute = ExecutionRoute(mode: .code, providerID: "opencode", modelID: "opencode-go/model", runtimeID: "pi")
+        let unavailablePiReadiness = RouteReadinessEvaluator.evaluate(
+            route: livePiRoute,
+            requirements: .init(runtimePresent: false, authenticationValidated: false, modelValidated: false, sandboxAvailable: true)
+        )
+        let unavailablePiCapabilities = HarnessCapabilitySnapshot.resolve(
+            route: livePiRoute,
+            policy: .ask,
+            readiness: unavailablePiReadiness,
+            hasProviderSession: false,
+            isRunning: false,
+            routeCredentialEnabled: false
+        )
+        expect(unavailablePiCapabilities.protocolTransport.summary.contains("Pi RPC"), "Live capability surface identifies Pi protocol and transport")
+        expect(unavailablePiCapabilities.providerAvailability.assurance == .absent && unavailablePiCapabilities.modelAvailability.assurance == .unknown, "Live capability surface derives unavailable and unknown discovery states")
+        let readyPiReadiness = RouteReadinessEvaluator.evaluate(
+            route: livePiRoute,
+            requirements: .init(runtimePresent: true, authenticationValidated: true, modelValidated: true, sandboxAvailable: true)
+        )
+        let recoveredPi = HarnessCapabilitySnapshot.resolve(
+            route: livePiRoute,
+            policy: .ask,
+            readiness: readyPiReadiness,
+            hasProviderSession: true,
+            isRunning: false,
+            routeCredentialEnabled: true
+        )
+        expect(recoveredPi.providerAvailability.assurance == .present && recoveredPi.modelAvailability.assurance == .present, "Live capability surface recovers with current runtime discovery")
+        expect(recoveredPi.resumeState == .resumable && recoveredPi.resume.summary == "Ready to resume", "Live capability surface derives current resume state without exposing the handle")
+        expect(recoveredPi.sandboxOwner.summary == "Lattice" && recoveredPi.routeCapability.fileReadRestriction.assurance == .absent, "Live capability surface names Lattice write-only containment honestly")
         expect(RouteConnectionCaption.caption(forHarnessID: "codex") == "Provider-owned tools · policy-dependent sandbox", "Codex Connections caption is policy-agnostic")
         expect(RouteConnectionCaption.caption(forHarnessID: "grok") == "Lattice write containment · provider-owned tools", "ACP Connections caption is truthful and invariant")
         expect(RouteConnectionCaption.caption(forHarnessID: "antigravity") == "Provider sandbox option · runtime-probed events", "Antigravity Connections caption is truthful and invariant")

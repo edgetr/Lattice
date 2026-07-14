@@ -649,6 +649,22 @@ final class AppState: ObservableObject {
         )
     }
 
+    /// Live, non-persisted harness disclosure for the selected chat.
+    var selectedHarnessCapabilities: HarnessCapabilitySnapshot? {
+        guard let session = selectedSession else { return nil }
+        let credentialEnabled: Bool? = OpenCodeCredentialPolicy.allowsKeychainCredential(for: session.executionRoute)
+            ? openCodeAPIKeySaved && openCodeCredentialEnabledModes.contains(session.executionRoute.mode)
+            : nil
+        return HarnessCapabilitySnapshot.resolve(
+            route: session.executionRoute,
+            policy: session.policy,
+            readiness: routeReadinessSnapshot(for: session.executionRoute),
+            hasProviderSession: session.harnessThreadID != nil,
+            isRunning: session.isStreaming,
+            routeCredentialEnabled: credentialEnabled
+        )
+    }
+
     var editingMessageID: UUID? { editingMessageContext?.messageID }
 
     var activeBackend: ChatBackend { selectedSession?.backend ?? composerSelectionBackend ?? defaultBackend }
@@ -2368,6 +2384,14 @@ final class AppState: ObservableObject {
         guard ExecutionRouteResolver.isDeclared(route) else {
             return .failed("This route is available only for a legacy chat.")
         }
+        return routeReadinessSnapshot(for: route)?.readiness
+            ?? .failed("The selected mode, provider, and runtime are incompatible.")
+    }
+
+    func routeReadinessSnapshot(for route: ExecutionRoute) -> RouteReadinessSnapshot? {
+        guard ExecutionRouteResolver.isDeclared(route) else {
+            return nil
+        }
 
         let runtimePresent: Bool
         let authenticationValidated: Bool
@@ -2418,7 +2442,7 @@ final class AppState: ObservableObject {
             } ?? false
             sandboxAvailable = true
         default:
-            return .failed("The selected mode, provider, and runtime are incompatible.")
+            return nil
         }
 
         return RouteReadinessEvaluator.evaluate(
@@ -2430,7 +2454,7 @@ final class AppState: ObservableObject {
                 sandboxAvailable: sandboxAvailable
             ),
             validating: cliBusyProviders.contains(route.runtimeID) || cliBusyProviders.contains("\(route.runtimeID)-\(route.providerID)")
-        ).readiness
+        )
     }
 
     func modeReadiness(_ mode: ConversationMode, providerID: String) -> ExecutionRouteReadiness {

@@ -116,17 +116,22 @@ struct InspectorView: View {
                 }
             }
 
-            if let capability = state.selectedRouteCapability {
-                InspectorOpaqueDisclosure(title: "Route & safety", systemImage: "shield.lefthalf.filled") {
-                    InspectorFactRow(title: "Owner", value: capability.executionOwner.displayName)
+            if let snapshot = state.selectedHarnessCapabilities {
+                let capability = snapshot.routeCapability
+                InspectorOpaqueDisclosure(title: "Harness capabilities", systemImage: "switch.2") {
+                    capabilityRow("Protocol · transport", snapshot.protocolTransport)
+                    capabilityRow("Provider", snapshot.providerAvailability)
+                    capabilityRow("Model", snapshot.modelAvailability)
+                    InspectorFactRow(title: "Tool owner", value: capability.executionOwner.displayName)
                     InspectorFactRow(title: "Tool broker", value: capability.brokerMediation.displayName)
+                    capabilityRow("Sandbox owner", snapshot.sandboxOwner)
                     capabilityRow("Write containment", capability.writeContainment)
-                    capabilityRow("Approvals", capability.approvalBehavior)
+                    capabilityRow("Approval path", capability.approvalBehavior)
                     capabilityRow("File reads", capability.fileReadRestriction)
                     capabilityRow("Network", capability.networkRestriction)
-                    capabilityRow("Credentials", capability.credentialReadProtection)
+                    capabilityRow("Credential boundary", snapshot.credentialBoundary)
                     capabilityRow("Events", capability.structuredEvents)
-                    capabilityRow("Resume", capability.providerSessionResume)
+                    capabilityRow("Resume", snapshot.resume)
                     capabilityRow("Cancel", capability.cancellation)
                 }
             }
