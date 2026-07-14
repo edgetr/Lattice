@@ -3,16 +3,15 @@ import LatticeCore
 
 struct InspectorView: View {
     @ObservedObject var state: AppState
+
     var body: some View {
         ScrollView {
             if let session = state.selectedSession {
-                LazyVStack(alignment: .leading, spacing: 12) {
-                    Text("Chat details").font(.title3.weight(.semibold)).accessibilityAddTraits(.isHeader)
-                    chatCard(session)
-                    workspaceCard(session)
-                    contextCard(session)
-                    if let capability = state.selectedRouteCapability { routeCard(capability) }
-                    if case .codex = session.backend, let usage = state.codexUsage { usageCard(usage) }
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Inspector")
+                        .font(.title3.weight(.semibold))
+                        .accessibilityAddTraits(.isHeader)
+                    inspectorShell(session)
                 }
                 .padding(12)
             } else {
@@ -23,76 +22,95 @@ struct InspectorView: View {
         .background(.background.secondary.opacity(0.35))
     }
 
-    private func chatCard(_ session: LatticeSession) -> some View {
-        InspectorPanelCard(title: "Chat", systemImage: "bubble.left.and.text.bubble.right") {
-            InspectorFactRow(title: "Provider", value: session.backend.harnessName)
-            InspectorFactRow(title: "Model", value: session.backend.displayName)
-            if let reasoning = session.reasoningEffort { InspectorFactRow(title: "Reasoning", value: reasoning.displayName) }
-            Divider()
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Execution policy").font(.caption).foregroundStyle(.secondary)
+    @ViewBuilder
+    private func inspectorShell(_ session: LatticeSession) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            InspectorOpaqueSection(title: "Route", systemImage: "point.3.connected.trianglepath.dotted") {
+                InspectorFactRow(title: "Mode", value: session.executionRoute.mode.displayName)
+                InspectorFactRow(title: "Provider", value: session.backend.harnessName)
+                InspectorFactRow(title: "Model", value: session.backend.displayName)
+                InspectorFactRow(title: "Runtime", value: session.executionRoute.runtimeID)
+                if let reasoning = session.reasoningEffort {
+                    InspectorFactRow(title: "Reasoning", value: reasoning.displayName)
+                }
                 Picker("Execution policy", selection: Binding(get: { session.policy }, set: { state.setSessionPolicy($0) })) {
                     ForEach(ExecutionPolicy.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                 }
-                .labelsHidden().pickerStyle(.segmented).disabled(session.isStreaming)
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .disabled(session.isStreaming)
                 .accessibilityLabel("Execution policy")
                 .accessibilityHint("Controls approvals and provider tool risk for this chat.")
-            }
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Model privacy").font(.caption).foregroundStyle(.secondary)
                 Picker("Model privacy", selection: Binding(get: { session.privacyMode }, set: { state.setSessionPrivacyMode($0) })) {
                     ForEach(SessionPrivacyMode.allCases, id: \.self) { Text($0.displayName).tag($0) }
                 }
-                .labelsHidden().pickerStyle(.segmented).disabled(session.isStreaming)
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .disabled(session.isStreaming)
                 .accessibilityLabel("Model privacy")
-            }
-            if session.privacyMode == .localOnly {
-                Label("Cloud routes are blocked for this chat.", systemImage: "lock.fill").font(.caption).foregroundStyle(.secondary)
-                if !session.backend.isLocal && session.messages.contains(where: { $0.role == .user }) {
-                    Text("This chat is locked to its cloud route. Start a separate local chat to continue without cloud requests.").font(.caption).foregroundStyle(.orange)
-                    Button("Start New Local Chat") { state.startLocalOnlyChatFromSelected() }
-                        .disabled(!state.canStartLocalOnlyChat)
-                        .help(state.canStartLocalOnlyChat ? "Create a fresh chat with a local backend" : "Make Apple Intelligence or Ollama available in Connections first")
-                }
-            }
-        }
-    }
-
-    private func workspaceCard(_ session: LatticeSession) -> some View {
-        InspectorPanelCard(title: "Workspace", systemImage: "folder") {
-            Text(session.workspacePath ?? "No workspace selected")
-                .font(.caption.monospaced()).foregroundStyle(session.workspacePath == nil ? .secondary : .primary)
-                .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-            Button("Choose Workspace…") { state.chooseWorkspace() }
-                .disabled(!session.messages.isEmpty)
-                .help(session.messages.isEmpty ? "Choose this chat’s workspace" : "A chat workspace cannot change after messages are sent")
-        }
-    }
-
-    private func contextCard(_ session: LatticeSession) -> some View {
-        InspectorPanelCard(title: "Context", systemImage: "paperclip") {
-            if let estimate = state.selectedContextBudgetEstimate { ContextBudgetMeter(estimate: estimate) }
-            if session.attachments.isEmpty {
-                Text("No attached paths. Drag files or use the paperclip to add context.").font(.caption).foregroundStyle(.secondary)
-            } else {
-                ForEach(session.attachments) { attachment in
-                    HStack(spacing: 8) {
-                        Label(attachment.name, systemImage: attachment.isImage ? "photo" : "doc").lineLimit(1)
-                        Spacer(minLength: 4)
-                        if attachment.isMissing { Text("Missing").font(.caption2).foregroundStyle(.orange) }
-                        Button { state.removeAttachment(attachment.id) } label: { Image(systemName: "xmark") }
-                            .buttonStyle(LatticeIconButtonStyle(size: .compact))
-                            .accessibilityLabel("Remove \(attachment.name)").help("Remove \(attachment.name)")
+                if session.privacyMode == .localOnly {
+                    Label("Cloud routes blocked for this chat.", systemImage: "lock.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if !session.backend.isLocal && session.messages.contains(where: { $0.role == .user }) {
+                        Text("This chat is locked to its cloud route. Start a separate local chat to continue without cloud requests.")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                        Button("Start New Local Chat") { state.startLocalOnlyChatFromSelected() }
+                            .disabled(!state.canStartLocalOnlyChat)
+                            .help(state.canStartLocalOnlyChat ? "Create a fresh chat with a local backend" : "Make Apple Intelligence or Ollama available in Connections first")
                     }
                 }
             }
-        }
-    }
 
-    private func routeCard(_ capability: RouteCapability) -> some View {
-        InspectorPanelCard {
-            DisclosureGroup {
-                VStack(alignment: .leading, spacing: 9) {
+            inspectorWarnings(for: session)
+            instructionEditor
+
+            InspectorOpaqueDisclosure(title: "Workspace", systemImage: "folder") {
+                Text(session.workspacePath ?? "No workspace selected")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(session.workspacePath == nil ? .secondary : .primary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                Toggle("Trust workspace instruction files", isOn: Binding(
+                    get: { state.selectedWorkspaceInstructionsTrusted },
+                    set: { state.setSelectedWorkspaceInstructionTrust($0) }
+                ))
+                .toggleStyle(.switch)
+                .disabled(session.workspacePath == nil && state.selectedWorkspacePath.isEmpty)
+                .accessibilityHint("Allows exact AGENTS.md, AGENTS.MD, CLAUDE.md, and CLAUDE.MD files to be applied as workspace guidance. Does not grant credentials or bypass policy.")
+                Text("Trust means Lattice may apply only these exact filenames as guidance. It does not make files safe, grant credentials, or change approval policy.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                let names = state.selectedAppliedInstructionFileNames
+                InspectorFactRow(title: "Applied files", value: names.isEmpty ? "None" : names.joined(separator: ", "))
+                Button("Choose Workspace…") { state.chooseWorkspace() }
+                    .disabled(!session.messages.isEmpty)
+                    .help(session.messages.isEmpty ? "Choose this chat’s workspace" : "A chat workspace cannot change after messages are sent")
+            }
+
+            InspectorOpaqueDisclosure(title: "Context", systemImage: "paperclip") {
+                if let estimate = state.selectedContextBudgetEstimate { ContextBudgetMeter(estimate: estimate) }
+                if session.attachments.isEmpty {
+                    Text("No attached paths. Drag files or use paperclip to add context.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(session.attachments) { attachment in
+                        HStack(spacing: 8) {
+                            Label(attachment.name, systemImage: attachment.isImage ? "photo" : "doc").lineLimit(1)
+                            Spacer(minLength: 4)
+                            if attachment.isMissing { Text("Missing").font(.caption2).foregroundStyle(.orange) }
+                            Button { state.removeAttachment(attachment.id) } label: { Image(systemName: "xmark") }
+                                .buttonStyle(LatticeIconButtonStyle(size: .compact))
+                                .accessibilityLabel("Remove \(attachment.name)")
+                        }
+                    }
+                }
+            }
+
+            if let capability = state.selectedRouteCapability {
+                InspectorOpaqueDisclosure(title: "Route & safety", systemImage: "shield.lefthalf.filled") {
                     InspectorFactRow(title: "Owner", value: capability.executionOwner.displayName)
                     InspectorFactRow(title: "Tool broker", value: capability.brokerMediation.displayName)
                     capabilityRow("Write containment", capability.writeContainment)
@@ -103,53 +121,131 @@ struct InspectorView: View {
                     capabilityRow("Events", capability.structuredEvents)
                     capabilityRow("Resume", capability.providerSessionResume)
                     capabilityRow("Cancel", capability.cancellation)
-                    ForEach(Array(capability.warnings.enumerated()), id: \.offset) { index, warning in
-                        Text(warning).font(index == 0 ? .caption : .caption2)
-                            .foregroundStyle(index == 0 ? .orange : .secondary).fixedSize(horizontal: false, vertical: true)
-                    }
-                }.padding(.top, 10)
-            } label: {
-                HStack {
-                    Label("Route & safety", systemImage: "shield.lefthalf.filled")
-                    Spacer()
-                    if capability.primaryWarning != nil { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).accessibilityLabel("Route warning") }
-                }.font(.headline)
+                }
             }
-        }
-        .accessibilityElement(children: .contain).accessibilityLabel("Route and safety controls")
-    }
-
-    private func usageCard(_ usage: ProviderUsage) -> some View {
-        InspectorPanelCard {
-            DisclosureGroup {
-                VStack(alignment: .leading, spacing: 10) {
+            if case .codex = session.backend, let usage = state.codexUsage {
+                InspectorOpaqueDisclosure(title: "Usage", systemImage: "gauge.with.dots.needle.33percent") {
                     ForEach(usage.windows) { UsageWindowRow(window: $0) }
                     if let balance = usage.creditsBalance { InspectorFactRow(title: "Credits", value: balance) }
-                }.padding(.top, 10)
-            } label: { Label("Usage", systemImage: "gauge.with.dots.needle.33percent").font(.headline) }
+                }
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .latticeGlass(cornerRadius: LatticeMetrics.surfaceRadius)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Chat inspector")
+    }
+
+    @ViewBuilder
+    private func inspectorWarnings(for session: LatticeSession) -> some View {
+        let warnings = (state.selectedRouteCapability?.warnings ?? []) + (state.activeRouteStatusText.map { [$0] } ?? [])
+        if !warnings.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(Array(Set(warnings)).sorted(), id: \.self) { warning in
+                    Label(warning, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: LatticeMetrics.compactRadius, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: LatticeMetrics.compactRadius, style: .continuous).strokeBorder(Color.orange.opacity(0.35)))
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Inspector warnings")
+        }
+    }
+
+    private var instructionEditor: some View {
+        InspectorOpaqueSection(title: "Mode instructions", systemImage: "text.quote") {
+            Text("Optional guidance add-on for selected mode. Maximum 8 KiB. Not for credentials.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ModeInstructionEditor(mode: .code, text: Binding(
+                get: { state.codeInstructionAddOn },
+                set: { _ = state.setInstructionAddOn($0, for: .code) }
+            ))
+            ModeInstructionEditor(mode: .work, text: Binding(
+                get: { state.workInstructionAddOn },
+                set: { _ = state.setInstructionAddOn($0, for: .work) }
+            ))
         }
     }
 
     private func capabilityRow(_ title: String, _ capability: RouteCapabilityDetail) -> some View {
-        InspectorFactRow(title: title, value: capability.displayValue).accessibilityValue(capability.detail).help(capability.detail)
+        InspectorFactRow(title: title, value: capability.displayValue)
+            .accessibilityValue(capability.detail)
+            .help(capability.detail)
     }
 }
 
-private struct InspectorPanelCard<Content: View>: View {
-    let title: String?
-    let systemImage: String?
+private struct InspectorOpaqueSection<Content: View>: View {
+    let title: String
+    let systemImage: String
     @ViewBuilder let content: Content
 
-    init(title: String? = nil, systemImage: String? = nil, @ViewBuilder content: () -> Content) {
-        self.title = title; self.systemImage = systemImage; self.content = content()
-    }
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if let title, let systemImage { Label(title, systemImage: systemImage).font(.headline).accessibilityAddTraits(.isHeader) }
+        VStack(alignment: .leading, spacing: 9) {
+            Label(title, systemImage: systemImage)
+                .font(.headline)
+                .accessibilityAddTraits(.isHeader)
             content
         }
-        .padding(12).frame(maxWidth: .infinity, alignment: .leading).latticeGlass(cornerRadius: 14)
+        .padding(11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: LatticeMetrics.controlRadius, style: .continuous))
+    }
+}
+
+private struct InspectorOpaqueDisclosure<Content: View>: View {
+    let title: String
+    let systemImage: String
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 9) { content }
+                .padding(.top, 8)
+        } label: {
+            Label(title, systemImage: systemImage)
+                .font(.headline)
+        }
+        .padding(11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: LatticeMetrics.controlRadius, style: .continuous))
+    }
+}
+
+private struct ModeInstructionEditor: View {
+    let mode: ConversationMode
+    @Binding var text: String
+
+    private var byteCount: Int { text.utf8.count }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text("\(mode.displayName) add-on")
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                Text("\(byteCount) / \(LatticeInstructionEnvelope.maximumUserAddOnBytes) bytes")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(byteCount > LatticeInstructionEnvelope.maximumUserAddOnBytes ? .red : .secondary)
+            }
+            TextEditor(text: $text)
+                .font(.callout.monospaced())
+                .scrollContentBackground(.hidden)
+                .padding(5)
+                .frame(minHeight: 58, maxHeight: 130)
+                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.secondary.opacity(0.25)))
+                .accessibilityLabel("\(mode.displayName) mode instruction add-on")
+            Text("Do not paste passwords, API keys, tokens, or other credentials.")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+        }
     }
 }
 
@@ -655,6 +751,7 @@ private struct ModelsCatalogNotice: View {
 
 struct ConnectionsView: View {
     @ObservedObject var state: AppState
+    @AppStorage("lattice.connections.runtimeComponentsExpanded") private var runtimeComponentsExpanded = false
 
     private var ollamaConnectionReady: Bool {
         state.ollamaReady && state.ollamaCatalogStatus == .loaded
@@ -674,235 +771,374 @@ struct ConnectionsView: View {
     }
 
     var body: some View {
-        AdaptiveCatalogPage { contentWidth in
+        AdaptiveCatalogPage { _ in
             VStack(alignment: .leading, spacing: 20) {
-                PageHeader(title: "Connections", subtitle: "Provider setup, harnesses, and cloud model visibility")
-
-                CatalogCardGrid(contentWidth: contentWidth, minimum: LatticeCatalogPageLayout.connectionCardMinimum, maximum: LatticeCatalogPageLayout.connectionCardMaximum) {
-                    ConnectionCard(
-                        identity: .provider(.codex),
-                        name: "Codex",
-                        detail: state.codexReadinessCopy.detail,
-                        ready: state.codexReady
-                    ) {
-                        if state.codex.isInstalled {
-                            CatalogRefreshButton(status: state.codexCatalogStatus, state: state)
-                            if !state.codexAuthenticated {
-                                CLIActionButton(title: "Sign In", provider: "codex", state: state) { state.connectCodex() }
-                            }
-                            if CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: state.codexCLIVersion, latestVersion: state.codexLatestCLIVersion) {
-                                CLIActionButton(title: CLIVersionDisplayPolicy.updateActionTitle("Update CLI", currentVersion: state.codexCLIVersion, latestVersion: state.codexLatestCLIVersion), provider: "codex", state: state) { state.updateCodex() }
-                            }
-                        } else {
-                            CLIActionButton(title: "Install CLI", provider: "codex", state: state) { state.installCodex() }
-                        }
-                    } content: {
-                        VStack(alignment: .leading, spacing: 12) {
-                            CLIMetadata(version: state.codexCLIVersion, latestVersion: state.codexLatestCLIVersion, updateInfo: nil)
-                            if let caption = RouteConnectionCaption.caption(forHarnessID: "codex") {
-                                Text(caption)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            CLIActionMessage(provider: "codex", state: state)
-                            ModelChecklist(providerID: "codex", models: state.codexModels, state: state)
-                        }
-                    }
-
-                    ConnectionCard(
-                        identity: .provider(.grok),
-                        name: "Grok",
-                        detail: state.grokReadinessCopy.detail,
-                        ready: state.grokReady
-                    ) {
-                        if state.grok.isInstalled {
-                            CatalogRefreshButton(status: state.grokCatalogStatus, state: state)
-                            if !state.grokAuthenticated {
-                                CLIActionButton(title: "Sign In", provider: "grok", state: state) { state.connectGrok() }
-                            }
-                            CLIActionButton(title: CLIVersionDisplayPolicy.updateActionTitle(state.grokCLIInfo.updateAvailable == true ? "Update CLI" : "Check Update", currentVersion: state.grokCLIInfo.currentVersion, latestVersion: state.grokCLIInfo.updateAvailable == true ? state.grokCLIInfo.latestVersion : nil), provider: "grok", state: state) {
-                                if state.grokCLIInfo.updateAvailable == true { state.updateGrok() } else { state.checkGrokUpdate() }
-                            }
-                        } else {
-                            CLIActionButton(title: "Install CLI", provider: "grok", state: state) { state.installGrok() }
-                        }
-                    } content: {
-                        VStack(alignment: .leading, spacing: 12) {
-                            CLIMetadata(version: state.grokCLIInfo.currentVersion, latestVersion: nil, updateInfo: state.grokCLIInfo)
-                            if state.grokReady, let caption = RouteConnectionCaption.caption(forHarnessID: "grok") {
-                                Text(caption)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            CLIActionMessage(provider: "grok", state: state)
-                            ModelChecklist(providerID: "grok", models: state.grokModels, state: state)
-                        }
-                    }
-
-                    ConnectionCard(
-                        identity: .provider(.opencode),
-                        name: "OpenCode",
-                        detail: state.openCodeReadinessCopy.detail,
-                        ready: state.openCodeReady
-                    ) {
-                        if state.openCode.isInstalled {
-                            CatalogRefreshButton(status: state.openCodeCatalogStatus, state: state)
-                            if !state.openCodeAuthenticated {
-                                CLIActionButton(title: "Sign In", provider: "opencode", state: state) { state.connectOpenCode() }
-                            }
-                            if CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: state.openCodeCLIVersion, latestVersion: state.openCodeLatestCLIVersion) {
-                                CLIActionButton(title: CLIVersionDisplayPolicy.updateActionTitle("Update CLI", currentVersion: state.openCodeCLIVersion, latestVersion: state.openCodeLatestCLIVersion), provider: "opencode", state: state) { state.updateOpenCode() }
-                            }
-                        } else {
-                            CLIActionButton(title: "Install CLI", provider: "opencode", state: state) { state.installOpenCode() }
-                        }
-                    } content: {
-                        VStack(alignment: .leading, spacing: 14) {
-                            CLIMetadata(version: state.openCodeCLIVersion, latestVersion: state.openCodeLatestCLIVersion, updateInfo: nil)
-                            if state.openCodeReady, let caption = RouteConnectionCaption.caption(forHarnessID: "opencode") {
-                                Text(caption)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            CLIActionMessage(provider: "opencode", state: state)
-                            VStack(alignment: .leading, spacing: 8) {
-                                HStack {
-                                    Text("OpenCode Go API key").font(.caption).fontWeight(.semibold).foregroundStyle(.secondary)
-                                    Spacer()
-                                    if state.openCodeAPIKeySaved {
-                                        Label("Saved", systemImage: "checkmark.circle.fill")
-                                            .labelStyle(.titleAndIcon)
-                                            .font(.caption)
-                                            .foregroundStyle(.green)
-                                    }
-                                }
-                                if state.openCodeAPIKeySaved {
-                                    Button("Remove key", role: .destructive) { state.clearOpenCodeAPIKey() }
-                                } else {
-                                    HStack(spacing: 8) {
-                                        SecureField("Paste API key", text: $state.openCodeAPIKeyDraft)
-                                            .textFieldStyle(.roundedBorder)
-                                        Button("Save") { state.saveOpenCodeAPIKey() }
-                                            .disabled(state.openCodeAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                                    }
-                                }
-                            }
-                            ModelChecklist(providerID: "opencode", models: state.openCodeModels, state: state)
-                        }
-                    }
-
-                    ConnectionCard(identity: .systemImage("paperplane"), name: "Antigravity", detail: state.antigravityCatalogReady ? "Ready · CLI" : (state.antigravityAuthenticated ? "Connected · no models reported" : (state.antigravityInstalled ? "Sign in required" : "Not installed")), ready: state.antigravityCatalogReady) {
-                        if state.antigravityInstalled {
-                            if !state.antigravityAuthenticated { CLIActionButton(title: "Sign In", provider: "antigravity", state: state) { state.connectAntigravity() } }
-                            if CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: state.antigravityCLIVersion, latestVersion: state.antigravityLatestCLIVersion) {
-                                CLIActionButton(title: CLIVersionDisplayPolicy.updateActionTitle("Update CLI", currentVersion: state.antigravityCLIVersion, latestVersion: state.antigravityLatestCLIVersion), provider: "antigravity", state: state) { state.updateAntigravity() }
-                            }
-                        } else {
-                            CLIActionButton(title: "Install CLI", provider: "antigravity", state: state) { state.installAntigravity() }
-                        }
-                    } content: {
-                        VStack(alignment: .leading, spacing: 10) {
-                            if state.antigravityInstalled {
-                                CLIMetadata(version: state.antigravityCLIVersion, latestVersion: state.antigravityLatestCLIVersion, updateInfo: nil)
-                                if let caption = RouteConnectionCaption.caption(forHarnessID: "antigravity") {
-                                    Label(caption, systemImage: "shield.slash")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            } else {
-                                Label("Official Homebrew cask", systemImage: "shippingbox")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            CLIActionMessage(provider: "antigravity", state: state)
-                            ModelChecklist(providerID: "antigravity", models: state.antigravityModels, state: state)
-                        }
-                    }
-                }
-
-                SectionHeader("Agent runtimes")
-                CatalogCardGrid(contentWidth: contentWidth, minimum: LatticeCatalogPageLayout.connectionCardMinimum, maximum: LatticeCatalogPageLayout.connectionCardMaximum) {
-                    ConnectionCard(
-                        identity: .systemImage("terminal"),
-                        name: "Pi",
-                        detail: state.piInstalled ? "Installed" : "Not installed",
-                        ready: state.piInstalled
-                    ) {
-                        if state.piInstalled {
-                            if CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: state.piCLIVersion, latestVersion: state.piLatestCLIVersion) {
-                                CLIActionButton(title: CLIVersionDisplayPolicy.updateActionTitle("Update CLI", currentVersion: state.piCLIVersion, latestVersion: state.piLatestCLIVersion), provider: "pi", state: state) { state.updatePi() }
-                            }
-                        } else {
-                            CLIActionButton(title: "Install CLI", provider: "pi", state: state) { state.installPi() }
-                        }
-                    } content: {
-                        VStack(alignment: .leading, spacing: 10) {
-                            if state.piInstalled {
-                                CLIMetadata(version: state.piCLIVersion, latestVersion: state.piLatestCLIVersion, updateInfo: state.piCLIInfo)
-                                if let caption = RouteConnectionCaption.caption(forHarnessID: "pi") {
-                                    Label(caption, systemImage: "lock.shield")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                            CLIActionMessage(provider: "pi", state: state)
-                        }
-                    }
-                    ConnectionCard(
-                        identity: .systemImage("shippingbox"),
-                        name: "Hermes",
-                        detail: state.hermesReadinessCopy.detail,
-                        ready: state.hermesReady
-                    ) {
-                        if state.hermesInstalled {
-                            CatalogRefreshButton(status: state.hermesCatalogStatus, state: state)
-                            if state.hermesCatalogStatus == .unknown {
-                                CLIActionButton(title: "Set Up", provider: "hermes", state: state) { state.connectHermes() }
-                            }
-                            CLIActionButton(title: CLIVersionDisplayPolicy.updateActionTitle(state.hermesCLIInfo.updateAvailable == true ? "Update CLI" : "Check Update", currentVersion: state.hermesCLIInfo.currentVersion, latestVersion: state.hermesCLIInfo.updateAvailable == true ? state.hermesCLIInfo.latestVersion : nil), provider: "hermes", state: state) {
-                                if state.hermesCLIInfo.updateAvailable == true { state.updateHermes() } else { state.checkHermesUpdate() }
-                            }
-                        } else {
-                            CLIActionButton(title: "Install CLI", provider: "hermes", state: state) { state.installHermes() }
-                        }
-                    } content: {
-                        VStack(alignment: .leading, spacing: 10) {
-                            if state.hermesInstalled {
-                                CLIMetadata(version: state.hermesCLIInfo.currentVersion, latestVersion: nil, updateInfo: state.hermesCLIInfo)
-                                if let caption = RouteConnectionCaption.caption(forHarnessID: "hermes") {
-                                    Label(caption, systemImage: "lock.shield")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                            CLIActionMessage(provider: "hermes", state: state)
-                        }
-                    }
-                }
-
-                SectionHeader("System")
-                CatalogCardGrid(contentWidth: contentWidth, minimum: LatticeCatalogPageLayout.connectionCardMinimum, maximum: LatticeCatalogPageLayout.connectionCardMaximum) {
-                    ConnectionCard(identity: .systemImage("apple.intelligence"), name: "Apple Intelligence", detail: state.appleIntelligenceStatus, ready: state.appleIntelligenceReady, showsContent: false) {
-                        EmptyView()
-                    } content: {
-                        EmptyView()
-                    }
-                    ConnectionCard(identity: .systemImage("cpu"), name: "Ollama", detail: ollamaConnectionDetail, ready: ollamaConnectionReady, showsContent: false) {
-                        if state.ollamaReady {
-                            Button("Refresh") { Task { await state.refreshLocalModels() } }
-                        } else if state.ollamaInstalled {
-                            Button("Start") { state.openOllama() }
-                        } else {
-                            Button("Get") { state.installOllama() }
-                        }
-                    } content: {
-                        EmptyView()
-                    }
-                }
+                PageHeader(title: "Connections", subtitle: "Provider routes, runtime readiness, and local availability")
+                providerPanel
+                runtimeComponents
+                localPanel
             }
         }
         .navigationTitle("Connections")
         .toolbar { Button { Task { await state.refreshConnections(refreshProviderCatalogs: true) } } label: { Label("Refresh", systemImage: "arrow.clockwise") } }
+    }
+
+    private var providerPanel: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Label("Providers", systemImage: "cloud")
+                    .font(.headline)
+                Spacer()
+                Text("Code / Work")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Text("Mode badges stay conservative until readiness worker reports auth, model, and sandbox validation for each route.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 8)
+            providerRow(
+                identity: .provider(.codex), name: "Codex", detail: "Code via Pi · Work via Hermes",
+                modes: [
+                    .init(title: "Code", runtime: "Pi", ready: codexCodeReady),
+                    .init(title: "Work", runtime: "Hermes", ready: codexWorkReady)
+                ]
+            ) {
+                codexActions
+            } content: {
+                Text("Pi Code and Hermes Work authenticate separately. Direct Codex CLI sign-in does not enable either route.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                ModelChecklist(providerID: "codex", models: state.codexModels, state: state)
+            }
+            providerRow(
+                identity: .provider(.grok), name: "Grok", detail: state.grokAuthenticated ? "Build connected · Work Hermes pending validation" : state.grokReadinessCopy.detail,
+                modes: [
+                    .init(title: "Code", runtime: "Build", ready: false),
+                    .init(title: "Work", runtime: "Hermes", ready: grokWorkReady)
+                ]
+            ) {
+                grokActions
+            } content: {
+                ModelChecklist(providerID: "grok", models: state.grokModels, state: state)
+            }
+            providerRow(
+                identity: .provider(.opencode), name: "OpenCode", detail: state.openCodeAuthenticated ? "ACP connected · mode key policy pending" : state.openCodeReadinessCopy.detail,
+                modes: [
+                    .init(title: "Code", runtime: "Pi", ready: openCodeCodeReady),
+                    .init(title: "Work", runtime: "Hermes", ready: openCodeWorkReady)
+                ]
+            ) {
+                openCodeActions
+            } content: {
+                openCodeKeyControls
+                ModelChecklist(providerID: "opencode", models: state.openCodeModels, state: state)
+            }
+            providerRow(
+                identity: .systemImage("paperplane"), name: "Antigravity",
+                detail: state.antigravityAuthenticated ? "Connected · Code route pending validation" : (state.antigravityInstalled ? "Sign in required" : "Not installed"),
+                modes: [.init(title: "Code", runtime: "Antigravity", ready: false)]
+            ) {
+                antigravityActions
+            } content: {
+                ModelChecklist(providerID: "antigravity", models: state.antigravityModels, state: state)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .latticeGlass(cornerRadius: LatticeMetrics.surfaceRadius)
+    }
+
+    private var codexCodeReady: Bool {
+        // AppState exposes Pi install/model discovery, not Pi-owned auth. Stay conservative.
+        false
+    }
+
+    private var codexWorkReady: Bool {
+        false
+    }
+
+    private var grokWorkReady: Bool {
+        false
+    }
+
+    private var openCodeCodeReady: Bool {
+        // No Pi-owned auth or mode-scoped key policy in current AppState.
+        false
+    }
+
+    private var openCodeWorkReady: Bool {
+        // No Hermes-owned OpenCode auth/key policy in current AppState.
+        false
+    }
+
+    @ViewBuilder private var codexActions: some View {
+        if !state.codex.isInstalled {
+            CLIActionButton(title: "Install legacy CLI", provider: "codex", state: state) { state.installCodex() }
+        } else if CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: state.codexCLIVersion, latestVersion: state.codexLatestCLIVersion) {
+            CLIActionButton(title: "Update legacy CLI", provider: "codex", state: state) { state.updateCodex() }
+        }
+        runtimeAction(provider: "pi", installed: state.piInstalled, install: state.installPi, update: state.updatePi, version: state.piCLIVersion, latest: state.piLatestCLIVersion)
+        runtimeAction(provider: "hermes", installed: state.hermesInstalled, install: state.installHermes, update: state.updateHermes, version: state.hermesCLIInfo.currentVersion, latest: state.hermesCLIInfo.latestVersion)
+    }
+
+    @ViewBuilder private var grokActions: some View {
+        providerInstallOrUpdate(provider: "grok", installed: state.grok.isInstalled, authenticated: state.grokAuthenticated, install: state.installGrok, signIn: state.connectGrok, update: state.grokCLIInfo.updateAvailable == true ? state.updateGrok : state.checkGrokUpdate, version: state.grokCLIInfo.currentVersion, latest: state.grokCLIInfo.latestVersion)
+        runtimeAction(provider: "hermes", installed: state.hermesInstalled, install: state.installHermes, update: state.updateHermes, version: state.hermesCLIInfo.currentVersion, latest: state.hermesCLIInfo.latestVersion)
+    }
+
+    @ViewBuilder private var openCodeActions: some View {
+        providerInstallOrUpdate(provider: "opencode", installed: state.openCode.isInstalled, authenticated: state.openCodeAuthenticated, install: state.installOpenCode, signIn: state.connectOpenCode, update: state.updateOpenCode, version: state.openCodeCLIVersion, latest: state.openCodeLatestCLIVersion)
+        runtimeAction(provider: "pi", installed: state.piInstalled, install: state.installPi, update: state.updatePi, version: state.piCLIVersion, latest: state.piLatestCLIVersion)
+        runtimeAction(provider: "hermes", installed: state.hermesInstalled, install: state.installHermes, update: state.updateHermes, version: state.hermesCLIInfo.currentVersion, latest: state.hermesCLIInfo.latestVersion)
+    }
+
+    @ViewBuilder private var antigravityActions: some View {
+        providerInstallOrUpdate(provider: "antigravity", installed: state.antigravityInstalled, authenticated: state.antigravityAuthenticated, install: state.installAntigravity, signIn: state.connectAntigravity, update: state.updateAntigravity, version: state.antigravityCLIVersion, latest: state.antigravityLatestCLIVersion)
+    }
+
+    private func providerInstallOrUpdate(provider: String, installed: Bool, authenticated: Bool, install: @escaping () -> Void, signIn: @escaping () -> Void, update: @escaping () -> Void, version: String?, latest: String?) -> some View {
+        Group {
+            if !installed {
+                CLIActionButton(title: "Install", provider: provider, state: state, action: install)
+            } else if !authenticated {
+                CLIActionButton(title: "Sign in", provider: provider, state: state, action: signIn)
+            } else if CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: version, latestVersion: latest) {
+                CLIActionButton(title: "Update", provider: provider, state: state, action: update)
+            }
+        }
+    }
+
+    private func runtimeAction(provider: String, installed: Bool, install: @escaping () -> Void, update: @escaping () -> Void, version: String?, latest: String?) -> some View {
+        Group {
+            if !installed {
+                CLIActionButton(title: "Set up \(provider.capitalized)", provider: provider, state: state, action: install)
+            } else if CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: version, latestVersion: latest) {
+                CLIActionButton(title: "Update \(provider.capitalized)", provider: provider, state: state, action: update)
+            }
+        }
+    }
+
+    private var openCodeKeyControls: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text("OpenCode Go key")
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                Label(state.openCodeAPIKeySaved ? "Saved in Keychain" : "Not saved", systemImage: state.openCodeAPIKeySaved ? "checkmark.circle.fill" : "minus.circle")
+                    .font(.caption)
+                    .foregroundStyle(state.openCodeAPIKeySaved ? .green : .secondary)
+            }
+            HStack(spacing: 10) {
+                Toggle("Code key enablement", isOn: .constant(false))
+                    .toggleStyle(.checkbox)
+                    .disabled(true)
+                Toggle("Work key enablement", isOn: .constant(false))
+                    .toggleStyle(.checkbox)
+                    .disabled(true)
+            }
+            if state.openCodeAPIKeySaved {
+                Text("Mode-specific key policy pending readiness-worker integration. Current AppState applies saved key provider-wide; route badges stay not-ready.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Save key before enabling either mode. Key never appears in this UI.")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            }
+            if state.openCodeAPIKeySaved {
+                Button("Remove key", role: .destructive) { state.clearOpenCodeAPIKey() }
+                    .controlSize(.small)
+            } else {
+                HStack(spacing: 8) {
+                    SecureField("Paste API key", text: $state.openCodeAPIKeyDraft)
+                        .textFieldStyle(.roundedBorder)
+                    Button("Save") { state.saveOpenCodeAPIKey() }
+                        .disabled(state.openCodeAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+    }
+
+    private var runtimeComponents: some View {
+        DisclosureGroup(isExpanded: $runtimeComponentsExpanded) {
+            VStack(alignment: .leading, spacing: 8) {
+                RuntimeComponentRow(name: "Pi", icon: "terminal", installed: state.piInstalled, version: state.piCLIVersion, latest: state.piLatestCLIVersion, provider: "pi", state: state)
+                RuntimeComponentRow(name: "Hermes", icon: "shippingbox", installed: state.hermesInstalled, version: state.hermesCLIInfo.currentVersion, latest: state.hermesCLIInfo.latestVersion, provider: "hermes", state: state)
+            }
+            .padding(.top, 8)
+        } label: {
+            HStack {
+                Label("Runtime Components", systemImage: "shippingbox")
+                    .font(.headline)
+                Spacer()
+                Text("Pi · Hermes")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: LatticeMetrics.surfaceRadius, style: .continuous))
+    }
+
+    private var localPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("On this Mac", systemImage: "desktopcomputer")
+                .font(.headline)
+            LocalConnectionRow(name: "Apple Intelligence", detail: state.appleIntelligenceStatus, ready: state.appleIntelligenceReady)
+            LocalConnectionRow(name: "Ollama", detail: ollamaConnectionDetail, ready: ollamaConnectionReady) {
+                if state.ollamaReady {
+                    Button("Refresh") { Task { await state.refreshLocalModels() } }
+                } else if state.ollamaInstalled {
+                    Button("Start") { state.openOllama() }
+                } else {
+                    Button("Get") { state.installOllama() }
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: LatticeMetrics.surfaceRadius, style: .continuous))
+    }
+
+    private func providerRow<Actions: View, Content: View>(identity: ConnectionIdentity, name: String, detail: String, modes: [ModeReadiness], @ViewBuilder actions: () -> Actions, @ViewBuilder content: () -> Content) -> some View {
+        ProviderConnectionRow(identity: identity, name: name, detail: detail, modes: modes, actions: actions, content: content)
+    }
+}
+
+private struct ModeReadiness: Identifiable {
+    let title: String
+    let runtime: String
+    let ready: Bool
+    var id: String { title }
+}
+
+private struct ModeReadinessBadge: View {
+    let mode: ModeReadiness
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: mode.ready ? "checkmark.circle.fill" : "circle.dashed")
+            Text("\(mode.title) · \(mode.runtime)")
+        }
+        .font(.caption2.weight(.semibold))
+        .foregroundStyle(mode.ready ? .green : .secondary)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .background((mode.ready ? Color.green : Color.secondary).opacity(0.10), in: Capsule())
+        .overlay(Capsule().strokeBorder((mode.ready ? Color.green : Color.secondary).opacity(0.28)))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(mode.title) mode, \(mode.runtime)")
+        .accessibilityValue(mode.ready ? "Ready" : "Not ready")
+    }
+}
+
+private struct ProviderConnectionRow<Actions: View, Content: View>: View {
+    let identity: ConnectionIdentity
+    let name: String
+    let detail: String
+    let modes: [ModeReadiness]
+    @ViewBuilder let actions: Actions
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .top, spacing: 10) {
+                switch identity {
+                case .provider(let provider): ProviderIdentityMark(identity: provider, size: 26)
+                case .systemImage(let systemName): Image(systemName: systemName).font(.title3).foregroundStyle(.secondary).frame(width: 28, height: 28)
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(name).font(.body.weight(.semibold))
+                    Text(detail).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 5) { ForEach(modes) { ModeReadinessBadge(mode: $0) } }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                actions
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+            content
+        }
+        .padding(.vertical, 11)
+        .padding(.horizontal, 9)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: LatticeMetrics.controlRadius, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: LatticeMetrics.controlRadius, style: .continuous).strokeBorder(Color.secondary.opacity(0.16)))
+    }
+}
+
+private struct RuntimeComponentRow: View {
+    let name: String
+    let icon: String
+    let installed: Bool
+    let version: String?
+    let latest: String?
+    let provider: String
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon).foregroundStyle(.secondary).frame(width: 22)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(name).font(.body.weight(.semibold))
+                Text(installed ? "Installed · \(version ?? "version unknown")" : "Not installed")
+                    .font(.caption).foregroundStyle(.secondary)
+                if installed {
+                    Text("Remove: readiness-worker integration pending")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 8)
+            VStack(alignment: .trailing, spacing: 5) {
+                if installed {
+                    if CLIVersionDisplayPolicy.isUpdateAvailable(currentVersion: version, latestVersion: latest) {
+                        CLIActionButton(title: "Update", provider: provider, state: state) {
+                            if provider == "pi" { state.updatePi() } else { state.updateHermes() }
+                        }
+                    }
+                    Button("Diagnostics") { Task { await state.refreshConnections(refreshProviderCatalogs: true) } }
+                        .controlSize(.small)
+                        .help("Re-run runtime and model discovery")
+                    Button("Remove", role: .destructive) { }
+                        .controlSize(.small)
+                        .disabled(true)
+                        .help("Enable when readiness worker exposes safe runtime removal")
+                } else {
+                    CLIActionButton(title: "Install", provider: provider, state: state) {
+                        if provider == "pi" { state.installPi() } else { state.installHermes() }
+                    }
+                }
+            }
+        }
+        .padding(10)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: LatticeMetrics.controlRadius, style: .continuous))
+    }
+}
+
+private struct LocalConnectionRow<Actions: View>: View {
+    let name: String
+    let detail: String
+    let ready: Bool
+    @ViewBuilder let actions: Actions
+
+    init(name: String, detail: String, ready: Bool, @ViewBuilder actions: () -> Actions = { EmptyView() }) {
+        self.name = name; self.detail = detail; self.ready = ready; self.actions = actions()
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: ready ? "checkmark.circle.fill" : "circle.dashed")
+                .foregroundStyle(ready ? .green : .secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(name).font(.body.weight(.medium))
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            actions
+        }
+        .padding(10)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: LatticeMetrics.controlRadius, style: .continuous))
     }
 }
 
@@ -1380,70 +1616,6 @@ struct UsageWindowRow: View {
 enum ConnectionIdentity {
     case provider(LatticeProviderIdentity)
     case systemImage(String)
-}
-
-struct ConnectionCard<Actions: View, Content: View>: View {
-    let identity: ConnectionIdentity
-    let name: String
-    let detail: String
-    let ready: Bool
-    var showsContent = true
-    @ViewBuilder let actions: () -> Actions
-    @ViewBuilder let content: () -> Content
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .top, spacing: 14) {
-                connectionIdentityMark
-                    .frame(width: 30, height: 30)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(name)
-                        .fontWeight(.semibold)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text(detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .layoutPriority(1)
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel(name)
-                .accessibilityValue(detail)
-
-                Spacer(minLength: 0)
-                actions().fixedSize(horizontal: true, vertical: false)
-                // Shape/symbol distinguishes readiness without color alone; detail already
-                // carries the spoken status, so hide this chrome from VoiceOver.
-                ReadinessStatusIndicator(ready: ready, accessibilityStatus: detail)
-                    .accessibilityHidden(true)
-                    .fixedSize(horizontal: true, vertical: false)
-            }
-            if showsContent {
-                content()
-            }
-        }
-        .padding(LatticeMetrics.panelPadding)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .latticeGlass(cornerRadius: LatticeMetrics.surfaceRadius)
-    }
-
-    @ViewBuilder
-    private var connectionIdentityMark: some View {
-        switch identity {
-        case .provider(let provider):
-            ProviderIdentityMark(identity: provider, size: 28)
-        case .systemImage(let systemName):
-            Image(systemName: systemName)
-                .font(.title3)
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(.secondary)
-                .frame(width: 30, height: 30)
-                .accessibilityHidden(true)
-        }
-    }
 }
 
 struct PageHeader: View {

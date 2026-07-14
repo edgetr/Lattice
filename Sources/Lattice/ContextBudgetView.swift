@@ -29,7 +29,11 @@ struct ContextBudgetMeter: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
-        .latticeGlass(cornerRadius: LatticeMetrics.compactRadius, tint: statusAccent.opacity(increasedContrast ? 0.10 : 0.06))
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: LatticeMetrics.compactRadius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: LatticeMetrics.compactRadius, style: .continuous)
+                .strokeBorder(statusBorder, lineWidth: increasedContrast ? 1.25 : 1)
+        }
         .help("Local estimate from visible transcript, current draft, and attached path metadata. Provider tokenizers may differ.")
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Context budget")

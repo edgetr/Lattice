@@ -767,7 +767,8 @@ private struct ComposerRoutePopover: View {
                     }
                 }
                 .padding(9)
-                .latticeGlass(cornerRadius: 12, interactive: true)
+                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(Color.secondary.opacity(0.22)))
                 .accessibilityIdentifier("lattice.composer.model.search")
 
                 Text("Models")
@@ -899,78 +900,6 @@ private struct ModelChooserRow: View {
     }
 }
 
-struct BackendMenu: View {
-    @ObservedObject var state: AppState
-    var body: some View {
-        Group {
-            if state.isSelectedSessionRouteLocked {
-                Label(state.activeBackend.displayName, systemImage: "lock.fill")
-                    .foregroundStyle(.secondary)
-                    .help("Start a new chat to switch model or provider")
-            } else {
-                Menu {
-                    if !state.visibleCodexModels.isEmpty {
-                        Section("Codex") {
-                            ForEach(state.visibleCodexModels) { model in
-                                let backend = ChatBackend.codex(model: model.id)
-                                Button(model.name) { state.setBackend(backend) }
-                                    .disabled(!state.canUseBackendInNewChat(backend))
-                            }
-                        }
-                    }
-                    if !state.visibleGrokModels.isEmpty {
-                        Section("Grok") {
-                            ForEach(state.visibleGrokModels) { model in
-                                let backend = ChatBackend.grok(model: model.id)
-                                Button(model.name) { state.setBackend(backend) }
-                                    .disabled(!state.canUseBackendInNewChat(backend))
-                            }
-                        }
-                    }
-                    if !state.visibleOpenCodeModels.isEmpty {
-                        Section("OpenCode") {
-                            ForEach(state.visibleOpenCodeModels) { model in
-                                let backend = ChatBackend.openCode(model: model.id)
-                                Button(model.name) { state.setBackend(backend) }
-                                    .disabled(!state.canUseBackendInNewChat(backend))
-                            }
-                        }
-                    }
-                    if !state.visibleAntigravityModels.isEmpty {
-                        Section("Antigravity") {
-                            ForEach(state.visibleAntigravityModels) { model in
-                                let backend = ChatBackend.antigravity(model: model.id)
-                                Button(model.name) { state.setBackend(backend) }
-                                    .disabled(!state.canUseBackendInNewChat(backend))
-                            }
-                        }
-                    }
-                    if state.appleIntelligenceReady {
-                        Section("On this Mac") {
-                            let backend = ChatBackend.appleIntelligence
-                            Button("Apple Intelligence") { state.setBackend(backend) }
-                                .disabled(!state.canUseBackendInNewChat(backend))
-                        }
-                    }
-                    if !state.ollamaModels.isEmpty {
-                        Section("Local models") {
-                            ForEach(state.ollamaModels) { model in
-                                let backend = ChatBackend.ollama(model: model.name)
-                                Button(model.name) { state.setBackend(backend) }
-                                    .disabled(!state.canUseBackendInNewChat(backend))
-                            }
-                        }
-                    }
-                } label: {
-                    Text(state.activeBackend.displayName)
-                }
-                .menuStyle(.borderlessButton)
-            }
-        }
-        .fixedSize()
-    }
-}
-
 struct ReasoningMenu: View {
     @ObservedObject var state: AppState
     var body: some View {
@@ -987,41 +916,6 @@ struct ReasoningMenu: View {
             Label(state.activeReasoningEffort?.displayName ?? "Reasoning", systemImage: "brain")
         }
         .menuStyle(.borderlessButton).fixedSize().help("Reasoning effort")
-    }
-}
-
-struct HarnessMenu: View {
-    @ObservedObject var state: AppState
-
-    var body: some View {
-        Group {
-            if state.isSelectedSessionRouteLocked {
-                Label(state.activeHarnessID.capitalized, systemImage: "lock.fill")
-                    .foregroundStyle(.secondary)
-                    .help("Start a new chat to switch execution harness")
-            } else {
-                Menu {
-                    ForEach(state.availableExecutionRoutes) { route in
-                        Button {
-                            state.setExecutionRoute(engineID: route.engineID, harnessID: route.harnessID)
-                        } label: {
-                            if state.activeHarnessID == route.harnessID {
-                                Label(route.title, systemImage: "checkmark")
-                            } else {
-                                Text(route.title)
-                            }
-                        }
-                    }
-                } label: {
-                    Label(state.activeHarnessID.capitalized, systemImage: "arrow.triangle.branch")
-                }
-                .menuStyle(.borderlessButton)
-                .help("Choose the execution harness for this model")
-                .accessibilityLabel("Execution harness")
-                .accessibilityValue(state.activeHarnessID)
-            }
-        }
-        .fixedSize()
     }
 }
 
