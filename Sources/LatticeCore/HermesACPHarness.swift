@@ -57,7 +57,7 @@ public final class ACPHarness: @unchecked Sendable {
     }
 
     private final class PendingPermission: @unchecked Sendable {
-        enum Decision: Sendable { case selected(String), cancelled }
+        enum Decision: Sendable { case selected(String), cancelled(AgentCancellationReason) }
 
         let sessionID: UUID
         let owner: InteractiveProcessRegistry.Owner
@@ -73,19 +73,19 @@ public final class ACPHarness: @unchecked Sendable {
         }
 
         @discardableResult
-        func resolve(optionID: String?) -> Bool {
+        func resolve(optionID: String?, cancellationReason: AgentCancellationReason = .permissionDeclined) -> Bool {
             if let optionID {
                 guard optionIDs.contains(optionID) else { return false }
                 return waiter.resolve(.selected(optionID))
             }
-            return waiter.resolve(.cancelled)
+            return waiter.resolve(.cancelled(cancellationReason))
         }
 
         func wait(timeoutNanoseconds: UInt64) async -> PermissionWaitResult<Decision> {
             await withTaskCancellationHandler(operation: {
                 await waiter.wait(timeoutNanoseconds: timeoutNanoseconds)
             }, onCancel: {
-                _ = waiter.resolve(.cancelled)
+                _ = waiter.resolve(.cancelled(.streamConsumerTerminated))
             })
         }
     }
@@ -95,6 +95,7 @@ public final class ACPHarness: @unchecked Sendable {
     private let profile: Profile
     private let hermesProfile: LatticeHermesProfile?
     private let permissionTimeoutNanoseconds: UInt64
+    private let reconnectPolicy: ACPReconnectPolicy
     private let lock = NSLock()
     private let processRegistry = InteractiveProcessRegistry()
     private var pendingPermissions: [UUID: PendingPermission] = [:]
@@ -104,6 +105,7 @@ public final class ACPHarness: @unchecked Sendable {
         executableURL: URL? = nil,
         sandboxExecutableURL: URL? = HarnessSandbox.systemExecutableURL,
         permissionTimeout: TimeInterval = 120,
+        reconnectPolicy: ACPReconnectPolicy = ACPReconnectPolicy(),
         hermesProfile: LatticeHermesProfile? = nil
     ) {
         self.profile = profile
@@ -111,6 +113,7 @@ public final class ACPHarness: @unchecked Sendable {
         self.sandboxExecutableURL = sandboxExecutableURL
         self.hermesProfile = profile == .hermes ? (hermesProfile ?? LatticeHermesProfile()) : hermesProfile
         self.permissionTimeoutNanoseconds = PermissionTimeout.nanoseconds(for: permissionTimeout)
+        self.reconnectPolicy = reconnectPolicy
     }
 
     public var isInstalled: Bool { executableURL != nil }
@@ -323,6 +326,7 @@ public final class ACPHarness: @unchecked Sendable {
         AsyncStream { continuation in
             let start = processRegistry.beginStart(for: sessionID)
             let task = Task.detached(priority: .userInitiated) { [self] in
+                continuation.yield(.providerSessionLifecycle(.init(provider: profile.displayName, health: .connecting)))
                 guard let executableURL else {
                     _ = processRegistry.abandonStart(start, sessionID: sessionID)
                     continuation.yield(.failed("\(profile.displayName) is not installed.")); continuation.finish(); return
@@ -330,6 +334,7 @@ public final class ACPHarness: @unchecked Sendable {
                 let scratchDirectory = scratchDirectory(for: sessionID)
                 var transport: BoundedProcessTransport?
                 var owner: InteractiveProcessRegistry.Owner?
+                var reportedTerminalHealthIssue = false
                 do {
                     try FileManager.default.createDirectory(at: scratchDirectory, withIntermediateDirectories: true)
                     let canonicalWorkspace = try HarnessSandbox.canonicalDirectory(workspace)
@@ -406,6 +411,24 @@ public final class ACPHarness: @unchecked Sendable {
                         didRecover = true
                         recoveryPromptForDelivery = validatedRecoveryPrompt
                         let reason = Self.responseError(sessionResponse, fallback: "saved session was rejected or expired")
+                        continuation.yield(.providerSessionLifecycle(.init(
+                            provider: profile.displayName,
+                            providerSessionID: storedID,
+                            health: .unhealthy(.sessionRejected(reason))
+                        )))
+                        let reconnect = reconnectPolicy.state(forAttempt: 1)
+                        continuation.yield(.providerSessionLifecycle(.init(
+                            provider: profile.displayName,
+                            providerSessionID: storedID,
+                            health: .reconnecting(reconnect)
+                        )))
+                        guard reconnect.disposition == .scheduled else {
+                            reportedTerminalHealthIssue = true
+                            throw HarnessError.message("\(profile.displayName) rejected the saved session and provider-session recovery is unavailable.")
+                        }
+                        if reconnect.delayNanoseconds > 0 {
+                            try await Task.sleep(nanoseconds: reconnect.delayNanoseconds)
+                        }
                         continuation.yield(.harnessSessionRecovery(recoveryMessage(reason: reason)))
                         sessionRequestID += 1
                         try Self.write(Self.sessionRequest(id: sessionRequestID, method: "session/new", workspace: canonicalWorkspace, threadID: nil), to: runningTransport)
@@ -425,6 +448,12 @@ public final class ACPHarness: @unchecked Sendable {
                         ? Self.bestMatch(for: requestedModel, in: models)
                         : Self.exactMatch(for: requestedModel, in: models)
                     guard let matched else {
+                        reportedTerminalHealthIssue = true
+                        continuation.yield(.providerSessionLifecycle(.init(
+                            provider: profile.displayName,
+                            providerSessionID: acpID,
+                            health: .unhealthy(.unsupportedProvider(requestedModel))
+                        )))
                         throw HarnessError.message("\(profile.displayName) does not expose \(requestedModel) through its configured provider.")
                     }
                     let current = Self.currentModelID(from: result)
@@ -446,6 +475,11 @@ public final class ACPHarness: @unchecked Sendable {
                     // Registry-only metadata enables graceful protocol cancellation.
                     // Durable AppState persistence remains gated on the started event below.
                     setACPSessionID(acpID, owner: registeredOwner, for: sessionID)
+                    continuation.yield(.providerSessionLifecycle(.init(
+                        provider: profile.displayName,
+                        providerSessionID: acpID,
+                        health: didRecover ? .recovered : .healthy
+                    )))
 
                     sessionRequestID += 1
                     let promptText: String
@@ -462,14 +496,34 @@ public final class ACPHarness: @unchecked Sendable {
                     continuation.yield(.harnessSessionStarted("\(profile.sessionPrefix)\(acpID)"))
                     runningTransport.finish()
                     let didCancel = unregister(registeredOwner, start: start, sessionID: sessionID)
-                    continuation.yield(didCancel ? .cancelled : .completed)
+                    if didCancel {
+                        continuation.yield(.runCancelled(.init(reason: .userRequested)))
+                        continuation.yield(.cancelled)
+                    } else {
+                        continuation.yield(.completed)
+                    }
                 } catch {
                     let didCancel = unregister(owner, start: start, sessionID: sessionID)
                     transport?.cancel()
-                    if didCancel || transport?.terminationReason == .cancelled { continuation.yield(.cancelled) }
+                    if didCancel || transport?.terminationReason == .cancelled {
+                        continuation.yield(.runCancelled(.init(reason: .userRequested)))
+                        continuation.yield(.cancelled)
+                    }
                     else if transport?.terminationReason == .timedOut { continuation.yield(.failed("\(profile.displayName) timed out.")) }
                     else if transport?.terminationReason == .outputLimitExceeded { continuation.yield(.failed("\(profile.displayName) output exceeded its limit.")) }
-                    else { continuation.yield(.failed((error as? HarnessError)?.text ?? error.localizedDescription)) }
+                    else {
+                        let detail = (error as? HarnessError)?.text ?? error.localizedDescription
+                        if !reportedTerminalHealthIssue {
+                            let issue: ProviderSessionIssue = transport?.isRunning == false
+                                ? .disconnected(detail)
+                                : .protocolViolation(detail)
+                            continuation.yield(.providerSessionLifecycle(.init(
+                                provider: profile.displayName,
+                                health: .unhealthy(issue)
+                            )))
+                        }
+                        continuation.yield(.failed(detail))
+                    }
                 }
                 try? FileManager.default.removeItem(at: scratchDirectory)
                 continuation.finish()
@@ -491,7 +545,7 @@ public final class ACPHarness: @unchecked Sendable {
     }
 
     private func cancel(_ target: InteractiveProcessRegistry.CancellationTarget) {
-        cancelPendingPermissions(target.metadata.pendingPermissionIDs)
+        cancelPendingPermissions(target.metadata.pendingPermissionIDs, reason: .userRequested)
         if let acpID = target.metadata.providerSessionID {
             try? Self.write(["jsonrpc": "2.0", "method": "session/cancel", "params": ["sessionId": acpID]], to: target.process)
         }
@@ -662,7 +716,7 @@ public final class ACPHarness: @unchecked Sendable {
         let stale = pendingPermissions.values.filter { $0.sessionID == id }
         pendingPermissions = pendingPermissions.filter { $0.value.sessionID != id }
         lock.unlock()
-        stale.forEach { _ = $0.resolve(optionID: nil) }
+        stale.forEach { _ = $0.resolve(optionID: nil, cancellationReason: .superseded) }
         return owner
     }
 
@@ -718,11 +772,11 @@ public final class ACPHarness: @unchecked Sendable {
         lock.lock(); pendingPermissions[requestID] = nil; lock.unlock()
     }
 
-    private func cancelPendingPermissions(_ requestIDs: Set<UUID>) {
+    private func cancelPendingPermissions(_ requestIDs: Set<UUID>, reason: AgentCancellationReason) {
         lock.lock()
         let pending = requestIDs.compactMap { pendingPermissions[$0] }
         lock.unlock()
-        pending.forEach { $0.resolve(optionID: nil) }
+        pending.forEach { $0.resolve(optionID: nil, cancellationReason: reason) }
     }
 
     private static func initializeRequest(id: Int) -> [String: Any] {
@@ -797,17 +851,26 @@ public final class ACPHarness: @unchecked Sendable {
         let result = await pending.wait(timeoutNanoseconds: permissionTimeoutNanoseconds)
         removePendingPermission(request.id, owner: owner, sessionID: sessionID)
         let outcome: [String: Any]
+        let decision: ProviderPermissionDecision
         switch result {
         case .resolved(.selected(let optionID)):
             outcome = ["outcome": "selected", "optionId": optionID]
-        case .resolved(.cancelled):
+            let kind = request.options.first(where: { $0.id == optionID })?.kind ?? "unknown"
+            decision = .init(
+                requestID: request.id,
+                outcome: .selected(optionID: optionID, kind: kind)
+            )
+        case .resolved(.cancelled(let reason)):
             outcome = ["outcome": "cancelled"]
+            decision = .init(requestID: request.id, outcome: .cancelled(reason))
         case .timedOut:
             outcome = ["outcome": "cancelled"]
             try? Self.writeControl(["jsonrpc": "2.0", "id": id, "result": ["outcome": outcome]], to: transport)
+            continuation.yield(.permissionDecided(.init(requestID: request.id, outcome: .cancelled(.permissionTimedOut))))
             throw HarnessError.message(PermissionTimeout.message)
         }
         try Self.writeControl(["jsonrpc": "2.0", "id": id, "result": ["outcome": outcome]], to: transport)
+        continuation.yield(.permissionDecided(decision))
     }
 
     public static func permissionRequest(from object: [String: Any], workspace: URL? = nil) -> ApprovalRequest? {

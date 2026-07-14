@@ -173,6 +173,7 @@ final class AppState: ObservableObject {
     @Published var policy: ExecutionPolicy = .ask
     @Published var privacyMode: SessionPrivacyMode = .cloudAllowed
     @Published var harnessPermissionNotices: [UUID: HarnessPermissionNotice] = [:]
+    @Published private(set) var providerSessionHealth: [UUID: ProviderSessionLifecycleEvent] = [:]
     @Published private(set) var pendingUnsafeProviderRouteAcknowledgement: UnsafeProviderRouteAcknowledgement?
     @Published var editingMessageContext: MessageEditContext?
     /// Composer draft present before the current edit began; restored when edit mode exits without a successful send.
@@ -1420,6 +1421,7 @@ final class AppState: ObservableObject {
         sessions.removeAll { $0.id == id }
         submittedRequests[id] = nil
         retryableRequests[id] = nil
+        providerSessionHealth[id] = nil
         clearConversationScrollState(for: id)
         selectedSessionID = LatticeSessionListOrdering.sorted(sessions).first?.id
         persist()
@@ -2667,6 +2669,7 @@ final class AppState: ObservableObject {
         }
         reduceRunUI(.cancelled, for: id)
         harnessPermissionNotices[id] = nil
+        providerSessionHealth[id] = nil
         persist()
         cancelHarnessProcess(for: session, sessionID: id)
     }
@@ -6122,6 +6125,50 @@ Lattice self-edit rules:
                 setActivity([.init(icon: "hand.raised.fill", title: request.title, detail: "Waiting for your decision")], sessionID: id)
                 reduceRunUI(.permissionRequested, for: id)
             }
+        case .permissionDecided(let decision):
+            if harnessPermissionNotices[id]?.request.id == decision.requestID {
+                harnessPermissionNotices[id] = nil
+            }
+            switch decision.outcome {
+            case .selected(_, let kind):
+                updateSessionAction(
+                    id: decision.requestID,
+                    status: kind.hasPrefix("allow_") ? .allowed : .denied,
+                    at: index
+                )
+            case .cancelled:
+                updateSessionAction(id: decision.requestID, status: .denied, at: index)
+            }
+        case .providerSessionLifecycle(let lifecycle):
+            providerSessionHealth[id] = lifecycle
+            switch lifecycle.health {
+            case .connecting, .healthy:
+                break
+            case .unhealthy(let issue):
+                upsertActivity(.init(
+                    icon: "exclamationmark.triangle",
+                    title: "\(lifecycle.provider) session unhealthy",
+                    detail: Self.providerSessionIssueDetail(issue)
+                ), sessionID: id)
+            case .reconnecting(let reconnect):
+                upsertActivity(.init(
+                    icon: "arrow.triangle.2.circlepath",
+                    title: "Reconnecting \(lifecycle.provider)",
+                    detail: "Attempt \(reconnect.attempt) of \(reconnect.maximumAttempts)"
+                ), sessionID: id)
+            case .recovered:
+                upsertActivity(.init(
+                    icon: "checkmark.circle",
+                    title: "\(lifecycle.provider) session recovered",
+                    detail: "Structured provider session is healthy again."
+                ), sessionID: id)
+            }
+        case .runCancelled(let cancellation):
+            upsertActivity(.init(
+                icon: "stop.circle",
+                title: "Run cancelled",
+                detail: cancellation.detail ?? cancellation.reason.rawValue
+            ), sessionID: id)
         case .metric: break
         case .providerDiagnostic(let diagnostic):
             upsertActivity(.init(icon: "exclamationmark.triangle", title: diagnostic.title, detail: diagnostic.detail), sessionID: id)
@@ -6176,6 +6223,16 @@ Lattice self-edit rules:
             if sessions[index].messages.last?.text.isEmpty == true { sessions[index].messages.removeLast() }
             persist()
             scheduleIdleUnloadIfNeeded(for: backend)
+        }
+    }
+
+    private static func providerSessionIssueDetail(_ issue: ProviderSessionIssue) -> String {
+        switch issue {
+        case .disconnected(let detail): detail
+        case .sessionRejected(let detail): detail
+        case .protocolViolation(let detail): detail
+        case .unsupportedProvider(let provider): "The provider does not expose \(provider)."
+        case .authenticationRequired: "The provider requires authentication."
         }
     }
 

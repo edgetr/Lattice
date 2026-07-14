@@ -316,6 +316,12 @@ public enum AgentEvent: Sendable, Equatable {
     case toolRequested(ToolRequest)
     case toolProgress(id: UUID, fraction: Double, detail: String)
     case permissionRequested(ApprovalRequest)
+    /// Typed permission decision produced for a structured provider request.
+    case permissionDecided(ProviderPermissionDecision)
+    /// Observable provider-session lifecycle. This is ephemeral run state, not persisted provider state.
+    case providerSessionLifecycle(ProviderSessionLifecycleEvent)
+    /// Supplies the reason before the legacy terminal `cancelled` marker.
+    case runCancelled(AgentCancellation)
     case metric(name: String, value: Double, unit: String)
     case providerDiagnostic(ProviderEventDiagnostic)
     case completed
