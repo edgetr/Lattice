@@ -51,6 +51,22 @@ struct RouteCapabilityTests {
     }
 
     @Test(arguments: ExecutionPolicy.allCases)
+    func selfEditCodexAlwaysLaunchesReadOnlyOnRequest(sessionPolicy: ExecutionPolicy) {
+        _ = sessionPolicy
+        let route = CodexProviderExecutionRoute.resolve(
+            policy: SelfEditProviderLaunchPolicy.codexExecutionPolicy,
+            workspaceWrite: SelfEditProviderLaunchPolicy.codexWorkspaceWrite
+        )
+        #expect(route.approvalPolicy == "on-request")
+        #expect(route.sandbox == "read-only")
+    }
+
+    @Test func coldStartDoesNotInventAProviderModel() {
+        #expect(BackendAvailabilityPolicy.initialSelection(persisted: nil) == .ollama(model: ""))
+        #expect(BackendAvailabilityPolicy.initialSelection(persisted: .codex(model: "discovered")) == .codex(model: "discovered"))
+    }
+
+    @Test(arguments: ExecutionPolicy.allCases)
     func codexCapabilityDerivesFromSameMapping(policy: ExecutionPolicy) {
         let route = CodexProviderExecutionRoute.resolve(policy: policy)
         let capability = RouteCapability.resolve(harnessID: "codex", policy: policy)

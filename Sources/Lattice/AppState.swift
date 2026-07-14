@@ -370,7 +370,9 @@ final class AppState: ObservableObject {
         let savedIdleUnload = UserDefaults.standard.integer(forKey: Self.idleUnloadKey)
         localModelIdleUnloadMinutes = savedIdleUnload == 0 && UserDefaults.standard.object(forKey: Self.idleUnloadKey) == nil ? 5 : savedIdleUnload
         selectedWorkspacePath = cwd
-        let initialDefaultBackend = Self.loadDefaultBackend() ?? (codex.isInstalled ? .codex(model: "gpt-5.5") : .ollama(model: ""))
+        let initialDefaultBackend = BackendAvailabilityPolicy.initialSelection(
+            persisted: Self.loadDefaultBackend()
+        )
         defaultBackend = initialDefaultBackend
         selectedRouteEngineID = Self.engineID(for: initialDefaultBackend)
         selectedRouteHarnessID = Self.defaultHarnessID(for: initialDefaultBackend)
@@ -1808,7 +1810,20 @@ final class AppState: ObservableObject {
             stream = hermes.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: session.backend.displayName, allowFileModification: !isExtensionSelfEdit, recoveryPrompt: recoveryPrompt, recoveryUsesVisibleTranscriptHandoff: recoveryUsesVisibleTranscriptHandoff, recoveryDeliveryIssue: recoveryDeliveryIssue)
         } else { switch session.backend {
         case .codex(let model):
-            stream = codex.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, model: model, reasoningEffort: reasoningEffort, policy: session.policy)
+            stream = codex.stream(
+                prompt: prompt,
+                sessionID: id,
+                threadID: routeThreadID,
+                workspace: workspace,
+                model: model,
+                reasoningEffort: reasoningEffort,
+                policy: isExtensionSelfEdit
+                    ? SelfEditProviderLaunchPolicy.codexExecutionPolicy
+                    : session.policy,
+                workspaceWrite: isExtensionSelfEdit
+                    ? SelfEditProviderLaunchPolicy.codexWorkspaceWrite
+                    : false
+            )
         case .grok(let model):
             stream = grokACP.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: model, allowFileModification: !isExtensionSelfEdit, recoveryPrompt: recoveryPrompt, recoveryUsesVisibleTranscriptHandoff: recoveryUsesVisibleTranscriptHandoff, recoveryDeliveryIssue: recoveryDeliveryIssue)
         case .openCode(let model):

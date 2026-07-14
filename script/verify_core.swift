@@ -112,6 +112,12 @@ struct CoreVerification {
         let antigravityModels = [ProviderModel(id: "Gemini 3.5 Flash (High)", name: "Gemini 3.5 Flash (High)", isDefault: true)]
         let antigravitySnapshot = BackendAvailabilitySnapshot(antigravityModels: antigravityModels, antigravityReady: true)
         expect(BackendAvailabilityPolicy.normalize(.antigravity(model: "Retired"), using: antigravitySnapshot) == .antigravity(model: antigravityModels[0].id), "Antigravity stale models normalize to its available default")
+        expect(BackendAvailabilityPolicy.initialSelection(persisted: nil) == .ollama(model: ""), "Cold start remains model-less until discovery")
+        let selfEditCodexRoute = CodexProviderExecutionRoute.resolve(
+            policy: SelfEditProviderLaunchPolicy.codexExecutionPolicy,
+            workspaceWrite: SelfEditProviderLaunchPolicy.codexWorkspaceWrite
+        )
+        expect(selfEditCodexRoute.approvalPolicy == "on-request" && selfEditCodexRoute.sandbox == "read-only", "Self-edit Codex launch is enforced read-only with approvals")
         let importedSkillStore = LatticeSkillStore(rootURL: FileManager.default.temporaryDirectory, globalRoots: [])
         let longImportedSkill = "# Hatch Pet\n\n" + String(repeating: "Detailed validation workflow.\n", count: 1_200)
         let importedSkillIssues = importedSkillStore.validateExistingSkill(id: "hatch-pet", markdown: longImportedSkill)

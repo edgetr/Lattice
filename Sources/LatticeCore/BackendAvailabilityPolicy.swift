@@ -72,6 +72,12 @@ public struct BackendAvailabilitySnapshot: Hashable, Sendable {
 }
 
 public enum BackendAvailabilityPolicy {
+    /// Cold start must remain explicitly unresolved until persisted state or runtime
+    /// discovery provides a real model. Installation alone is not model evidence.
+    public static func initialSelection(persisted: ChatBackend?) -> ChatBackend {
+        persisted ?? .ollama(model: "")
+    }
+
     public static func normalize(_ backend: ChatBackend, using snapshot: BackendAvailabilitySnapshot) -> ChatBackend {
         switch backend {
         case .codex(let model):
