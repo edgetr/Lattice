@@ -167,6 +167,28 @@ struct RecommendationTests {
         try? FileManager.default.removeItem(at: root)
     }
 
+    @Test func structuredCatalogDistinguishesFailureFromValidEmptyResult() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let emptyExecutable = root.appendingPathComponent("empty-grok")
+        let failedExecutable = root.appendingPathComponent("failed-grok")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let emptyScript = "#!/bin/sh\nexit 0\n"
+        let failedScript = "#!/bin/sh\nexit 1\n"
+        try Data(emptyScript.utf8).write(to: emptyExecutable)
+        try Data(failedScript.utf8).write(to: failedExecutable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: emptyExecutable.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: failedExecutable.path)
+
+        let empty = await StructuredCLIHarness(kind: .grok, executableURL: emptyExecutable).modelsResult()
+        let failed = await StructuredCLIHarness(kind: .grok, executableURL: failedExecutable).modelsResult()
+
+        #expect(empty.models.isEmpty)
+        #expect(empty.status == .empty)
+        #expect(failed.models.isEmpty)
+        #expect(failed.status == .failed)
+        try? FileManager.default.removeItem(at: root)
+    }
+
     @Test func grokStructuredCatalogCanExposeReasoningOptions() throws {
         let output = """
         {"id":"grok-structured","name":"Grok Structured","isDefault":true,"reasoningOptions":["high","low"],"defaultReasoningEffort":"high"}
