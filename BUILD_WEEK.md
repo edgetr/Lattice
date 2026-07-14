@@ -63,30 +63,21 @@ Acceptance criteria:
 - A route cannot be described as broker-controlled when execution bypasses the broker.
 - Local-only and unavailable-route tests cover first run, continuation, import, catalog failure, and recovery.
 
-#### Harness customization boundary and future direction
+#### Code, Work, and Local runtime boundary
 
-Lattice should support provider-owned subscriptions without pretending every provider exposes the same customization surface. Today the implemented routes are intentionally different:
+New chats now use an explicit mode and discovered execution route. Direct Codex and OpenCode harnesses remain available only to persisted legacy chats; Lattice does not silently remap them.
 
-| Route | Transport used by Lattice | Workflow guidance | Custom tools / MCP controlled by Lattice | Important boundary |
-| --- | --- | --- | --- | --- |
-| Codex | Structured app-server JSON-RPC | Injected into the visible task prompt; ambient Codex configuration and `AGENTS.md` may also apply | Not yet | Codex owns its tool runtime; Lattice exposes only reviewed model, reasoning, sandbox, and approval controls. |
-| Grok Build | Structured ACP | Injected into the visible task prompt | Not yet; Lattice currently sends no MCP servers | Grok owns tools, profiles, plugins, and hooks used by its CLI. |
-| OpenCode | Structured ACP in pure mode | Injected into the visible task prompt | Not yet; Lattice currently sends no MCP servers | Pure mode deliberately avoids inheriting unreviewed plugins and agents. |
-| Hermes | Structured ACP | Injected into the visible task prompt | Not yet; Lattice currently sends no MCP servers | Hermes owns its skills, plugins, rules, memory, and toolsets. |
-| Pi | Structured NDJSON/RPC | Injected into the visible task prompt | Fixed provider-owned allowlist; no Lattice tool injection yet | Pi supports more prompt, extension, skill, and tool configuration than Lattice currently exposes. |
-| Antigravity | Streamed CLI transcript | Injected into the visible task prompt | No | The current print route is not a structured tool-event protocol and cannot offer resume or audited tool injection. |
-| Ollama | Local HTTP/NDJSON chat | Visible transcript messages | No tools | Local inference is supported, but a true system role and tool loop are future work. |
-| Apple Intelligence | Foundation Models session | Fixed Lattice instructions | No tools | The system model is fixed and local; no external agent tool harness is exposed. |
+| Mode and provider | Runtime | Lattice instructions | Tools and important boundary |
+| --- | --- | --- | --- |
+| Code · Codex | Pi RPC in an isolated Lattice profile | Versioned envelope applied at Pi's system-instruction extension boundary | Pi tools remain provider-owned; Lattice adds permission events and macOS write containment, not read/network confidentiality. |
+| Code · OpenCode Go/Zen | Pi RPC with a mode-consented Keychain key in child environment | Same system-level Lattice envelope | Credential never enters argv, events, or session persistence; Code and Work consent and validation are independent. |
+| Code · Grok | Grok Build ACP | Clearly labeled visible “Lattice task context,” not described as a system prompt | Grok owns its tools, login, plugins, and hooks. |
+| Code · Antigravity | Antigravity CLI | Clearly labeled visible “Lattice task context,” not described as a system prompt | Current transcript transport cannot promise structured tool events, resume, or injected tools. |
+| Work · Codex / Grok / OpenCode | Unmodified Hermes ACP in an isolated Lattice profile | Versioned envelope rendered into Lattice-owned `SOUL.md` and configuration | Curated browser, computer-use, web, file, and terminal toolsets; messaging, scheduling, credential, financial, and externally consequential categories remain disabled. Hermes tools are not broker-mediated. |
+| Local · Apple Intelligence | Foundation Models | Native Lattice instructions | On-device model; no external tool harness. |
+| Local · Ollama | Local HTTP/NDJSON | Visible transcript only | No tool loop or claimed system-role control. |
 
-The near-term direction is hybrid, not one lowest-common-denominator abstraction:
-
-1. Keep subscription-backed provider harnesses and expose only capabilities proven by their structured protocols.
-2. Add isolated, reviewable provider configuration profiles where a CLI supports them; never silently inherit ambient plugins, MCP servers, hooks, or memory.
-3. Route any Lattice-supplied MCP server or tool through the existing permission, scope, redaction, and audit design before enabling it for ACP or RPC harnesses.
-4. Build a Lattice-owned API harness for workflows that require uniform custom system prompts, a common brokered tool loop, and explicit API-key billing. Store those credentials only in Keychain.
-5. Treat Antigravity as a transcript route until a stable structured protocol can provide typed events, approvals, cancellation, and session resume.
-
-This keeps the product honest: workflow guidance works across current routes, but true custom system prompts and Lattice-owned tools are not uniformly available. The Lattice-owned API harness is the path to uniform control; provider subscriptions continue to bring their own harness behavior.
+The user always chooses Code, Work, or Local and then a discovered model. Lattice never automatically crosses modes, providers, runtimes, or models. Runtime components are shown only under collapsed diagnostics/setup; Pi and Hermes are not presented as model providers.
 
 ### 2. Durable run ledger and protocol replay
 
@@ -198,6 +189,7 @@ Do not include prompts, transcripts, or identifiers that contain secrets or priv
 | 2026-07-14 | Integrated UI and verification repair | `5724576`, `2eecbd1` | Current Codex desktop task; `/feedback` ID pending | GPT-5.6 Luna reviewed the merged UI for contradictory catalog and scroll accessibility states and repaired fallback parity. | Use human-readable VoiceOver state, distinguish hidden from undiscovered models, and keep verification claims tied to observed results. | Real app built and packaged successfully; bundle structure and arm64 executable verification passed. |
 | 2026-07-14 | Bounded slash commands and usable chat inspector | `9652a7d`, `d9752b3` | Current Codex desktop task; `/feedback` ID pending | GPT-5.6 traced the slash-only layout collapse and reshaped the inspector around the information hierarchy. | Keep the transcript visible, preserve every searchable command, widen the inspector, and collapse secondary safety/usage detail without hiding warnings. | Fallback verifier passed 812 checks; the manually compiled app packaged and verified successfully. |
 | 2026-07-14 | Local-first Models and provider-owned Connections | `178d74b`, `a129fb3`, `58b357f` | Current Codex desktop task; `/feedback` ID pending | GPT-5.6 separated local model discovery from provider setup and implemented the bounded Ollama delete flow with failure tests. | Models launches new local chats and manages local storage; Connections owns provider authentication, harnesses, and cloud model visibility; deletion always asks first and never removes chat history. | Two Ollama deletion tests added; fallback verifier passed 814 checks; app compilation, packaging, and bundle verification passed. |
+| 2026-07-14 | Explicit Code, Work, and Local modes | `33a5dac` through `62520a5` | Current Codex desktop task; `/feedback` ID pending | Eight planned GPT-5.6 Luna roles implemented and reviewed route architecture, Pi Code, Hermes Work, readiness, mode UI, compatibility, and integration boundaries in isolated worktrees. | User-selected modes only; Pi and Hermes stay hidden as implementation runtimes; no forks, cross-mode fallback, ambient credentials, provider-token copying, Grok subagents, or Sol subagents. | Current integration checkpoint: 838 deterministic fallback checks, 38 native test files / 419 declarations inventoried but not executed, and packaged arm64 app verification passed. Final Luna audit and real-app QA remain required before merge. |
 
 ## Submission checklist
 
