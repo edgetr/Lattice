@@ -513,44 +513,7 @@ struct ComposerView: View {
 
     var body: some View {
         VStack(spacing: state.composerSpacing()) {
-            HStack(spacing: 10) {
-                ComposerRouteMenu(state: state)
-                if let routeStatus = state.activeRouteStatusText {
-                    Label(routeStatus, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .lineLimit(1)
-                        .help(routeStatus)
-                }
-                if !state.activeReasoningOptions.isEmpty { ReasoningMenu(state: state) }
-                if state.canContinueSelectedSession {
-                    Button {
-                        state.continueSelectedResponse()
-                    } label: {
-                        Label("Continue", systemImage: "arrow.turn.down.right")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .help("Ask the current chat to continue from the last assistant response")
-                }
-                if state.editingMessageID != nil {
-                    HStack(spacing: 6) {
-                        Text("Editing")
-                        Button(action: state.cancelEditingMessage) { Image(systemName: "xmark") }
-                            .buttonStyle(LatticeIconButtonStyle(size: .compact))
-                            .accessibilityLabel("Cancel edit")
-                            .help("Cancel edit")
-                    }
-                    .font(.caption)
-                    .padding(.leading, 9)
-                    .padding(.trailing, 4)
-                    .padding(.vertical, 4)
-                    .latticeGlass(cornerRadius: 20, interactive: true)
-                }
-                Spacer()
-                Text(state.selectedSession?.workspacePath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "No workspace")
-                    .font(.caption).foregroundStyle(.tertiary).lineLimit(1)
-            }
+            composerHeader
             if !commandSuggestions.isEmpty {
                 AppCommandSuggestionList(commands: commandSuggestions) { command in
                     state.insertAppCommand(command)
@@ -581,6 +544,125 @@ struct ComposerView: View {
         .padding(.horizontal, state.composerHorizontalPadding())
         .padding(.vertical, state.composerVerticalPadding())
         .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder
+    private var composerHeader: some View {
+        ViewThatFits(in: .horizontal) {
+            fullComposerHeader
+            compactComposerHeader
+            stackedComposerHeader
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .latticeGlass(cornerRadius: 14, interactive: true, tint: state.tintColor(for: .composer)?.opacity(0.08))
+    }
+
+    private var fullComposerHeader: some View {
+        HStack(spacing: 10) {
+            ComposerRouteMenu(state: state)
+            routeStatusLabel
+            reasoningMenu
+            continueButton
+            editingBadge
+            Spacer(minLength: 8)
+            workspaceLabel
+        }
+    }
+
+    private var compactComposerHeader: some View {
+        HStack(spacing: 8) {
+            ComposerRouteMenu(state: state)
+            if !state.activeReasoningOptions.isEmpty { ReasoningMenu(state: state) }
+            if state.canContinueSelectedSession { continueButton }
+            if state.editingMessageID != nil { editingBadge }
+            Spacer(minLength: 4)
+            if let routeStatus = state.activeRouteStatusText {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .accessibilityLabel(routeStatus)
+                    .help(routeStatus)
+            }
+            workspaceLabel
+        }
+    }
+
+    private var stackedComposerHeader: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                ComposerRouteMenu(state: state)
+                Spacer(minLength: 4)
+                workspaceLabel
+            }
+            HStack(spacing: 8) {
+                routeStatusLabel
+                reasoningMenu
+                continueButton
+                editingBadge
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var routeStatusLabel: some View {
+        if let routeStatus = state.activeRouteStatusText {
+            Label(routeStatus, systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: 220, alignment: .leading)
+                .help(routeStatus)
+        }
+    }
+
+    @ViewBuilder
+    private var reasoningMenu: some View {
+        if !state.activeReasoningOptions.isEmpty { ReasoningMenu(state: state) }
+    }
+
+    @ViewBuilder
+    private var continueButton: some View {
+        if state.canContinueSelectedSession {
+            Button {
+                state.continueSelectedResponse()
+            } label: {
+                Label("Continue", systemImage: "arrow.turn.down.right")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Ask the current chat to continue from the last assistant response")
+        }
+    }
+
+    @ViewBuilder
+    private var editingBadge: some View {
+        if state.editingMessageID != nil {
+            HStack(spacing: 6) {
+                Text("Editing")
+                Button(action: state.cancelEditingMessage) { Image(systemName: "xmark") }
+                    .buttonStyle(LatticeIconButtonStyle(size: .compact))
+                    .accessibilityLabel("Cancel edit")
+                    .help("Cancel edit")
+            }
+            .font(.caption)
+            .padding(.leading, 9)
+            .padding(.trailing, 4)
+            .padding(.vertical, 4)
+            .latticeGlass(cornerRadius: 20, interactive: true)
+        }
+    }
+
+    private var workspaceLabel: some View {
+        Text(state.selectedSession?.workspacePath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "No workspace")
+            .font(.caption)
+            .foregroundStyle(.tertiary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .frame(maxWidth: 160, alignment: .trailing)
+            .help(state.selectedSession?.workspacePath ?? "No workspace")
     }
 }
 

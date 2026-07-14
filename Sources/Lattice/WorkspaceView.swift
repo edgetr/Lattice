@@ -118,33 +118,36 @@ struct WorkspaceView: View {
             }
         }
         .safeAreaInset(edge: .top, spacing: 0) {
-            VStack(spacing: 8) {
-                // Non-blocking save-failure status; load-recovery modal remains the exclusive recovery surface when present.
-                if state.needsSessionSaveFailureAttention, !state.needsPersistenceRecovery {
-                    SessionSaveFailureView(state: state)
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                }
-                if let status = state.exportChatStatusMessage {
-                    HStack(alignment: .top, spacing: 10) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                        Text(status)
-                            .font(.callout)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .textSelection(.enabled)
-                        Button("Dismiss") {
-                            state.exportChatStatusMessage = nil
-                        }
-                        .buttonStyle(.borderless)
-                        .accessibilityLabel("Dismiss export or import status")
+            LatticeGlassGroup(spacing: 10) {
+                VStack(spacing: 8) {
+                    // Non-blocking save-failure status; load-recovery modal remains the exclusive recovery surface when present.
+                    if state.needsSessionSaveFailureAttention, !state.needsPersistenceRecovery {
+                        SessionSaveFailureView(state: state)
+                            .transition(.move(edge: .top).combined(with: .opacity))
                     }
-                    .padding(12)
-                    .latticeGlass(cornerRadius: 14, tint: Color.green.opacity(0.08))
-                    .accessibilityElement(children: .contain)
-                    .accessibilityLabel("Export or import status")
-                    .accessibilityValue(status)
-                    .accessibilityIdentifier("export-import-status")
-                    .transition(.move(edge: .top).combined(with: .opacity))
+                    if let status = state.exportChatStatusMessage {
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                            Text(status)
+                                .font(.callout)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .textSelection(.enabled)
+                            Button("Dismiss") {
+                                state.exportChatStatusMessage = nil
+                            }
+                            .buttonStyle(.borderless)
+                            .accessibilityLabel("Dismiss export or import status")
+                        }
+                        .padding(12)
+                        .latticeGlass(cornerRadius: 14, tint: Color.green.opacity(0.08))
+                        .accessibilityElement(children: .contain)
+                        .accessibilityLabel("Export or import status")
+                        .accessibilityValue(status)
+                        .accessibilityIdentifier("export-import-status")
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                    }
                 }
             }
             .padding(.horizontal, 16)

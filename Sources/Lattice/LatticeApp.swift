@@ -23,6 +23,12 @@ struct LatticeApp: App {
             CommandMenu("Session") {
                 Button("New Chat") { delegate.state.newSession() }
                     .keyboardShortcut("n", modifiers: [.command])
+                Button("Previous Chat") { delegate.state.selectAdjacentSession(offset: -1) }
+                    .keyboardShortcut("[", modifiers: [.command, .option])
+                    .disabled(!delegate.state.canNavigateSessionList)
+                Button("Next Chat") { delegate.state.selectAdjacentSession(offset: 1) }
+                    .keyboardShortcut("]", modifiers: [.command, .option])
+                    .disabled(!delegate.state.canNavigateSessionList)
                 Button("Send Message") { delegate.state.sendDraft() }
                     .keyboardShortcut(.return, modifiers: [.command])
                     .disabled(!delegate.state.canSendDraft)
@@ -63,7 +69,8 @@ struct WorkspaceRootView: View {
 
     var body: some View {
         WorkspaceView(state: state)
-            .frame(minWidth: 980, minHeight: 660)
+            .frame(minWidth: 900, minHeight: 620)
+            .background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea())
             .preferredColorScheme(nil)
             .sheet(isPresented: Binding(
                 get: { state.showsOnboarding && !state.needsPersistenceRecovery },

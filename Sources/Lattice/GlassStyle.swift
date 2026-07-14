@@ -54,7 +54,7 @@ struct GlassSurface: ViewModifier {
     private var tintOpacity: Double {
         if tint == nil { return 0 }
         if reduceTransparency { return increasedContrast ? 0.10 : 0.08 }
-        return 0.14
+        return increasedContrast ? 0.18 : 0.16
     }
 
     private var lightShadowOpacity: Double {

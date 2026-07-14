@@ -127,6 +127,30 @@ struct ModeCompatibilityTests {
         }
     }
 
+    @Test func modeInstructionContractsStayDistinctAndLocalRemainsLightweight() {
+        #expect(LatticeProductInstructions.modeInstructions(for: .code).contains("Lattice Code mode operating contract"))
+        #expect(LatticeProductInstructions.modeInstructions(for: .code).contains("smallest correct change"))
+        #expect(LatticeProductInstructions.modeInstructions(for: .work).contains("Lattice Work mode SOUL"))
+        #expect(LatticeProductInstructions.modeInstructions(for: .work).contains("Never invent browsing"))
+        #expect(LatticeProductInstructions.modeInstructions(for: .local) == LatticeProductInstructions.piRuntime)
+
+        let codeEnvelope = try! LatticeInstructionEnvelope.default(
+            mode: .code,
+            workspace: URL(fileURLWithPath: "/tmp/lattice-test-workspace"),
+            allowFileModification: false,
+            workspaceInstructionsTrusted: false
+        )
+        let workEnvelope = try! LatticeInstructionEnvelope.default(
+            mode: .work,
+            workspace: URL(fileURLWithPath: "/tmp/lattice-test-workspace"),
+            allowFileModification: false,
+            workspaceInstructionsTrusted: false
+        )
+        #expect(codeEnvelope.renderedSystemInstructions.contains("Lattice Code mode operating contract"))
+        #expect(workEnvelope.renderedSystemInstructions.contains("Lattice Work mode SOUL"))
+        #expect(!codeEnvelope.renderedSystemInstructions.contains("Lattice Work mode SOUL"))
+    }
+
     @Test func piLaunchKeepsCredentialsOutOfArgvLogsEventsAndPersistence() throws {
         let fixture = try PiFixture()
         defer { fixture.remove() }

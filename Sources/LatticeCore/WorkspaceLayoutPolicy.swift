@@ -4,7 +4,7 @@ import Foundation
 
 /// Pure breakpoints for adaptive `NavigationSplitView` column management.
 ///
-/// The Lattice window minimum is ~980 pt. At that width, three simultaneous
+/// The Lattice window minimum is ~900 pt. At that width, three simultaneous
 /// columns (section sidebar + chat list + transcript) leave the transcript too
 /// narrow for readable message chrome. These rules prefer hiding the section
 /// sidebar first while keeping the chat list available.

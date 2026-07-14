@@ -201,6 +201,7 @@ public struct LatticeInstructionEnvelope: Codable, Equatable, Sendable {
             capabilityFacts: capabilityFacts,
             workspaceInstructionsTrusted: workspaceInstructionsTrusted,
             trustedWorkspaceInstructionNames: trustedWorkspaceInstructionNames,
+            latticeInstructions: LatticeProductInstructions.modeInstructions(for: mode),
             codeUserAddOn: codeUserAddOn,
             workUserAddOn: workUserAddOn
         )

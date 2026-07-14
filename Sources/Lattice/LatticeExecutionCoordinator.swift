@@ -28,6 +28,7 @@ struct LatticeExecutionLaunch {
     let recoveryUsesVisibleTranscriptHandoff: Bool
     let recoveryDeliveryIssue: String?
     let instructionEnvelope: LatticeInstructionEnvelope?
+    let developerInstructions: String?
     let hermesProvider: String?
     let hermesSystemIdentity: String?
     let openCodeAPIKey: String?
@@ -127,7 +128,8 @@ final class DefaultLatticeExecutionCoordinator: LatticeExecutionCoordinating {
                 model: model,
                 reasoningEffort: launch.reasoningEffort,
                 policy: launch.policy,
-                workspaceWrite: launch.workspaceWrite
+                workspaceWrite: launch.workspaceWrite,
+                developerInstructions: launch.developerInstructions
             )
         case .grok(let model):
             return runtimes.grok.stream(

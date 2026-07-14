@@ -122,7 +122,7 @@ public final class CodexExecHarness: @unchecked Sendable {
         return accumulator.snapshot
     }
 
-    public func stream(prompt: String, sessionID: UUID, threadID: String?, workspace: URL, model: String, reasoningEffort: ReasoningEffort? = nil, policy: ExecutionPolicy = .ask, workspaceWrite: Bool = false) -> AsyncStream<AgentEvent> {
+    public func stream(prompt: String, sessionID: UUID, threadID: String?, workspace: URL, model: String, reasoningEffort: ReasoningEffort? = nil, policy: ExecutionPolicy = .ask, workspaceWrite: Bool = false, developerInstructions: String? = nil) -> AsyncStream<AgentEvent> {
         AsyncStream<AgentEvent>(bufferingPolicy: .unbounded) { continuation in
             let start = processRegistry.beginStart(for: sessionID)
             let task = Task.detached(priority: .userInitiated) { [self] in
@@ -160,6 +160,9 @@ public final class CodexExecHarness: @unchecked Sendable {
                         "approvalsReviewer": "user",
                         "sandbox": route.sandbox
                     ]
+                    if let developerInstructions = developerInstructions?.trimmingCharacters(in: .whitespacesAndNewlines), !developerInstructions.isEmpty {
+                        threadParams["developerInstructions"] = developerInstructions
+                    }
                     if let threadID { threadParams["threadId"] = threadID }
                     try Self.write(["method": method, "id": 2, "params": threadParams], to: transport)
                     let threadResponse = try await readResponse(id: 2, sessionID: sessionID, owner: registeredOwner, from: reader, transport: transport, continuation: continuation)

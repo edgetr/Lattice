@@ -555,6 +555,31 @@ final class AppState: ObservableObject {
         return sessions.first { $0.id == id }
     }
 
+    var canNavigateSessionList: Bool {
+        navigableSessions.count > 1
+    }
+
+    /// Fast, keyboard-friendly thread switching using the same ordering and
+    /// search scope as the visible chat list. Selection itself is synchronous;
+    /// draft persistence is coalesced by the selection boundary below.
+    func selectAdjacentSession(offset: Int) {
+        guard offset != 0 else { return }
+        let ordered = navigableSessions
+        guard !ordered.isEmpty else { return }
+        guard let selectedSessionID,
+              let currentIndex = ordered.firstIndex(where: { $0.id == selectedSessionID }) else {
+            self.selectedSessionID = ordered[0].id
+            return
+        }
+        let nextIndex = currentIndex + offset
+        guard ordered.indices.contains(nextIndex) else { return }
+        self.selectedSessionID = ordered[nextIndex].id
+    }
+
+    private var navigableSessions: [LatticeSession] {
+        LatticeSessionListOrdering.sorted(sessions.filter { $0.matchesSearch(searchText) })
+    }
+
     var selectedSessionUsesLegacyDirectOpenCode: Bool {
         selectedSession.map { LegacyOpenCodeBridgePolicy.allows($0.executionRoute) } ?? false
     }
@@ -2162,7 +2187,7 @@ final class AppState: ObservableObject {
         let trustedInstructions = envelope.map {
             trustedWorkspaceInstructionText(for: workspace, names: $0.trustedWorkspaceInstructionNames)
         } ?? ""
-        let hermesSystemIdentity = envelope.map {
+        let developerInstructions = envelope.map {
             [$0.renderedSystemInstructions, trustedInstructions].filter { !$0.isEmpty }.joined(separator: "\n\n")
         }
         let openCodeAPIKey = OpenCodeCredentialPolicy.allowsKeychainCredential(
@@ -2197,8 +2222,9 @@ final class AppState: ObservableObject {
                 recoveryUsesVisibleTranscriptHandoff: recoveryUsesVisibleTranscriptHandoff,
                 recoveryDeliveryIssue: recoveryDeliveryIssue,
                 instructionEnvelope: envelope,
+                developerInstructions: developerInstructions,
                 hermesProvider: hermesProvider(for: session.executionRoute),
-                hermesSystemIdentity: hermesSystemIdentity,
+                hermesSystemIdentity: developerInstructions,
                 openCodeAPIKey: openCodeAPIKey,
                 appleTranscript: appleTranscript,
                 ollamaMessages: ollamaMessages,
@@ -3877,7 +3903,10 @@ final class AppState: ObservableObject {
         if session.executionRoute.runtimeID == "pi" || session.executionRoute.runtimeID == "hermes" || session.executionRoute.mode == .local {
             taskContext = ""
         } else {
-            taskContext = "\n\nLattice task context (visible task guidance; not a system prompt):\n" + LatticeProductInstructions.current
+            let guidance = session.executionRoute.runtimeID == "codex"
+                ? LatticeProductInstructions.current
+                : LatticeProductInstructions.taskContext(for: session.executionRoute.mode)
+            taskContext = "\n\nLattice task context (visible task guidance; not a system prompt):\n" + guidance
         }
         return taskContext
             + selfEditContext(for: submittedText, isExtensionSelfEdit: isExtensionSelfEdit, sessionID: session.id)
@@ -6405,6 +6434,12 @@ Lattice self-edit rules:
         sessionSaveCoordinator.scheduleDraftSnapshot(sessions)
     }
 
+    private func scheduleSelectionPersist() {
+        // Thread switching can happen repeatedly while scanning a session list;
+        // coalescing avoids synchronous JSON serialization on the main actor.
+        sessionSaveCoordinator.scheduleDebounced(sessions)
+    }
+
     private func scheduleStreamingPersist() {
         // Partial assistant text and progress must survive a crash without rewriting the full
         // session archive for every token or provider progress notification.
@@ -6437,8 +6472,10 @@ Lattice self-edit rules:
         }
 
         applyComposerDraft(transition.composerDraft)
-        // Session selection is a safe boundary: immediate flush so prior chat draft durability does not lag.
-        persist()
+        // Selection is a high-frequency interaction. Coalesce the full-store
+        // write so switching threads stays responsive while the latest draft
+        // remains durable within the same bounded save window used for typing.
+        scheduleSelectionPersist()
     }
 
     private func upsertSessionAction(_ action: SessionAction, at sessionIndex: Int) {

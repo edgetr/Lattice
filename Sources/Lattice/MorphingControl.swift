@@ -63,6 +63,7 @@ struct MorphingControl: View {
                         .textFieldStyle(.plain).focused($focused).lineLimit(1...5)
                         .foregroundStyle(.primary)
                         .tint(.pink)
+                        .layoutPriority(1)
                         .accessibilityIdentifier(LatticeAccessibilityID.composerDraft)
                         .accessibilityLabel("Composer draft")
                         .accessibilityValue(text)
@@ -100,7 +101,10 @@ struct MorphingControl: View {
                         Image(systemName: icon)
                             .foregroundStyle(semanticColor(presentation.statusSemantic) ?? Color.secondary)
                     }
-                    Text(presentation.statusTitle ?? "Add context").fontWeight(.medium)
+                    Text(presentation.statusTitle ?? "Add context")
+                        .fontWeight(.medium)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .layoutPriority(1)
                     Spacer()
                     Button("Files…", action: onChooseFiles).buttonStyle(.borderedProminent)
                     if let dismiss = presentation.secondaryAction {
@@ -124,6 +128,7 @@ struct MorphingControl: View {
                             .font(.caption.weight(.medium))
                             .foregroundStyle(.secondary)
                             .monospacedDigit()
+                            .fixedSize(horizontal: false, vertical: true)
                             // Status copy can flip Starting/Working without a phase animation.
                             .transaction { transaction in
                                 if reduceMotion { transaction.disablesAnimations = true }
@@ -133,6 +138,7 @@ struct MorphingControl: View {
                         .textFieldStyle(.plain)
                         .focused($focused)
                         .lineLimit(1...3)
+                        .layoutPriority(1)
                         .onSubmit { onSubmit() }
                     if let queue = presentation.primaryAction {
                         Button(action: onSubmit) {
@@ -167,6 +173,8 @@ struct MorphingControl: View {
                             .foregroundStyle(semanticColor(presentation.statusSemantic) ?? Color.orange)
                     }
                     Text(presentation.statusTitle ?? "Approval needed")
+                        .fixedSize(horizontal: false, vertical: true)
+                        .layoutPriority(1)
                     Spacer()
                     if let stop = presentation.secondaryAction {
                         Button(action: onStop) {
@@ -202,7 +210,9 @@ struct MorphingControl: View {
                         Image(systemName: presentation.statusSystemImage ?? "exclamationmark.triangle.fill")
                     }
                     .foregroundStyle(semanticColor(presentation.statusSemantic) ?? Color.orange)
-                    .lineLimit(2)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .layoutPriority(1)
                     Spacer(minLength: 8)
                     if let retry = presentation.primaryAction {
                         Button {
