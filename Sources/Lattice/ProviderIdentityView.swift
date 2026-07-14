@@ -62,9 +62,9 @@ struct ReadinessStatusIndicator: View {
             .font(.system(size: 13, weight: .semibold))
             .symbolRenderingMode(.hierarchical)
             .foregroundStyle(ready ? Color.green : Color.secondary)
-            .accessibilityLabel(ready ? "Ready" : "Not ready")
+            .accessibilityLabel(ready ? "Available" : "Unavailable")
             .accessibilityValue(accessibilityStatus ?? (ready ? "Available" : "Unavailable"))
-            .help(ready ? "Ready" : "Not ready")
+            .help(ready ? "Available" : "Unavailable")
     }
 }
 

@@ -241,13 +241,11 @@ private struct RuntimeConfirmationSheet: View {
 
     private var descriptor: RuntimeInstallDescriptor { request.descriptor }
     private var actionTitle: String {
-        switch request.action {
-        case .firstUseInstall: "Install"
-        case .update: "Reinstall Pin"
-        case .uninstall: "Remove"
-        case .rollback: "Roll Back"
-        case .cancel, .interruptUpdate: "Continue"
-        }
+        RuntimeLifecyclePresentationPolicy.actionTitle(
+            for: request.action,
+            installedVersion: request.runtime == .pi ? state.piCLIVersion : state.hermesCLIInfo.currentVersion,
+            targetVersion: descriptor.immutableVersion
+        )
     }
 
     var body: some View {
@@ -259,7 +257,7 @@ private struct RuntimeConfirmationSheet: View {
                     .background(Color.accentColor.opacity(0.12), in: Circle())
                 VStack(alignment: .leading, spacing: 2) {
                     Text("\(actionTitle) \(descriptor.displayName)").font(.title3.weight(.semibold))
-                    Text("Lattice runtime component").font(.caption).foregroundStyle(.secondary)
+                    Text("Agent runtime").font(.caption).foregroundStyle(.secondary)
                 }
             }
 

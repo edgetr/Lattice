@@ -151,6 +151,36 @@ public enum RuntimeLifecycleAction: String, Codable, Hashable, Sendable {
     case uninstall
 }
 
+/// User-facing runtime actions use ordinary verbs. Installation pins and
+/// package mechanics remain available in confirmation details, not controls.
+public enum RuntimeLifecyclePresentationPolicy {
+    public static func actionTitle(
+        for action: RuntimeLifecycleAction,
+        installedVersion: String? = nil,
+        targetVersion: String? = nil
+    ) -> String {
+        switch action {
+        case .firstUseInstall:
+            "Install"
+        case .update:
+            versionsMatch(installedVersion, targetVersion) ? "Repair" : "Update"
+        case .uninstall:
+            "Remove"
+        case .rollback:
+            "Restore Previous Version"
+        case .cancel, .interruptUpdate:
+            "Stop"
+        }
+    }
+
+    private static func versionsMatch(_ installedVersion: String?, _ targetVersion: String?) -> Bool {
+        guard let installedVersion, let targetVersion else { return false }
+        let installed = installedVersion.trimmingCharacters(in: .whitespacesAndNewlines)
+        let target = targetVersion.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !installed.isEmpty && installed == target
+    }
+}
+
 public enum RuntimeLifecyclePhase: String, Codable, Hashable, Sendable {
     case idle
     case awaitingConfirmation
@@ -311,11 +341,11 @@ public enum OpenCodeCredentialPolicy {
 public extension ExecutionRouteReadiness {
     var detail: String {
         switch self {
-        case .loading: "Checking runtime readiness…"
+        case .loading: "Checking availability…"
         case .missingRuntime: "Runtime is not installed."
-        case .authenticationRequired: "Authentication is required."
-        case .validating: "Validating runtime, model, and sandbox…"
-        case .runnable: "Ready"
+        case .authenticationRequired: "Sign in required."
+        case .validating: "Checking runtime, model, and write containment…"
+        case .runnable: "Available"
         case .failed(let detail): detail
         }
     }

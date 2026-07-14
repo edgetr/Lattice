@@ -87,17 +87,17 @@ public enum ProviderReadinessPresentationPolicy: Sendable {
     public static func copy(
         providerName: String,
         readiness: ProviderReadinessSnapshot,
-        readyDetail: String = "Connected"
+        readyDetail: String = "Available"
     ) -> ProviderReadinessCopy {
         let name = providerName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Provider" : providerName
         guard readiness.installed else { return ProviderReadinessCopy(detail: "Not installed", isReady: false) }
         guard readiness.authenticated else { return ProviderReadinessCopy(detail: "Sign in required", isReady: false) }
 
         switch readiness.catalogStatus {
-        case .unknown: return ProviderReadinessCopy(detail: "Signed in · \(name) model catalog not checked", isReady: false)
-        case .loading: return ProviderReadinessCopy(detail: "Signed in · loading \(name) model catalog", isReady: false)
+        case .unknown: return ProviderReadinessCopy(detail: "Signed in · models not checked", isReady: false)
+        case .loading: return ProviderReadinessCopy(detail: "Signed in · checking models", isReady: false)
         case .empty: return ProviderReadinessCopy(detail: "Signed in · no \(name) models found", isReady: false)
-        case .failed: return ProviderReadinessCopy(detail: "Signed in · \(name) model catalog unavailable", isReady: false)
+        case .failed: return ProviderReadinessCopy(detail: "Signed in · models unavailable", isReady: false)
         case .loaded:
             guard readiness.runnableModelCount > 0 else { return ProviderReadinessCopy(detail: "Signed in · no runnable models", isReady: false) }
             return ProviderReadinessCopy(detail: readyDetail, isReady: true)

@@ -128,8 +128,8 @@ struct OnboardingView: View {
                 onChooseWorkspace()
             }
             .focused($focusedField, equals: .chooseWorkspace)
-            .accessibilityHint("Opens a folder picker supplied by the host. Onboarding does not write preferences itself.")
-            Text("Choosing a folder only runs the action the host provides. Skip if you prefer to set a workspace later from a chat.")
+            .accessibilityHint("Opens a folder picker. Lattice does not write to the chosen folder from this guide.")
+            Text("Choosing a folder sets the workspace for new chats. Skip if you prefer to choose one later.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -146,8 +146,8 @@ struct OnboardingView: View {
                 detail: "Apple Intelligence and Ollama stay on this Mac. Idle unload for Ollama is configured in Settings."
             )
             labeledBullet(
-                title: "Cloud / connected",
-                detail: "Provider CLIs sign in under Connections. Per-chat privacy can block cloud routes."
+                title: "Cloud providers",
+                detail: "Sign in and check provider availability in Connections. Per-chat privacy can block cloud routes."
             )
             labeledBullet(
                 title: "Sandbox truth",
@@ -168,9 +168,9 @@ struct OnboardingView: View {
                     onOpenConnections()
                 }
                 .focused($focusedField, equals: .openConnections)
-                .accessibilityHint("Switches to the Connections section when the host supplies this action.")
+                .accessibilityHint("Opens Connections to install runtimes and sign in to providers.")
             } else {
-                Text("Use the sidebar Connections section when you are ready to sign in or install provider CLIs.")
+                Text("Use Connections when you are ready to install runtimes or sign in to providers.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

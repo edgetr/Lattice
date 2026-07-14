@@ -948,14 +948,14 @@ final class AppState: ObservableObject {
         ProviderReadinessPresentationPolicy.copy(
             providerName: "Grok",
             readiness: ProviderReadinessSnapshot(installed: grok.isInstalled, authenticated: grokAuthenticated, catalogStatus: grokCatalogStatus, runnableModelCount: runnableGrokModels.count),
-            readyDetail: "Ready · ACP"
+            readyDetail: "Available · ACP"
         )
     }
     var openCodeReadinessCopy: ProviderReadinessCopy {
         ProviderReadinessPresentationPolicy.copy(
             providerName: "OpenCode",
             readiness: ProviderReadinessSnapshot(installed: openCode.isInstalled, authenticated: openCodeAuthenticated, catalogStatus: openCodeCatalogStatus, runnableModelCount: runnableOpenCodeModels.count),
-            readyDetail: "Ready · ACP"
+            readyDetail: "Available · ACP"
         )
     }
     var piCLIInfo: CLIUpdateInfo {
@@ -1312,11 +1312,11 @@ final class AppState: ObservableObject {
             .init(id: "choose-workspace", title: "Choose Workspace…", detail: "Select the project folder for new or empty chats", keywords: ["project", "folder", "path"]),
             .init(
                 id: "refresh-connections",
-                title: "Refresh Connections",
-                detail: "Refresh provider readiness and model catalogs",
-                keywords: ["models", "providers", "sync"],
+                title: "Check Connections",
+                detail: "Check provider sign-in, runtimes, and models",
+                keywords: ["models", "providers", "refresh", "sync"],
                 isEnabled: canRequestConnectionRefresh,
-                disabledReason: connectionRefreshDisabledReason ?? "Connection refresh is unavailable"
+                disabledReason: connectionRefreshDisabledReason ?? "Connection checks are unavailable"
             ),
             .init(id: "open-extensions-folder", title: "Open Extensions Folder", detail: "Show the user-owned Lattice modification layer", keywords: ["self edit", "customization", "application support"]),
             .init(id: "open-skills-folder", title: "Open Skills Folder", detail: "Show Lattice’s shared SKILL.md folder for imported and generated skills", keywords: ["skills", "skill.md", "agents", "customization", "application support"]),
@@ -2532,7 +2532,7 @@ final class AppState: ObservableObject {
         case .loaded: break
         }
         guard antigravityAuthenticated else { return "Sign in required" }
-        return antigravityProtocolSupport.isStructured ? "Connected · structured events" : "Connected · transcript events only"
+        return antigravityProtocolSupport.isStructured ? "Available · structured events" : "Available · transcript events only"
     }
 
     private func codeRouteReadinessDetail(providerID: String) -> String {
@@ -2562,9 +2562,9 @@ final class AppState: ObservableObject {
         }
         switch providerID {
         case "codex":
-            guard validatedHermesProviders.contains(LatticeHermesProvider.openAICodex.rawValue) else { return "Validate Hermes Codex authentication" }
+            guard validatedHermesProviders.contains(LatticeHermesProvider.openAICodex.rawValue) else { return "Check Hermes Codex sign-in" }
         case "grok":
-            guard validatedHermesProviders.contains(LatticeHermesProvider.xAIOAuth.rawValue) else { return "Validate Hermes Grok authentication" }
+            guard validatedHermesProviders.contains(LatticeHermesProvider.xAIOAuth.rawValue) else { return "Check Hermes Grok sign-in" }
         case "opencode":
             guard openCodeAPIKeySaved, openCodeCredentialEnabledModes.contains(.work) else { return "Enable the OpenCode key for Work" }
         default:
@@ -2688,10 +2688,10 @@ final class AppState: ObservableObject {
             switch session.executionRoute.runtimeID {
             case "pi":
                 if !piInstalled { return "Set up the Pi Code runtime in Connections." }
-                return "Pi authentication or exact model validation is required for this Code route."
+                return "Check Pi sign-in and exact model availability for this Code route."
             case "hermes":
                 if !hermesInstalled { return "Set up the Hermes Work runtime in Connections." }
-                return "Hermes authentication or exact model validation is required for this Work route."
+                return "Check Hermes sign-in and exact model availability for this Work route."
             case "grok": return grokReadinessCopy.detail
             case "antigravity": return antigravityReadinessDetail
             case "lattice": break
@@ -2929,7 +2929,7 @@ final class AppState: ObservableObject {
             Task { await unloadLocalModel(model, reason: "Unloaded after model switch") }
         }
         if case .ollama(let model) = backend {
-            localModelStatus = "Ready: \(model)"
+            localModelStatus = "Available: \(model)"
             scheduleLocalModelIdleUnload(model: model)
         }
     }
@@ -3773,7 +3773,7 @@ final class AppState: ObservableObject {
             cliActionMessages["pi"] = "Lattice could not open the isolated Pi login terminal."
             return
         }
-        cliActionMessages["pi"] = "In Pi, run /login and choose ChatGPT. Return here, then Validate."
+        cliActionMessages["pi"] = "In Pi, run /login and choose ChatGPT. Return here, then choose Check Code."
     }
 
     func validatePiAuthentication(providerID: String) {
@@ -3795,7 +3795,7 @@ final class AppState: ObservableObject {
             return
         }
         let actionID = "pi-\(providerID)"
-        guard beginCLIAction(provider: actionID, progress: "Validating Pi \(providerID)…", estimatedSeconds: 30) else { return }
+        guard beginCLIAction(provider: actionID, progress: "Checking Pi \(providerID)…", estimatedSeconds: 30) else { return }
         let refreshGeneration = connectionRefreshGeneration.current()
         Task {
             let key = providerID == "opencode" && openCodeCredentialEnabledModes.contains(.code)
@@ -3816,11 +3816,11 @@ final class AppState: ObservableObject {
                 } else {
                     validatedPiOpenCodeModels = Set(candidates.map(\.model))
                 }
-                cliActionMessages["pi"] = "Pi \(providerID) authentication validated."
+                cliActionMessages["pi"] = "Pi \(providerID) sign-in and models are available."
             } else {
                 if providerID == "codex" { validatedPiCodexModels.removeAll() }
                 else { validatedPiOpenCodeModels.removeAll() }
-                cliActionMessages["pi"] = "Pi could not validate \(providerID). Check the isolated login or enabled key, then try again."
+                cliActionMessages["pi"] = "Pi could not verify \(providerID). Check the isolated sign-in or enabled key, then try again."
             }
             finishCLIAction(actionID)
         }
@@ -3843,7 +3843,7 @@ final class AppState: ObservableObject {
             cliActionMessages["hermes"] = "Lattice could not open the isolated Hermes model setup terminal."
             return
         }
-        cliActionMessages["hermes"] = "Choose and authenticate the Work provider in Hermes, then validate it here."
+        cliActionMessages["hermes"] = "Choose and sign in to the Work provider in Hermes, then choose Check Work here."
     }
 
     func validateHermesAuthentication(providerID: String) {
@@ -3858,7 +3858,7 @@ final class AppState: ObservableObject {
         let actionID = "hermes-\(providerID)"
         guard hermesInstalled,
               !isRefreshingConnections,
-              beginCLIAction(provider: actionID, progress: "Validating Hermes \(providerID)…", estimatedSeconds: 20) else { return }
+              beginCLIAction(provider: actionID, progress: "Checking Hermes \(providerID)…", estimatedSeconds: 20) else { return }
         let refreshGeneration = connectionRefreshGeneration.current()
         Task {
             let valid = await hermes.validateHermesAuthentication(provider: provider)
@@ -3869,7 +3869,7 @@ final class AppState: ObservableObject {
             if valid { validatedHermesProviders.insert(provider) }
             else { validatedHermesProviders.remove(provider) }
             cliActionMessages["hermes"] = valid
-                ? "Hermes \(providerID) authentication validated."
+                ? "Hermes \(providerID) sign-in is available."
                 : "Hermes did not report an authenticated \(providerID) session in its isolated profile."
             finishCLIAction(actionID)
         }
@@ -3891,7 +3891,7 @@ final class AppState: ObservableObject {
               ),
               let provider = hermesProvider(for: route),
               let key = KeychainStore.read(account: OpenCodeCredentialPolicy.keychainAccount),
-              beginCLIAction(provider: "hermes-opencode", progress: "Validating Hermes OpenCode…", estimatedSeconds: 30) else {
+              beginCLIAction(provider: "hermes-opencode", progress: "Checking Hermes OpenCode…", estimatedSeconds: 30) else {
             cliActionMessages["hermes"] = "Enable the saved OpenCode key for Work and discover a Hermes OpenCode model first."
             return
         }
@@ -3913,8 +3913,8 @@ final class AppState: ObservableObject {
             if valid { validatedHermesOpenCodeModels = Set(candidates.map(\.id)) }
             else { validatedHermesOpenCodeModels.removeAll() }
             cliActionMessages["hermes"] = valid
-                ? "Hermes OpenCode credential and model catalog validated for Work."
-                : "Hermes could not validate the OpenCode Work route."
+                ? "Hermes OpenCode sign-in and models are available for Work."
+                : "Hermes could not verify the OpenCode Work route."
             finishCLIAction("hermes-opencode")
         }
     }

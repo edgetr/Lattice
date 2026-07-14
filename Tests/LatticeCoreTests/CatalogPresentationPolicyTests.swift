@@ -15,7 +15,7 @@ struct CatalogPresentationPolicyTests {
         #expect(on.label == "Theme Pack extension")
         #expect(on.value == "On")
         #expect(on.disabledReason == nil)
-        #expect(on.hint.contains("Disable"))
+        #expect(on.hint == "Disable to stop applying this extension’s changes.")
 
         let invalid = CatalogToggleAccessibility.extensionToggle(
             name: "Broken",
@@ -68,7 +68,7 @@ struct CatalogPresentationPolicyTests {
 
         let none = CatalogEmptyStatePolicy.copy(for: .noConnectedProviderModels)
         #expect(none.primaryActionTitle == "Open Connections")
-        #expect(none.secondaryActionTitle == "Refresh")
+        #expect(none.secondaryActionTitle == "Check Again")
     }
 
     @Test func catalogFailureAndValidEmptyStayDistinct() {
@@ -87,7 +87,7 @@ struct CatalogPresentationPolicyTests {
             providerName: "Codex",
             readiness: ProviderReadinessSnapshot(installed: true, authenticated: true, catalogStatus: empty.status, runnableModelCount: 0)
         )
-        #expect(failedCopy.detail.contains("catalog unavailable"))
+        #expect(failedCopy.detail == "Signed in · models unavailable")
         #expect(emptyCopy.detail.contains("no Codex models found"))
         #expect(!failedCopy.isReady)
         #expect(!emptyCopy.isReady)

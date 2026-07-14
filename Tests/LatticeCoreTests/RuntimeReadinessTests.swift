@@ -11,6 +11,30 @@ struct RuntimeReadinessTests {
         #expect(request.id == "pi:firstUseInstall")
     }
 
+    @Test func runtimeActionsUsePlainConsistentVerbs() {
+        #expect(RuntimeLifecyclePresentationPolicy.actionTitle(for: .firstUseInstall) == "Install")
+        #expect(RuntimeLifecyclePresentationPolicy.actionTitle(
+            for: .update,
+            installedVersion: "0.79.3",
+            targetVersion: "0.80.6"
+        ) == "Update")
+        #expect(RuntimeLifecyclePresentationPolicy.actionTitle(
+            for: .update,
+            installedVersion: "0.80.6",
+            targetVersion: "0.80.6"
+        ) == "Repair")
+        #expect(RuntimeLifecyclePresentationPolicy.actionTitle(for: .uninstall) == "Remove")
+        #expect(RuntimeLifecyclePresentationPolicy.actionTitle(for: .rollback) == "Restore Previous Version")
+        #expect(RuntimeLifecyclePresentationPolicy.actionTitle(for: .cancel) == "Stop")
+    }
+
+    @Test func availabilityStatesUseConsistentUserFacingLanguage() {
+        #expect(ExecutionRouteReadiness.loading.detail == "Checking availability…")
+        #expect(ExecutionRouteReadiness.authenticationRequired.detail == "Sign in required.")
+        #expect(ExecutionRouteReadiness.runnable.detail == "Available")
+        #expect(!ExecutionRouteReadiness.validating.detail.localizedCaseInsensitiveContains("validating"))
+    }
+
     @Test func readinessRequiresEachIndependentRequirement() {
         let missing = RouteReadinessEvaluator.evaluate(
             route: route,

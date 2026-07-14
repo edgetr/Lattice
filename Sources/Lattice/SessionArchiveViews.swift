@@ -83,7 +83,7 @@ struct ExportChatSheet: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Privacy")
                         .font(.caption.weight(.semibold))
-                    Text("Exports include visible transcript, timestamps, pins, route/model/harness labels, reasoning label when user-visible, policy/privacy, attachment names only, and sanitized completed action summaries. Provider thread IDs, secrets, hidden reasoning, approval replay state, running state, and attachment file contents are never included.")
+                    Text("Exports include the visible transcript, timestamps, pins, mode, provider, model, and runtime labels, user-visible reasoning labels, policy and privacy settings, attachment names only, and sanitized completed action summaries. Provider thread IDs, secrets, hidden reasoning, approval replay state, running state, and attachment file contents are never included.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -152,7 +152,7 @@ struct ImportChatPreviewSheet: View {
                         labeledRow("Title", preview.title)
                         labeledRow("Route", "\(preview.routeLabel) · \(preview.modelLabel)")
                         if let harness = preview.harnessLabel, !harness.isEmpty {
-                            labeledRow("Harness", harness)
+                            labeledRow("Runtime", harness)
                         }
                         if let reasoning = preview.reasoningLabel {
                             labeledRow("Reasoning", reasoning)

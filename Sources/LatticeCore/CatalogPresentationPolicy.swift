@@ -35,11 +35,11 @@ public enum CatalogToggleAccessibility: Sendable {
         if !isValid {
             hint = "Extension failed validation and cannot be enabled."
         } else if !hasRuntimePatches {
-            hint = "This extension has no runtime patches to enable."
+            hint = "This extension has no active changes to enable."
         } else {
             hint = isEnabled
-                ? "Disable to stop applying this extension’s runtime patches."
-                : "Enable to apply this extension’s runtime patches."
+                ? "Disable to stop applying this extension’s changes."
+                : "Enable to apply this extension’s changes."
         }
         let disabledReason: String?
         if !isValid {
@@ -51,7 +51,7 @@ public enum CatalogToggleAccessibility: Sendable {
                 ? "Extension is invalid and cannot be toggled."
                 : "Extension is invalid: \(detail)"
         } else if !hasRuntimePatches {
-            disabledReason = "No runtime patches to enable."
+            disabledReason = "No active changes to enable."
         } else {
             disabledReason = nil
         }
@@ -193,10 +193,10 @@ public enum CatalogEmptyStatePolicy: Sendable {
             )
         case .noConnectedProviderModels:
             return CatalogEmptyStateCopy(
-                title: "No connected provider models",
-                message: "Connect a provider under Connections, or Refresh after signing in. Model installs never start automatically from this page.",
+                title: "No provider models available",
+                message: "Sign in to a provider in Connections, or check again after signing in. Model installs never start automatically from this page.",
                 primaryActionTitle: "Open Connections",
-                secondaryActionTitle: "Refresh"
+                secondaryActionTitle: "Check Again"
             )
         case .noInstalledLocalModels:
             return CatalogEmptyStateCopy(
@@ -257,11 +257,11 @@ public enum LatticeOnboardingStep: Int, CaseIterable, Sendable, Equatable, Compa
         case .welcome:
             return "Lattice is a macOS workspace for chatting with local and connected coding agents. This short guide explains the basics. Nothing is installed and no preferences change until you act."
         case .chooseWorkspace:
-            return "Chats can bind to a folder used as the selected workspace for harness tools. Write containment depends on the route and execution policy—inspect Route controls before a run. You can choose a folder now or skip and set one later from a chat’s inspector."
+            return "A chat can use a folder as its workspace. Write containment depends on the route and execution policy—check Route & Safety before a run. You can choose a folder now or choose one later from the chat inspector."
         case .localVersusCloud:
-            return "Local routes use Apple Intelligence or Ollama on this Mac and have no delegated tool loop in this product path. Cloud routes use connected provider CLIs (for example Codex, Grok, OpenCode). Per-chat Model privacy can block cloud routes. Write containment, approvals, and broker mediation are route- and policy-specific—not universal. Reads and network are not confidentiality-contained where tools run."
+            return "Local routes use Apple Intelligence or Ollama on this Mac and do not run delegated tools here. Cloud routes use signed-in providers such as Codex, Grok, and OpenCode. Per-chat model privacy can block cloud routes. Write containment, approvals, and tool mediation depend on the route and policy—they are not universal. Reads and network are not confidentiality-contained where tools run."
         case .ready:
-            return "Open Connections to sign in or install provider CLIs when you need them. Use Models to pick a route, inspect Route controls for what that route enforces, and use Extensions & Skills for user-owned customizations. You can reopen this guide later if Settings is wired to show it."
+            return "Open Connections to install runtimes, sign in to providers, and check availability. Use Models to pick a provider and model, check Route & Safety for the selected runtime’s limits, and use Extensions & Skills for your customizations. You can reopen this guide later from Settings."
         }
     }
 

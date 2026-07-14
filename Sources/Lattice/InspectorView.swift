@@ -406,8 +406,8 @@ struct ModelsView: View {
 
     private var catalogProblemState: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label("Provider catalog unavailable", systemImage: "exclamationmark.triangle").font(.headline)
-            Text(state.providerCatalogProblemMessage ?? "Refresh the provider connection to try again.")
+            Label("Provider models unavailable", systemImage: "exclamationmark.triangle").font(.headline)
+            Text(state.providerCatalogProblemMessage ?? "Check the provider connection again.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -429,12 +429,12 @@ struct ModelsView: View {
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 10) {
                 Button(copy.primaryActionTitle ?? "Open Connections") { state.selectedSection = .connections }
-                Button(copy.secondaryActionTitle ?? "Refresh") {
+                Button(copy.secondaryActionTitle ?? "Check Again") {
                     state.requestConnectionRefresh()
                 }
                 .buttonStyle(.link)
                 .disabled(!state.canRequestConnectionRefresh)
-                .help(state.connectionRefreshDisabledReason ?? "Refresh provider readiness and model catalogs")
+                .help(state.connectionRefreshDisabledReason ?? "Check provider sign-in, runtimes, and models")
             }
         }
         .padding(LatticeMetrics.cardPadding)
@@ -504,7 +504,7 @@ struct ModelsView: View {
     }
 
     private var ollamaStatusActionTitle: String {
-        if !state.ollamaInstalled { return "Get" }
+        if !state.ollamaInstalled { return "Install" }
         if !state.ollamaReady { return "Start" }
         return "Refresh"
     }
@@ -531,7 +531,7 @@ struct ProviderModelSection: View {
         guard visibleModels.contains(where: { state.canUseBackendInNewChat(backend($0)) }) else {
             return "Unavailable for this chat"
         }
-        return "Ready"
+        return "Available"
     }
 
     private var isReadyForCurrentChat: Bool {
@@ -569,7 +569,7 @@ struct ProviderModelSection: View {
             .accessibilityValue(statusText)
 
             if models.isEmpty {
-                Text("No \(providerName) models have been reported yet. Retry discovery in Connections.")
+                Text("No \(providerName) models have been reported yet. Check again in Connections.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 4)
@@ -724,7 +724,7 @@ struct RecommendationRow: View {
                     .accessibilityHint(runnable ? "Use \(model.name) in a chat." : "Start Ollama before using this local model.")
                     .help(runnable ? "Use \(model.name) in a chat." : "Start Ollama before using this local model.")
             } else if !state.ollamaInstalled {
-                Button("Get Ollama") { state.installOllama() }.fixedSize(horizontal: true, vertical: false)
+                Button("Install Ollama") { state.installOllama() }.fixedSize(horizontal: true, vertical: false)
             } else if !state.ollamaReady {
                 Button("Start Ollama") { state.openOllama() }.fixedSize(horizontal: true, vertical: false)
             } else if !catalogAuthoritative {
@@ -756,11 +756,11 @@ private struct ModelsCatalogNotice: View {
         HStack(spacing: 10) {
             Image(systemName: "exclamationmark.triangle")
                 .foregroundStyle(.orange)
-            Text("\(provider) model catalog unavailable. Connections can retry discovery.")
+            Text("\(provider) models are unavailable. Check again in Connections.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Spacer(minLength: 8)
-            Button("Retry") {
+            Button("Check Again") {
                 state.requestConnectionRefresh()
             }
             .buttonStyle(.borderless)
@@ -769,8 +769,8 @@ private struct ModelsCatalogNotice: View {
         .padding(10)
         .latticeGlass(cornerRadius: 10, tint: Color.orange.opacity(0.08))
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("\(provider) model catalog unavailable")
-        .accessibilityHint("Retry model discovery")
+        .accessibilityLabel("\(provider) models unavailable")
+        .accessibilityHint("Check \(provider) models again")
     }
 }
 
@@ -798,7 +798,7 @@ struct ConnectionsView: View {
     var body: some View {
         AdaptiveCatalogPage { _ in
             VStack(alignment: .leading, spacing: 20) {
-                PageHeader(title: "Connections", subtitle: "Provider routes, runtime readiness, and local availability")
+                PageHeader(title: "Connections", subtitle: "Provider sign-in, runtime setup, and model availability")
                 providerPanel
                 runtimeComponents
                 localPanel
@@ -809,10 +809,10 @@ struct ConnectionsView: View {
         .navigationTitle("Connections")
         .toolbar {
             Button { state.requestConnectionRefresh() } label: {
-                Label(state.connectionRefreshAction.isRunning ? "Refreshing" : "Refresh", systemImage: "arrow.clockwise")
+                Label(state.connectionRefreshAction.isRunning ? "Checking" : "Check Connections", systemImage: "arrow.clockwise")
             }
             .disabled(!state.canRequestConnectionRefresh)
-            .help(state.connectionRefreshDisabledReason ?? "Refresh provider readiness and model catalogs")
+            .help(state.connectionRefreshDisabledReason ?? "Check provider sign-in, runtimes, and models")
         }
     }
 
@@ -822,12 +822,12 @@ struct ConnectionsView: View {
                 Label("Providers", systemImage: "cloud")
                     .font(.headline)
                 Spacer()
-                Text("Code / Work")
+                Text("Mode · Runtime")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             providerRow(
-                identity: .provider(.codex), name: "Codex", detail: "Code via Pi · Work via Hermes",
+                identity: .provider(.codex), name: "Codex", detail: "Code uses Pi · Work uses Hermes",
                 modes: [
                     .init(title: "Code", runtime: "Pi", readiness: state.modeReadiness(.code, providerID: "codex")),
                     .init(title: "Work", runtime: "Hermes", readiness: state.modeReadiness(.work, providerID: "codex"))
@@ -835,7 +835,7 @@ struct ConnectionsView: View {
             ) {
                 codexActions
             } content: {
-                Text("Pi Code and Hermes Work authenticate separately. Direct Codex CLI sign-in does not enable either route.")
+                Text("Sign in separately for Code through Pi and Work through Hermes. Signing in to the Codex CLI does not enable either route.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -843,7 +843,7 @@ struct ConnectionsView: View {
                 CLIActionMessage(provider: "codex", state: state)
             }
             providerRow(
-                identity: .provider(.grok), name: "Grok", detail: "Code via Grok Build · Work via Hermes",
+                identity: .provider(.grok), name: "Grok", detail: "Code uses Grok Build · Work uses Hermes",
                 modes: [
                     .init(title: "Code", runtime: "Build", readiness: state.modeReadiness(.code, providerID: "grok")),
                     .init(title: "Work", runtime: "Hermes", readiness: state.modeReadiness(.work, providerID: "grok"))
@@ -869,7 +869,7 @@ struct ConnectionsView: View {
             }
             providerRow(
                 identity: .systemImage("paperplane"), name: "Antigravity",
-                detail: "Subscription-native Code runtime",
+                detail: "Code uses the Antigravity runtime",
                 modes: [.init(title: "Code", runtime: "Antigravity", readiness: state.modeReadiness(.code, providerID: "antigravity"))]
             ) {
                 antigravityActions
@@ -885,23 +885,23 @@ struct ConnectionsView: View {
 
     @ViewBuilder private var codexActions: some View {
         Menu {
-            runtimeMenu(runtime: .pi, installed: state.piInstalled, update: state.updatePi, install: state.installPi)
+            runtimeMenu(runtime: .pi, installed: state.piInstalled, installedVersion: state.piCLIVersion, update: state.updatePi, install: state.installPi)
             if state.piInstalled {
                 Button("Sign in to Pi Codex…") { state.openPiAuthentication() }
-                Button("Validate Code") { state.validatePiAuthentication(providerID: "codex") }
+                Button("Check Code") { state.validatePiAuthentication(providerID: "codex") }
             }
             Divider()
-            runtimeMenu(runtime: .hermes, installed: state.hermesInstalled, update: state.updateHermes, install: state.installHermes)
+            runtimeMenu(runtime: .hermes, installed: state.hermesInstalled, installedVersion: state.hermesCLIInfo.currentVersion, update: state.updateHermes, install: state.installHermes)
             if state.hermesInstalled {
                 Button("Sign in to Hermes Codex…") { state.openHermesAuthentication() }
-                Button("Validate Work") { state.validateHermesAuthentication(providerID: "codex") }
+                Button("Check Work") { state.validateHermesAuthentication(providerID: "codex") }
             }
             Divider()
-            Button("Legacy Codex setup…") {
+            Button("Set Up Legacy Codex…") {
                 if state.codex.isInstalled { state.connectCodex() } else { state.installCodex() }
             }
         } label: {
-            Image(systemName: "ellipsis.circle").accessibilityLabel("Codex setup actions")
+            Image(systemName: "ellipsis.circle").accessibilityLabel("Codex connection actions")
         }
         .menuStyle(.borderlessButton)
         .disabled(!state.canRequestConnectionRefresh)
@@ -914,12 +914,12 @@ struct ConnectionsView: View {
             else if !state.grokAuthenticated { Button("Sign in to Grok Build…") { state.connectGrok() } }
             else { Button("Update Grok Build") { state.updateGrok() } }
             Divider()
-            runtimeMenu(runtime: .hermes, installed: state.hermesInstalled, update: state.updateHermes, install: state.installHermes)
+            runtimeMenu(runtime: .hermes, installed: state.hermesInstalled, installedVersion: state.hermesCLIInfo.currentVersion, update: state.updateHermes, install: state.installHermes)
             if state.hermesInstalled {
                 Button("Sign in to Hermes Grok…") { state.openHermesAuthentication() }
-                Button("Validate Work") { state.validateHermesAuthentication(providerID: "grok") }
+                Button("Check Work") { state.validateHermesAuthentication(providerID: "grok") }
             }
-        } label: { Image(systemName: "ellipsis.circle").accessibilityLabel("Grok setup actions") }
+        } label: { Image(systemName: "ellipsis.circle").accessibilityLabel("Grok connection actions") }
         .menuStyle(.borderlessButton)
         .disabled(!state.canRequestConnectionRefresh)
         .help(state.connectionRefreshDisabledReason ?? "Grok setup actions")
@@ -927,12 +927,12 @@ struct ConnectionsView: View {
 
     @ViewBuilder private var openCodeActions: some View {
         Menu {
-            runtimeMenu(runtime: .pi, installed: state.piInstalled, update: state.updatePi, install: state.installPi)
-            if state.piInstalled { Button("Validate Code") { state.validatePiAuthentication(providerID: "opencode") } }
+            runtimeMenu(runtime: .pi, installed: state.piInstalled, installedVersion: state.piCLIVersion, update: state.updatePi, install: state.installPi)
+            if state.piInstalled { Button("Check Code") { state.validatePiAuthentication(providerID: "opencode") } }
             Divider()
-            runtimeMenu(runtime: .hermes, installed: state.hermesInstalled, update: state.updateHermes, install: state.installHermes)
-            if state.hermesInstalled { Button("Validate Work") { state.validateHermesOpenCodeAuthentication() } }
-        } label: { Image(systemName: "ellipsis.circle").accessibilityLabel("OpenCode setup actions") }
+            runtimeMenu(runtime: .hermes, installed: state.hermesInstalled, installedVersion: state.hermesCLIInfo.currentVersion, update: state.updateHermes, install: state.installHermes)
+            if state.hermesInstalled { Button("Check Work") { state.validateHermesOpenCodeAuthentication() } }
+        } label: { Image(systemName: "ellipsis.circle").accessibilityLabel("OpenCode connection actions") }
         .menuStyle(.borderlessButton)
         .disabled(!state.canRequestConnectionRefresh)
         .help(state.connectionRefreshDisabledReason ?? "OpenCode setup actions")
@@ -945,10 +945,18 @@ struct ConnectionsView: View {
     @ViewBuilder private func runtimeMenu(
         runtime: LatticeRuntimeID,
         installed: Bool,
+        installedVersion: String?,
         update: @escaping () -> Void,
         install: @escaping () -> Void
     ) -> some View {
-        if installed { Button("Reinstall pinned \(runtime.displayName)…", action: update) }
+        if installed {
+            let title = RuntimeLifecyclePresentationPolicy.actionTitle(
+                for: .update,
+                installedVersion: installedVersion,
+                targetVersion: RuntimeInstallDescriptor.firstUse(for: runtime).immutableVersion
+            )
+            Button("\(title) \(runtime.displayName)…", action: update)
+        }
         else { Button("Install \(runtime.displayName)…", action: install) }
     }
 
@@ -1004,16 +1012,16 @@ struct ConnectionsView: View {
                     .help(state.openCodeAPIKeySaved ? "Allow Hermes Work routes to use the saved key" : "Save the key before enabling Work")
             }
             if state.openCodeAPIKeySaved {
-                Text("Each mode validates independently. The key is injected only for an enabled OpenCode route and is never written to its arguments.")
+                Text("Code and Work are checked separately. The key is injected only for an enabled OpenCode route and is never written to command arguments.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 HStack(spacing: 8) {
-                    Button("Validate Code") { state.validatePiAuthentication(providerID: "opencode") }
+                    Button("Check Code") { state.validatePiAuthentication(providerID: "opencode") }
                         .disabled(!state.isOpenCodeCredentialEnabled(for: .code) || !state.piInstalled)
-                        .help(!state.piInstalled ? "Install Pi before validating Code" : (state.isOpenCodeCredentialEnabled(for: .code) ? "Validate the saved key through Pi" : "Enable the saved key for Code first"))
-                    Button("Validate Work") { state.validateHermesOpenCodeAuthentication() }
+                        .help(!state.piInstalled ? "Install Pi before checking Code" : (state.isOpenCodeCredentialEnabled(for: .code) ? "Check the saved key through Pi" : "Enable the saved key for Code first"))
+                    Button("Check Work") { state.validateHermesOpenCodeAuthentication() }
                         .disabled(!state.isOpenCodeCredentialEnabled(for: .work) || !state.hermesInstalled)
-                        .help(!state.hermesInstalled ? "Install Hermes before validating Work" : (state.isOpenCodeCredentialEnabled(for: .work) ? "Validate the saved key through Hermes" : "Enable the saved key for Work first"))
+                        .help(!state.hermesInstalled ? "Install Hermes before checking Work" : (state.isOpenCodeCredentialEnabled(for: .work) ? "Check the saved key through Hermes" : "Enable the saved key for Work first"))
                 }
                 .controlSize(.small)
             } else {
@@ -1062,7 +1070,7 @@ struct ConnectionsView: View {
             .padding(.top, 8)
         } label: {
             HStack {
-                Label("Runtime Components", systemImage: "shippingbox")
+                Label("Runtimes", systemImage: "shippingbox")
                     .font(.headline)
                 Spacer()
                 Text("Pi · Hermes")
@@ -1087,7 +1095,7 @@ struct ConnectionsView: View {
                 } else if state.ollamaInstalled {
                     Button("Start") { state.openOllama() }
                 } else {
-                    Button("Get") { state.installOllama() }
+                    Button("Install") { state.installOllama() }
                 }
             }
         }
@@ -1209,7 +1217,7 @@ private struct RuntimeComponentRow: View {
                 Text(name).font(.body.weight(.semibold))
                 Text(installed ? "Installed · \(version ?? "version unknown")" : "Not installed")
                     .font(.caption).foregroundStyle(.secondary)
-                Text("Lattice pin: \(descriptor.immutableVersion)")
+                Text("Lattice version: \(descriptor.immutableVersion)")
                     .font(.caption2).foregroundStyle(.secondary)
                 if installed, !managedByLattice {
                     Text("External install · Lattice will not remove it")
@@ -1225,24 +1233,28 @@ private struct RuntimeComponentRow: View {
             Spacer(minLength: 8)
             VStack(alignment: .trailing, spacing: 5) {
                 if state.isCLIBusy(provider) {
-                    ProgressView().controlSize(.small).accessibilityLabel("Runtime setup in progress")
+                    ProgressView().controlSize(.small).accessibilityLabel("Runtime action in progress")
                     Button("Cancel", role: .cancel) { state.cancelRunningRuntimeAction(runtime) }
                         .controlSize(.small)
                 } else if installed {
-                    Button("Reinstall Pin") {
+                    Button(RuntimeLifecyclePresentationPolicy.actionTitle(
+                        for: .update,
+                        installedVersion: version,
+                        targetVersion: descriptor.immutableVersion
+                    )) {
                         if provider == "pi" { state.updatePi() } else { state.updateHermes() }
                     }
                     .controlSize(.small)
                     .disabled(!state.canRequestConnectionRefresh)
-                    .help(state.connectionRefreshDisabledReason ?? "Reinstall Lattice's pinned runtime version after confirmation")
-                    Button("Diagnostics") { state.requestConnectionRefresh(diagnosticsRuntime: runtime) }
+                    .help(state.connectionRefreshDisabledReason ?? "Repair or update this Lattice runtime after confirmation")
+                    Button("Diagnose") { state.requestConnectionRefresh(diagnosticsRuntime: runtime) }
                         .controlSize(.small)
                         .disabled(!state.canRequestConnectionRefresh)
-                        .help(state.connectionRefreshDisabledReason ?? "Re-run runtime and model discovery")
+                        .help(state.connectionRefreshDisabledReason ?? "Diagnose this runtime, its sign-in status, and provider models")
                     Button("Remove", role: .destructive) { state.requestRuntimeAction(.uninstall, runtime: runtime) }
                         .controlSize(.small)
                         .disabled(!managedByLattice || !state.canRequestConnectionRefresh)
-                        .help(!managedByLattice ? "This runtime is externally managed and cannot be removed by Lattice" : (state.connectionRefreshDisabledReason ?? "Remove the runtime after confirmation; Lattice-owned profile data is preserved"))
+                        .help(!managedByLattice ? "Lattice can remove only runtimes it installed" : (state.connectionRefreshDisabledReason ?? "Remove this Lattice-installed runtime and its Lattice-owned profile after confirmation"))
                 } else {
                     CLIActionButton(title: "Install", provider: provider, state: state, isEnabled: state.canRequestConnectionRefresh) {
                         if provider == "pi" { state.installPi() } else { state.installHermes() }
@@ -1297,7 +1309,7 @@ struct CatalogRefreshButton: View {
 
     var body: some View {
         if status.isRefreshable {
-            Button(status == .failed ? "Retry catalog" : "Refresh catalog") {
+            Button(status == .failed ? "Check Again" : "Check Models") {
                 state.requestConnectionRefresh()
             }
             .disabled(!state.canRequestConnectionRefresh)
@@ -1311,7 +1323,7 @@ struct ExtensionsView: View {
     var body: some View {
         AdaptiveCatalogPage { contentWidth in
             VStack(alignment: .leading, spacing: 20) {
-                PageHeader(title: "Extensions & Skills", subtitle: "User-owned Lattice customizations and shared harness skills")
+                PageHeader(title: "Extensions & Skills", subtitle: "User-owned Lattice customizations and shared agent skills")
 
                 if LatticeCatalogPageLayout.usesSideBySideSections(forContentWidth: contentWidth) {
                     HStack(alignment: .top, spacing: LatticeCatalogPageLayout.cardSpacing) {
@@ -1522,7 +1534,7 @@ struct ExtensionRecordRow: View {
                         .disabled(!record.isValid)
                         .accessibilityLabel("Enable \(record.name) extension")
                         .accessibilityValue(state.isExtensionEnabled(record) ? "Enabled" : "Disabled")
-                        .accessibilityHint(record.isValid ? "Controls whether this extension's runtime patches are active" : "This extension cannot be enabled until validation errors are fixed")
+                        .accessibilityHint(record.isValid ? "Controls whether this extension's changes are active" : "This extension cannot be enabled until validation errors are fixed")
                 } else {
                     Text(record.isValid ? "Valid" : "Invalid")
                         .font(.caption)
