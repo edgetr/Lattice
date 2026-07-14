@@ -773,8 +773,35 @@ private struct ComposerRoutePopover: View {
 
                 Text("Models")
                     .font(.headline)
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
+                if state.isRefreshingConnections {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Refreshing discovered models…")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Refreshing discovered models")
+                }
+                if filteredOptions.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        if !state.isRefreshingConnections {
+                            Text(state.composerModelSearchText.isEmpty ? "No models were discovered for this mode." : "No models match search.")
+                            if state.composerModelSearchText.isEmpty {
+                                Button("Open Connections") {
+                                    state.composerRoutePopoverPresented = false
+                                    state.openConnectionsFromComposer()
+                                }
+                                .buttonStyle(.link)
+                            }
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 10) {
                         ForEach(groupedOptions, id: \.provider) { group in
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(group.provider)
@@ -786,16 +813,10 @@ private struct ComposerRoutePopover: View {
                                 }
                             }
                         }
-                        if filteredOptions.isEmpty {
-                            Text("No models match search.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.vertical, 16)
                         }
                     }
+                    .frame(maxHeight: 300)
                 }
-                .frame(maxHeight: 300)
             } else {
                 Text("Select mode to see its discovered models.")
                     .font(.caption)
