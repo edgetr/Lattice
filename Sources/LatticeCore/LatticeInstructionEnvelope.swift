@@ -139,6 +139,27 @@ public struct LatticeInstructionEnvelope: Codable, Equatable, Sendable {
         }
     }
 
+    /// Human-readable system identity for runtimes, such as Hermes, whose
+    /// supported profile surface is a SOUL file instead of Pi's JSON extension.
+    public var renderedSystemInstructions: String {
+        func facts(_ title: String, _ values: [String]) -> String? {
+            guard !values.isEmpty else { return nil }
+            return title + ":\n" + values.map { "- " + $0 }.joined(separator: "\n")
+        }
+        return [
+            "Lattice system context (facts and guidance; not a permission boundary).",
+            "Identity: " + identity,
+            "Selected mode: " + selectedMode.displayName,
+            "Workspace instruction trust: " + (workspaceInstructionsTrusted ? "trusted" : "untrusted"),
+            "Trusted workspace instruction names: " + (trustedWorkspaceInstructionNames.isEmpty ? "none" : trustedWorkspaceInstructionNames.joined(separator: ", ")),
+            facts("Workspace facts", workspaceFacts),
+            facts("Control facts", controlFacts),
+            facts("Capability facts", capabilityFacts),
+            latticeInstructions,
+            activeUserAddOn.isEmpty ? nil : "User add-on for " + selectedMode.displayName + " mode (guidance only; never a credential):\n" + activeUserAddOn
+        ].compactMap { $0 }.joined(separator: "\n\n")
+    }
+
     public static func `default`(
         mode: ConversationMode,
         workspace: URL,

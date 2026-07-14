@@ -262,7 +262,7 @@ public final class PiRPCHarness: @unchecked Sendable {
             piArguments += ["--thinking", Self.piThinkingLevel(reasoningEffort)]
         }
 
-        var environment = ProcessInfo.processInfo.environment
+        var environment = Self.safeChildEnvironment(from: ProcessInfo.processInfo.environment)
         environment["LATTICE_PI_WORKSPACE"] = canonicalWorkspace.path
         environment["PI_CODING_AGENT_DIR"] = agentDirectory.path
         environment["PI_CODING_AGENT_SESSION_DIR"] = sessionDirectory.path
@@ -282,7 +282,7 @@ public final class PiRPCHarness: @unchecked Sendable {
             command: executableURL,
             arguments: piArguments,
             writableDirectories: writableDirectories,
-            writablePaths: [Self.piSettingsLockURL()],
+            writablePaths: [Self.piSettingsLockURL(in: agentDirectory)],
             sandboxExecutableURL: sandboxExecutableURL
         )
         retainScratchDirectory = true
@@ -715,7 +715,17 @@ public final class PiRPCHarness: @unchecked Sendable {
         return LatticeApplicationSupport.productRootURL().appendingPathComponent("HarnessSupport/Pi", isDirectory: true)
     }
 
-    private static func piSettingsLockURL() -> URL {
-        URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".pi/agent/settings.json.lock", isDirectory: true)
+    private static func safeChildEnvironment(from base: [String: String]) -> [String: String] {
+        let safeKeys = [
+            "PATH", "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TERM",
+            "TERM_PROGRAM", "DISPLAY", "WAYLAND_DISPLAY"
+        ]
+        return safeKeys.reduce(into: [String: String]()) { environment, key in
+            environment[key] = base[key]
+        }
+    }
+
+    private static func piSettingsLockURL(in agentDirectory: URL) -> URL {
+        agentDirectory.appendingPathComponent("settings.json.lock")
     }
 }

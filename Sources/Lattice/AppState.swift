@@ -196,6 +196,9 @@ final class AppState: ObservableObject {
     @Published private(set) var composerSelectionBackend: ChatBackend?
     @Published var composerRoutePopoverPresented = false
     @Published var composerModelSearchText = ""
+    @Published private(set) var codeInstructionAddOn: String
+    @Published private(set) var workInstructionAddOn: String
+    @Published private(set) var trustedWorkspacePaths: Set<String>
     @Published var installingModelTag: String?
     @Published var installStatus: String?
     @Published var showDeleteLocalModelConfirmation = false
@@ -327,6 +330,9 @@ final class AppState: ObservableObject {
     private static let disabledSkillIDsKey = "disabledSkillIDs"
     private static let onboardingCompletedVersionKey = "onboardingCompletedVersion"
     private static let onboardingVersion = 1
+    private static let codeInstructionAddOnKey = "codeInstructionAddOn"
+    private static let workInstructionAddOnKey = "workInstructionAddOn"
+    private static let trustedWorkspacePathsKey = "trustedWorkspacePaths"
 
     var needsPersistenceRecovery: Bool { !persistenceRecoveryIssues.isEmpty }
 
@@ -395,6 +401,9 @@ final class AppState: ObservableObject {
         let savedIdleUnload = UserDefaults.standard.integer(forKey: Self.idleUnloadKey)
         localModelIdleUnloadMinutes = savedIdleUnload == 0 && UserDefaults.standard.object(forKey: Self.idleUnloadKey) == nil ? 5 : savedIdleUnload
         selectedWorkspacePath = cwd
+        codeInstructionAddOn = UserDefaults.standard.string(forKey: Self.codeInstructionAddOnKey) ?? ""
+        workInstructionAddOn = UserDefaults.standard.string(forKey: Self.workInstructionAddOnKey) ?? ""
+        trustedWorkspacePaths = Set(UserDefaults.standard.stringArray(forKey: Self.trustedWorkspacePathsKey) ?? [])
         let initialDefaultBackend = BackendAvailabilityPolicy.initialSelection(
             persisted: Self.loadDefaultBackend()
         )
@@ -589,40 +598,56 @@ final class AppState: ObservableObject {
     }
 
     func composerModelOptions(for mode: ConversationMode) -> [ComposerModelOption] {
-        let catalogByProvider: [(String, String, [ProviderModel], ProviderCatalogStatus, String)] = [
-            ("codex", "Codex", codexModels, codexCatalogStatus, codexReadinessCopy.detail),
-            ("grok", "Grok", grokModels, grokCatalogStatus, grokReadinessCopy.detail),
-            ("opencode", "OpenCode", openCodeModels, openCodeCatalogStatus, openCodeReadinessCopy.detail),
-            ("antigravity", "Antigravity", antigravityModels, .loaded, antigravityReadinessDetail)
-        ]
-        let providers: [(String, String, [ProviderModel], String?)] = switch mode {
-        case .code:
-            catalogByProvider.map { ($0.0, $0.1, $0.2, $0.4) }
-        case .work:
-            catalogByProvider.filter { ["codex", "grok", "opencode"].contains($0.0) }.map { ($0.0, $0.1, $0.2, $0.4) }
-        case .local:
-            []
+        var options: [ComposerModelOption] = []
+
+        func append(providerID: String, providerTitle: String, modelID: String, title: String) {
+            guard let backend = backend(for: providerID, modelID: modelID),
+                  let route = ExecutionRouteResolver.resolve(mode: mode, providerID: providerID, modelID: modelID) else { return }
+            let reason = isModelEnabled(backend.id) ? composerUnavailableReason(for: backend, route: route) : "Hidden in Connections"
+            options.append(ComposerModelOption(route: route, backend: backend, providerTitle: providerTitle, title: title, reason: reason))
         }
 
-        var options = providers.flatMap { providerID, providerTitle, models, providerReason in
-            if models.isEmpty {
-                guard let template = ExecutionRouteResolver.catalog().entries(for: mode).first(where: { $0.route.providerID == providerID }) else { return [ComposerModelOption]() }
-                return [ComposerModelOption(route: template.route, backend: nil, providerTitle: providerTitle, title: "No models reported", reason: providerReason)]
+        switch mode {
+        case .code:
+            for identifier in piModelIDs.sorted() where identifier.hasPrefix("openai-codex/") {
+                let model = String(identifier.dropFirst("openai-codex/".count))
+                append(providerID: "codex", providerTitle: "Codex", modelID: model, title: model)
             }
-            return models.map { model in
-                let backend = backend(for: providerID, modelID: model.id)
-                let route = ExecutionRouteResolver.resolve(mode: mode, providerID: providerID, modelID: model.id)
-                guard let backend, let route else {
-                    return ComposerModelOption(
-                        route: ExecutionRoute(mode: mode, providerID: providerID, modelID: model.id, runtimeID: "unavailable"),
-                        backend: nil,
-                        providerTitle: providerTitle,
-                        title: model.name,
-                        reason: "Route unavailable"
-                    )
+            for identifier in piModelIDs.sorted() where identifier.hasPrefix("opencode-go/") || identifier.hasPrefix("opencode-zen/") {
+                append(providerID: "opencode", providerTitle: "OpenCode", modelID: identifier, title: identifier.split(separator: "/", maxSplits: 1).last.map(String.init) ?? identifier)
+            }
+            for model in grokModels { append(providerID: "grok", providerTitle: "Grok", modelID: model.id, title: model.name) }
+            for model in antigravityModels { append(providerID: "antigravity", providerTitle: "Antigravity", modelID: model.id, title: model.name) }
+        case .work:
+            for model in hermesModels {
+                if model.id.hasPrefix("openai-codex:") {
+                    append(providerID: "codex", providerTitle: "Codex", modelID: model.id, title: model.name)
+                } else if model.id.hasPrefix("xai-oauth:") || model.id.hasPrefix("xai:") {
+                    append(providerID: "grok", providerTitle: "Grok", modelID: model.id, title: model.name)
+                } else if model.id.hasPrefix("opencode-go:") || model.id.hasPrefix("opencode-zen:") {
+                    append(providerID: "opencode", providerTitle: "OpenCode", modelID: model.id, title: model.name)
                 }
-                let reason = isModelEnabled(backend.id) ? composerUnavailableReason(for: backend, route: route) : "Hidden in Connections"
-                return ComposerModelOption(route: route, backend: backend, providerTitle: providerTitle, title: model.name, reason: reason)
+            }
+        case .local:
+            break
+        }
+
+        if mode != .local {
+            for entry in ExecutionRouteResolver.catalog().entries(for: mode)
+            where !options.contains(where: { $0.route.providerID == entry.route.providerID }) {
+                let providerTitle: String = switch entry.route.providerID {
+                case "codex": "Codex"
+                case "grok": "Grok"
+                case "opencode": "OpenCode"
+                default: "Antigravity"
+                }
+                options.append(ComposerModelOption(
+                    route: entry.route,
+                    backend: nil,
+                    providerTitle: providerTitle,
+                    title: "No models reported",
+                    reason: mode == .work ? hermesReadinessCopy.detail : codeRouteReadinessDetail(providerID: entry.route.providerID)
+                ))
             }
         }
 
@@ -690,6 +715,45 @@ final class AppState: ObservableObject {
     func openConnectionsFromComposer() {
         selectedSection = .connections
         openWorkspaceAction?()
+    }
+
+    @discardableResult
+    func setInstructionAddOn(_ value: String, for mode: ConversationMode) -> Bool {
+        guard mode != .local, value.utf8.count <= LatticeInstructionEnvelope.maximumUserAddOnBytes else {
+            setError("Mode instructions must be 8 KiB or less and must not contain credentials.", sessionID: selectedSessionID)
+            return false
+        }
+        switch mode {
+        case .code:
+            codeInstructionAddOn = value
+            UserDefaults.standard.set(value, forKey: Self.codeInstructionAddOnKey)
+        case .work:
+            workInstructionAddOn = value
+            UserDefaults.standard.set(value, forKey: Self.workInstructionAddOnKey)
+        case .local:
+            return false
+        }
+        return true
+    }
+
+    func setSelectedWorkspaceInstructionTrust(_ trusted: Bool) {
+        guard let workspace = selectedSession?.workspacePath ?? Optional(selectedWorkspacePath),
+              let canonical = try? HarnessSandbox.canonicalDirectory(URL(fileURLWithPath: workspace)).path else { return }
+        if trusted { trustedWorkspacePaths.insert(canonical) }
+        else { trustedWorkspacePaths.remove(canonical) }
+        UserDefaults.standard.set(Array(trustedWorkspacePaths).sorted(), forKey: Self.trustedWorkspacePathsKey)
+        objectWillChange.send()
+    }
+
+    var selectedWorkspaceInstructionsTrusted: Bool {
+        guard let workspace = selectedSession?.workspacePath ?? Optional(selectedWorkspacePath),
+              let canonical = try? HarnessSandbox.canonicalDirectory(URL(fileURLWithPath: workspace)).path else { return false }
+        return trustedWorkspacePaths.contains(canonical)
+    }
+
+    var selectedAppliedInstructionFileNames: [String] {
+        guard let session = selectedSession else { return [] }
+        return appliedInstructionFileNames(for: workspaceURL(for: session, isExtensionSelfEdit: false), trusted: selectedWorkspaceInstructionsTrusted)
     }
     var attachments: [ContextAttachment] { selectedSession?.attachments ?? [] }
     var selectedContextBudgetEstimate: LatticeContextBudgetEstimate? {
@@ -1920,6 +1984,68 @@ final class AppState: ObservableObject {
         return false
     }
 
+    private func failedAgentStream(_ message: String) -> AsyncStream<AgentEvent> {
+        AsyncStream { continuation in
+            continuation.yield(.failed(message))
+            continuation.finish()
+        }
+    }
+
+    private func workspaceInstructionsAreTrusted(for workspace: URL) -> Bool {
+        guard let canonical = try? HarnessSandbox.canonicalDirectory(workspace).path else { return false }
+        return trustedWorkspacePaths.contains(canonical)
+    }
+
+    private func appliedInstructionFileNames(for workspace: URL, trusted: Bool) -> [String] {
+        guard trusted else { return [] }
+        return LatticeInstructionEnvelope.documentedWorkspaceInstructionNames.filter { name in
+            let url = workspace.appendingPathComponent(name)
+            var isDirectory: ObjCBool = false
+            return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && !isDirectory.boolValue
+        }
+    }
+
+    private func instructionEnvelope(for session: LatticeSession, workspace: URL, allowFileModification: Bool) throws -> LatticeInstructionEnvelope {
+        let trusted = workspaceInstructionsAreTrusted(for: workspace)
+        return try .default(
+            mode: session.executionRoute.mode,
+            workspace: workspace,
+            allowFileModification: allowFileModification,
+            workspaceInstructionsTrusted: trusted,
+            trustedWorkspaceInstructionNames: appliedInstructionFileNames(for: workspace, trusted: trusted),
+            codeUserAddOn: codeInstructionAddOn,
+            workUserAddOn: workInstructionAddOn
+        )
+    }
+
+    private func trustedWorkspaceInstructionText(for workspace: URL, names: [String]) -> String {
+        let maximumBytesPerFile = 32 * 1024
+        return names.compactMap { name -> String? in
+            let url = workspace.appendingPathComponent(name)
+            guard WorkspacePathScope.isScoped(url.path, under: workspace),
+                  let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+            defer { try? handle.close() }
+            guard let data = try? handle.read(upToCount: maximumBytesPerFile + 1),
+                  data.count <= maximumBytesPerFile,
+                  let text = String(data: data, encoding: .utf8) else { return nil }
+            return "Trusted workspace instruction " + name + ":\n" + text
+        }.joined(separator: "\n\n")
+    }
+
+    private func hermesProvider(for route: ExecutionRoute) -> String? {
+        guard route.mode == .work, route.runtimeID == "hermes", let model = route.modelID,
+              let separator = model.firstIndex(of: ":") else { return nil }
+        let provider = String(model[..<separator]).lowercased()
+        let allowed: Set<String>
+        switch route.providerID {
+        case "codex": allowed = [LatticeHermesProvider.openAICodex.rawValue]
+        case "grok": allowed = [LatticeHermesProvider.xAIOAuth.rawValue, LatticeHermesProvider.xAI.rawValue]
+        case "opencode": allowed = [LatticeHermesProvider.openCodeGo.rawValue, LatticeHermesProvider.openCodeZen.rawValue]
+        default: return nil
+        }
+        return allowed.contains(provider) ? provider : nil
+    }
+
     private func startRun(for id: UUID, at index: Int, submittedText: String) {
         // Defense in depth: every provider stream launch stays behind the same
         // acknowledgement check, even if a future caller skips send validation.
@@ -1997,7 +2123,54 @@ final class AppState: ObservableObject {
             Task { for await event in failedStream { apply(event, to: id, runID: runID) } }
             return
         }
-        if harnessID == "pi", let piRoute = piRoute(for: session.backend) {
+        if ExecutionRouteResolver.isDeclared(session.executionRoute), session.executionRoute.runtimeID == "pi" {
+            do {
+                guard let model = session.executionRoute.modelID else { throw LatticeInstructionEnvelopeError.invalidIdentity }
+                let envelope = try instructionEnvelope(for: session, workspace: workspace, allowFileModification: !isExtensionSelfEdit)
+                let openCodeAPIKey = session.executionRoute.providerID == "opencode" ? KeychainStore.read(account: "opencode-go-api-key") : nil
+                stream = pi.stream(
+                    prompt: prompt,
+                    sessionID: id,
+                    threadID: routeThreadID,
+                    workspace: workspace,
+                    provider: session.executionRoute.providerID,
+                    model: model,
+                    reasoningEffort: reasoningEffort,
+                    allowFileModification: !isExtensionSelfEdit,
+                    mode: .code,
+                    workspaceInstructionsTrusted: envelope.workspaceInstructionsTrusted,
+                    instructionEnvelope: envelope,
+                    openCodeAPIKey: openCodeAPIKey
+                )
+            } catch {
+                stream = failedAgentStream(error.localizedDescription)
+            }
+        } else if ExecutionRouteResolver.isDeclared(session.executionRoute), session.executionRoute.runtimeID == "hermes" {
+            do {
+                guard let provider = hermesProvider(for: session.executionRoute),
+                      let model = session.executionRoute.modelID else { throw LatticeHermesProfileError.invalidProvider(session.executionRoute.providerID) }
+                let envelope = try instructionEnvelope(for: session, workspace: workspace, allowFileModification: !isExtensionSelfEdit)
+                let workspaceInstructions = trustedWorkspaceInstructionText(for: workspace, names: envelope.trustedWorkspaceInstructionNames)
+                let systemIdentity = [envelope.renderedSystemInstructions, workspaceInstructions].filter { !$0.isEmpty }.joined(separator: "\n\n")
+                let openCodeAPIKey = session.executionRoute.providerID == "opencode" ? KeychainStore.read(account: "opencode-go-api-key") : nil
+                stream = hermes.stream(
+                    prompt: prompt,
+                    sessionID: id,
+                    threadID: routeThreadID,
+                    workspace: workspace,
+                    provider: provider,
+                    model: model,
+                    systemIdentity: systemIdentity,
+                    opencodeAPIKey: openCodeAPIKey,
+                    allowFileModification: !isExtensionSelfEdit,
+                    recoveryPrompt: recoveryPrompt,
+                    recoveryUsesVisibleTranscriptHandoff: recoveryUsesVisibleTranscriptHandoff,
+                    recoveryDeliveryIssue: recoveryDeliveryIssue
+                )
+            } catch {
+                stream = failedAgentStream(error.localizedDescription)
+            }
+        } else if harnessID == "pi", let piRoute = piRoute(for: session.backend) {
             stream = pi.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, provider: piRoute.provider, model: piRoute.model, reasoningEffort: reasoningEffort, allowFileModification: !isExtensionSelfEdit)
         } else if harnessID == "hermes" {
             stream = hermes.stream(prompt: prompt, sessionID: id, threadID: routeThreadID, workspace: workspace, requestedModel: session.backend.displayName, allowFileModification: !isExtensionSelfEdit, recoveryPrompt: recoveryPrompt, recoveryUsesVisibleTranscriptHandoff: recoveryUsesVisibleTranscriptHandoff, recoveryDeliveryIssue: recoveryDeliveryIssue)
@@ -2039,6 +2212,9 @@ final class AppState: ObservableObject {
 
     private func normalizeSessionBackendBeforeRun(at index: Int) {
         guard !sessions[index].messages.contains(where: { $0.role == .user }) else { return }
+        // New mode routes are explicit user choices. Never normalize them back
+        // through the legacy backend selector or switch their runtime implicitly.
+        if ExecutionRouteResolver.isDeclared(sessions[index].executionRoute) { return }
         let backend = sessions[index].backend
         let valid = validBackend(backend, privacyMode: sessions[index].privacyMode)
         guard valid != backend else { return }
@@ -2052,6 +2228,10 @@ final class AppState: ObservableObject {
     }
 
     private func canRunSession(_ session: LatticeSession) -> Bool {
+        if ExecutionRouteResolver.isDeclared(session.executionRoute) {
+            if session.privacyMode == .localOnly && session.executionRoute.mode != .local { return false }
+            return canRunDeclaredRoute(session.executionRoute)
+        }
         let harnessID = effectiveHarnessID(for: session)
         let routeLocked = session.messages.contains(where: { $0.role == .user }) || session.harnessThreadID != nil
         if session.privacyMode == .localOnly && !session.backend.isLocal && routeLocked {
@@ -2061,6 +2241,30 @@ final class AppState: ObservableObject {
             return canContinueLockedRoute(session.backend, harnessID: harnessID)
         }
         return canRunBackend(validBackend(session.backend, privacyMode: session.privacyMode), harnessID: harnessID)
+    }
+
+    private func canRunDeclaredRoute(_ route: ExecutionRoute) -> Bool {
+        switch (route.mode, route.providerID, route.runtimeID) {
+        case (.code, "codex", "pi"), (.code, "opencode", "pi"):
+            guard piInstalled, let providerModel = PiRPCHarness.providerModel(for: route) else { return false }
+            return piModelIDs.contains(providerModel.provider + "/" + providerModel.model)
+        case (.code, "grok", "grok"):
+            guard let model = route.modelID else { return false }
+            return grokReady && ACPHarness.bestMatch(for: model, in: grokACPModels) != nil
+        case (.code, "antigravity", "antigravity"):
+            guard let model = route.modelID else { return false }
+            return antigravityAuthenticated && visibleAntigravityModels.contains(where: { $0.id == model })
+        case (.work, _, "hermes"):
+            guard hermesInstalled, let model = route.modelID, hermesProvider(for: route) != nil else { return false }
+            return HermesACPHarness.exactMatch(for: model, in: hermesModels) != nil
+        case (.local, "apple", "lattice"):
+            return appleIntelligenceReady
+        case (.local, "ollama", "lattice"):
+            guard let model = route.modelID else { return false }
+            return ollamaReady && ollamaCatalogStatus == .loaded && ollamaModels.contains(where: { $0.name == model })
+        default:
+            return false
+        }
     }
 
     private func canContinueLockedRoute(_ backend: ChatBackend, harnessID: String?) -> Bool {
@@ -2098,6 +2302,17 @@ final class AppState: ObservableObject {
         return "Connected"
     }
 
+    private func codeRouteReadinessDetail(providerID: String) -> String {
+        switch providerID {
+        case "codex", "opencode":
+            if !piInstalled { return "Set up the Pi Code runtime in Connections" }
+            return piModelIDs.isEmpty ? "Pi authentication or model validation is required" : "No compatible models reported"
+        case "grok": return grokReadinessCopy.detail
+        case "antigravity": return antigravityReadinessDetail
+        default: return "Route unavailable"
+        }
+    }
+
     private var ollamaReadinessDetail: String {
         guard ollamaInstalled else { return "Not installed" }
         guard ollamaReady else { return "Start Ollama" }
@@ -2127,7 +2342,10 @@ final class AppState: ObservableObject {
         guard validBackend(backend, privacyMode: activePrivacyMode) == backend else {
             return backendUnavailableMessage(for: backend) ?? "Unavailable"
         }
-        guard canRunBackend(backend, harnessID: route.runtimeID) else {
+        let routeIsRunnable = ExecutionRouteResolver.isDeclared(route)
+            ? canRunDeclaredRoute(route)
+            : canRunBackend(backend, harnessID: route.runtimeID)
+        guard routeIsRunnable else {
             return routeUnavailableMessage(for: LatticeSession(
                 title: "New chat",
                 backend: backend,
@@ -2206,6 +2424,20 @@ final class AppState: ObservableObject {
             return message
         }
         if canRunSession(session) { return nil }
+        if ExecutionRouteResolver.isDeclared(session.executionRoute) {
+            switch session.executionRoute.runtimeID {
+            case "pi":
+                if !piInstalled { return "Set up the Pi Code runtime in Connections." }
+                return "Pi authentication or exact model validation is required for this Code route."
+            case "hermes":
+                if !hermesInstalled { return "Set up the Hermes Work runtime in Connections." }
+                return "Hermes authentication or exact model validation is required for this Work route."
+            case "grok": return grokReadinessCopy.detail
+            case "antigravity": return antigravityReadinessDetail
+            case "lattice": break
+            default: return "The selected runtime is unavailable."
+            }
+        }
         if harnessID == "pi" {
             return piInstalled ? "Pi cannot run this locked provider/model route." : "Pi is not installed."
         }
@@ -3234,7 +3466,13 @@ final class AppState: ObservableObject {
         let attachmentContext = liveAttachmentPaths.isEmpty
             ? ""
             : "\n\nAttached paths:\n" + liveAttachmentPaths.joined(separator: "\n")
-        return "\n\n" + LatticeProductInstructions.current
+        let taskContext: String
+        if session.executionRoute.runtimeID == "pi" || session.executionRoute.runtimeID == "hermes" || session.executionRoute.mode == .local {
+            taskContext = ""
+        } else {
+            taskContext = "\n\nLattice task context (visible task guidance; not a system prompt):\n" + LatticeProductInstructions.current
+        }
+        return taskContext
             + selfEditContext(for: submittedText, isExtensionSelfEdit: isExtensionSelfEdit, sessionID: session.id)
             + attachmentContext
     }

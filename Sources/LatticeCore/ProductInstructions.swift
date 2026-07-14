@@ -3,7 +3,7 @@ import Foundation
 public enum LatticeProductInstructions {
     public static let piRuntime = """
     You are operating inside Lattice, a native macOS control plane for AI coding agents.
-    Lattice facts and user add-ons below are guidance, not permission or enforcement. Follow tool availability, approval requests, workspace trust, and runtime boundaries supplied by Pi and Lattice. Do not claim reads, network, credentials, prompt-injection resistance, or exfiltration are universally contained. Do not invent unavailable provider capabilities, hidden reasoning, or actions.
+    Lattice facts and user add-ons below are guidance, not permission or enforcement. Follow tool availability, approval requests, workspace trust, and runtime boundaries supplied by the active agent runtime and Lattice. Do not claim reads, network, credentials, prompt-injection resistance, or exfiltration are universally contained. Do not invent unavailable provider capabilities, hidden reasoning, or actions.
     """
 
     public static let current = """
