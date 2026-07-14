@@ -8,6 +8,60 @@ private enum CodexHarnessError: LocalizedError {
     }
 }
 
+public struct CodexAppServerCapabilities: Sendable, Equatable {
+    public enum Support: String, Sendable, Equatable {
+        case unknown
+        case supported
+        case unsupported
+    }
+
+    public let serverIdentity: String?
+    public let protocolVersion: String?
+    public let modelCatalog: Support
+    public let usage: Support
+    public let providerTools: Support
+    public let threadResume: Support
+    public let approvals: Support
+
+    public init(
+        serverIdentity: String? = nil,
+        protocolVersion: String? = nil,
+        modelCatalog: Support = .unknown,
+        usage: Support = .unknown,
+        providerTools: Support = .unknown,
+        threadResume: Support = .unknown,
+        approvals: Support = .unknown
+    ) {
+        self.serverIdentity = serverIdentity
+        self.protocolVersion = protocolVersion
+        self.modelCatalog = modelCatalog
+        self.usage = usage
+        self.providerTools = providerTools
+        self.threadResume = threadResume
+        self.approvals = approvals
+    }
+}
+
+private final class CodexProtocolTimeout: @unchecked Sendable {
+    private let lock = NSLock()
+    private var active = true
+    private var didTimeOut = false
+
+    func finish() { lock.withLock { active = false } }
+
+    func fire(_ transport: BoundedProcessTransport) {
+        let shouldCancel = lock.withLock { () -> Bool in
+            guard active else { return false }
+            didTimeOut = true
+            active = false
+            return true
+        }
+        if shouldCancel { transport.cancel() }
+    }
+
+    var timedOut: Bool { lock.withLock { didTimeOut } }
+}
+
 public final class CodexExecHarness: @unchecked Sendable {
     private final class PendingPermission: @unchecked Sendable {
         enum Decision: Sendable {
@@ -49,13 +103,19 @@ public final class CodexExecHarness: @unchecked Sendable {
 
     private let executableURL: URL?
     private let permissionTimeoutNanoseconds: UInt64
+    private let protocolTimeout: TimeInterval
     private let lock = NSLock()
     private let processRegistry = InteractiveProcessRegistry()
     private var pendingPermissions: [UUID: PendingPermission] = [:]
 
-    public init(executableURL: URL? = ExecutableDiscovery.locate("codex"), permissionTimeout: TimeInterval = 120) {
+    public init(
+        executableURL: URL? = ExecutableDiscovery.locate("codex"),
+        permissionTimeout: TimeInterval = 120,
+        protocolTimeout: TimeInterval = 8
+    ) {
         self.executableURL = executableURL
         self.permissionTimeoutNanoseconds = PermissionTimeout.nanoseconds(for: permissionTimeout)
+        self.protocolTimeout = max(0.01, protocolTimeout)
     }
 
     public var isInstalled: Bool { executableURL != nil }
@@ -87,39 +147,70 @@ public final class CodexExecHarness: @unchecked Sendable {
 
     public func providerSnapshot() async -> CodexProviderSnapshot {
         guard let executableURL else { return .empty }
-        let messages: [[String: Any]] = [
-            ["method": "initialize", "id": 0, "params": ["clientInfo": ["name": "lattice", "title": "Lattice", "version": "0.1.0"], "capabilities": ["experimentalApi": true]]],
-            ["method": "initialized", "params": [:]],
-            ["method": "model/list", "id": 1, "params": ["includeHidden": false, "limit": 100]],
-            ["method": "account/rateLimits/read", "id": 2]
-        ]
-        let stdinData: Data
-        do {
-            stdinData = try messages.reduce(into: Data()) { data, message in
-                data.append(contentsOf: try JSONSerialization.data(withJSONObject: message))
-                data.append(0x0A)
-            }
-        } catch {
-            return CodexProviderSnapshot(models: [], usage: nil, catalogStatus: .failed)
-        }
-        let accumulator = AppServerAccumulator()
-        let result = await BoundedSubprocess.run(
-            .init(
+        let timeout = protocolTimeout
+        return await BoundedSubprocess.performOffCooperativeExecutor {
+            let transport = BoundedProcessTransport(request: .init(
                 executableURL: executableURL,
                 arguments: ["app-server", "-c", "service_tier=\"flex\""],
-                stdinData: stdinData,
-                deadline: 6
-            ),
-            stopWhen: { stdout, _ in
-                accumulator.append(stdout)
-                return accumulator.isComplete
+                deadline: timeout,
+                maximumOutputBytes: 4_000_000
+            ))
+            do {
+                try transport.start()
+                let reader = BoundedJSONLineReader(transport)
+                try Self.write(Self.initializeRequest(id: 0), to: transport)
+                let initialize = try Self.readProbeResponse(id: 0, from: reader)
+                var capabilities = try Self.negotiatedCapabilities(from: initialize)
+                try Self.write(["method": "initialized", "params": [:]], to: transport)
+                try Self.write(["method": "model/list", "id": 1, "params": ["includeHidden": false, "limit": 100]], to: transport)
+                try Self.write(["method": "modelProvider/capabilities/read", "id": 2, "params": [:]], to: transport)
+                try Self.write(["method": "account/rateLimits/read", "id": 3, "params": [:]], to: transport)
+                var responses: [Int: [String: Any]] = [:]
+                while responses.count < 3, let object = try reader.next() {
+                    guard object["method"] == nil, let id = (object["id"] as? NSNumber)?.intValue, (1...3).contains(id) else { continue }
+                    responses[id] = object
+                }
+                transport.finish()
+                let modelResponse = responses[1]
+                let toolsResponse = responses[2]
+                let usageResponse = responses[3]
+                let modelSupport = Self.probeSupport(modelResponse) { result in result["data"] is [[String: Any]] }
+                let toolSupport = Self.probeSupport(toolsResponse) { result in
+                    result["webSearch"] is Bool
+                        && result["imageGeneration"] is Bool
+                        && result["namespaceTools"] is Bool
+                }
+                let usageSupport = Self.probeSupport(usageResponse) { result in result["rateLimits"] is [String: Any] }
+                capabilities = .init(
+                    serverIdentity: capabilities.serverIdentity,
+                    protocolVersion: capabilities.protocolVersion,
+                    modelCatalog: modelSupport,
+                    usage: usageSupport,
+                    providerTools: toolSupport,
+                    threadResume: capabilities.threadResume,
+                    approvals: capabilities.approvals
+                )
+                let models = modelSupport == .supported ? Self.parseModels(modelResponse ?? [:]) : []
+                let usage = usageSupport == .supported ? Self.parseUsage(usageResponse ?? [:]) : nil
+                return CodexProviderSnapshot(
+                    models: models,
+                    usage: usage,
+                    catalogStatus: .resolved(modelCount: models.count, succeeded: modelSupport == .supported),
+                    capabilities: capabilities,
+                    unavailableReason: Self.modelCatalogUnavailableReason(for: modelSupport)
+                )
+            } catch {
+                transport.cancel()
+                return CodexProviderSnapshot(
+                    models: [],
+                    usage: nil,
+                    catalogStatus: .failed,
+                    unavailableReason: transport.terminationReason == .timedOut
+                        ? "Codex app-server protocol negotiation timed out. Retry or update Codex."
+                        : error.localizedDescription
+                )
             }
-        )
-        guard result.outcome == .completed || result.outcome == .exited else {
-            return CodexProviderSnapshot(models: [], usage: nil, catalogStatus: .failed)
         }
-        accumulator.append(result.stdout)
-        return accumulator.snapshot
     }
 
     public func stream(prompt: String, sessionID: UUID, threadID: String?, workspace: URL, model: String, reasoningEffort: ReasoningEffort? = nil, policy: ExecutionPolicy = .ask, workspaceWrite: Bool = false, developerInstructions: String? = nil) -> AsyncStream<AgentEvent> {
@@ -138,6 +229,8 @@ public final class CodexExecHarness: @unchecked Sendable {
                     maximumOutputBytes: 8_000_000
                 ))
                 var owner: InteractiveProcessRegistry.Owner?
+                let handshakeTimeout = CodexProtocolTimeout()
+                var handshakeCompleted = false
                 do {
                     try transport.start()
                     guard let registeredOwner = register(process: transport, input: transport.input, for: sessionID, start: start) else {
@@ -145,8 +238,14 @@ public final class CodexExecHarness: @unchecked Sendable {
                     }
                     owner = registeredOwner
                     let reader = BoundedJSONLineReader(transport)
+                    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + protocolTimeout) {
+                        handshakeTimeout.fire(transport)
+                    }
                     try Self.write(Self.initializeRequest(id: 1), to: transport)
-                    _ = try await readResponse(id: 1, sessionID: sessionID, owner: registeredOwner, from: reader, transport: transport, continuation: continuation)
+                    let initializeResponse = try await readResponse(id: 1, sessionID: sessionID, owner: registeredOwner, from: reader, transport: transport, continuation: continuation)
+                    _ = try Self.negotiatedCapabilities(from: initializeResponse)
+                    handshakeCompleted = true
+                    handshakeTimeout.finish()
                     try Self.write(["method": "initialized", "params": [:]], to: transport)
 
                     let route = Self.executionRoute(policy: policy, workspaceWrite: workspaceWrite)
@@ -166,11 +265,14 @@ public final class CodexExecHarness: @unchecked Sendable {
                     if let threadID { threadParams["threadId"] = threadID }
                     try Self.write(["method": method, "id": 2, "params": threadParams], to: transport)
                     let threadResponse = try await readResponse(id: 2, sessionID: sessionID, owner: registeredOwner, from: reader, transport: transport, continuation: continuation)
+                    if Self.isUnsupportedMethod(threadResponse), threadID != nil {
+                        throw CodexHarnessError.message("This Codex app-server cannot resume existing threads. Update Codex or start a new chat.")
+                    }
                     guard let result = threadResponse["result"] as? [String: Any],
-                          let thread = result["thread"] as? [String: Any],
-                          let activeThreadID = thread["id"] as? String else {
+                          let activeThreadID = Self.threadID(from: result) else {
                         throw CodexHarnessError.message(Self.responseError(threadResponse, fallback: "Codex did not return a thread ID."))
                     }
+                    try Self.validateEffectiveRoute(result, requested: route)
                     setThreadID(activeThreadID, owner: registeredOwner, for: sessionID)
                     continuation.yield(.harnessSessionStarted(activeThreadID))
 
@@ -190,8 +292,7 @@ public final class CodexExecHarness: @unchecked Sendable {
                     try Self.write(["method": "turn/start", "id": 3, "params": turnParams], to: transport)
                     let turnResponse = try await readResponse(id: 3, sessionID: sessionID, owner: registeredOwner, from: reader, transport: transport, continuation: continuation)
                     guard let turnResult = turnResponse["result"] as? [String: Any],
-                          let turn = turnResult["turn"] as? [String: Any],
-                          let turnID = turn["id"] as? String else {
+                          let turnID = Self.turnID(from: turnResult) else {
                         throw CodexHarnessError.message(Self.responseError(turnResponse, fallback: "Codex did not start the turn."))
                     }
                     setTurnID(turnID, owner: registeredOwner, for: sessionID)
@@ -200,11 +301,21 @@ public final class CodexExecHarness: @unchecked Sendable {
                     let didCancel = unregister(registeredOwner, start: start, sessionID: sessionID)
                     if didCancel && !turnReportedCancellation { continuation.yield(.cancelled) }
                 } catch {
+                    handshakeTimeout.finish()
                     let didCancel = unregister(owner, start: start, sessionID: sessionID)
+                    let terminationReason = transport.terminationReason
                     transport.cancel()
-                    if didCancel || transport.terminationReason == .cancelled { continuation.yield(.cancelled) }
-                    else if transport.terminationReason == .timedOut { continuation.yield(.failed("Codex timed out.")) }
-                    else if transport.terminationReason == .outputLimitExceeded { continuation.yield(.failed("Codex output exceeded its limit.")) }
+                    if handshakeTimeout.timedOut { continuation.yield(.failed("Codex app-server protocol negotiation timed out. Retry or update Codex.")) }
+                    else if !handshakeCompleted {
+                        let detail = error.localizedDescription
+                        let message = detail.contains("Update Codex")
+                            ? detail
+                            : "Codex returned a malformed protocol handshake: \(detail) Update Codex and retry."
+                        continuation.yield(.failed(message))
+                    }
+                    else if didCancel || terminationReason == .cancelled { continuation.yield(.cancelled) }
+                    else if terminationReason == .timedOut { continuation.yield(.failed("Codex timed out.")) }
+                    else if terminationReason == .outputLimitExceeded { continuation.yield(.failed("Codex output exceeded its limit.")) }
                     else { continuation.yield(.failed(error.localizedDescription)) }
                 }
                 continuation.finish()
@@ -318,6 +429,101 @@ public final class CodexExecHarness: @unchecked Sendable {
         ]]
     }
 
+    static func negotiatedCapabilities(from response: [String: Any]) throws -> CodexAppServerCapabilities {
+        if response["error"] != nil {
+            let detail = responseError(response, fallback: "The initialize request was rejected.")
+            throw CodexHarnessError.message("Codex app-server protocol negotiation failed: \(detail) Update Codex and retry.")
+        }
+        guard let result = response["result"] as? [String: Any] else {
+            throw CodexHarnessError.message("Codex returned a malformed protocol handshake. Update Codex and retry.")
+        }
+        let identity = (result["userAgent"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let version: String? = {
+            if let value = result["protocolVersion"] as? String { return value }
+            if let value = result["protocolVersion"] as? NSNumber { return value.stringValue }
+            return nil
+        }()
+        return CodexAppServerCapabilities(
+            serverIdentity: identity?.isEmpty == false ? identity : nil,
+            protocolVersion: version
+        )
+    }
+
+    private static func threadID(from result: [String: Any]) -> String? {
+        ((result["thread"] as? [String: Any])?["id"] as? String) ?? (result["threadId"] as? String)
+    }
+
+    private static func turnID(from result: [String: Any]) -> String? {
+        ((result["turn"] as? [String: Any])?["id"] as? String) ?? (result["turnId"] as? String)
+    }
+
+    private static func validateEffectiveRoute(
+        _ result: [String: Any],
+        requested: (approvalPolicy: String, sandbox: String)
+    ) throws {
+        guard let approvalPolicy = result["approvalPolicy"] as? String,
+              let sandbox = effectiveSandbox(from: result) else {
+            throw CodexHarnessError.message("Codex did not confirm the requested approval and workspace safety settings. Update Codex before using this connection.")
+        }
+        guard approvalPolicy == requested.approvalPolicy, sandbox == requested.sandbox else {
+            throw CodexHarnessError.message("Codex applied different approval or workspace safety settings than Lattice requested. The turn was not started.")
+        }
+    }
+
+    private static func effectiveSandbox(from result: [String: Any]) -> String? {
+        let raw: String?
+        if let value = result["sandbox"] as? String {
+            raw = value
+        } else if let object = result["sandbox"] as? [String: Any] {
+            raw = object["type"] as? String ?? object["mode"] as? String
+        } else {
+            raw = nil
+        }
+        switch raw {
+        case "readOnly": return "read-only"
+        case "workspaceWrite": return "workspace-write"
+        case "dangerFullAccess": return "danger-full-access"
+        default: return raw
+        }
+    }
+
+    private static func probeSupport(
+        _ response: [String: Any]?,
+        validate: ([String: Any]) -> Bool
+    ) -> CodexAppServerCapabilities.Support {
+        guard let response else { return .unknown }
+        if response["error"] == nil,
+           let result = response["result"] as? [String: Any],
+           validate(result) { return .supported }
+        return isUnsupportedMethod(response) ? .unsupported : .unknown
+    }
+
+    private static func modelCatalogUnavailableReason(
+        for support: CodexAppServerCapabilities.Support
+    ) -> String? {
+        switch support {
+        case .supported: nil
+        case .unsupported: "This Codex app-server does not support model discovery. Update Codex and refresh Connections."
+        case .unknown: "Codex returned an incomplete model discovery response. Check sign-in, update Codex, and refresh Connections."
+        }
+    }
+
+    private static func isUnsupportedMethod(_ response: [String: Any]) -> Bool {
+        guard let error = response["error"] as? [String: Any] else { return false }
+        return (error["code"] as? NSNumber)?.intValue == -32601
+    }
+
+    private static func readProbeResponse(id: Int, from reader: BoundedJSONLineReader) throws -> [String: Any] {
+        while let object = try reader.next() {
+            guard object["method"] == nil, (object["id"] as? NSNumber)?.intValue == id else { continue }
+            if object["error"] != nil {
+                throw CodexHarnessError.message(responseError(object, fallback: "Codex app-server protocol negotiation failed."))
+            }
+            return object
+        }
+        throw CodexHarnessError.message("Codex app-server ended before protocol negotiation completed.")
+    }
+
     private static func executionRoute(policy: ExecutionPolicy, workspaceWrite: Bool) -> (approvalPolicy: String, sandbox: String) {
         switch policy {
         case .ask: ("on-request", workspaceWrite ? "workspace-write" : "read-only")
@@ -342,7 +548,6 @@ public final class CodexExecHarness: @unchecked Sendable {
                 continue
             }
             if (object["id"] as? NSNumber)?.intValue == id {
-                if object["error"] != nil { throw CodexHarnessError.message(Self.responseError(object, fallback: "Codex app-server request failed.")) }
                 return object
             }
         }
@@ -382,11 +587,17 @@ public final class CodexExecHarness: @unchecked Sendable {
         continuation: AsyncStream<AgentEvent>.Continuation
     ) async throws {
         guard let serverID = object["id"], let method = object["method"] as? String else { return }
-        guard let workspace,
-              ["item/commandExecution/requestApproval", "item/fileChange/requestApproval"].contains(method),
-              let request = Self.appServerPermissionRequest(from: object, workspace: workspace) else {
+        let approvalMethods = ["item/commandExecution/requestApproval", "item/fileChange/requestApproval"]
+        guard approvalMethods.contains(method) else {
             try Self.write(["id": serverID, "error": ["code": -32601, "message": "Unsupported Codex client request: \(method)"]], to: transport)
+            if method.hasSuffix("/requestApproval") {
+                throw CodexHarnessError.message("Codex requested approval for a tool this Lattice version cannot safely handle. Update Lattice or Codex and retry.")
+            }
             return
+        }
+        guard let workspace, let request = Self.appServerPermissionRequest(from: object, workspace: workspace), !request.options.isEmpty else {
+            try Self.write(["id": serverID, "error": ["code": -32602, "message": "Unsupported or malformed Codex approval request: \(method)"]], to: transport)
+            throw CodexHarnessError.message("Codex requested approval using a schema this Lattice version cannot safely handle. Update Lattice or Codex and retry.")
         }
         let decisions = Set(request.options.map(\.id)).union(["cancel"])
         let pending = PendingPermission(sessionID: sessionID, owner: owner, requestID: request.id, serverRequestID: serverID, allowedDecisions: decisions)
@@ -437,10 +648,12 @@ public final class CodexExecHarness: @unchecked Sendable {
                 workspaceScoped: root.map { WorkspacePathScope.isWorkspaceScoped($0, workspace: workspace) } ?? false,
                 reversible: false
             )
+            let decisions = (params["availableDecisions"] as? [Any])?.compactMap { $0 as? String }
+                ?? ["accept", "acceptForSession", "decline", "cancel"]
             return ApprovalRequest(
                 title: request.title,
                 detail: request.detail,
-                options: Self.approvalOptions(["accept", "acceptForSession", "decline", "cancel"]),
+                options: Self.approvalOptions(decisions),
                 toolRequest: request
             )
         }
@@ -572,8 +785,8 @@ public final class CodexExecHarness: @unchecked Sendable {
         return values.compactMap { value in
             guard value["hidden"] as? Bool != true,
                   value["upgrade"] == nil || value["upgrade"] is NSNull,
-                  let id = value["model"] as? String,
-                  let name = value["displayName"] as? String else { return nil }
+                  let id = (value["model"] as? String) ?? (value["id"] as? String) else { return nil }
+            let name = (value["displayName"] as? String) ?? (value["name"] as? String) ?? id
             let options = (value["supportedReasoningEfforts"] as? [[String: Any]] ?? []).compactMap { option -> ReasoningOption? in
                 guard let raw = option["reasoningEffort"] as? String, let effort = ReasoningEffort(rawValue: raw) else { return nil }
                 return ReasoningOption(effort: effort, description: option["description"] as? String ?? "")
@@ -607,58 +820,24 @@ public final class CodexExecHarness: @unchecked Sendable {
 
 }
 
-private final class AppServerAccumulator: @unchecked Sendable {
-    private let lock = NSLock()
-    private var frameBuffer = BoundedJSONLineBuffer()
-    private var processedInputBytes = 0
-    private var models: [ProviderModel] = []
-    private var usage: ProviderUsage?
-    private var received: Set<Int> = []
-    private var failed = false
-    private var modelCatalogSucceeded = false
-
-    var isComplete: Bool { lock.withLock { failed || received.isSuperset(of: [1, 2]) } }
-    var snapshot: CodexProviderSnapshot {
-        lock.withLock {
-            if failed { return CodexProviderSnapshot(models: [], usage: nil, catalogStatus: .failed) }
-            let status = received.contains(1)
-                ? ProviderCatalogStatus.resolved(modelCount: models.count, succeeded: modelCatalogSucceeded)
-                : .failed
-            return CodexProviderSnapshot(models: models, usage: usage, catalogStatus: status)
-        }
-    }
-
-    func append(_ chunk: Data) {
-        lock.withLock {
-            guard !failed, chunk.count >= processedInputBytes else { return }
-            let delta = chunk.dropFirst(processedInputBytes)
-            processedInputBytes = chunk.count
-            do {
-                for object in try frameBuffer.append(Data(delta)) {
-                    guard let id = object["id"] as? Int else { continue }
-                    if id == 1 {
-                        modelCatalogSucceeded = object["error"] == nil
-                        models = CodexExecHarness.parseModels(object)
-                        received.insert(id)
-                    }
-                    if id == 2 { usage = CodexExecHarness.parseUsage(object); received.insert(id) }
-                }
-            } catch {
-                failed = true
-                models.removeAll(keepingCapacity: false)
-                usage = nil
-                received.removeAll(keepingCapacity: false)
-            }
-        }
-    }
-}
-
 public struct CodexProviderSnapshot: Sendable {
     public let models: [ProviderModel]
     public let usage: ProviderUsage?
     public let catalogStatus: ProviderCatalogStatus
-    public init(models: [ProviderModel], usage: ProviderUsage?, catalogStatus: ProviderCatalogStatus = .unknown) {
-        self.models = models; self.usage = usage; self.catalogStatus = catalogStatus
+    public let capabilities: CodexAppServerCapabilities
+    public let unavailableReason: String?
+    public init(
+        models: [ProviderModel],
+        usage: ProviderUsage?,
+        catalogStatus: ProviderCatalogStatus = .unknown,
+        capabilities: CodexAppServerCapabilities = .init(),
+        unavailableReason: String? = nil
+    ) {
+        self.models = models
+        self.usage = usage
+        self.catalogStatus = catalogStatus
+        self.capabilities = capabilities
+        self.unavailableReason = unavailableReason
     }
     public static let empty = CodexProviderSnapshot(models: [], usage: nil, catalogStatus: .unknown)
 }

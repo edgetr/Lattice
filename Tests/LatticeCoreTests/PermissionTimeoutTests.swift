@@ -9,8 +9,8 @@ struct PermissionTimeoutTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let executable = try makeExecutable(
             """
-            printf '%s\\n' '{"id":1,"result":{}}'
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread"}}}'
+            printf '%s\\n' '{"id":1,"result":{"userAgent":"test-codex","futureField":true}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread"},"approvalPolicy":"on-request","sandbox":"read-only"}}'
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn"}}}'
             printf '%s\\n' '{"id":"permission","method":"item/commandExecution/requestApproval","params":{"command":"echo test","availableDecisions":["accept","decline"]}}'
             while IFS= read -r line; do :; done

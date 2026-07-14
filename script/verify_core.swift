@@ -1002,7 +1002,7 @@ struct CoreVerification {
         IFS= read -r initialized
         IFS= read -r thread_request
         print -r -- "$thread_request" > "\(codexThreadRequestURL.path)"
-        print -r -- '{"id":2,"result":{"thread":{"id":"thread-native","turns":[]}}}'
+        print -r -- '{"id":2,"result":{"thread":{"id":"thread-native","turns":[]},"approvalPolicy":"on-request","sandbox":"workspace-write"}}'
         IFS= read -r turn_request
         print -r -- "$turn_request" > "\(codexTurnRequestURL.path)"
         print -r -- '{"id":3,"result":{"turn":{"id":"turn-native","status":"inProgress","items":[]}}}'

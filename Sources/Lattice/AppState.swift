@@ -210,6 +210,7 @@ final class AppState: ObservableObject {
     @Published var codexReady = false
     @Published var codexAuthenticated = false
     @Published var codexCatalogStatus: ProviderCatalogStatus = .unknown
+    @Published private(set) var codexProtocolUnavailableReason: String?
     @Published var codexModels: [ProviderModel] = []
     @Published var codexUsage: ProviderUsage?
     @Published var codexCLIVersion: String?
@@ -2572,7 +2573,9 @@ final class AppState: ObservableObject {
         switch session.backend {
         case .codex(let model):
             if !codex.isInstalled { return "Codex is not installed." }
-            if !codexReady { return "Codex sign-in is required before this chat can continue." }
+            if !codexAuthenticated { return "Codex sign-in is required before this chat can continue." }
+            if let codexProtocolUnavailableReason { return codexProtocolUnavailableReason }
+            if !codexReady { return "Codex is not ready. Refresh Connections before continuing." }
             if codexModels.isEmpty { return "Codex has not reported a model catalog. Refresh Connections before continuing." }
             if !codexModels.contains(where: { $0.id == model }) {
                 return "Codex no longer exposes \(model). Start a new chat to choose another model."
@@ -3032,6 +3035,7 @@ final class AppState: ObservableObject {
         guard canApplyCatalogRefresh(generation) else { return }
         codexAuthenticated = auth
         codexCatalogStatus = snapshot.catalogStatus
+        codexProtocolUnavailableReason = snapshot.unavailableReason
         codexModels = snapshot.models
         codexReady = ProviderReadinessSnapshot(installed: codex.isInstalled, authenticated: auth, catalogStatus: snapshot.catalogStatus, runnableModelCount: visibleCodexModels.count).isRunnable
         codexUsage = snapshot.usage
