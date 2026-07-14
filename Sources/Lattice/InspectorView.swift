@@ -4,131 +4,167 @@ import LatticeCore
 struct InspectorView: View {
     @ObservedObject var state: AppState
     var body: some View {
-        Form {
+        ScrollView {
             if let session = state.selectedSession {
-                Section("Chat") {
-                    LabeledContent("Provider", value: session.backend.harnessName)
-                    LabeledContent("Model", value: session.backend.displayName)
-                    if let reasoning = session.reasoningEffort { LabeledContent("Reasoning", value: reasoning.displayName) }
-                    Picker("Execution policy", selection: Binding(
-                        get: { session.policy },
-                        set: { state.setSessionPolicy($0) }
-                    )) {
-                        ForEach(ExecutionPolicy.allCases, id: \.self) { policy in
-                            Text(policy.rawValue).tag(policy)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .disabled(session.isStreaming)
-                    .accessibilityLabel("Execution policy")
-                    .accessibilityHint("Controls how this chat handles approvals and provider tool risk for the selected harness.")
-                    Picker("Model privacy", selection: Binding(
-                        get: { session.privacyMode },
-                        set: { state.setSessionPrivacyMode($0) }
-                    )) {
-                        ForEach(SessionPrivacyMode.allCases, id: \.self) { mode in
-                            Text(mode.displayName).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .disabled(session.isStreaming)
-                    if session.privacyMode == .localOnly {
-                        Text("Cloud provider routes are blocked for this chat.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        if !session.backend.isLocal && session.messages.contains(where: { $0.role == .user }) {
-                            Text("This chat is locked to its cloud route. Start a separate local chat to continue without sending cloud requests.")
-                                .font(.caption)
-                                .foregroundStyle(.orange)
-                            Button("Start New Local Chat") {
-                                state.startLocalOnlyChatFromSelected()
-                            }
-                            .disabled(!state.canStartLocalOnlyChat)
-                            .help(state.canStartLocalOnlyChat ? "Create a fresh chat with a local backend" : "Make Apple Intelligence or Ollama available in Connections first")
-                        }
-                    }
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    Text("Chat details").font(.title3.weight(.semibold)).accessibilityAddTraits(.isHeader)
+                    chatCard(session)
+                    workspaceCard(session)
+                    contextCard(session)
+                    if let capability = state.selectedRouteCapability { routeCard(capability) }
+                    if case .codex = session.backend, let usage = state.codexUsage { usageCard(usage) }
                 }
-                if let capability = state.selectedRouteCapability {
-                    Section("Route controls") {
-                        LabeledContent("Owner", value: capability.executionOwner.displayName)
-                        LabeledContent("Tool broker", value: capability.brokerMediation.displayName)
-                        LabeledContent("Write containment", value: capability.writeContainment.displayValue)
-                            .accessibilityValue(capability.writeContainment.detail)
-                            .help(capability.writeContainment.detail)
-                        LabeledContent("Approvals", value: capability.approvalBehavior.displayValue)
-                            .accessibilityValue(capability.approvalBehavior.detail)
-                            .help(capability.approvalBehavior.detail)
-                        capabilityRow("File reads", capability.fileReadRestriction)
-                        capabilityRow("Network", capability.networkRestriction)
-                        capabilityRow("Credentials", capability.credentialReadProtection)
-                        capabilityRow("Events", capability.structuredEvents)
-                        capabilityRow("Resume", capability.providerSessionResume)
-                        capabilityRow("Cancel", capability.cancellation)
-                        if let warning = capability.primaryWarning {
-                            Text(warning)
-                                .font(.caption)
-                                .foregroundStyle(.orange)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .accessibilityLabel("Route warning")
-                                .accessibilityValue(warning)
-                        }
-                        if capability.warnings.count > 1 {
-                            ForEach(Array(capability.warnings.dropFirst().enumerated()), id: \.offset) { _, warning in
-                                Text(warning)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
-                    }
-                    .accessibilityElement(children: .contain)
-                    .accessibilityLabel("Route controls")
-                    .accessibilityHint("What the selected harness and execution policy actually enforce before a run.")
+                .padding(12)
+            } else {
+                ContentUnavailableView("No Chat Selected", systemImage: "bubble.left", description: Text("Select a chat to inspect its route, workspace, and context."))
+                    .padding(20)
+            }
+        }
+        .background(.background.secondary.opacity(0.35))
+    }
+
+    private func chatCard(_ session: LatticeSession) -> some View {
+        InspectorPanelCard(title: "Chat", systemImage: "bubble.left.and.text.bubble.right") {
+            InspectorFactRow(title: "Provider", value: session.backend.harnessName)
+            InspectorFactRow(title: "Model", value: session.backend.displayName)
+            if let reasoning = session.reasoningEffort { InspectorFactRow(title: "Reasoning", value: reasoning.displayName) }
+            Divider()
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Execution policy").font(.caption).foregroundStyle(.secondary)
+                Picker("Execution policy", selection: Binding(get: { session.policy }, set: { state.setSessionPolicy($0) })) {
+                    ForEach(ExecutionPolicy.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                 }
-                if case .codex = session.backend, let usage = state.codexUsage {
-                    Section("Usage") {
-                        ForEach(usage.windows) { window in UsageWindowRow(window: window) }
-                        if let balance = usage.creditsBalance { LabeledContent("Credits", value: balance) }
-                    }
+                .labelsHidden().pickerStyle(.segmented).disabled(session.isStreaming)
+                .accessibilityLabel("Execution policy")
+                .accessibilityHint("Controls approvals and provider tool risk for this chat.")
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Model privacy").font(.caption).foregroundStyle(.secondary)
+                Picker("Model privacy", selection: Binding(get: { session.privacyMode }, set: { state.setSessionPrivacyMode($0) })) {
+                    ForEach(SessionPrivacyMode.allCases, id: \.self) { Text($0.displayName).tag($0) }
                 }
-                Section("Workspace") {
-                    Text(session.workspacePath ?? "None").font(.caption).textSelection(.enabled)
-                    Button("Choose…") { state.chooseWorkspace() }.disabled(!session.messages.isEmpty)
+                .labelsHidden().pickerStyle(.segmented).disabled(session.isStreaming)
+                .accessibilityLabel("Model privacy")
+            }
+            if session.privacyMode == .localOnly {
+                Label("Cloud routes are blocked for this chat.", systemImage: "lock.fill").font(.caption).foregroundStyle(.secondary)
+                if !session.backend.isLocal && session.messages.contains(where: { $0.role == .user }) {
+                    Text("This chat is locked to its cloud route. Start a separate local chat to continue without cloud requests.").font(.caption).foregroundStyle(.orange)
+                    Button("Start New Local Chat") { state.startLocalOnlyChatFromSelected() }
+                        .disabled(!state.canStartLocalOnlyChat)
+                        .help(state.canStartLocalOnlyChat ? "Create a fresh chat with a local backend" : "Make Apple Intelligence or Ollama available in Connections first")
                 }
-                Section("Context") {
-                    if let estimate = state.selectedContextBudgetEstimate {
-                        ContextBudgetMeter(estimate: estimate)
-                    }
-                    if session.attachments.isEmpty {
-                        Text("No attached paths. Drag files or use the paperclip to add context.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(session.attachments) { attachment in
-                            HStack {
-                                Label(attachment.name, systemImage: attachment.isImage ? "photo" : "doc")
-                                Spacer()
-                                Text(attachment.isMissing ? "Missing" : "Path")
-                                    .font(.caption2)
-                                    .foregroundStyle(attachment.isMissing ? AnyShapeStyle(.orange) : AnyShapeStyle(.tertiary))
-                                    .accessibilityLabel(attachment.isMissing ? "Attachment unavailable" : "Local path")
-                                Button { state.removeAttachment(attachment.id) } label: { Image(systemName: "xmark") }
-                                    .buttonStyle(LatticeIconButtonStyle(size: .compact))
-                                    .accessibilityLabel("Remove \(attachment.name)")
-                                    .help("Remove \(attachment.name)")
-                            }
-                        }
+            }
+        }
+    }
+
+    private func workspaceCard(_ session: LatticeSession) -> some View {
+        InspectorPanelCard(title: "Workspace", systemImage: "folder") {
+            Text(session.workspacePath ?? "No workspace selected")
+                .font(.caption.monospaced()).foregroundStyle(session.workspacePath == nil ? .secondary : .primary)
+                .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            Button("Choose Workspace…") { state.chooseWorkspace() }
+                .disabled(!session.messages.isEmpty)
+                .help(session.messages.isEmpty ? "Choose this chat’s workspace" : "A chat workspace cannot change after messages are sent")
+        }
+    }
+
+    private func contextCard(_ session: LatticeSession) -> some View {
+        InspectorPanelCard(title: "Context", systemImage: "paperclip") {
+            if let estimate = state.selectedContextBudgetEstimate { ContextBudgetMeter(estimate: estimate) }
+            if session.attachments.isEmpty {
+                Text("No attached paths. Drag files or use the paperclip to add context.").font(.caption).foregroundStyle(.secondary)
+            } else {
+                ForEach(session.attachments) { attachment in
+                    HStack(spacing: 8) {
+                        Label(attachment.name, systemImage: attachment.isImage ? "photo" : "doc").lineLimit(1)
+                        Spacer(minLength: 4)
+                        if attachment.isMissing { Text("Missing").font(.caption2).foregroundStyle(.orange) }
+                        Button { state.removeAttachment(attachment.id) } label: { Image(systemName: "xmark") }
+                            .buttonStyle(LatticeIconButtonStyle(size: .compact))
+                            .accessibilityLabel("Remove \(attachment.name)").help("Remove \(attachment.name)")
                     }
                 }
             }
         }
-        .formStyle(.grouped).padding(.top, 8)
+    }
+
+    private func routeCard(_ capability: RouteCapability) -> some View {
+        InspectorPanelCard {
+            DisclosureGroup {
+                VStack(alignment: .leading, spacing: 9) {
+                    InspectorFactRow(title: "Owner", value: capability.executionOwner.displayName)
+                    InspectorFactRow(title: "Tool broker", value: capability.brokerMediation.displayName)
+                    capabilityRow("Write containment", capability.writeContainment)
+                    capabilityRow("Approvals", capability.approvalBehavior)
+                    capabilityRow("File reads", capability.fileReadRestriction)
+                    capabilityRow("Network", capability.networkRestriction)
+                    capabilityRow("Credentials", capability.credentialReadProtection)
+                    capabilityRow("Events", capability.structuredEvents)
+                    capabilityRow("Resume", capability.providerSessionResume)
+                    capabilityRow("Cancel", capability.cancellation)
+                    ForEach(Array(capability.warnings.enumerated()), id: \.offset) { index, warning in
+                        Text(warning).font(index == 0 ? .caption : .caption2)
+                            .foregroundStyle(index == 0 ? .orange : .secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+                }.padding(.top, 10)
+            } label: {
+                HStack {
+                    Label("Route & safety", systemImage: "shield.lefthalf.filled")
+                    Spacer()
+                    if capability.primaryWarning != nil { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).accessibilityLabel("Route warning") }
+                }.font(.headline)
+            }
+        }
+        .accessibilityElement(children: .contain).accessibilityLabel("Route and safety controls")
+    }
+
+    private func usageCard(_ usage: ProviderUsage) -> some View {
+        InspectorPanelCard {
+            DisclosureGroup {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(usage.windows) { UsageWindowRow(window: $0) }
+                    if let balance = usage.creditsBalance { InspectorFactRow(title: "Credits", value: balance) }
+                }.padding(.top, 10)
+            } label: { Label("Usage", systemImage: "gauge.with.dots.needle.33percent").font(.headline) }
+        }
     }
 
     private func capabilityRow(_ title: String, _ capability: RouteCapabilityDetail) -> some View {
-        LabeledContent(title, value: capability.displayValue)
-            .accessibilityValue(capability.detail)
-            .help(capability.detail)
+        InspectorFactRow(title: title, value: capability.displayValue).accessibilityValue(capability.detail).help(capability.detail)
+    }
+}
+
+private struct InspectorPanelCard<Content: View>: View {
+    let title: String?
+    let systemImage: String?
+    @ViewBuilder let content: Content
+
+    init(title: String? = nil, systemImage: String? = nil, @ViewBuilder content: () -> Content) {
+        self.title = title; self.systemImage = systemImage; self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let title, let systemImage { Label(title, systemImage: systemImage).font(.headline).accessibilityAddTraits(.isHeader) }
+            content
+        }
+        .padding(12).frame(maxWidth: .infinity, alignment: .leading).latticeGlass(cornerRadius: 14)
+    }
+}
+
+private struct InspectorFactRow: View {
+    let title: String
+    let value: String
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text(title).foregroundStyle(.secondary); Spacer(minLength: 8); Text(value).multilineTextAlignment(.trailing)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.caption).foregroundStyle(.secondary); Text(value).fixedSize(horizontal: false, vertical: true)
+            }
+        }.font(.caption).accessibilityElement(children: .combine)
     }
 }
 

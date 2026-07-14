@@ -235,7 +235,7 @@ private struct ConversationWorkspaceLayout: View {
                 ConversationView(state: state)
                     .inspector(isPresented: $state.showInspector) {
                         InspectorView(state: state)
-                            .inspectorColumnWidth(min: 240, ideal: 280, max: 330)
+                            .inspectorColumnWidth(min: 300, ideal: 350, max: 420)
                     }
             }
         }
