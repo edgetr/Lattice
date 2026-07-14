@@ -859,6 +859,11 @@ private struct ModelChooserRow: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(2)
+                        } else if let reasoning = option.reasoningSummary {
+                            Text(reasoning)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
                         }
                     }
                     Spacer(minLength: 4)

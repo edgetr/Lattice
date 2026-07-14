@@ -95,6 +95,7 @@ struct ComposerModelOption: Identifiable, Equatable {
     let providerTitle: String
     let title: String
     let reason: String?
+    var reasoningSummary: String? = nil
 
     var id: String { route.id }
     var isAvailable: Bool { backend != nil && reason == nil }
@@ -554,6 +555,10 @@ final class AppState: ObservableObject {
         return sessions.first { $0.id == id }
     }
 
+    var selectedSessionUsesLegacyDirectOpenCode: Bool {
+        selectedSession.map { LegacyOpenCodeBridgePolicy.allows($0.executionRoute) } ?? false
+    }
+
     /// Truthful controls for the selected chat's harness route and execution policy.
     /// Live provider tools do not pass through `LocalToolBroker` today.
     var selectedRouteCapability: RouteCapability? {
@@ -638,7 +643,16 @@ final class AppState: ObservableObject {
             guard let backend = backend(for: providerID, modelID: modelID),
                   let route = ExecutionRouteResolver.resolve(mode: mode, providerID: providerID, modelID: modelID) else { return }
             let reason = isModelEnabled(backend.id) ? composerUnavailableReason(for: backend, route: route) : "Hidden in Connections"
-            options.append(ComposerModelOption(route: route, backend: backend, providerTitle: providerTitle, title: title, reason: reason))
+            let reasoning = reasoningOptions(for: backend, harnessID: route.runtimeID)
+                .map(\.effort.displayName)
+            options.append(ComposerModelOption(
+                route: route,
+                backend: backend,
+                providerTitle: providerTitle,
+                title: title,
+                reason: reason,
+                reasoningSummary: reasoning.isEmpty ? nil : "Reasoning · " + reasoning.joined(separator: ", ")
+            ))
         }
 
         switch mode {
@@ -2932,6 +2946,10 @@ final class AppState: ObservableObject {
     func refreshConnections(refreshProviderCatalogs: Bool = false) async {
         let generation = connectionRefreshGeneration.begin()
         let localGeneration = localModelRefreshGeneration.begin()
+        // Authentication probes are observations of a specific runtime/profile
+        // state. Every refresh invalidates them so revoked or changed login state
+        // cannot remain runnable from a stale in-memory success.
+        invalidateRuntimeAuthenticationValidations()
         let previousCatalogStatuses = (
             codex: codexCatalogStatus,
             grok: grokCatalogStatus,
@@ -3063,7 +3081,9 @@ final class AppState: ObservableObject {
         let version = await antigravityVersion
         let latest = await antigravityLatest
         let models = await antigravityCatalog
-        let authenticated = executable != nil && Self.antigravityCredentialsExist()
+        // A successful provider-owned catalog command is the authentication
+        // probe. Never read Antigravity's OAuth token file in Lattice.
+        let authenticated = executable != nil && !models.isEmpty
         guard canApplyCatalogRefresh(generation) else { return }
         antigravityInstalled = executable != nil
         antigravityAuthenticated = authenticated
@@ -3334,7 +3354,12 @@ final class AppState: ObservableObject {
                 installedVersion: request.runtime == .pi ? piCLIVersion : hermesCLIInfo.currentVersion
             )
         case .cancel, .interruptUpdate:
-            cancelRuntimeAction()
+            runtimeLifecycleStates[request.runtime] = RuntimeLifecycleState(
+                runtime: request.runtime,
+                phase: request.action == .interruptUpdate ? .updateInterrupted : .cancelled,
+                detail: "No additional runtime change was started.",
+                installedVersion: request.runtime == .pi ? piCLIVersion : hermesCLIInfo.currentVersion
+            )
         }
     }
 
@@ -3429,6 +3454,7 @@ final class AppState: ObservableObject {
             cliActionMessages["pi"] = "Install Pi before signing in."
             return
         }
+        validatedPiCodexModels.removeAll()
         let profile = PiRPCHarness().sharedProfileDirectory
         guard openRuntimeTerminal(
             name: "pi-login",
@@ -3443,7 +3469,9 @@ final class AppState: ObservableObject {
     }
 
     func validatePiAuthentication(providerID: String) {
-        guard piInstalled, !cliBusyProviders.contains("pi-\(providerID)") else { return }
+        guard piInstalled,
+              !isRefreshingConnections,
+              !cliBusyProviders.contains("pi-\(providerID)") else { return }
         let candidates = piModelIDs.sorted().compactMap { identifier -> (provider: String, model: String)? in
             if providerID == "codex", identifier.hasPrefix("openai-codex/") {
                 return ("codex", String(identifier.dropFirst("openai-codex/".count)))
@@ -3460,6 +3488,7 @@ final class AppState: ObservableObject {
         }
         let actionID = "pi-\(providerID)"
         guard beginCLIAction(provider: actionID, progress: "Validating Pi \(providerID)…", estimatedSeconds: 30) else { return }
+        let refreshGeneration = connectionRefreshGeneration.current()
         Task {
             let key = providerID == "opencode" && openCodeCredentialEnabledModes.contains(.code)
                 ? KeychainStore.read(account: OpenCodeCredentialPolicy.keychainAccount)
@@ -3469,6 +3498,10 @@ final class AppState: ObservableObject {
                 model: candidate.model,
                 openCodeAPIKey: key
             )
+            guard connectionRefreshGeneration.isCurrent(refreshGeneration), !isRefreshingConnections else {
+                finishCLIAction(actionID)
+                return
+            }
             if valid {
                 if providerID == "codex" {
                     validatedPiCodexModels = Set(candidates.map(\.model))
@@ -3490,6 +3523,8 @@ final class AppState: ObservableObject {
             cliActionMessages["hermes"] = "Install Hermes before signing in."
             return
         }
+        validatedHermesProviders.removeAll()
+        validatedHermesOpenCodeModels.removeAll()
         let profile = LatticeHermesProfile().homeURL
         guard openRuntimeTerminal(
             name: "hermes-model",
@@ -3514,9 +3549,15 @@ final class AppState: ObservableObject {
         }
         let actionID = "hermes-\(providerID)"
         guard hermesInstalled,
+              !isRefreshingConnections,
               beginCLIAction(provider: actionID, progress: "Validating Hermes \(providerID)…", estimatedSeconds: 20) else { return }
+        let refreshGeneration = connectionRefreshGeneration.current()
         Task {
             let valid = await hermes.validateHermesAuthentication(provider: provider)
+            guard connectionRefreshGeneration.isCurrent(refreshGeneration), !isRefreshingConnections else {
+                finishCLIAction(actionID)
+                return
+            }
             if valid { validatedHermesProviders.insert(provider) }
             else { validatedHermesProviders.remove(provider) }
             cliActionMessages["hermes"] = valid
@@ -3531,6 +3572,7 @@ final class AppState: ObservableObject {
             $0.id.hasPrefix("opencode-go:") || $0.id.hasPrefix("opencode-zen:")
         }
         guard hermesInstalled,
+              !isRefreshingConnections,
               openCodeAPIKeySaved,
               openCodeCredentialEnabledModes.contains(.work),
               let candidate = candidates.first,
@@ -3545,6 +3587,7 @@ final class AppState: ObservableObject {
             cliActionMessages["hermes"] = "Enable the saved OpenCode key for Work and discover a Hermes OpenCode model first."
             return
         }
+        let refreshGeneration = connectionRefreshGeneration.current()
         Task {
             let result = await hermes.modelsResult(
                 workspace: URL(fileURLWithPath: selectedWorkspacePath),
@@ -3555,6 +3598,10 @@ final class AppState: ObservableObject {
             )
             let valid = result.status == .loaded
                 && HermesACPHarness.exactMatch(for: candidate.id, in: result.models) != nil
+            guard connectionRefreshGeneration.isCurrent(refreshGeneration), !isRefreshingConnections else {
+                finishCLIAction("hermes-opencode")
+                return
+            }
             if valid { validatedHermesOpenCodeModels = Set(candidates.map(\.id)) }
             else { validatedHermesOpenCodeModels.removeAll() }
             cliActionMessages["hermes"] = valid
@@ -5089,6 +5136,7 @@ Lattice self-edit rules:
         guard beginCLIAction(provider: provider, progress: progress, estimatedSeconds: 90) else { return }
         let runtime = LatticeRuntimeID(rawValue: provider)
         let wasUpdate = runtime.flatMap { runtimeLifecycleStates[$0]?.phase } == .updating
+        let lifecycleAction: RuntimeLifecycleAction = wasUpdate ? .update : .firstUseInstall
         let previousVersion: String?
         if runtime == .pi { previousVersion = piCLIVersion }
         else if runtime == .hermes { previousVersion = hermesCLIInfo.currentVersion }
@@ -5105,7 +5153,12 @@ Lattice self-edit rules:
             )
             if let runtime {
                 let available = ExecutableDiscovery.locate(executableName) != nil
-                if !cancelled, result.status == 0, available {
+                if !cancelled,
+                   RuntimeOwnershipPolicy.shouldRecordOwnership(
+                    after: lifecycleAction,
+                    status: result.status,
+                    executableAvailable: available
+                   ) {
                     latticeManagedRuntimeIDs.insert(runtime)
                     UserDefaults.standard.set(latticeManagedRuntimeIDs.map(\.rawValue).sorted(), forKey: Self.managedRuntimeIDsKey)
                 }
@@ -5445,37 +5498,15 @@ Lattice self-edit rules:
         }
     }
 
-    nonisolated private static func antigravityCredentialsExist() -> Bool {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let oauthURL = home.appendingPathComponent(".gemini/oauth_creds.json")
-        guard let oauthData = try? Data(contentsOf: oauthURL),
-              CredentialPresencePolicy.hasAntigravityOAuthCredential(in: oauthData) else {
-            return false
-        }
-
-        // google_accounts.json is only an account-selection cache. It can
-        // refine a valid OAuth state, but must not establish authentication.
-        let accountsURL = home.appendingPathComponent(".gemini/google_accounts.json")
-        guard FileManager.default.fileExists(atPath: accountsURL.path) else { return true }
-        guard let accountsData = try? Data(contentsOf: accountsURL) else { return false }
-        return CredentialPresencePolicy.hasAntigravityAccountMarker(in: accountsData)
-    }
-
     private static func runAntigravityLogin() async -> (status: Int32, output: Data) {
         guard let executable = ExecutableDiscovery.locate("agy") else {
             return (-1, Data("Antigravity CLI is not installed.".utf8))
         }
-        let result = await BoundedSubprocess.run(
-            .init(
-                executableURL: URL(fileURLWithPath: "/usr/bin/script"),
-                arguments: ["-q", "/dev/null", executable.path],
-                deadline: 180
-            ),
-            isCancelled: { Self.antigravityCredentialsExist() }
-        )
-        if Self.antigravityCredentialsExist() {
-            return (0, result.combinedOutput)
-        }
+        let result = await BoundedSubprocess.run(.init(
+            executableURL: URL(fileURLWithPath: "/usr/bin/script"),
+            arguments: ["-q", "/dev/null", executable.path],
+            deadline: 180
+        ))
         switch result.outcome {
         case .exited:
             return (result.exitStatus ?? -1, result.combinedOutput)
@@ -5564,6 +5595,10 @@ Lattice self-edit rules:
     /// Compatibility-only bridge for an existing direct OpenCode chat. New
     /// Pi/Hermes routes receive the Keychain value through child environment.
     func enableLegacyDirectOpenCodeCredential() {
+        guard selectedSessionUsesLegacyDirectOpenCode else {
+            cliActionMessages["opencode"] = "The compatibility credential bridge is available only inside a selected legacy direct OpenCode chat."
+            return
+        }
         switch OpenCodeAuthBridge.syncGoAPIKeyFromKeychainResult() {
         case .success:
             cliActionMessages["opencode"] = "Credential copied to OpenCode for legacy direct chats."
@@ -5581,6 +5616,13 @@ Lattice self-edit rules:
         UserDefaults.standard.removeObject(forKey: Self.openCodeCredentialModesKey)
         openCodeAPIKeyDraft = ""
         Task { await refreshConnections() }
+    }
+
+    private func invalidateRuntimeAuthenticationValidations() {
+        validatedPiCodexModels.removeAll()
+        validatedPiOpenCodeModels.removeAll()
+        validatedHermesOpenCodeModels.removeAll()
+        validatedHermesProviders.removeAll()
     }
 
     func installModel(_ recommendation: LocalModelRecommendation) {

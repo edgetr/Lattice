@@ -777,6 +777,16 @@ struct CoreVerification {
         expect(RuntimeLifecycleTransition.phaseAfterCancellation(from: .updating) == .updateInterrupted, "Update cancellation is reported as interrupted")
         expect(RuntimeLifecycleTransition.rollbackPhase(previousVersion: nil) == .failed, "Rollback without recorded prior version fails closed")
         expect(!RuntimeOwnershipPolicy.canUninstall(.pi, managedRuntimeIDs: []), "External runtimes cannot be removed by Lattice")
+        expect(!RuntimeOwnershipPolicy.shouldRecordOwnership(after: .update, status: 0, executableAvailable: true), "Updating an external runtime does not transfer ownership")
+        let safeProviderEnvironment = ChildProcessEnvironmentPolicy.providerOwnedRuntime(
+            from: ["PATH": "/usr/bin", "HOME": "/Users/example", "OPENAI_API_KEY": "synthetic-secret"],
+            temporaryDirectory: URL(fileURLWithPath: "/tmp/lattice-provider")
+        )
+        expect(safeProviderEnvironment["PATH"] == "/usr/bin", "Provider child environment preserves required executable search path")
+        expect(safeProviderEnvironment["OPENAI_API_KEY"] == nil, "Provider child environment excludes ambient credentials")
+        let legacyOpenCodeRoute = ExecutionRoute(mode: .code, providerID: "opencode", modelID: "legacy", runtimeID: "opencode")
+        expect(LegacyOpenCodeBridgePolicy.allows(legacyOpenCodeRoute), "OpenCode bridge remains limited to direct legacy routes")
+        expect(!LegacyOpenCodeBridgePolicy.allows(modeScopedOpenCodeRoute), "New Pi OpenCode routes cannot use legacy auth-file bridge")
         expect(RuntimeInstallDescriptor.hermes.pinnedSourceCommit == "b7751df34688835a108e0d630f3495fc11f3df79", "Hermes first-use setup pins an immutable commit")
         expect(OllamaClient.deleteTimeout > 0, "Local model deletion has a bounded request timeout")
         expect(OllamaModelDeletionResult.deleted == .deleted, "Local model deletion result represents confirmed success")

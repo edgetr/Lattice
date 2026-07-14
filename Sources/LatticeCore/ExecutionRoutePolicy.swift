@@ -276,3 +276,15 @@ public extension ExecutionRoutePolicy {
         ExecutionRouteResolver.catalog(readiness: readiness)
     }
 }
+
+/// The old OpenCode auth-file bridge exists only for a selected persisted
+/// direct OpenCode route. New Pi/Hermes routes must never use it.
+public enum LegacyOpenCodeBridgePolicy {
+    public static func allows(_ route: ExecutionRoute) -> Bool {
+        route.mode == .code
+            && route.providerID == "opencode"
+            && route.runtimeID == "opencode"
+            && route.modelID?.isEmpty == false
+            && !ExecutionRouteResolver.isDeclared(route)
+    }
+}

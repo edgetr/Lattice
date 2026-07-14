@@ -203,6 +203,16 @@ public enum RuntimeOwnershipPolicy {
     public static func canUninstall(_ runtime: LatticeRuntimeID, managedRuntimeIDs: Set<LatticeRuntimeID>) -> Bool {
         managedRuntimeIDs.contains(runtime)
     }
+
+    /// Updating an external runtime does not transfer ownership to Lattice.
+    /// Only a successful first-use installation creates removal authority.
+    public static func shouldRecordOwnership(
+        after action: RuntimeLifecycleAction,
+        status: Int32,
+        executableAvailable: Bool
+    ) -> Bool {
+        action == .firstUseInstall && status == 0 && executableAvailable
+    }
 }
 
 public struct RuntimeConfirmationRequest: Equatable, Hashable, Codable, Sendable, Identifiable {

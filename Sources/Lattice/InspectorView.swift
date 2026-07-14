@@ -48,6 +48,13 @@ struct InspectorView: View {
                 .pickerStyle(.segmented)
                 .disabled(session.isStreaming)
                 .accessibilityLabel("Model privacy")
+                if state.selectedSessionUsesLegacyDirectOpenCode {
+                    Button("Enable saved key for this legacy OpenCode chat") {
+                        state.enableLegacyDirectOpenCodeCredential()
+                    }
+                    .disabled(!state.openCodeAPIKeySaved)
+                    .help("Compatibility only: copy the saved API key into OpenCode's provider-owned auth file for this persisted direct route")
+                }
                 if session.privacyMode == .localOnly {
                     Label("Cloud routes blocked for this chat.", systemImage: "lock.fill")
                         .font(.caption)
@@ -889,9 +896,6 @@ struct ConnectionsView: View {
             Divider()
             runtimeMenu(runtime: .hermes, installed: state.hermesInstalled, update: state.updateHermes, install: state.installHermes)
             if state.hermesInstalled { Button("Validate Work") { state.validateHermesOpenCodeAuthentication() } }
-            Divider()
-            Button("Enable legacy direct OpenCode") { state.enableLegacyDirectOpenCodeCredential() }
-                .disabled(!state.openCodeAPIKeySaved)
         } label: { Image(systemName: "ellipsis.circle").accessibilityLabel("OpenCode setup actions") }
         .menuStyle(.borderlessButton)
     }

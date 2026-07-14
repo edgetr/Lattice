@@ -91,6 +91,54 @@ struct RuntimeReadinessTests {
         #expect(!RuntimeOwnershipPolicy.canUninstall(.hermes, managedRuntimeIDs: [.pi]))
     }
 
+    @Test func onlySuccessfulFirstUseInstallCreatesRuntimeOwnership() {
+        #expect(RuntimeOwnershipPolicy.shouldRecordOwnership(
+            after: .firstUseInstall,
+            status: 0,
+            executableAvailable: true
+        ))
+        #expect(!RuntimeOwnershipPolicy.shouldRecordOwnership(
+            after: .update,
+            status: 0,
+            executableAvailable: true
+        ))
+        #expect(!RuntimeOwnershipPolicy.shouldRecordOwnership(
+            after: .firstUseInstall,
+            status: 1,
+            executableAvailable: true
+        ))
+    }
+
+    @Test func providerOwnedChildEnvironmentExcludesAmbientSecrets() {
+        let environment = ChildProcessEnvironmentPolicy.providerOwnedRuntime(
+            from: [
+                "PATH": "/usr/bin",
+                "HOME": "/Users/example",
+                "OPENAI_API_KEY": "synthetic-secret",
+                "GITHUB_TOKEN": "synthetic-token",
+                "AWS_SECRET_ACCESS_KEY": "synthetic-aws-secret"
+            ],
+            temporaryDirectory: URL(fileURLWithPath: "/tmp/lattice-child")
+        )
+
+        #expect(environment["PATH"] == "/usr/bin")
+        #expect(environment["HOME"] == "/Users/example")
+        #expect(environment["TMPDIR"] == "/tmp/lattice-child/")
+        #expect(environment["OPENAI_API_KEY"] == nil)
+        #expect(environment["GITHUB_TOKEN"] == nil)
+        #expect(environment["AWS_SECRET_ACCESS_KEY"] == nil)
+    }
+
+    @Test func legacyOpenCodeBridgeCannotServeNewPiOrHermesRoutes() {
+        let direct = ExecutionRoute(mode: .code, providerID: "opencode", modelID: "legacy-model", runtimeID: "opencode")
+        let pi = ExecutionRoute(mode: .code, providerID: "opencode", modelID: "opencode-go/model", runtimeID: "pi")
+        let hermes = ExecutionRoute(mode: .work, providerID: "opencode", modelID: "opencode-go:model", runtimeID: "hermes")
+
+        #expect(LegacyOpenCodeBridgePolicy.allows(direct))
+        #expect(!LegacyOpenCodeBridgePolicy.allows(pi))
+        #expect(!LegacyOpenCodeBridgePolicy.allows(hermes))
+    }
+
     @Test func OpenCodeKeychainCredentialIsLimitedToPiAndHermesAndUsesRuntimeEnvNames() {
         let pi = route
         let hermesGo = ExecutionRoute(mode: .work, providerID: "opencode", modelID: "opencode-go:model", runtimeID: "hermes")

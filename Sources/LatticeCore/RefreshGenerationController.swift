@@ -23,4 +23,10 @@ public final class RefreshGenerationController: @unchecked Sendable {
         defer { lock.unlock() }
         return generation == candidate
     }
+
+    public func current() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return generation
+    }
 }

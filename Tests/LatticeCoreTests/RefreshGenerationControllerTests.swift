@@ -16,10 +16,12 @@ struct RefreshGenerationControllerTests {
         let controller = RefreshGenerationController()
         let generation = controller.begin()
 
+        #expect(controller.current() == generation)
         #expect(controller.isCurrent(generation))
         #expect(controller.isCurrent(generation))
 
-        _ = controller.begin()
+        let next = controller.begin()
+        #expect(controller.current() == next)
         #expect(!controller.isCurrent(generation))
     }
 }

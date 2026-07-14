@@ -582,9 +582,10 @@ public final class ACPHarness: @unchecked Sendable {
                 opencodeAPIKey: opencodeAPIKey
             )
         }
-        var environment = ProcessInfo.processInfo.environment
-        environment["TMPDIR"] = scratchDirectory.path + "/"
-        return environment
+        return ChildProcessEnvironmentPolicy.providerOwnedRuntime(
+            from: ProcessInfo.processInfo.environment,
+            temporaryDirectory: scratchDirectory
+        )
     }
 
     private func hermesHome() -> URL {
