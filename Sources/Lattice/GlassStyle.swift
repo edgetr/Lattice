@@ -21,9 +21,33 @@ enum LatticeMetrics {
     /// Comfortable inset for larger catalog panels.
     static let panelPadding: CGFloat = 16
     /// Shared vertical inset for catalog / page scroll hosts (around page headers).
-    static let pageVerticalPadding: CGFloat = 30
+    static let pageVerticalPadding: CGFloat = 24
     /// Bottom breathing room under page titles before the first content block.
     static let pageHeaderBottomSpacing: CGFloat = 4
+}
+
+// MARK: - Content surface
+
+/// Quiet, opaque grouping for dense content. Glass is reserved for chrome and
+/// floating controls so nested information does not become a stack of blur.
+struct LatticeContentSurface: ViewModifier {
+    let cornerRadius: CGFloat
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        content
+            .background(
+                Color.primary.opacity(colorScheme == .dark ? 0.055 : 0.035),
+                in: shape
+            )
+            .overlay {
+                if colorSchemeContrast == .increased {
+                    shape.strokeBorder(Color.primary.opacity(0.28), lineWidth: 1.5)
+                }
+            }
+    }
 }
 
 // MARK: - Glass surface
@@ -101,6 +125,10 @@ struct GlassSurface: ViewModifier {
 extension View {
     func latticeGlass(cornerRadius: CGFloat = LatticeMetrics.glassRadius, interactive: Bool = false, tint: Color? = nil) -> some View {
         modifier(GlassSurface(cornerRadius: cornerRadius, interactive: interactive, tint: tint))
+    }
+
+    func latticeContentSurface(cornerRadius: CGFloat = LatticeMetrics.surfaceRadius) -> some View {
+        modifier(LatticeContentSurface(cornerRadius: cornerRadius))
     }
 }
 

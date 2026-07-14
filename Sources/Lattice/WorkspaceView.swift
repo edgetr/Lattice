@@ -30,20 +30,11 @@ struct WorkspaceView: View {
             ToolbarItemGroup {
                 if layout.selectedSection == .conversations {
                     Button { state.newSession() } label: { Label("New chat", systemImage: "square.and.pencil") }
-                    Button { state.openCommandPalette() } label: { Label("Commands", systemImage: "command") }
-                        .accessibilityIdentifier(LatticeAccessibilityID.toolbarCommands)
-                    Button { state.overlayMode = .prompt; state.showOverlayAction?() } label: { Label("Overlay", systemImage: "rectangle.on.rectangle") }
-                        .accessibilityIdentifier(LatticeAccessibilityID.toolbarOverlay)
-                        .disabled(state.showOverlayAction == nil)
-                        .help(state.showOverlayAction == nil ? "Overlay is not ready" : "Show Lattice overlay")
                     Button { layout.showInspector.toggle() } label: { Label("Inspector", systemImage: "sidebar.trailing") }
+                        .help(layout.showInspector ? "Hide chat inspector" : "Show chat inspector")
+                    workspaceActionsMenu
                 } else {
-                    Button { state.openCommandPalette() } label: { Label("Commands", systemImage: "command") }
-                        .accessibilityIdentifier(LatticeAccessibilityID.toolbarCommands)
-                    Button { state.overlayMode = .prompt; state.showOverlayAction?() } label: { Label("Overlay", systemImage: "rectangle.on.rectangle") }
-                        .accessibilityIdentifier(LatticeAccessibilityID.toolbarOverlay)
-                        .disabled(state.showOverlayAction == nil)
-                        .help(state.showOverlayAction == nil ? "Overlay is not ready" : "Show Lattice overlay")
+                    workspaceActionsMenu
                 }
             }
         }
@@ -198,6 +189,27 @@ struct WorkspaceView: View {
         } message: {
             Text(state.importChatErrorMessage ?? "Something went wrong. Existing chats were not changed.")
         }
+    }
+
+    private var workspaceActionsMenu: some View {
+        Menu {
+            Button { state.openCommandPalette() } label: {
+                Label("Commands", systemImage: "command")
+            }
+            .accessibilityIdentifier(LatticeAccessibilityID.toolbarCommands)
+            Button {
+                state.overlayMode = .prompt
+                state.showOverlayAction?()
+            } label: {
+                Label("Show Overlay", systemImage: "rectangle.on.rectangle")
+            }
+            .accessibilityIdentifier(LatticeAccessibilityID.toolbarOverlay)
+            .disabled(state.showOverlayAction == nil)
+        } label: {
+            Label("More workspace actions", systemImage: "ellipsis.circle")
+        }
+        .help("Commands and overlay")
+        .accessibilityLabel("More workspace actions")
     }
 
     private func noteSelectedSectionChanged(_ section: WorkspaceSection) {
@@ -451,9 +463,13 @@ struct SessionListView: View {
         }
         .padding(.leading, 12)
         .padding(.trailing, state.searchText.isEmpty ? 12 : 4)
-        .padding(.vertical, state.searchText.isEmpty ? 10 : 4)
-        .latticeGlass(cornerRadius: state.cornerRadius(for: .search, default: 18), tint: state.tintColor(for: .search)?.opacity(0.18))
-        .padding(10)
+        .padding(.vertical, state.searchText.isEmpty ? 8 : 3)
+        .background(
+            Color.primary.opacity(0.055),
+            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+        )
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
     }
 
     private var chatSearchField: some View {
@@ -805,9 +821,9 @@ struct ProjectsView: View {
             .accessibilityLabel("Choose Workspace")
             .accessibilityHint("Opens a folder picker to set the current workspace")
         }
-        .padding(22)
+        .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .latticeGlass(cornerRadius: LatticeMetrics.surfaceRadius)
+        .latticeContentSurface()
         .accessibilityElement(children: .contain)
         .accessibilityLabel("No workspace selected")
     }
@@ -821,9 +837,9 @@ struct ProjectsView: View {
             }
             recentChatsSection
         }
-        .padding(22)
+        .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .latticeGlass(cornerRadius: LatticeMetrics.surfaceRadius)
+        .latticeContentSurface()
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Current workspace")
         .accessibilityValue(workspaceDisplayName)

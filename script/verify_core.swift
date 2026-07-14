@@ -3402,6 +3402,13 @@ struct CoreVerification {
         controlAction.succeed("Ready")
         expect(controlAction.phase == .succeeded && controlAction.message == "Ready", "Retried control action surfaces success")
 
+        expect(LatticeResponsiveLayoutPolicy.horizontalPadding(forAvailableWidth: 640) == 16, "Narrow pages use compact horizontal insets")
+        expect(LatticeResponsiveLayoutPolicy.contentWidth(forAvailableWidth: 640) == 608, "Narrow pages preserve a usable content region")
+        expect(LatticeResponsiveLayoutPolicy.contentWidth(forAvailableWidth: 900) == 852, "Regular pages preserve comfortable margins")
+        expect(LatticeResponsiveLayoutPolicy.contentWidth(forAvailableWidth: 1_600) == 1_280, "Wide pages cap their reading region")
+        expect(!LatticeResponsiveLayoutPolicy.usesSideBySideSections(forContentWidth: 1_039), "Secondary sections stay stacked before the wide breakpoint")
+        expect(LatticeResponsiveLayoutPolicy.canFitMultipleCards(contentWidth: 694, minimumCardWidth: 340), "Card collections split only when both minimum widths fit")
+
         print("Core verification passed: \(checks) checks")
     }
 }

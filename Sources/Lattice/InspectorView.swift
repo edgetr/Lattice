@@ -19,7 +19,7 @@ struct InspectorView: View {
                     .padding(20)
             }
         }
-        .background(.background.secondary.opacity(0.35))
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     @ViewBuilder
@@ -146,9 +146,7 @@ struct InspectorView: View {
                 }
             }
         }
-        .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .latticeGlass(cornerRadius: LatticeMetrics.surfaceRadius)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Chat inspector")
     }
@@ -207,9 +205,9 @@ private struct InspectorOpaqueSection<Content: View>: View {
                 .accessibilityAddTraits(.isHeader)
             content
         }
-        .padding(11)
+        .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: LatticeMetrics.controlRadius, style: .continuous))
+        .latticeContentSurface(cornerRadius: LatticeMetrics.controlRadius)
     }
 }
 
@@ -226,9 +224,9 @@ private struct InspectorOpaqueDisclosure<Content: View>: View {
             Label(title, systemImage: systemImage)
                 .font(.headline)
         }
-        .padding(11)
+        .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: LatticeMetrics.controlRadius, style: .continuous))
+        .latticeContentSurface(cornerRadius: LatticeMetrics.controlRadius)
     }
 }
 
@@ -878,9 +876,7 @@ struct ConnectionsView: View {
                 CLIActionMessage(provider: "antigravity", state: state)
             }
         }
-        .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .latticeGlass(cornerRadius: LatticeMetrics.surfaceRadius)
     }
 
     @ViewBuilder private var codexActions: some View {
@@ -1148,13 +1144,12 @@ private struct ModeReadinessBadge: View {
     let mode: ModeReadiness
 
     var body: some View {
-        Text("\(mode.title) \(mode.readiness.conciseStatus)")
-        .font(.caption2.weight(.semibold))
+        Label("\(mode.title) \(mode.readiness.conciseStatus)", systemImage: statusImage)
+        .font(.caption.weight(.medium))
         .foregroundStyle(foregroundColor)
         .padding(.horizontal, 7)
         .padding(.vertical, 4)
-        .background(accentColor.opacity(0.10), in: Capsule())
-        .overlay(Capsule().strokeBorder(accentColor.opacity(0.28)))
+        .background(accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(mode.title) mode through \(mode.runtime), \(mode.readiness.conciseStatus)")
         .accessibilityValue(mode.readiness.detail)
@@ -1172,6 +1167,15 @@ private struct ModeReadinessBadge: View {
 
     private var foregroundColor: Color {
         mode.ready ? .green : .primary
+    }
+
+    private var statusImage: String {
+        switch mode.readiness {
+        case .runnable: "checkmark"
+        case .loading, .validating: "arrow.clockwise"
+        case .missingRuntime, .authenticationRequired: "exclamationmark"
+        case .failed: "xmark"
+        }
     }
 }
 
@@ -1193,7 +1197,10 @@ private struct ProviderConnectionRow<Actions: View, Content: View>: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(name).font(.body.weight(.semibold))
                     Text(detail).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    HStack(spacing: 5) { ForEach(modes) { ModeReadinessBadge(mode: $0) } }
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 5) { ForEach(modes) { ModeReadinessBadge(mode: $0) } }
+                        VStack(alignment: .leading, spacing: 5) { ForEach(modes) { ModeReadinessBadge(mode: $0) } }
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 actions
@@ -1201,10 +1208,9 @@ private struct ProviderConnectionRow<Actions: View, Content: View>: View {
             }
             content
         }
-        .padding(.vertical, 11)
+        .padding(.vertical, 10)
         .padding(.horizontal, 9)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: LatticeMetrics.controlRadius, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: LatticeMetrics.controlRadius, style: .continuous).strokeBorder(Color.secondary.opacity(0.16)))
+        .latticeContentSurface(cornerRadius: LatticeMetrics.controlRadius)
     }
 }
 
@@ -1789,12 +1795,12 @@ enum ConnectionIdentity {
 
 struct PageHeader: View {
     let title: String; let subtitle: String
-    @ScaledMetric(relativeTo: .title) private var titleFontSize: CGFloat = 30
+    @ScaledMetric(relativeTo: .title) private var titleFontSize: CGFloat = 28
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
-                .font(.system(size: titleFontSize, weight: .semibold, design: .rounded))
+                .font(.system(size: titleFontSize, weight: .semibold))
                 .fixedSize(horizontal: false, vertical: true)
             Text(subtitle)
                 .foregroundStyle(.secondary)
@@ -1813,13 +1819,7 @@ struct PageHeader: View {
 /// Content-relative layout rules for catalog pages. Thresholds use measured
 /// available width, not hard-coded display or screen sizes.
 private enum LatticeCatalogPageLayout {
-    /// Comfortable fallback when host width is not yet measured.
-    static let comfortableSingleColumn: CGFloat = 900
-    /// Soft cap so ultra-wide windows keep modest side margins without empty gutters.
-    static let absoluteContentCap: CGFloat = 1480
-    /// Side-by-side Extensions + Skills when content region is this wide or more.
-    static let sideBySideSectionBreakpoint: CGFloat = 1040
-    static let cardSpacing: CGFloat = 14
+    static let cardSpacing = CGFloat(LatticeResponsiveLayoutPolicy.cardSpacing)
 
     static let featureCardMaximum: CGFloat = 720
     static let modelCardMinimum: CGFloat = 340
@@ -1830,27 +1830,25 @@ private enum LatticeCatalogPageLayout {
     static let connectionCardMaximum: CGFloat = 720
 
     static func horizontalPadding(forAvailableWidth width: CGFloat) -> CGFloat {
-        if width > 0 && width < 720 { return 20 }
-        if width > 0 && width < 1100 { return 32 }
-        return 40
+        CGFloat(LatticeResponsiveLayoutPolicy.horizontalPadding(forAvailableWidth: Double(width)))
     }
 
     /// Grows with the host so wide windows fill gutters; capped to avoid endless stretch.
     static func contentMaxWidth(forAvailableWidth width: CGFloat) -> CGFloat {
-        guard width > 0 else { return comfortableSingleColumn }
-        let padding = horizontalPadding(forAvailableWidth: width)
-        let usable = width - padding * 2
-        return min(max(usable, 0), absoluteContentCap)
+        CGFloat(LatticeResponsiveLayoutPolicy.contentWidth(forAvailableWidth: Double(width)))
     }
 
     static func usesSideBySideSections(forContentWidth width: CGFloat) -> Bool {
-        width >= sideBySideSectionBreakpoint
+        LatticeResponsiveLayoutPolicy.usesSideBySideSections(forContentWidth: Double(width))
     }
 
     /// Adaptive columns for card collections. Falls back to a single flexible
     /// column until two minima fit with spacing.
     static func cardColumns(contentWidth: CGFloat, minimum: CGFloat, maximum: CGFloat) -> [GridItem] {
-        if contentWidth >= minimum * 2 + cardSpacing {
+        if LatticeResponsiveLayoutPolicy.canFitMultipleCards(
+            contentWidth: Double(contentWidth),
+            minimumCardWidth: Double(minimum)
+        ) {
             return [GridItem(.adaptive(minimum: minimum, maximum: maximum), spacing: cardSpacing, alignment: .top)]
         }
         return [GridItem(.flexible(minimum: 0, maximum: .infinity), spacing: cardSpacing, alignment: .top)]

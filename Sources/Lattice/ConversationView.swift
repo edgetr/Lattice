@@ -597,9 +597,8 @@ struct ComposerView: View {
             stackedComposerHeader
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .latticeGlass(cornerRadius: 14, interactive: true, tint: state.tintColor(for: .composer)?.opacity(0.08))
+        .padding(.horizontal, 6)
+        .padding(.bottom, 2)
     }
 
     private var fullComposerHeader: some View {
