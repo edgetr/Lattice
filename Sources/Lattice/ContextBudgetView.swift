@@ -48,6 +48,7 @@ struct ContextBudgetMeter: View {
             .symbolRenderingMode(.hierarchical)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
+            .fixedSize(horizontal: true, vertical: false)
             .background(statusBackground, in: Capsule())
             .overlay(
                 Capsule()
