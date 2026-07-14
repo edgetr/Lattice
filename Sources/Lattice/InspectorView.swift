@@ -989,8 +989,9 @@ struct ConnectionsView: View {
                 Text("OpenCode Go key")
                     .font(.caption.weight(.semibold))
                 Spacer()
-                Label(openCodeCredentialStatusLabel, systemImage: state.openCodeAPIKeySaved ? "checkmark.circle.fill" : "minus.circle")
+                Text(openCodeCredentialStatusLabel)
                     .font(.caption)
+                    .fontWeight(.semibold)
                     .foregroundStyle(state.openCodeAPIKeySaved ? .green : .secondary)
             }
             HStack(spacing: 10) {
@@ -1147,20 +1148,30 @@ private struct ModeReadinessBadge: View {
     let mode: ModeReadiness
 
     var body: some View {
-        HStack(spacing: 4) {
-            Image(systemName: mode.ready ? "checkmark.circle.fill" : "circle.dashed")
-            Text("\(mode.title) · \(mode.runtime)")
-        }
+        Text("\(mode.title) \(mode.readiness.conciseStatus)")
         .font(.caption2.weight(.semibold))
-        .foregroundStyle(mode.ready ? .green : .secondary)
+        .foregroundStyle(foregroundColor)
         .padding(.horizontal, 7)
         .padding(.vertical, 4)
-        .background((mode.ready ? Color.green : Color.secondary).opacity(0.10), in: Capsule())
-        .overlay(Capsule().strokeBorder((mode.ready ? Color.green : Color.secondary).opacity(0.28)))
+        .background(accentColor.opacity(0.10), in: Capsule())
+        .overlay(Capsule().strokeBorder(accentColor.opacity(0.28)))
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(mode.title) mode, \(mode.runtime)")
+        .accessibilityLabel("\(mode.title) mode through \(mode.runtime), \(mode.readiness.conciseStatus)")
         .accessibilityValue(mode.readiness.detail)
         .help(mode.readiness.detail)
+    }
+
+    private var accentColor: Color {
+        switch mode.readiness {
+        case .runnable: .green
+        case .loading, .validating: .blue
+        case .missingRuntime, .authenticationRequired: .orange
+        case .failed: .red
+        }
+    }
+
+    private var foregroundColor: Color {
+        mode.ready ? .green : .primary
     }
 }
 
@@ -1279,8 +1290,6 @@ private struct LocalConnectionRow<Actions: View>: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: ready ? "checkmark.circle.fill" : "circle.dashed")
-                .foregroundStyle(ready ? .green : .secondary)
             VStack(alignment: .leading, spacing: 2) {
                 Text(name).font(.body.weight(.medium))
                 Text(detail).font(.caption).foregroundStyle(.secondary)

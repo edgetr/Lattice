@@ -339,6 +339,18 @@ public enum OpenCodeCredentialPolicy {
 }
 
 public extension ExecutionRouteReadiness {
+    /// Short, plain-language state used where a compact route label already
+    /// identifies the mode. Avoids unexplained status glyphs in setup UI.
+    var conciseStatus: String {
+        switch self {
+        case .loading, .validating: "checking"
+        case .missingRuntime: "setup needed"
+        case .authenticationRequired: "sign-in needed"
+        case .runnable: "ready"
+        case .failed: "unavailable"
+        }
+    }
+
     var detail: String {
         switch self {
         case .loading: "Checking availability…"

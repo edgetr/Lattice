@@ -182,4 +182,13 @@ struct RuntimeReadinessTests {
         #expect(OpenCodeCredentialPolicy.environmentKey(for: hermesZen) == "OPENCODE_ZEN_API_KEY")
         #expect(OpenCodeCredentialPolicy.environmentKey(for: direct) == nil)
     }
+
+    @Test func routeReadinessUsesExplicitCompactStatusWords() {
+        #expect(ExecutionRouteReadiness.loading.conciseStatus == "checking")
+        #expect(ExecutionRouteReadiness.validating.conciseStatus == "checking")
+        #expect(ExecutionRouteReadiness.missingRuntime.conciseStatus == "setup needed")
+        #expect(ExecutionRouteReadiness.authenticationRequired.conciseStatus == "sign-in needed")
+        #expect(ExecutionRouteReadiness.runnable.conciseStatus == "ready")
+        #expect(ExecutionRouteReadiness.failed("offline").conciseStatus == "unavailable")
+    }
 }
