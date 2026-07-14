@@ -249,6 +249,27 @@ struct ContextAttachmentMetadataTests {
         #expect(ContextAttachmentTypeMap.kind(forPathExtension: "swift") == .file)
     }
 
+    @Test func fileInspectorRejectsImageExtensionWithoutDecodableImageContent() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lattice-context-spoof-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let disguised = directory.appendingPathComponent("notes.png")
+        try Data("not an image".utf8).write(to: disguised)
+
+        let attachment = ContextAttachment.inspecting(
+            url: disguised,
+            source: .picker,
+            inspector: FileContextAttachmentInspector()
+        )
+
+        #expect(!attachment.isMissing)
+        #expect(attachment.kind == .file)
+        #expect(attachment.mimeType == "application/octet-stream")
+        #expect(attachment.pixelDimensions == nil)
+    }
+
     @Test func fileInspectorClassifiesRealPNGAndTextFiles() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("lattice-context-attachment-\(UUID().uuidString)", isDirectory: true)

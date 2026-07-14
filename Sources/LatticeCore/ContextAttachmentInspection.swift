@@ -127,7 +127,6 @@ public struct FileContextAttachmentInspector: ContextAttachmentInspecting {
             if let contentType = values.contentType {
                 contentTypeIdentifier = contentType.identifier
                 mimeType = contentType.preferredMIMEType
-                typeEvidenceFromContent = true
             }
         }
 
@@ -148,6 +147,14 @@ public struct FileContextAttachmentInspector: ContextAttachmentInspecting {
            let byteCount,
            byteCount <= Self.imageMetadataByteLimit {
             pixelDimensions = readImagePixelDimensions(at: fileURL)
+            // macOS commonly infers `contentTypeKey` from the filename extension.
+            // Require ImageIO to decode basic metadata before trusting a local file
+            // as image input; a renamed text or binary file must remain a file.
+            if pixelDimensions == nil {
+                contentTypeIdentifier = UTType.data.identifier
+                mimeType = "application/octet-stream"
+                typeEvidenceFromContent = true
+            }
         }
 
         return ContextAttachmentInspectionEvidence(
