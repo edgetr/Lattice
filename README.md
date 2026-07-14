@@ -32,31 +32,39 @@ Lattice is building a single native workspace where developers can:
 
 ### Execution routes
 
-Lattice can use a route when its provider or runtime is installed and ready:
+Every new chat starts with an explicit user choice:
 
-| Route | Integration |
-| --- | --- |
-| Codex | App-server thread and turn protocol |
-| Grok | `grok agent stdio` ACP |
-| OpenCode | `opencode acp` |
-| Antigravity | Transcript-driven `agy --print` |
-| Apple Intelligence | Foundation Models on supported macOS versions |
-| Ollama | Local model catalog, pull/install, and streaming chat |
-| Pi / Hermes | Compatible RPC or ACP harnesses |
+- **Code** — Build, debug, and ship.
+- **Work** — Research, browse, and act.
+- **Local** — Private models on this Mac.
 
-Provider CLIs are optional and are not redistributed with Lattice. Authentication remains provider-owned unless a documented Lattice flow stores a limited credential in macOS Keychain.
+The model chooser shows only runtime-discovered models for the selected mode. Lattice never automatically switches modes, providers, runtimes, or models.
+
+| Mode | Provider | Integration |
+| --- | --- | --- |
+| Code | Codex | Pi RPC with a Lattice system-instruction and permission extension |
+| Code | OpenCode Go/Zen | Pi RPC with an explicitly enabled Keychain credential |
+| Code | Grok | Grok Build ACP |
+| Code | Antigravity | Transcript-driven `agy --print` |
+| Work | Codex / Grok / OpenCode | Unmodified Hermes ACP with an isolated Lattice profile and curated toolsets |
+| Local | Apple Intelligence | Foundation Models on supported macOS versions |
+| Local | Ollama | Local model catalog, pull/install, and streaming chat |
+
+Pi and Hermes are runtime components, not model providers. Their setup and diagnostics live in a collapsed Connections section. Direct Codex app-server and OpenCode ACP remain compatibility routes for existing chats and v1 archives, but are not offered for new chats.
+
+Authentication is runtime-owned and isolated: Pi owns the Code Codex login, while Hermes owns the Work Codex and Grok logins. One OpenCode key may be stored in macOS Keychain, but Code and Work access must be enabled and validated separately. Lattice never copies OAuth sessions between CLIs.
 
 ### Safety and privacy
 
-Each session has explicit execution and privacy choices. What they enforce depends on the selected harness—inspect **Route controls** in the chat inspector before running:
+Each session has explicit execution and privacy choices. What they enforce depends on the selected runtime—inspect **Route & safety** in the chat inspector before running:
 
-- **Ask** requests approval for material or non-reversible tool work when the provider protocol can forward requests (Codex on-request; ACP/Pi permission surfaces). Antigravity Ask stays plan-only.
-- **Smart** may auto-allow scoped reads after a provider permission request arrives on ACP routes; current ACP write requests remain approval-gated because their metadata is conservatively non-reversible. Codex uses on-request approvals with a provider workspace-write sandbox. Antigravity Smart stays plan-only.
-- **YOLO** is explicitly high-trust: Codex disables provider approvals and uses danger-full-access (no write containment); ACP/Pi may auto-allow after requests; Antigravity skips provider permissions. Live provider tools do **not** pass through `LocalToolBroker`.
+- **Ask** requests approval for material or non-reversible work when the selected provider protocol can forward permission requests. Antigravity Ask stays plan-only.
+- **Smart** may auto-allow scoped reads only after a structured provider request arrives; writes remain approval-gated when reversibility or scope evidence is incomplete.
+- **YOLO** is explicitly high-trust and may auto-allow provider permission requests. Legacy direct Codex YOLO uses provider `danger-full-access`. Live provider tools do **not** pass through `LocalToolBroker`.
 - **Cloud allowed** permits connected cloud and local routes.
 - **Local only** blocks routes classified as cloud and keeps execution on available local backends.
 
-Where Lattice applies `sandbox-exec`, it is a **write-containment control**, not a confidentiality boundary: reads and network remain allowed. Codex sandbox settings are provider-configured, not Lattice `sandbox-exec`. Antigravity only receives a provider sandbox option that Lattice does not independently verify. Local lattice chat (Apple Intelligence / Ollama) has no delegated tool loop. Do not treat local-only mode as encryption, YOLO as isolation from secrets, or any route as prompt-injection or exfiltration prevention.
+Where Lattice applies `sandbox-exec`, it is a **write-containment control**, not a confidentiality boundary: reads and network remain allowed. Legacy direct Codex sandbox settings are provider-configured, not Lattice `sandbox-exec`. Antigravity only receives a provider sandbox option that Lattice does not independently verify. Local chat has no delegated tool loop. Do not treat Local mode as encryption, YOLO as isolation from secrets, or any route as prompt-injection or exfiltration prevention.
 
 ## Requirements
 
@@ -84,7 +92,7 @@ cd Lattice
 
 The packaged development app is written to `dist/Lattice.app` and opened automatically.
 
-Additional modes:
+Additional build-script actions:
 
 ```bash
 ./script/build_and_run.sh --debug

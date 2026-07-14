@@ -680,7 +680,9 @@ final class AppState: ObservableObject {
                     backend: nil,
                     providerTitle: providerTitle,
                     title: "No models reported",
-                    reason: mode == .work ? hermesReadinessCopy.detail : codeRouteReadinessDetail(providerID: entry.route.providerID)
+                    reason: mode == .work
+                        ? workRouteReadinessDetail(providerID: entry.route.providerID)
+                        : codeRouteReadinessDetail(providerID: entry.route.providerID)
                 ))
             }
         }
@@ -838,14 +840,6 @@ final class AppState: ObservableObject {
             readyDetail: "Ready · ACP"
         )
     }
-    var hermesReadinessCopy: ProviderReadinessCopy {
-        ProviderReadinessPresentationPolicy.copy(
-            providerName: "Hermes",
-            readiness: ProviderReadinessSnapshot(installed: hermesInstalled, authenticated: hermesInstalled, catalogStatus: hermesCatalogStatus, runnableModelCount: hermesModels.count),
-            readyDetail: "Ready · \(hermesModels.count) models"
-        )
-    }
-    var hermesReady: Bool { hermesReadinessCopy.isReady }
     var piCLIInfo: CLIUpdateInfo {
         CLIUpdateInfo(
             currentVersion: piCLIVersion,
@@ -2368,13 +2362,40 @@ final class AppState: ObservableObject {
 
     private func codeRouteReadinessDetail(providerID: String) -> String {
         switch providerID {
-        case "codex", "opencode":
+        case "codex":
             if !piInstalled { return "Set up the Pi Code runtime in Connections" }
-            return piModelIDs.isEmpty ? "Pi authentication or model validation is required" : "No compatible models reported"
+            return piModelIDs.isEmpty ? "Pi did not report Codex models" : "No compatible Codex models reported"
+        case "opencode":
+            if !piInstalled { return "Set up the Pi Code runtime in Connections" }
+            if !openCodeAPIKeySaved { return "Save an OpenCode key in Connections" }
+            if !openCodeCredentialEnabledModes.contains(.code) { return "Enable the OpenCode key for Code" }
+            return piModelIDs.isEmpty ? "Pi did not report OpenCode models" : "No compatible OpenCode models reported"
         case "grok": return grokReadinessCopy.detail
         case "antigravity": return antigravityReadinessDetail
         default: return "Route unavailable"
         }
+    }
+
+    private func workRouteReadinessDetail(providerID: String) -> String {
+        guard hermesInstalled else { return "Set up the Hermes Work runtime in Connections" }
+        switch hermesCatalogStatus {
+        case .unknown: return "Hermes model catalog has not been checked"
+        case .loading: return "Loading Hermes models"
+        case .failed: return "Hermes model catalog unavailable"
+        case .empty: return "Hermes reported no models"
+        case .loaded: break
+        }
+        switch providerID {
+        case "codex":
+            guard validatedHermesProviders.contains(LatticeHermesProvider.openAICodex.rawValue) else { return "Validate Hermes Codex authentication" }
+        case "grok":
+            guard validatedHermesProviders.contains(LatticeHermesProvider.xAIOAuth.rawValue) else { return "Validate Hermes Grok authentication" }
+        case "opencode":
+            guard openCodeAPIKeySaved, openCodeCredentialEnabledModes.contains(.work) else { return "Enable the OpenCode key for Work" }
+        default:
+            return "Unsupported Work provider"
+        }
+        return "No compatible models reported for this Work provider"
     }
 
     private var ollamaReadinessDetail: String {
@@ -5507,6 +5528,8 @@ Lattice self-edit rules:
             cliActionMessages["opencode"] = error.message
         case .success:
             openCodeAPIKeySaved = true
+            validatedPiOpenCodeModels.removeAll()
+            validatedHermesOpenCodeModels.removeAll()
             openCodeAPIKeyDraft = ""
             cliActionMessages["opencode"] = "API key saved in Keychain. Enable Code, Work, or both explicitly."
             Task { await refreshConnections(refreshProviderCatalogs: true) }
