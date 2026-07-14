@@ -146,6 +146,11 @@ struct ConversationView: View {
                 if showsComposer {
                     ComposerView(state: state)
                 }
+            } else if state.isTransientNewChat {
+                NewChatShellView(state: state)
+                if showsComposer {
+                    ComposerView(state: state)
+                }
             } else {
                 ContentUnavailableView {
                     Label("Start a chat", systemImage: "bubble.left.and.bubble.right")
@@ -468,6 +473,32 @@ struct EmptyConversationView: View {
     }
 }
 
+private struct NewChatShellView: View {
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "bubble.left.and.bubble.right")
+                .font(.system(size: 30, weight: .medium))
+                .foregroundStyle(.secondary)
+            Text("New chat")
+                .font(.title2.weight(.semibold))
+            Text(state.activeConversationMode.map { "\($0.displayName) mode" } ?? "Choose a mode and model to begin")
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            if state.activeComposerBackend == nil {
+                Text("Nothing is saved until you send your first message.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("New chat setup")
+        .accessibilityValue(state.activeComposerBackend?.displayName ?? "Choose a mode and model")
+    }
+}
+
 struct ComposerView: View {
     @ObservedObject var state: AppState
     private var composerBinding: Binding<MorphingControlState> {
@@ -483,10 +514,7 @@ struct ComposerView: View {
     var body: some View {
         VStack(spacing: state.composerSpacing()) {
             HStack(spacing: 10) {
-                BackendMenu(state: state)
-                if state.availableExecutionRoutes.count > 1 {
-                    HarnessMenu(state: state)
-                }
+                ComposerRouteMenu(state: state)
                 if let routeStatus = state.activeRouteStatusText {
                     Label(routeStatus, systemImage: "exclamationmark.triangle.fill")
                         .font(.caption)
@@ -626,6 +654,247 @@ struct AttachmentStrip: View {
                     }
                 }
             }
+        }
+    }
+}
+
+struct ComposerRouteMenu: View {
+    @ObservedObject var state: AppState
+
+    private var selectedMode: ConversationMode? { state.activeConversationMode }
+    private var selectedBackend: ChatBackend? { state.activeComposerBackend }
+
+    var body: some View {
+        Button {
+            state.composerRoutePopoverPresented = true
+        } label: {
+            Label {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(selectedMode?.displayName ?? "Choose mode")
+                        .font(.callout.weight(.medium))
+                    Text(selectedBackend?.displayName ?? "Choose model")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            } icon: {
+                Image(systemName: modeIcon(selectedMode))
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(state.isComposerRouteLocked)
+        .opacity(state.isComposerRouteLocked ? 0.62 : 1)
+        .help(state.isComposerRouteLocked ? "Mode and model locked after first message" : "Choose mode and model")
+        .accessibilityLabel("Mode and model")
+        .accessibilityValue("\(selectedMode?.displayName ?? "Not selected"), \(selectedBackend?.displayName ?? "No model")")
+        .popover(isPresented: $state.composerRoutePopoverPresented, arrowEdge: .bottom) {
+            ComposerRoutePopover(state: state, dismiss: { state.composerRoutePopoverPresented = false })
+        }
+    }
+
+    private func modeIcon(_ mode: ConversationMode?) -> String {
+        switch mode {
+        case .code: "hammer"
+        case .work: "briefcase"
+        case .local: "lock.shield"
+        case nil: "slider.horizontal.3"
+        }
+    }
+}
+
+private struct ComposerRoutePopover: View {
+    @ObservedObject var state: AppState
+    let dismiss: () -> Void
+
+    private var selectedMode: ConversationMode? { state.activeConversationMode }
+    private var filteredOptions: [ComposerModelOption] {
+        guard let selectedMode else { return [] }
+        let query = state.composerModelSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return state.composerModelOptions(for: selectedMode).filter { option in
+            query.isEmpty || option.title.localizedCaseInsensitiveContains(query) || option.providerTitle.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Choose mode")
+                .font(.headline)
+            VStack(spacing: 4) {
+                ForEach(ConversationMode.allCases) { mode in
+                    Button {
+                        state.selectComposerMode(mode)
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: modeIcon(mode))
+                                .frame(width: 20)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(mode.displayName)
+                                    .font(.body.weight(.medium))
+                                Text(modeDetail(mode))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if selectedMode == mode {
+                                Image(systemName: "checkmark")
+                                    .foregroundStyle(.tint)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(state.isComposerRouteLocked)
+                    .accessibilityLabel("\(mode.displayName), \(modeDetail(mode))")
+                    .accessibilityValue(selectedMode == mode ? "Selected" : "")
+                }
+            }
+
+            if let selectedMode {
+                Divider()
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField("Search models", text: $state.composerModelSearchText)
+                        .textFieldStyle(.plain)
+                    if !state.composerModelSearchText.isEmpty {
+                        Button { state.composerModelSearchText = "" } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Clear model search")
+                    }
+                }
+                .padding(9)
+                .latticeGlass(cornerRadius: 12, interactive: true)
+                .accessibilityIdentifier("lattice.composer.model.search")
+
+                Text("Models")
+                    .font(.headline)
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(groupedOptions, id: \.provider) { group in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(group.provider)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                    .textCase(.uppercase)
+                                ForEach(group.options) { option in
+                                    ModelChooserRow(state: state, option: option, selectedMode: selectedMode, dismiss: dismiss)
+                                }
+                            }
+                        }
+                        if filteredOptions.isEmpty {
+                            Text("No models match search.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.vertical, 16)
+                        }
+                    }
+                }
+                .frame(maxHeight: 300)
+            } else {
+                Text("Select mode to see its discovered models.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 12)
+            }
+        }
+        .padding(16)
+        .frame(width: 370)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Mode and model chooser")
+    }
+
+    private var groupedOptions: [(provider: String, options: [ComposerModelOption])] {
+        let grouped = Dictionary(grouping: filteredOptions, by: \.providerTitle)
+        return grouped.keys.sorted().map { ($0, grouped[$0] ?? []) }
+    }
+
+    private func modeIcon(_ mode: ConversationMode) -> String {
+        switch mode {
+        case .code: "hammer"
+        case .work: "briefcase"
+        case .local: "lock.shield"
+        }
+    }
+
+    private func modeDetail(_ mode: ConversationMode) -> String {
+        switch mode {
+        case .code: "Build, debug, and ship"
+        case .work: "Research, browse, and act"
+        case .local: "Private models on this Mac"
+        }
+    }
+}
+
+private struct ModelChooserRow: View {
+    @ObservedObject var state: AppState
+    let option: ComposerModelOption
+    let selectedMode: ConversationMode
+    let dismiss: () -> Void
+
+    private var isSelected: Bool {
+        state.activeConversationMode == selectedMode && state.activeComposerBackend == option.backend
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button {
+                state.selectComposerModel(option)
+                dismiss()
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: providerIcon)
+                        .frame(width: 18)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(option.title)
+                            .font(.body)
+                            .lineLimit(1)
+                        if let reason = option.reason {
+                            Text(reason)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                    }
+                    Spacer(minLength: 4)
+                    if isSelected {
+                        Image(systemName: "checkmark")
+                            .foregroundStyle(.tint)
+                    }
+                }
+                .contentShape(Rectangle())
+                .padding(.vertical, 5)
+            }
+            .buttonStyle(.plain)
+            .disabled(!option.isAvailable || state.isComposerRouteLocked)
+            .opacity(option.isAvailable ? 1 : 0.62)
+            .accessibilityLabel("\(option.providerTitle), \(option.title)")
+            .accessibilityValue(option.reason ?? (isSelected ? "Selected" : "Available"))
+            if option.reason != nil {
+                Button("Open Connections") {
+                    state.composerRoutePopoverPresented = false
+                    state.openConnectionsFromComposer()
+                }
+                .buttonStyle(.link)
+                .font(.caption)
+                .disabled(state.isComposerRouteLocked)
+                .help("Open Connections to make this route available")
+            }
+        }
+    }
+
+    private var providerIcon: String {
+        switch option.route.providerID {
+        case "apple", "ollama": "cpu"
+        case "codex": "sparkles"
+        case "grok": "cloud"
+        case "opencode": "chevron.left.forwardslash.chevron.right"
+        case "antigravity": "airplane"
+        default: "circle"
         }
     }
 }

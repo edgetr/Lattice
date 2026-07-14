@@ -264,6 +264,12 @@ struct RecommendationTests {
         #expect(catalog.entries(for: .code).count == 4)
         #expect(catalog.entries(for: .work).count == 3)
         #expect(catalog.entries(for: .local).count == 2)
+        #expect(ConversationMode.allCases.map(\.displayName) == ["Code", "Work", "Local"])
+        #expect(catalog.entries(for: .code).allSatisfy { $0.route.mode == .code })
+        #expect(catalog.entries(for: .work).allSatisfy { $0.route.mode == .work })
+        #expect(catalog.entries(for: .local).allSatisfy { $0.route.mode == .local })
+        #expect(ExecutionRouteResolver.resolve(mode: .code, providerID: "codex") == nil)
+        #expect(ExecutionRouteResolver.resolve(mode: .work, providerID: "ollama", modelID: "local") == nil)
         #expect(catalog.entries.allSatisfy { $0.readiness == .validating })
         #expect(!ExecutionRouteReadiness.failed("offline").isRunnable)
     }

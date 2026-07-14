@@ -89,6 +89,17 @@ struct ExecutionRouteOption: Identifiable, Equatable {
     var id: String { "\(engineID):\(harnessID)" }
 }
 
+struct ComposerModelOption: Identifiable, Equatable {
+    let route: ExecutionRoute
+    let backend: ChatBackend?
+    let providerTitle: String
+    let title: String
+    let reason: String?
+
+    var id: String { route.id }
+    var isAvailable: Bool { backend != nil && reason == nil }
+}
+
 private struct PreparedSubmission {
     let userText: String
     let runText: String
@@ -106,6 +117,14 @@ final class AppState: ObservableObject {
     @Published var selectedSessionID: UUID? {
         didSet {
             guard oldValue != selectedSessionID else { return }
+            if selectedSessionID != nil {
+                isTransientNewChat = false
+                composerSelectionMode = selectedSession?.executionRoute.mode
+                composerSelectionBackend = selectedSession?.backend
+            } else {
+                composerSelectionMode = nil
+                composerSelectionBackend = nil
+            }
             applyComposerSessionSelection(from: oldValue, to: selectedSessionID)
         }
     }
@@ -171,6 +190,12 @@ final class AppState: ObservableObject {
     /// When true, do not auto-change columns until the window is comfortably wide again.
     private var respectsUserColumnChoice = false
     @Published var selectedWorkspacePath: String
+    /// New Chat setup lives in memory until first send. No placeholder session or route is persisted.
+    @Published private(set) var isTransientNewChat = false
+    @Published private(set) var composerSelectionMode: ConversationMode?
+    @Published private(set) var composerSelectionBackend: ChatBackend?
+    @Published var composerRoutePopoverPresented = false
+    @Published var composerModelSearchText = ""
     @Published var installingModelTag: String?
     @Published var installStatus: String?
     @Published var showDeleteLocalModelConfirmation = false
@@ -377,6 +402,8 @@ final class AppState: ObservableObject {
         selectedRouteEngineID = Self.engineID(for: initialDefaultBackend)
         selectedRouteHarnessID = Self.defaultHarnessID(for: initialDefaultBackend)
         selectedSessionID = LatticeSessionListOrdering.sorted(sessions).first?.id
+        composerSelectionMode = selectedSession?.executionRoute.mode
+        composerSelectionBackend = selectedSession?.backend
         // Property observers do not run for assignments made during initialization, so load the
         // restored selection's durable draft explicitly for the workspace and overlay composers.
         draft = ComposerSessionDraftTransition.initialComposerDraft(
@@ -496,9 +523,24 @@ final class AppState: ObservableObject {
 
     var editingMessageID: UUID? { editingMessageContext?.messageID }
 
-    var activeBackend: ChatBackend { selectedSession?.backend ?? defaultBackend }
+    var activeBackend: ChatBackend { selectedSession?.backend ?? composerSelectionBackend ?? defaultBackend }
     var activePrivacyMode: SessionPrivacyMode { selectedSession?.privacyMode ?? privacyMode }
     var activeHarnessID: String { selectedSession.map(effectiveHarnessID(for:)) ?? selectedRouteHarnessID }
+    var activeConversationMode: ConversationMode? {
+        if selectedSession != nil, !isSelectedSessionRouteLocked {
+            return composerSelectionMode
+        }
+        return selectedSession?.executionRoute.mode ?? composerSelectionMode
+    }
+    var activeComposerBackend: ChatBackend? {
+        if selectedSession != nil, !isSelectedSessionRouteLocked {
+            return composerSelectionBackend
+        }
+        return selectedSession?.backend ?? composerSelectionBackend
+    }
+    var isComposerRouteLocked: Bool {
+        isSelectedSessionRouteLocked
+    }
     var overlayMode: OverlayMode {
         get { selectedRunUIState?.overlayMode ?? .idle }
         set { updateSelectedRunUI { $0.overlayMode = newValue } }
@@ -536,6 +578,118 @@ final class AppState: ObservableObject {
     var activeReasoningEffort: ReasoningEffort? { selectedSession?.reasoningEffort ?? defaultReasoning(for: activeBackend, harnessID: activeHarnessID) }
     var isSelectedSessionRouteLocked: Bool {
         selectedSession?.messages.contains(where: { $0.role == .user }) == true
+    }
+
+    var composerModeOptions: [(mode: ConversationMode, icon: String, detail: String)] {
+        [
+            (.code, "hammer", "Build, debug, and ship"),
+            (.work, "briefcase", "Research, browse, and act"),
+            (.local, "lock.shield", "Private models on this Mac")
+        ]
+    }
+
+    func composerModelOptions(for mode: ConversationMode) -> [ComposerModelOption] {
+        let catalogByProvider: [(String, String, [ProviderModel], ProviderCatalogStatus, String)] = [
+            ("codex", "Codex", codexModels, codexCatalogStatus, codexReadinessCopy.detail),
+            ("grok", "Grok", grokModels, grokCatalogStatus, grokReadinessCopy.detail),
+            ("opencode", "OpenCode", openCodeModels, openCodeCatalogStatus, openCodeReadinessCopy.detail),
+            ("antigravity", "Antigravity", antigravityModels, .loaded, antigravityReadinessDetail)
+        ]
+        let providers: [(String, String, [ProviderModel], String?)] = switch mode {
+        case .code:
+            catalogByProvider.map { ($0.0, $0.1, $0.2, $0.4) }
+        case .work:
+            catalogByProvider.filter { ["codex", "grok", "opencode"].contains($0.0) }.map { ($0.0, $0.1, $0.2, $0.4) }
+        case .local:
+            []
+        }
+
+        var options = providers.flatMap { providerID, providerTitle, models, providerReason in
+            if models.isEmpty {
+                guard let template = ExecutionRouteResolver.catalog().entries(for: mode).first(where: { $0.route.providerID == providerID }) else { return [ComposerModelOption]() }
+                return [ComposerModelOption(route: template.route, backend: nil, providerTitle: providerTitle, title: "No models reported", reason: providerReason)]
+            }
+            return models.map { model in
+                let backend = backend(for: providerID, modelID: model.id)
+                let route = ExecutionRouteResolver.resolve(mode: mode, providerID: providerID, modelID: model.id)
+                guard let backend, let route else {
+                    return ComposerModelOption(
+                        route: ExecutionRoute(mode: mode, providerID: providerID, modelID: model.id, runtimeID: "unavailable"),
+                        backend: nil,
+                        providerTitle: providerTitle,
+                        title: model.name,
+                        reason: "Route unavailable"
+                    )
+                }
+                let reason = isModelEnabled(backend.id) ? composerUnavailableReason(for: backend, route: route) : "Hidden in Connections"
+                return ComposerModelOption(route: route, backend: backend, providerTitle: providerTitle, title: model.name, reason: reason)
+            }
+        }
+
+        if mode == .local {
+            let appleRoute = ExecutionRouteResolver.resolve(mode: .local, providerID: "apple")
+            if let appleRoute {
+                options.append(ComposerModelOption(
+                    route: appleRoute,
+                    backend: .appleIntelligence,
+                    providerTitle: "On this Mac",
+                    title: "Apple Intelligence",
+                    reason: appleIntelligenceReady ? nil : appleIntelligenceStatus
+                ))
+            }
+            let localModels = ollamaModels.map { model in
+                let backend = ChatBackend.ollama(model: model.name)
+                let route = ExecutionRouteResolver.resolve(mode: .local, providerID: "ollama", modelID: model.name)
+                let reason = isModelEnabled(backend.id) ? route.flatMap { composerUnavailableReason(for: backend, route: $0) } : "Hidden in Connections"
+                return route.map { ComposerModelOption(route: $0, backend: backend, providerTitle: "Ollama", title: model.name, reason: reason) }
+            }.compactMap { $0 }
+            if localModels.isEmpty {
+                let template = ExecutionRouteResolver.catalog().entries(for: .local).first { $0.route.providerID == "ollama" }
+                if let template {
+                    options.append(ComposerModelOption(route: template.route, backend: nil, providerTitle: "Ollama", title: "No local models reported", reason: ollamaReadinessDetail))
+                }
+            } else {
+                options.append(contentsOf: localModels)
+            }
+        }
+
+        return options.sorted { lhs, rhs in
+            if lhs.providerTitle != rhs.providerTitle { return lhs.providerTitle < rhs.providerTitle }
+            return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+        }
+    }
+
+    func selectComposerMode(_ mode: ConversationMode) {
+        guard !isComposerRouteLocked else { return }
+        composerSelectionMode = mode
+        composerSelectionBackend = nil
+        if selectedSessionID == nil {
+            isTransientNewChat = true
+        }
+    }
+
+    func selectComposerModel(_ option: ComposerModelOption) {
+        guard !isComposerRouteLocked, option.isAvailable, let backend = option.backend else { return }
+        guard let index = selectedSessionID.flatMap({ id in sessions.firstIndex { $0.id == id } }) else {
+            composerSelectionMode = option.route.mode
+            composerSelectionBackend = backend
+            isTransientNewChat = true
+            return
+        }
+        guard !sessions[index].messages.contains(where: { $0.role == .user }) else { return }
+        sessions[index].backend = backend
+        sessions[index].executionRoute = option.route
+        sessions[index].harnessID = option.route.runtimeID
+        sessions[index].reasoningEffort = defaultReasoning(for: backend, harnessID: option.route.runtimeID)
+        sessions[index].harnessThreadID = nil
+        composerSelectionMode = option.route.mode
+        composerSelectionBackend = backend
+        persist()
+    }
+
+    func openConnectionsFromComposer() {
+        selectedSection = .connections
+        openWorkspaceAction?()
     }
     var attachments: [ContextAttachment] { selectedSession?.attachments ?? [] }
     var selectedContextBudgetEstimate: LatticeContextBudgetEstimate? {
@@ -605,6 +759,13 @@ final class AppState: ObservableObject {
     var canSendDraft: Bool {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return false }
+        if !isSelectedSessionRouteLocked {
+            guard let mode = composerSelectionMode,
+                  let backend = composerSelectionBackend,
+                  let route = ExecutionRouteResolver.resolve(mode: mode, backend: backend),
+                  composerUnavailableReason(for: backend, route: route) == nil else { return false }
+            if selectedSession == nil, !isTransientNewChat { return false }
+        }
         if editingMessageID == nil, appCommandCompletion(for: draft) != nil { return true }
         if editingMessageID == nil,
            LatticeSelfEditReviewDecision.parse(text) != nil,
@@ -615,6 +776,7 @@ final class AppState: ObservableObject {
         }
         if LatticeSelfEditCommand.prompt(in: text) == "" { return true }
         if selectedSession?.isStreaming == true { return editingMessageID == nil }
+        if selectedSession == nil { return true }
         return selectedSession.map(canRunSession(_:)) != false
     }
     var canStopSelectedSession: Bool {
@@ -629,6 +791,11 @@ final class AppState: ObservableObject {
         }
         if selectedSession?.isStreaming == true, editingMessageID != nil {
             return "Finish editing before queuing a follow-up"
+        }
+        if !isSelectedSessionRouteLocked {
+            return composerSelectionMode == nil || composerSelectionBackend == nil
+                ? "Choose a mode and model"
+                : "Selected model is unavailable"
         }
         return activeRouteStatusText ?? "Send is unavailable"
     }
@@ -1019,19 +1186,13 @@ final class AppState: ObservableObject {
     }
 
     func newSession() {
-        let sessionPrivacy = activePrivacyMode
-        privacyMode = sessionPrivacy
-        let backend = validBackend(defaultBackend, privacyMode: sessionPrivacy)
-        let engineID = Self.engineID(for: backend)
-        let harnessID = selectedRouteEngineID == engineID && isRouteHarnessCompatible(engineID: engineID, harnessID: selectedRouteHarnessID)
-            ? selectedRouteHarnessID
-            : Self.defaultHarnessID(for: backend)
-        let session = LatticeSession(title: "New chat", backend: backend, harnessID: harnessID, reasoningEffort: defaultReasoning(for: backend, harnessID: harnessID), workspacePath: selectedWorkspacePath, policy: policy, privacyMode: sessionPrivacy)
-        sessions.insert(session, at: 0)
-        selectedSessionID = session.id
+        selectedSessionID = nil
+        isTransientNewChat = true
+        composerSelectionMode = nil
+        composerSelectionBackend = nil
+        draft = ""
         selectedSection = .conversations
         clearError()
-        persist()
     }
 
     var canStartLocalOnlyChat: Bool {
@@ -1558,9 +1719,41 @@ final class AppState: ObservableObject {
     func send(_ text: String) {
         if handleSelfEditReviewDecision(text) { return }
         guard let submission = prepareSubmission(text) else { return }
-        if selectedSessionID == nil { newSession() }
+        if selectedSessionID == nil {
+            guard materializeTransientSession() else {
+                setError("Choose a mode and model before sending.", sessionID: nil)
+                return
+            }
+        }
         guard let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }), !sessions[index].isStreaming else { return }
         startPreparedSubmission(submission, for: id, at: index)
+    }
+
+    @discardableResult
+    private func materializeTransientSession() -> Bool {
+        guard isTransientNewChat,
+              let mode = composerSelectionMode,
+              let backend = composerSelectionBackend,
+              let route = ExecutionRouteResolver.resolve(mode: mode, backend: backend),
+              composerUnavailableReason(for: backend, route: route) == nil else { return false }
+        let session = LatticeSession(
+            title: "New chat",
+            backend: backend,
+            executionRoute: route,
+            harnessID: route.runtimeID,
+            reasoningEffort: defaultReasoning(for: backend, harnessID: route.runtimeID),
+            workspacePath: selectedWorkspacePath,
+            policy: policy,
+            privacyMode: activePrivacyMode,
+            draft: draft
+        )
+        sessions.insert(session, at: 0)
+        isTransientNewChat = false
+        selectedSessionID = session.id
+        selectedSection = .conversations
+        clearError()
+        persist()
+        return true
     }
 
     @discardableResult
@@ -1898,6 +2091,54 @@ final class AppState: ObservableObject {
         return canRunBackend(backend, harnessID: Self.defaultHarnessID(for: backend))
     }
 
+    private var antigravityReadinessDetail: String {
+        guard antigravityInstalled else { return "Not installed" }
+        guard antigravityAuthenticated else { return "Sign in required" }
+        guard !antigravityModels.isEmpty else { return "No models reported" }
+        return "Connected"
+    }
+
+    private var ollamaReadinessDetail: String {
+        guard ollamaInstalled else { return "Not installed" }
+        guard ollamaReady else { return "Start Ollama" }
+        switch ollamaCatalogStatus {
+        case .unknown: return "Local model catalog not checked"
+        case .loading: return "Loading local model catalog"
+        case .failed: return "Local model catalog unavailable"
+        case .empty, .loaded: return "No installed local models"
+        }
+    }
+
+    private func backend(for providerID: String, modelID: String) -> ChatBackend? {
+        switch providerID {
+        case "codex": .codex(model: modelID)
+        case "grok": .grok(model: modelID)
+        case "opencode": .openCode(model: modelID)
+        case "antigravity": .antigravity(model: modelID)
+        case "ollama": .ollama(model: modelID)
+        default: nil
+        }
+    }
+
+    private func composerUnavailableReason(for backend: ChatBackend, route: ExecutionRoute) -> String? {
+        if let blocked = SessionPrivacyPolicy.blockedMessage(for: backend, in: activePrivacyMode) {
+            return blocked
+        }
+        guard validBackend(backend, privacyMode: activePrivacyMode) == backend else {
+            return backendUnavailableMessage(for: backend) ?? "Unavailable"
+        }
+        guard canRunBackend(backend, harnessID: route.runtimeID) else {
+            return routeUnavailableMessage(for: LatticeSession(
+                title: "New chat",
+                backend: backend,
+                executionRoute: route,
+                harnessID: route.runtimeID,
+                privacyMode: activePrivacyMode
+            )) ?? "Unavailable"
+        }
+        return nil
+    }
+
     func backendUnavailableMessage(for backend: ChatBackend) -> String? {
         if let message = SessionPrivacyPolicy.blockedMessage(for: backend, in: activePrivacyMode) {
             return message
@@ -2186,6 +2427,7 @@ final class AppState: ObservableObject {
             sessions[index].backend = backend
             sessions[index].harnessID = shouldSyncExecutionRoute ? Self.defaultHarnessID(for: backend) : selectedRouteHarnessID
             let sessionHarnessID = shouldSyncExecutionRoute ? Self.defaultHarnessID(for: backend) : selectedRouteHarnessID
+            sessions[index].executionRoute = ExecutionRoute.legacy(for: backend, harnessID: sessionHarnessID)
             sessions[index].reasoningEffort = defaultReasoning(for: backend, harnessID: sessionHarnessID)
             sessions[index].harnessThreadID = nil
             persist()
@@ -2281,7 +2523,10 @@ final class AppState: ObservableObject {
     }
 
     func chooseAttachments() {
-        if selectedSessionID == nil { newSession() }
+        guard selectedSessionID != nil else {
+            setError("Choose a mode and model before adding attachments.", sessionID: nil)
+            return
+        }
         let panel = NSOpenPanel()
         panel.canChooseFiles = true; panel.canChooseDirectories = true; panel.allowsMultipleSelection = true
         panel.prompt = "Add"
@@ -2290,7 +2535,6 @@ final class AppState: ObservableObject {
     }
 
     func addAttachments(_ urls: [URL]) {
-        if selectedSessionID == nil { newSession() }
         guard let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }) else {
             composerState = .expanded; overlayControlState = .expanded; overlayMode = .prompt
             return

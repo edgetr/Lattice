@@ -225,12 +225,16 @@ struct WorkspaceView: View {
 
 private struct ConversationWorkspaceLayout: View {
     @ObservedObject var state: AppState
+    @AppStorage("lattice.sidebar.expanded") private var sidebarExpanded = true
 
     var body: some View {
         NavigationSplitView(columnVisibility: $state.columnVisibility) {
             SidebarView(state: state)
-                // Section sidebar can shrink aggressively; chat list + transcript keep priority.
-                .navigationSplitViewColumnWidth(min: 160, ideal: 200, max: 230)
+                .navigationSplitViewColumnWidth(
+                    min: sidebarExpanded ? 170 : 56,
+                    ideal: sidebarExpanded ? 190 : 56,
+                    max: sidebarExpanded ? 220 : 56
+                )
         } content: {
             SessionListView(state: state)
                 .navigationSplitViewColumnWidth(min: 220, ideal: 280, max: 340)
@@ -253,11 +257,16 @@ private struct ConversationWorkspaceLayout: View {
 private struct SectionWorkspaceLayout<Detail: View>: View {
     @ObservedObject var state: AppState
     let detail: Detail
+    @AppStorage("lattice.sidebar.expanded") private var sidebarExpanded = true
 
     var body: some View {
         NavigationSplitView {
             SidebarView(state: state)
-                .navigationSplitViewColumnWidth(min: 168, ideal: 200, max: 230)
+                .navigationSplitViewColumnWidth(
+                    min: sidebarExpanded ? 170 : 56,
+                    ideal: sidebarExpanded ? 190 : 56,
+                    max: sidebarExpanded ? 220 : 56
+                )
         } detail: {
             detail
         }
@@ -273,14 +282,48 @@ private struct WorkspaceWidthPreferenceKey: PreferenceKey {
 
 struct SidebarView: View {
     @ObservedObject var state: AppState
+    @AppStorage("lattice.sidebar.expanded") private var isExpanded = true
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
-        List(selection: $state.selectedSection) {
-            ForEach(WorkspaceSection.allCases) { section in
-                Label(section.displayName, systemImage: section.icon).tag(section)
+        VStack(spacing: 8) {
+            HStack {
+                if isExpanded {
+                    Text("Lattice")
+                        .font(.headline)
+                        .accessibilityAddTraits(.isHeader)
+                }
+                Spacer()
+                Button {
+                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.16)) { isExpanded.toggle() }
+                } label: {
+                    Image(systemName: isExpanded ? "sidebar.left" : "sidebar.right")
+                }
+                .buttonStyle(LatticeIconButtonStyle(size: .compact))
+                .accessibilityLabel(isExpanded ? "Collapse sidebar" : "Expand sidebar")
+                .help(isExpanded ? "Collapse sidebar" : "Expand sidebar")
             }
+            .padding(.horizontal, isExpanded ? 12 : 8)
+            .padding(.top, 8)
+
+            List(selection: $state.selectedSection) {
+                ForEach(WorkspaceSection.allCases) { section in
+                    Group {
+                        if isExpanded {
+                            Label(section.displayName, systemImage: section.icon)
+                        } else {
+                            Image(systemName: section.icon)
+                                .frame(maxWidth: .infinity)
+                        }
+                    }
+                    .tag(section)
+                    .help(section.displayName)
+                    .accessibilityLabel(section.displayName)
+                    .accessibilityHint("Open \(section.displayName)")
+                }
+            }
+            .listStyle(.sidebar)
         }
-        .listStyle(.sidebar)
-        .navigationTitle("Lattice")
         .accessibilityIdentifier(LatticeAccessibilityID.brandingTitle)
     }
 }
@@ -336,9 +379,7 @@ struct SessionListView: View {
                     ForEach(filtered) { session in
                         SessionRow(
                             session: session,
-                            selected: state.selectedSessionID == session.id,
-                            pinAction: { state.togglePinnedSession(session.id) },
-                            deleteAction: { state.requestDeleteSession(session.id) }
+                            selected: state.selectedSessionID == session.id
                         )
                         .tag(session.id)
                         .accessibilityIdentifier(LatticeAccessibilityID.sessionRow(session.id))
@@ -418,16 +459,6 @@ struct SessionListView: View {
 struct SessionRow: View {
     let session: LatticeSession
     let selected: Bool
-    let pinAction: () -> Void
-    let deleteAction: () -> Void
-
-    private var showsPinButton: Bool {
-        selected || session.isPinned
-    }
-
-    private var showsDeleteButton: Bool {
-        selected && !session.isStreaming
-    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -450,34 +481,21 @@ struct SessionRow: View {
                             .accessibilityHidden(true)
                     }
                 }
-                if let last = session.messages.last, !last.text.isEmpty {
-                    Text(last.text)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                Text(metadata)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
             }
-            Button(action: pinAction) {
-                Image(systemName: session.isPinned ? "pin.slash" : "pin")
-            }
-            .buttonStyle(LatticeIconButtonStyle(size: .compact, tint: session.isPinned ? .pink : nil))
-            .opacity(showsPinButton ? 1 : 0)
-            .disabled(!showsPinButton)
-            .accessibilityLabel(session.isPinned ? "Unpin chat" : "Pin chat")
-            .help(session.isPinned ? "Unpin chat" : "Pin chat")
-            .accessibilityHidden(!showsPinButton)
-            Button(role: .destructive, action: deleteAction) {
-                Image(systemName: "trash")
-            }
-            .buttonStyle(LatticeIconButtonStyle(size: .compact, isDestructive: true))
-            .opacity(showsDeleteButton ? 1 : 0)
-            .disabled(!showsDeleteButton)
-            .accessibilityLabel("Delete chat")
-            .help("Delete chat")
-            .accessibilityHidden(!showsDeleteButton)
         }
         .padding(.vertical, 4)
+    }
+
+    private var metadata: String {
+        if let last = session.messages.last, !last.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return last.text.replacingOccurrences(of: "\n", with: " ")
+        }
+        return "\(session.executionRoute.mode.displayName) · \(session.backend.displayName)"
     }
 }
 
