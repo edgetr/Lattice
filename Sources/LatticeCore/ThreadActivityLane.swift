@@ -1,6 +1,6 @@
 import Foundation
 
-public enum ThreadActivityStatus: String, Equatable, Sendable {
+public enum ThreadActivityStatus: String, Hashable, Sendable {
     case idle
     case queued
     case running

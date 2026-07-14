@@ -24,7 +24,7 @@ Lattice is building a single native workspace where developers can:
 
 ### Native workspace
 
-- Durable chats with drafts, queues, continuation, branching, editing, deletion, pinning, and search.
+- Durable chats with drafts, queues, continuation, branching, editing, deletion, pinning, and search. The Command-K palette also provides metadata-only quick switching across recent chats with live run/attention state.
 - Project-bound working directories and a floating overlay.
 - Model and connection management with truthful unavailable states.
 - Session import/export with sensitive runtime state removed.
@@ -160,6 +160,8 @@ BUILD_WEEK.md                 Build Week contribution and evidence log
 - Keep core policy testable without provider accounts.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and [SECURITY.md](SECURITY.md) for responsible vulnerability reporting.
+
+Product research that informed the chat quick switcher is recorded in [docs/research/t3-code-comparison.md](docs/research/t3-code-comparison.md).
 
 ## Roadmap
 

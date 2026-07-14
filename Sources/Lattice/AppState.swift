@@ -1247,7 +1247,7 @@ final class AppState: ObservableObject {
                 // Re-clamp after handoff in case enabled actions changed while the overlay dismissed.
                 self.commandPaletteSelectedID = LatticeCommandPaletteSelection.clampedSelection(
                     selectedID: self.commandPaletteSelectedID,
-                    in: self.commandPaletteItems
+                    in: self.filteredCommandPaletteItems()
                 )
                 self.showCommandPalette = true
             }
@@ -1258,7 +1258,7 @@ final class AppState: ObservableObject {
         commandPaletteSearch = ""
         commandPaletteSelectedID = LatticeCommandPaletteSelection.clampedSelection(
             selectedID: nil,
-            in: commandPaletteItems
+            in: filteredCommandPaletteItems()
         )
     }
 
@@ -1304,6 +1304,18 @@ final class AppState: ObservableObject {
     }
 
     var commandPaletteItems: [LatticeCommandPaletteItem] {
+        commandPaletteChatItems + commandPaletteCommandItems
+    }
+
+    private var commandPaletteChatItems: [LatticeCommandPaletteItem] {
+        LatticeCommandPaletteChatNavigation.items(
+            sessions: sessions,
+            activityLanes: threadActivityLanes,
+            selectedSessionID: selectedSessionID
+        )
+    }
+
+    private var commandPaletteCommandItems: [LatticeCommandPaletteItem] {
         let routeIssue = selectedSession.flatMap(routeUnavailableMessage(for:))
         return [
             .init(id: "new-chat", title: "New Chat", detail: "Start a fresh conversation", keywords: ["session", "conversation", "chat"]),
@@ -1381,19 +1393,27 @@ final class AppState: ObservableObject {
     }
 
     func filteredCommandPaletteItems() -> [LatticeCommandPaletteItem] {
-        LatticeCommandPaletteMatcher.filtered(commandPaletteItems, query: commandPaletteSearch)
+        LatticeCommandPaletteChatNavigation.visibleItems(
+            chats: commandPaletteChatItems,
+            commands: commandPaletteCommandItems,
+            query: commandPaletteSearch
+        )
     }
 
     func performFirstCommandPaletteMatch() {
-        guard let item = LatticeCommandPaletteMatcher.firstEnabled(in: commandPaletteItems, query: commandPaletteSearch) else { return }
+        guard let item = filteredCommandPaletteItems().first(where: \.isEnabled) else { return }
         performCommandPaletteItem(item.id)
     }
 
     func performCommandPaletteItem(_ id: String) {
         // Closing first means a second submit/click in the same event cycle is a no-op.
         guard showCommandPalette else { return }
-        guard commandPaletteItems.first(where: { $0.id == id })?.isEnabled == true else { return }
+        guard let item = commandPaletteItems.first(where: { $0.id == id }), item.isEnabled else { return }
         closeCommandPalette()
+        if case .chat(let sessionID) = item.kind {
+            openSessionFromWorkspace(sessionID)
+            return
+        }
         switch id {
         case "new-chat":
             newSession()

@@ -206,20 +206,60 @@ public enum CommandSuggestionLayoutPolicy {
 }
 
 public struct LatticeCommandPaletteItem: Identifiable, Hashable, Sendable {
+    public enum Kind: Hashable, Sendable {
+        case command
+        case chat(UUID)
+    }
+
     public let id: String
     public let title: String
     public let detail: String
     public let keywords: [String]
     public let isEnabled: Bool
     public let disabledReason: String?
+    public let kind: Kind
+    public let chatState: LatticeCommandPaletteChatState?
 
-    public init(id: String, title: String, detail: String = "", keywords: [String] = [], isEnabled: Bool = true, disabledReason: String? = nil) {
+    public init(
+        id: String,
+        title: String,
+        detail: String = "",
+        keywords: [String] = [],
+        isEnabled: Bool = true,
+        disabledReason: String? = nil,
+        kind: Kind = .command,
+        chatState: LatticeCommandPaletteChatState? = nil
+    ) {
         self.id = id
         self.title = title
         self.detail = detail
         self.keywords = keywords
         self.isEnabled = isEnabled
         self.disabledReason = disabledReason
+        self.kind = kind
+        self.chatState = chatState
+    }
+}
+
+public struct LatticeCommandPaletteChatState: Hashable, Sendable {
+    public let activityStatus: ThreadActivityStatus
+    public let queuedCount: Int
+    public let hasUnreadActivity: Bool
+    public let requiresAttention: Bool
+    public let isCurrent: Bool
+
+    public init(
+        activityStatus: ThreadActivityStatus,
+        queuedCount: Int = 0,
+        hasUnreadActivity: Bool = false,
+        requiresAttention: Bool = false,
+        isCurrent: Bool = false
+    ) {
+        self.activityStatus = activityStatus
+        self.queuedCount = max(0, queuedCount)
+        self.hasUnreadActivity = hasUnreadActivity
+        self.requiresAttention = requiresAttention
+        self.isCurrent = isCurrent
     }
 }
 

@@ -971,6 +971,28 @@ struct CoreVerification {
         expect(LatticeCommandPaletteMatcher.filtered(paletteItems, query: "skill md").map(\.id) == ["open-skills-folder"], "Command palette exposes the shared skills folder")
         expect(LatticeCommandPaletteMatcher.firstEnabled(in: paletteItems, query: "response") == nil, "Command palette does not auto-run disabled matches")
         expect(LatticeCommandPaletteMatcher.firstEnabled(in: paletteItems, query: "show")?.id == "models", "Command palette selects first enabled filtered command")
+        let quickChatID = UUID(uuidString: "00000000-0000-0000-0000-000000000321")!
+        let quickChat = LatticeSession(
+            id: quickChatID,
+            title: "Repair navigation",
+            backend: .codex(model: "gpt-5"),
+            workspacePath: "/tmp/Lattice",
+            lastUpdated: Date(timeIntervalSince1970: 10)
+        )
+        var quickChatLanes = ThreadActivityLaneStore()
+        quickChatLanes.apply(.failed("Provider exited"), to: quickChatID)
+        let quickChatItems = LatticeCommandPaletteChatNavigation.items(
+            sessions: [quickChat],
+            activityLanes: quickChatLanes,
+            selectedSessionID: nil
+        )
+        expect(quickChatItems.first?.kind == .chat(quickChatID), "Command palette exposes durable chats as navigation targets")
+        expect(quickChatItems.first?.chatState?.activityStatus == .failed && quickChatItems.first?.chatState?.requiresAttention == true, "Command palette exposes truthful chat failure attention")
+        expect(LatticeCommandPaletteChatNavigation.visibleItems(chats: quickChatItems, commands: paletteItems, query: "repair").map(\.kind) == [.chat(quickChatID)], "Command palette searches chat titles alongside commands")
+        expect(LatticeCommandPaletteChatNavigation.visibleItems(chats: quickChatItems, commands: paletteItems, query: "lattice").contains(where: { $0.kind == .chat(quickChatID) }), "Command palette searches workspace metadata without transcript hydration")
+        quickChatLanes.apply(.started, to: quickChatID)
+        let recoveredQuickChat = LatticeCommandPaletteChatNavigation.items(sessions: [quickChat], activityLanes: quickChatLanes, selectedSessionID: quickChatID)[0]
+        expect(recoveredQuickChat.chatState?.activityStatus == .running && recoveredQuickChat.chatState?.requiresAttention == false, "Command palette chat status recovers when work restarts")
         let route = EngineHarnessSelection(engineID: "codex", harnessID: "codex")
         let routeData = try! JSONEncoder().encode(route)
         expect((try! JSONDecoder().decode(EngineHarnessSelection.self, from: routeData)) == route, "Engine harness route round trip")

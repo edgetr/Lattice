@@ -9,16 +9,27 @@ struct CommandPaletteView: View {
         state.filteredCommandPaletteItems()
     }
 
+    private var chatResults: [LatticeCommandPaletteItem] {
+        results.filter { item in
+            if case .chat = item.kind { return true }
+            return false
+        }
+    }
+
+    private var commandResults: [LatticeCommandPaletteItem] {
+        results.filter { $0.kind == .command }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 Image(systemName: "command")
                     .foregroundStyle(.secondary)
-                TextField("Search commands", text: $state.commandPaletteSearch)
+                TextField("Search chats and commands", text: $state.commandPaletteSearch)
                     .textFieldStyle(.plain)
                     .focused($searchFocused)
                     .accessibilityIdentifier(LatticeAccessibilityID.commandPaletteSearch)
-                    .accessibilityLabel("Search commands")
+                    .accessibilityLabel("Search chats and commands")
                     .onSubmit { state.performSelectedCommandPaletteItem() }
                     .onChange(of: state.commandPaletteSearch) { _, _ in
                         state.clampCommandPaletteSelection()
@@ -30,8 +41,8 @@ struct CommandPaletteView: View {
                         Image(systemName: "xmark.circle.fill")
                     }
                     .buttonStyle(LatticeIconButtonStyle(size: .compact))
-                    .accessibilityLabel("Clear command search")
-                    .help("Clear command search")
+                    .accessibilityLabel("Clear palette search")
+                    .help("Clear palette search")
                 }
             }
             .padding(.leading, 14)
@@ -41,28 +52,20 @@ struct CommandPaletteView: View {
             .padding(14)
 
             if results.isEmpty {
-                ContentUnavailableView("No commands", systemImage: "command", description: Text("Try a different action name."))
+                ContentUnavailableView("No matches", systemImage: "magnifyingglass", description: Text("Try a different chat, workspace, or command name."))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollViewReader { proxy in
-                    List(results) { item in
-                        Button {
-                            guard item.isEnabled else { return }
-                            state.selectCommandPaletteItem(item.id)
-                            state.performCommandPaletteItem(item.id)
-                        } label: {
-                            CommandPaletteRow(item: item, isSelected: state.commandPaletteSelectedID == item.id)
+                    List {
+                        if !chatResults.isEmpty {
+                            Section("Chats") {
+                                ForEach(chatResults) { item in paletteButton(item) }
+                            }
                         }
-                        .buttonStyle(.plain)
-                        .disabled(!item.isEnabled)
-                        .id(item.id)
-                        .accessibilityIdentifier(LatticeAccessibilityID.commandPaletteItem(item.id))
-                        .listRowBackground(selectionBackground(for: item))
-                        .help(item.isEnabled ? item.detail : (item.disabledReason ?? item.detail))
-                        .onHover { hovering in
-                            // Mouse exit must not clear the shared selection or steal search focus.
-                            guard hovering else { return }
-                            state.selectCommandPaletteItem(item.id)
+                        if !commandResults.isEmpty {
+                            Section("Commands") {
+                                ForEach(commandResults) { item in paletteButton(item) }
+                            }
                         }
                     }
                     .listStyle(.plain)
@@ -76,7 +79,7 @@ struct CommandPaletteView: View {
             }
 
             HStack {
-                Text("↑↓ select · Return runs the highlighted enabled command.")
+                Text("↑↓ select · Return opens the highlighted chat or runs the command.")
                 Spacer()
                 Button("Close") { state.closeCommandPalette() }
                     .keyboardShortcut(.cancelAction)
@@ -112,6 +115,27 @@ struct CommandPaletteView: View {
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(LatticeAccessibilityID.commandPalette)
         .accessibilityLabel("Command palette")
+    }
+
+    private func paletteButton(_ item: LatticeCommandPaletteItem) -> some View {
+        Button {
+            guard item.isEnabled else { return }
+            state.selectCommandPaletteItem(item.id)
+            state.performCommandPaletteItem(item.id)
+        } label: {
+            CommandPaletteRow(item: item, isSelected: state.commandPaletteSelectedID == item.id)
+        }
+        .buttonStyle(.plain)
+        .disabled(!item.isEnabled)
+        .id(item.id)
+        .accessibilityIdentifier(LatticeAccessibilityID.commandPaletteItem(item.id))
+        .listRowBackground(selectionBackground(for: item))
+        .help(item.isEnabled ? item.detail : (item.disabledReason ?? item.detail))
+        .onHover { hovering in
+            // Mouse exit must not clear the shared selection or steal search focus.
+            guard hovering else { return }
+            state.selectCommandPaletteItem(item.id)
+        }
     }
 
     private func scrollSelectionIntoView(_ proxy: ScrollViewProxy) {
@@ -155,7 +179,20 @@ private struct CommandPaletteRow: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 8)
-            if isSelected, item.isEnabled {
+            if let chatState = item.chatState, chatState.requiresAttention {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .foregroundStyle(.orange)
+                    .accessibilityHidden(true)
+            } else if let chatState = item.chatState, chatState.hasUnreadActivity {
+                Circle()
+                    .fill(Color.accentColor)
+                    .frame(width: 7, height: 7)
+                    .accessibilityHidden(true)
+            } else if item.chatState?.isCurrent == true {
+                Text("Current")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            } else if isSelected, item.isEnabled {
                 Text("↩")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
@@ -174,6 +211,17 @@ private struct CommandPaletteRow: View {
     /// Disabled/unavailable rows always use `nosign` regardless of id.
     private var symbolName: String {
         guard item.isEnabled else { return "nosign" }
+        if let chatState = item.chatState {
+            switch chatState.activityStatus {
+            case .idle: return "bubble.left"
+            case .queued: return "clock"
+            case .running: return "waveform"
+            case .waitingForApproval: return "hand.raised.fill"
+            case .failed: return "exclamationmark.triangle.fill"
+            case .completed: return "checkmark.circle.fill"
+            case .cancelled: return "stop.circle"
+            }
+        }
         switch item.id {
         case "new-chat": return "square.and.pencil"
         case "send-message": return "paperplane"
