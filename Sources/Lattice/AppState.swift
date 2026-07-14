@@ -268,6 +268,7 @@ final class AppState: ObservableObject {
     @Published var providerModelDisclosureStates: [String: ProviderModelDisclosureState] = [:]
     @Published var cliBusyProviders: Set<String> = []
     @Published var cliActionMessages: [String: String] = [:]
+    @Published private(set) var runtimeAuthenticationPhases: [LatticeRuntimeID: HarnessReadinessAuthenticationPhase] = [:]
     @Published private(set) var isRefreshingConnections = false
     @Published private(set) var connectionRefreshAction = ControlActionState()
     @Published private(set) var localModelRefreshAction = ControlActionState()
@@ -376,6 +377,8 @@ final class AppState: ObservableObject {
     private var lastAutomaticConnectionRefreshRequest = Date.distantPast
     @Published private var runUIStates: [UUID: RunUIState] = [:]
     @Published private(set) var threadActivityLanes = ThreadActivityLaneStore()
+    @Published private(set) var schedulerGlobalLimit = 4
+    @Published private(set) var schedulerWorkspaceLimit = 2
     @Published private var globalErrorMessage: String?
     /// Deliberately in-memory: provider tool bypass consent expires when Lattice exits.
     private var acknowledgedUnsafeProviderRouteKeys: Set<String> = []
@@ -395,6 +398,8 @@ final class AppState: ObservableObject {
     private static let managedRuntimeIDsKey = "latticeManagedRuntimeIDs"
     private static let persistedConnectionStateKey = "persistedConnectionState.v1"
     private static let schedulerMetadataKey = "agentTaskScheduler.metadata.v1"
+    private static let schedulerGlobalLimitKey = "agentTaskScheduler.globalLimit"
+    private static let schedulerWorkspaceLimitKey = "agentTaskScheduler.workspaceLimit"
 
     private var executionRuntimes: LatticeExecutionRuntimes {
         LatticeExecutionRuntimes(
@@ -497,6 +502,12 @@ final class AppState: ObservableObject {
         selectedRouteEngineID = Self.engineID(for: initialDefaultBackend)
         selectedRouteHarnessID = Self.defaultHarnessID(for: initialDefaultBackend)
         selectedSessionID = LatticeSessionListOrdering.sorted(sessions).first?.id
+        schedulerGlobalLimit = Self.storedSchedulerLimit(forKey: Self.schedulerGlobalLimitKey, fallback: 4)
+        schedulerWorkspaceLimit = Self.storedSchedulerLimit(forKey: Self.schedulerWorkspaceLimitKey, fallback: 2)
+        var restoredSchedulerLimits = taskScheduler.limits
+        restoredSchedulerLimits.global = schedulerGlobalLimit
+        restoredSchedulerLimits.perWorkspace = schedulerWorkspaceLimit
+        _ = taskScheduler.updateLimits(restoredSchedulerLimits)
         recoverSchedulerMetadata()
         rebuildThreadActivityLanes()
         composerSelectionMode = selectedSession?.executionRoute.mode
@@ -1112,6 +1123,26 @@ final class AppState: ObservableObject {
         handleSchedulerAdmissions(taskScheduler.reprioritize(sessionID, to: priority))
         refreshSchedulerLanes()
         persistSchedulerMetadata()
+    }
+
+    func setSchedulerGlobalLimit(_ value: Int) {
+        let value = min(max(value, 1), 8)
+        guard schedulerGlobalLimit != value else { return }
+        schedulerGlobalLimit = value
+        UserDefaults.standard.set(value, forKey: Self.schedulerGlobalLimitKey)
+        var limits = taskScheduler.limits
+        limits.global = value
+        handleSchedulerAdmissions(taskScheduler.updateLimits(limits))
+    }
+
+    func setSchedulerWorkspaceLimit(_ value: Int) {
+        let value = min(max(value, 1), 8)
+        guard schedulerWorkspaceLimit != value else { return }
+        schedulerWorkspaceLimit = value
+        UserDefaults.standard.set(value, forKey: Self.schedulerWorkspaceLimitKey)
+        var limits = taskScheduler.limits
+        limits.perWorkspace = value
+        handleSchedulerAdmissions(taskScheduler.updateLimits(limits))
     }
 
     func setVisibleComposerState(_ state: MorphingControlState, for sessionID: UUID?) {
@@ -3978,6 +4009,7 @@ final class AppState: ObservableObject {
 
     func openPiAuthentication() {
         guard piInstalled, let executable = ExecutableDiscovery.locate("pi") else {
+            runtimeAuthenticationPhases[.pi] = .signInRequired
             cliActionMessages["pi"] = "Install Pi before signing in."
             return
         }
@@ -3989,10 +4021,16 @@ final class AppState: ObservableObject {
             arguments: [],
             environment: ["PI_CODING_AGENT_DIR": profile.path]
         ) else {
+            runtimeAuthenticationPhases[.pi] = .signInRequired
             cliActionMessages["pi"] = "Lattice could not open the isolated Pi login terminal."
             return
         }
+        runtimeAuthenticationPhases[.pi] = .validationPending
         cliActionMessages["pi"] = "In Pi, run /login and choose ChatGPT. Return here, then choose Check Code."
+    }
+
+    func runtimeAuthenticationAction(for runtime: LatticeRuntimeID) -> HarnessReadinessAuthenticationAction {
+        (runtimeAuthenticationPhases[runtime] ?? .signInRequired).action
     }
 
     func validatePiAuthentication(providerID: String) {
@@ -4010,6 +4048,7 @@ final class AppState: ObservableObject {
             return nil
         }
         guard let candidate = candidates.first else {
+            runtimeAuthenticationPhases[.pi] = .signInRequired
             cliActionMessages["pi"] = "Pi did not report a compatible \(providerID) model."
             return
         }
@@ -4039,14 +4078,16 @@ final class AppState: ObservableObject {
             } else {
                 if providerID == "codex" { validatedPiCodexModels.removeAll() }
                 else { validatedPiOpenCodeModels.removeAll() }
-                cliActionMessages["pi"] = "Pi could not verify \(providerID). Check the isolated sign-in or enabled key, then try again."
+                cliActionMessages["pi"] = "Pi could not verify \(providerID). Sign in again or check the enabled key, then validate once more."
             }
+            runtimeAuthenticationPhases[.pi] = .afterValidation()
             finishCLIAction(actionID)
         }
     }
 
     func openHermesAuthentication() {
         guard hermesInstalled, let executable = ExecutableDiscovery.locate("hermes") else {
+            runtimeAuthenticationPhases[.hermes] = .signInRequired
             cliActionMessages["hermes"] = "Install Hermes before signing in."
             return
         }
@@ -4059,9 +4100,11 @@ final class AppState: ObservableObject {
             arguments: ["model"],
             environment: ["HOME": profile.path, "HERMES_HOME": profile.path]
         ) else {
+            runtimeAuthenticationPhases[.hermes] = .signInRequired
             cliActionMessages["hermes"] = "Lattice could not open the isolated Hermes model setup terminal."
             return
         }
+        runtimeAuthenticationPhases[.hermes] = .validationPending
         cliActionMessages["hermes"] = "Choose and sign in to the Work provider in Hermes, then choose Check Work here."
     }
 
@@ -4089,7 +4132,8 @@ final class AppState: ObservableObject {
             else { validatedHermesProviders.remove(provider) }
             cliActionMessages["hermes"] = valid
                 ? "Hermes \(providerID) sign-in is available."
-                : "Hermes did not report an authenticated \(providerID) session in its isolated profile."
+                : "Hermes did not report an authenticated \(providerID) session. Sign in again, then validate once more."
+            runtimeAuthenticationPhases[.hermes] = .afterValidation()
             finishCLIAction(actionID)
         }
     }
@@ -6434,6 +6478,11 @@ Lattice self-edit rules:
     private static func loadDefaultBackend() -> ChatBackend? {
         guard let data = UserDefaults.standard.data(forKey: defaultBackendKey) else { return nil }
         return try? JSONDecoder().decode(ChatBackend.self, from: data)
+    }
+
+    private static func storedSchedulerLimit(forKey key: String, fallback: Int) -> Int {
+        guard UserDefaults.standard.object(forKey: key) != nil else { return fallback }
+        return min(max(UserDefaults.standard.integer(forKey: key), 1), 8)
     }
 
     private static func defaultWorkspacePath(processDirectory: String) -> String {

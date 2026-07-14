@@ -58,6 +58,23 @@ struct CoreVerification {
         var recoveredScheduler = AgentTaskScheduler()
         recoveredScheduler.recover(.init(entries: [scheduledRequest(UUID(), priority: .high)]))
         expect(recoveredScheduler.snapshots.allSatisfy { $0.state == .recoveryHeld }, "Recovered queue metadata is held and never automatically replayed")
+        expect(HarnessReadinessAuthenticationPhase.afterTerminalOpen(succeeded: true).action == .validate, "Authentication continuation uses typed validation state instead of display copy")
+        expect(HarnessReadinessAuthenticationPhase.afterValidation().action == .signIn, "Authentication continuation resets after validation")
+
+        var adjustableScheduler = AgentTaskScheduler(limits: .init(global: 1, perWorkspace: 1))
+        let adjustableFirst = UUID(), adjustableSecond = UUID()
+        _ = adjustableScheduler.submit(.init(
+            id: adjustableFirst,
+            sessionID: adjustableFirst,
+            resources: .init(workspaceID: "one", providerID: "codex", routeID: "codex/openai")
+        ))
+        _ = adjustableScheduler.submit(.init(
+            id: adjustableSecond,
+            sessionID: adjustableSecond,
+            resources: .init(workspaceID: "two", providerID: "grok", routeID: "grok/xai")
+        ))
+        expect(adjustableScheduler.updateLimits(.init(global: 2, perWorkspace: 1)) == [adjustableSecond], "Increasing the global scheduler limit admits queued work")
+        expect(adjustableScheduler.updateLimits(.init(global: 1, perWorkspace: 1)).isEmpty, "Lowering scheduler limits never preempts active work")
 
         let layoutScreen = WorkspaceWindowFrame(x: 0, y: 0, width: 1440, height: 900)
         let defaultLayout = WorkspaceLayoutStatePolicy.restoredState(

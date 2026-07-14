@@ -828,7 +828,7 @@ struct ConnectionsView: View {
             providerRow(
                 identity: .provider(.codex), name: "Codex", detail: "Code uses Pi · Work uses Hermes",
                 modes: [
-                    readinessMode(title: "Code", runtime: "Pi", readiness: state.modeReadiness(.code, providerID: "codex"), authenticationAction: runtimeAuthenticationAction(message: state.cliActionMessages["pi"])) { kind in
+                    readinessMode(title: "Code", runtime: "Pi", readiness: state.modeReadiness(.code, providerID: "codex"), authenticationAction: state.runtimeAuthenticationAction(for: .pi)) { kind in
                         switch kind {
                         case .setupRuntime: state.installPi()
                         case .signIn: state.openPiAuthentication()
@@ -837,7 +837,7 @@ struct ConnectionsView: View {
                         default: break
                         }
                     },
-                    readinessMode(title: "Work", runtime: "Hermes", readiness: state.modeReadiness(.work, providerID: "codex"), authenticationAction: runtimeAuthenticationAction(message: state.cliActionMessages["hermes"])) { kind in
+                    readinessMode(title: "Work", runtime: "Hermes", readiness: state.modeReadiness(.work, providerID: "codex"), authenticationAction: state.runtimeAuthenticationAction(for: .hermes)) { kind in
                         switch kind {
                         case .setupRuntime: state.installHermes()
                         case .signIn: state.openHermesAuthentication()
@@ -868,7 +868,7 @@ struct ConnectionsView: View {
                         default: break
                         }
                     },
-                    readinessMode(title: "Work", runtime: "Hermes", readiness: state.modeReadiness(.work, providerID: "grok"), authenticationAction: runtimeAuthenticationAction(message: state.cliActionMessages["hermes"])) { kind in
+                    readinessMode(title: "Work", runtime: "Hermes", readiness: state.modeReadiness(.work, providerID: "grok"), authenticationAction: state.runtimeAuthenticationAction(for: .hermes)) { kind in
                         switch kind {
                         case .setupRuntime: state.installHermes()
                         case .signIn: state.openHermesAuthentication()
@@ -1125,13 +1125,6 @@ struct ConnectionsView: View {
         }
     }
 
-    private func runtimeAuthenticationAction(message: String?) -> HarnessReadinessAuthenticationAction {
-        let message = message?.lowercased() ?? ""
-        let validationIsNext = message.contains("choose check")
-            || message.contains("could not verify")
-            || message.contains("did not report an authenticated")
-        return validationIsNext ? .validate : .signIn
-    }
 }
 
 private struct ControlActionFeedback: View {

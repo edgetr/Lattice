@@ -228,4 +228,11 @@ struct RuntimeReadinessTests {
         #expect(!failure.isEnabled)
         #expect(failure.accessibilityHint.contains("Wait"))
     }
+
+    @Test func authenticationContinuationIsTypedAndIndependentOfCopy() {
+        #expect(HarnessReadinessAuthenticationPhase.signInRequired.action == .signIn)
+        #expect(HarnessReadinessAuthenticationPhase.afterTerminalOpen(succeeded: true).action == .validate)
+        #expect(HarnessReadinessAuthenticationPhase.afterTerminalOpen(succeeded: false).action == .signIn)
+        #expect(HarnessReadinessAuthenticationPhase.afterValidation().action == .signIn)
+    }
 }

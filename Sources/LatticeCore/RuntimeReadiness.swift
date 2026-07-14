@@ -370,6 +370,26 @@ public enum HarnessReadinessAuthenticationAction: Equatable, Sendable {
     case validate
 }
 
+/// Typed continuation for provider-owned terminal authentication. User-facing
+/// copy may change without changing whether the next safe action is sign-in or validation.
+public enum HarnessReadinessAuthenticationPhase: String, Equatable, Codable, Sendable {
+    case signInRequired
+    case validationPending
+
+    public var action: HarnessReadinessAuthenticationAction {
+        switch self {
+        case .signInRequired: .signIn
+        case .validationPending: .validate
+        }
+    }
+
+    public static func afterTerminalOpen(succeeded: Bool) -> Self {
+        succeeded ? .validationPending : .signInRequired
+    }
+
+    public static func afterValidation() -> Self { .signInRequired }
+}
+
 public enum HarnessReadinessActionKind: Equatable, Sendable {
     case stateOnly
     case setupRuntime

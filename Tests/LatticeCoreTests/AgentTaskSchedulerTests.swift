@@ -120,4 +120,19 @@ struct AgentTaskSchedulerTests {
         #expect(recovered.snapshots.filter { $0.state == .running }.isEmpty)
         #expect(recovered.persistedMetadata.entries.isEmpty)
     }
+
+    @Test("updated concurrency limits admit safely without preempting active work")
+    func updatedLimits() {
+        var scheduler = AgentTaskScheduler(limits: .init(global: 1, perWorkspace: 1))
+        let running = UUID(), queued = UUID()
+        #expect(scheduler.submit(request(running)) == [running])
+        #expect(scheduler.submit(request(queued, workspace: "workspace-b", provider: "grok")) == [])
+
+        #expect(scheduler.updateLimits(.init(global: 2, perWorkspace: 1)) == [queued])
+        #expect(scheduler.snapshot(for: running)?.state == .running)
+        #expect(scheduler.snapshot(for: queued)?.state == .running)
+
+        #expect(scheduler.updateLimits(.init(global: 1, perWorkspace: 1)) == [])
+        #expect(scheduler.snapshots.filter { $0.state == .running }.count == 2)
+    }
 }

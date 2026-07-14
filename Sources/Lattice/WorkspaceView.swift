@@ -205,10 +205,32 @@ struct WorkspaceView: View {
             }
             .accessibilityIdentifier(LatticeAccessibilityID.toolbarOverlay)
             .disabled(state.showOverlayAction == nil)
+            Divider()
+            Menu {
+                Picker("Global limit", selection: Binding(
+                    get: { state.schedulerGlobalLimit },
+                    set: { state.setSchedulerGlobalLimit($0) }
+                )) {
+                    ForEach(1...8, id: \.self) { value in
+                        Text("\(value)").tag(value)
+                    }
+                }
+                Picker("Per-workspace limit", selection: Binding(
+                    get: { state.schedulerWorkspaceLimit },
+                    set: { state.setSchedulerWorkspaceLimit($0) }
+                )) {
+                    ForEach(1...8, id: \.self) { value in
+                        Text("\(value)").tag(value)
+                    }
+                }
+            } label: {
+                Label("Concurrent Tasks", systemImage: "rectangle.3.group")
+            }
+            .help("Limit simultaneous agent tasks globally and within each workspace")
         } label: {
             Label("More workspace actions", systemImage: "ellipsis.circle")
         }
-        .help("Commands and overlay")
+        .help("Commands, overlay, and task scheduling")
         .accessibilityLabel("More workspace actions")
     }
 
