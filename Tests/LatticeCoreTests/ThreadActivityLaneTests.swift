@@ -59,11 +59,16 @@ struct ThreadActivityLaneTests {
         let sessionID = UUID()
         var store = ThreadActivityLaneStore()
         store.apply(.queued(2), to: sessionID)
+        store.apply(.priorityChanged(.high), to: sessionID)
+        store.apply(.queuePositionChanged(3), to: sessionID)
         #expect(store.lane(for: sessionID).status == .queued)
+        #expect(store.lane(for: sessionID).priority == .high)
+        #expect(store.lane(for: sessionID).queuePosition == 3)
 
         store.apply(.started, to: sessionID)
         #expect(store.lane(for: sessionID).status == .running)
         #expect(store.lane(for: sessionID).queuedCount == 2)
+        #expect(store.lane(for: sessionID).queuePosition == nil)
 
         store.apply(.completed, to: sessionID)
         #expect(store.lane(for: sessionID).status == .queued)

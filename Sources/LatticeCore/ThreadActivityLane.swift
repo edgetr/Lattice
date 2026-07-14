@@ -22,7 +22,7 @@ public enum ThreadActivityStatus: String, Equatable, Sendable {
     }
 
     public var canCancel: Bool {
-        self == .running || self == .waitingForApproval
+        self == .queued || self == .running || self == .waitingForApproval
     }
 }
 
@@ -32,19 +32,25 @@ public struct ThreadActivityLane: Equatable, Sendable {
     public var hasUnreadActivity: Bool
     public var requiresAttention: Bool
     public var failureMessage: String?
+    public var priority: AgentTaskPriority
+    public var queuePosition: Int?
 
     public init(
         status: ThreadActivityStatus = .idle,
         queuedCount: Int = 0,
         hasUnreadActivity: Bool = false,
         requiresAttention: Bool = false,
-        failureMessage: String? = nil
+        failureMessage: String? = nil,
+        priority: AgentTaskPriority = .normal,
+        queuePosition: Int? = nil
     ) {
         self.status = status
         self.queuedCount = max(0, queuedCount)
         self.hasUnreadActivity = hasUnreadActivity
         self.requiresAttention = requiresAttention
         self.failureMessage = failureMessage
+        self.priority = priority
+        self.queuePosition = queuePosition
     }
 }
 
@@ -53,10 +59,13 @@ public enum ThreadActivityAction: Equatable, Sendable {
     case started
     case approvalRequested
     case approvalResolved
+    case approvalQueued(Int)
     case completed
     case failed(String)
     case cancelled
     case attentionHandled
+    case priorityChanged(AgentTaskPriority)
+    case queuePositionChanged(Int?)
 }
 
 /// In-memory ownership for independent thread activity. Transcript persistence remains the
@@ -98,6 +107,7 @@ public struct ThreadActivityLaneStore: Equatable, Sendable {
             }
         case .started:
             lane.status = .running
+            lane.queuePosition = nil
             lane.requiresAttention = false
             lane.failureMessage = nil
         case .approvalRequested:
@@ -106,6 +116,10 @@ public struct ThreadActivityLaneStore: Equatable, Sendable {
             lane.hasUnreadActivity = !isSelected
         case .approvalResolved:
             lane.status = .running
+            lane.requiresAttention = false
+        case .approvalQueued(let count):
+            lane.status = .queued
+            lane.queuedCount = max(1, count)
             lane.requiresAttention = false
         case .completed:
             lane.status = lane.queuedCount > 0 ? .queued : .completed
@@ -122,9 +136,14 @@ public struct ThreadActivityLaneStore: Equatable, Sendable {
             lane.requiresAttention = false
             lane.failureMessage = nil
             lane.hasUnreadActivity = !isSelected
+            lane.queuePosition = nil
         case .attentionHandled:
             if lane.status != .waitingForApproval { lane.requiresAttention = false }
             lane.hasUnreadActivity = false
+        case .priorityChanged(let priority):
+            lane.priority = priority
+        case .queuePositionChanged(let position):
+            lane.queuePosition = position.map { max(1, $0) }
         }
 
         lanes[sessionID] = lane

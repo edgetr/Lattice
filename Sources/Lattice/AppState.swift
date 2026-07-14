@@ -346,6 +346,13 @@ final class AppState: ObservableObject {
     private var retryableRequests: [UUID: String] = [:]
     private var selfEditRunIDs: Set<UUID> = []
     private var activeRunIDs: [UUID: UUID] = [:]
+    private var taskScheduler = AgentTaskScheduler(limits: .init(
+        global: 4,
+        perWorkspace: 2,
+        providerCaps: ["codex": 2, "grok": 2, "opencode": 2, "antigravity": 1, "apple": 1, "ollama": 1],
+        routeCaps: ["lattice/ollama": 1, "lattice/apple": 1]
+    ))
+    private var pendingApprovalResponses: [UUID: (notice: HarnessPermissionNotice, option: ApprovalOption)] = [:]
     private var lastAutomaticConnectionRefreshRequest = Date.distantPast
     @Published private var runUIStates: [UUID: RunUIState] = [:]
     @Published private(set) var threadActivityLanes = ThreadActivityLaneStore()
@@ -367,6 +374,7 @@ final class AppState: ObservableObject {
     private static let openCodeCredentialModesKey = "openCodeCredentialEnabledModes"
     private static let managedRuntimeIDsKey = "latticeManagedRuntimeIDs"
     private static let persistedConnectionStateKey = "persistedConnectionState.v1"
+    private static let schedulerMetadataKey = "agentTaskScheduler.metadata.v1"
 
     private var executionRuntimes: LatticeExecutionRuntimes {
         LatticeExecutionRuntimes(
@@ -469,6 +477,7 @@ final class AppState: ObservableObject {
         selectedRouteEngineID = Self.engineID(for: initialDefaultBackend)
         selectedRouteHarnessID = Self.defaultHarnessID(for: initialDefaultBackend)
         selectedSessionID = LatticeSessionListOrdering.sorted(sessions).first?.id
+        recoverSchedulerMetadata()
         rebuildThreadActivityLanes()
         composerSelectionMode = selectedSession?.executionRoute.mode
         composerSelectionBackend = selectedSession?.backend
@@ -1063,6 +1072,13 @@ final class AppState: ObservableObject {
 
     func cancelThreadActivity(_ sessionID: UUID) {
         stop(sessionID: sessionID)
+    }
+
+    func setThreadPriority(_ priority: AgentTaskPriority, sessionID: UUID) {
+        threadActivityLanes.apply(.priorityChanged(priority), to: sessionID)
+        handleSchedulerAdmissions(taskScheduler.reprioritize(sessionID, to: priority))
+        refreshSchedulerLanes()
+        persistSchedulerMetadata()
     }
 
     func setVisibleComposerState(_ state: MorphingControlState, for sessionID: UUID?) {
@@ -2238,9 +2254,44 @@ final class AppState: ObservableObject {
         sessions[index].isStreaming = true
         sessions[index].lastUpdated = .now
         globalErrorMessage = nil
+        let session = sessions[index]
+        let harnessID = effectiveHarnessID(for: session)
+        let providerID = ExecutionRouteResolver.isDeclared(session.executionRoute)
+            ? session.executionRoute.providerID
+            : Self.engineID(for: session.backend)
+        let routeID = "\(harnessID)/\(providerID)"
+        let isExtensionSelfEdit = isExtensionSelfEditThread(session, submittedText: submittedText)
+        let sensitivity: AgentTaskRecoverySensitivity = isExtensionSelfEdit
+            ? .externallyConsequential
+            : (session.policy == .yolo ? .ordinary : .approvalSensitive)
+        let request = AgentTaskSchedulerRequest(
+            id: id,
+            sessionID: id,
+            resources: .init(
+                workspaceID: workspaceURL(for: session, isExtensionSelfEdit: isExtensionSelfEdit).standardizedFileURL.path,
+                providerID: providerID,
+                routeID: routeID
+            ),
+            priority: threadActivityLanes.lane(for: id).priority,
+            recoverySensitivity: sensitivity
+        )
+        if taskScheduler.snapshot(for: id)?.state == .recoveryHeld {
+            taskScheduler.discardRecovered(id)
+        }
+        let admitted = taskScheduler.submit(request)
+        threadActivityLanes.apply(.queued(1 + session.queuedFollowUps.count), to: id)
+        persist()
+        persistSchedulerMetadata()
+        handleSchedulerAdmissions(admitted)
+        refreshSchedulerLanes()
+    }
+
+    private func launchScheduledRun(for id: UUID) {
+        guard let index = sessions.firstIndex(where: { $0.id == id }),
+              let submittedText = submittedRequests[id],
+              taskScheduler.snapshot(for: id)?.state == .running else { return }
         threadActivityLanes.apply(.started, to: id)
         reduceRunUI(.started, for: id)
-        persist()
 
         let session = sessions[index]
         let isExtensionSelfEdit = isExtensionSelfEditThread(session, submittedText: submittedText)
@@ -2357,6 +2408,73 @@ final class AppState: ObservableObject {
         let runID = UUID()
         activeRunIDs[id] = runID
         Task { for await event in stream { apply(event, to: id, runID: runID) } }
+    }
+
+    private func handleSchedulerAdmissions(_ admitted: [UUID]) {
+        for id in admitted {
+            if taskScheduler.snapshot(for: id)?.isApprovalResume == true,
+               let pending = pendingApprovalResponses.removeValue(forKey: id) {
+                forwardAdmittedHarnessPermission(pending.notice, option: pending.option)
+            } else {
+                launchScheduledRun(for: id)
+            }
+        }
+        refreshSchedulerLanes()
+        persistSchedulerMetadata()
+    }
+
+    private func refreshSchedulerLanes() {
+        for snapshot in taskScheduler.snapshots {
+            let id = snapshot.request.sessionID
+            threadActivityLanes.apply(.priorityChanged(snapshot.request.priority), to: id)
+            threadActivityLanes.apply(.queuePositionChanged(snapshot.queuePosition), to: id)
+            switch snapshot.state {
+            case .queued:
+                let followUps = sessions.first(where: { $0.id == id })?.queuedFollowUps.count ?? 0
+                if snapshot.isApprovalResume {
+                    threadActivityLanes.apply(.approvalQueued(1 + followUps), to: id)
+                } else {
+                    threadActivityLanes.apply(.queued(1 + followUps), to: id)
+                }
+            case .running:
+                let followUps = sessions.first(where: { $0.id == id })?.queuedFollowUps.count ?? 0
+                threadActivityLanes.apply(.queued(followUps), to: id)
+                threadActivityLanes.apply(.started, to: id)
+            case .waitingForApproval:
+                let followUps = sessions.first(where: { $0.id == id })?.queuedFollowUps.count ?? 0
+                threadActivityLanes.apply(.queued(followUps), to: id)
+                threadActivityLanes.apply(.approvalRequested, to: id)
+            case .recoveryHeld:
+                threadActivityLanes.apply(.failed("Interrupted work was not replayed. Review the chat and submit it again."), to: id)
+            }
+        }
+    }
+
+    private func persistSchedulerMetadata() {
+        guard let data = try? JSONEncoder().encode(taskScheduler.persistedMetadata) else { return }
+        UserDefaults.standard.set(data, forKey: Self.schedulerMetadataKey)
+    }
+
+    private func recoverSchedulerMetadata() {
+        guard let data = UserDefaults.standard.data(forKey: Self.schedulerMetadataKey),
+              let metadata = try? JSONDecoder().decode(PersistedAgentTaskQueue.self, from: data) else { return }
+        taskScheduler.recover(metadata)
+        // Remove metadata for sessions the durable session store no longer owns.
+        let knownSessionIDs = Set(sessions.map(\.id))
+        for snapshot in taskScheduler.snapshots where !knownSessionIDs.contains(snapshot.request.sessionID) {
+            taskScheduler.discardRecovered(snapshot.request.id)
+        }
+        for snapshot in taskScheduler.snapshots where snapshot.state == .recoveryHeld {
+            if let index = sessions.firstIndex(where: { $0.id == snapshot.request.sessionID }) {
+                sessions[index].isStreaming = false
+                if sessions[index].messages.last?.role == .assistant,
+                   sessions[index].messages.last?.text.isEmpty == true {
+                    sessions[index].messages.removeLast()
+                }
+            }
+        }
+        // Recovery-held work is intentionally not written back as executable queue metadata.
+        persistSchedulerMetadata()
     }
 
     private func normalizeSessionBackendBeforeRun(at index: Int) {
@@ -2793,6 +2911,7 @@ final class AppState: ObservableObject {
     func stop(sessionID id: UUID) {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
         let session = sessions[index]
+        let schedulerState = taskScheduler.snapshot(for: id)?.state
         if let request = submittedRequests[id] { retryableRequests[id] = request }
         activeRunIDs[id] = nil
         finishPendingActions(status: .cancelled, at: index)
@@ -2803,9 +2922,13 @@ final class AppState: ObservableObject {
         reduceRunUI(.cancelled, for: id)
         threadActivityLanes.apply(.cancelled, to: id)
         harnessPermissionNotices[id] = nil
+        pendingApprovalResponses[id] = nil
         providerSessionHealth[id] = nil
+        if schedulerState == .running || schedulerState == .waitingForApproval {
+            cancelHarnessProcess(for: session, sessionID: id)
+        }
+        handleSchedulerAdmissions(taskScheduler.cancel(id))
         persist()
-        cancelHarnessProcess(for: session, sessionID: id)
     }
 
     private func cancelHarnessProcess(for session: LatticeSession, sessionID id: UUID) {
@@ -2849,6 +2972,16 @@ final class AppState: ObservableObject {
             updateSessionAction(id: notice.request.id, status: .cancelled, sessionID: notice.sessionID)
             return
         }
+        pendingApprovalResponses[notice.sessionID] = (notice, option)
+        let admitted = taskScheduler.resolveApproval(notice.sessionID)
+        handleSchedulerAdmissions(admitted)
+        if !admitted.contains(notice.sessionID) {
+            threadActivityLanes.apply(.approvalQueued(1), to: notice.sessionID)
+            refreshSchedulerLanes()
+        }
+    }
+
+    private func forwardAdmittedHarnessPermission(_ notice: HarnessPermissionNotice, option: ApprovalOption) {
         guard forwardHarnessPermission(notice, optionID: option.id) else {
             setError("This permission request is no longer active.", sessionID: notice.sessionID)
             harnessPermissionNotices[notice.sessionID] = nil
@@ -2861,8 +2994,16 @@ final class AppState: ObservableObject {
                     outcome: .stale,
                     providerAcknowledgement: .rejectedByHarness
                 )
+                activeRunIDs[notice.sessionID] = nil
+                sessions[sessionIndex].isStreaming = false
+                finishPendingActions(status: .cancelled, at: sessionIndex)
+                cancelHarnessProcess(for: sessions[sessionIndex], sessionID: notice.sessionID)
             }
             updateSessionAction(id: notice.request.id, status: .cancelled, sessionID: notice.sessionID)
+            reduceRunUI(.failed("The provider could not resume this approval request."), for: notice.sessionID)
+            threadActivityLanes.apply(.failed("The provider could not resume this approval request."), to: notice.sessionID)
+            handleSchedulerAdmissions(taskScheduler.finish(notice.sessionID))
+            persist()
             return
         }
         harnessPermissionNotices[notice.sessionID] = nil
@@ -2886,6 +3027,8 @@ final class AppState: ObservableObject {
         ], sessionID: notice.sessionID)
         reduceRunUI(.permissionResolved, for: notice.sessionID)
         threadActivityLanes.apply(.approvalResolved, to: notice.sessionID)
+        refreshSchedulerLanes()
+        persistSchedulerMetadata()
     }
 
     private func forwardHarnessPermission(_ notice: HarnessPermissionNotice, optionID: String?) -> Bool {
@@ -6461,6 +6604,7 @@ Lattice self-edit rules:
                     reduceRunUI(.failed("The provider rejected Lattice's automatic permission decision."), for: id)
                     threadActivityLanes.apply(.failed("The provider rejected Lattice's automatic permission decision."), to: id)
                     cancelHarnessProcess(for: sessions[index], sessionID: id)
+                    handleSchedulerAdmissions(taskScheduler.finish(id))
                     persist()
                     return
                 }
@@ -6492,12 +6636,16 @@ Lattice self-edit rules:
                 reduceRunUI(.failed("Blocked by Lattice policy: \(reason)"), for: id)
                 threadActivityLanes.apply(.failed("Blocked by Lattice policy: \(reason)"), to: id)
                 cancelHarnessProcess(for: sessions[index], sessionID: id)
+                handleSchedulerAdmissions(taskScheduler.finish(id))
                 persist()
             case .requestUser:
                 harnessPermissionNotices[id] = notice
                 setActivity([.init(icon: "hand.raised.fill", title: request.title, detail: "Waiting for your decision")], sessionID: id)
                 reduceRunUI(.permissionRequested, for: id)
                 threadActivityLanes.apply(.approvalRequested, to: id)
+                // Structured harnesses are suspended at this boundary with no tool executing,
+                // so capacity can be released and must be reacquired before forwarding a choice.
+                handleSchedulerAdmissions(taskScheduler.waitForApproval(id, releasesExecutionSlot: true))
             }
         case .permissionDecided(let decision):
             if harnessPermissionNotices[id]?.request.id == decision.requestID {
@@ -6593,6 +6741,7 @@ Lattice self-edit rules:
             }
             submittedRequests[id] = nil
             retryableRequests[id] = nil
+            handleSchedulerAdmissions(taskScheduler.finish(id))
             if runNextQueuedFollowUpIfPossible(for: id) { return }
             persist()
             scheduleIdleUnloadIfNeeded(for: backend)
@@ -6606,6 +6755,7 @@ Lattice self-edit rules:
             submittedRequests[id] = nil
             reduceRunUI(.cancelled, for: id)
             threadActivityLanes.apply(.cancelled, to: id)
+            handleSchedulerAdmissions(taskScheduler.finish(id))
             persist()
             scheduleIdleUnloadIfNeeded(for: backend)
         case .failed(let message):
@@ -6624,6 +6774,7 @@ Lattice self-edit rules:
             sessions[index].isStreaming = false
             reduceRunUI(.failed(message), for: id)
             threadActivityLanes.apply(.failed(message), to: id)
+            handleSchedulerAdmissions(taskScheduler.finish(id))
             if sessions[index].messages.last?.text.isEmpty == true { sessions[index].messages.removeLast() }
             persist()
             scheduleIdleUnloadIfNeeded(for: backend)
@@ -6854,6 +7005,7 @@ Lattice self-edit rules:
             rebuilt.apply(.queued(session.queuedFollowUps.count), to: session.id)
         }
         threadActivityLanes = rebuilt
+        refreshSchedulerLanes()
     }
 
     private func replacePersistenceRecoveryIssue(_ issue: DurableStoreIssue) {

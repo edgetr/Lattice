@@ -32,7 +32,7 @@ struct SessionListAccessibilityPolicyTests {
 
         #expect(
             SessionListAccessibilityPolicy.value(for: session, activity: lane)
-                == "0 messages, Waiting for approval, Not pinned, 2 queued, Unread activity, Needs attention"
+                == "0 messages, Waiting for approval, Not pinned, 2 queued, Normal priority, Unread activity, Needs attention"
         )
     }
 }

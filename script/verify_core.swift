@@ -35,6 +35,30 @@ struct CoreVerification {
             expect(false, "Secret-free connection state encodes")
         }
 
+        var scheduler = AgentTaskScheduler(
+            limits: .init(global: 1, perWorkspace: 1, providerCaps: ["codex": 1]),
+            fairnessInterval: 1
+        )
+        func scheduledRequest(_ id: UUID, priority: AgentTaskPriority = .normal) -> AgentTaskSchedulerRequest {
+            AgentTaskSchedulerRequest(
+                id: id,
+                sessionID: id,
+                resources: .init(workspaceID: "verify-workspace", providerID: "codex", routeID: "codex/openai"),
+                priority: priority
+            )
+        }
+        let scheduledFirst = UUID(), scheduledLow = UUID(), scheduledHigh = UUID()
+        expect(scheduler.submit(scheduledRequest(scheduledFirst)) == [scheduledFirst], "Scheduler admits within global and workspace limits")
+        expect(scheduler.submit(scheduledRequest(scheduledLow, priority: .low)).isEmpty, "Scheduler queues work over its limits")
+        expect(scheduler.submit(scheduledRequest(scheduledHigh, priority: .high)).isEmpty, "Scheduler queues priority work without exceeding capacity")
+        expect(scheduler.finish(scheduledFirst) == [scheduledHigh], "Scheduler admits high priority work first")
+        expect(scheduler.waitForApproval(scheduledHigh, releasesExecutionSlot: true) == [scheduledLow], "Approval waiting safely releases execution capacity")
+        expect(scheduler.resolveApproval(scheduledHigh).isEmpty, "Approval resumption waits to reacquire capacity")
+        expect(scheduler.finish(scheduledLow) == [scheduledHigh], "Approval resumption reacquires capacity deterministically")
+        var recoveredScheduler = AgentTaskScheduler()
+        recoveredScheduler.recover(.init(entries: [scheduledRequest(UUID(), priority: .high)]))
+        expect(recoveredScheduler.snapshots.allSatisfy { $0.state == .recoveryHeld }, "Recovered queue metadata is held and never automatically replayed")
+
         let transportRoundTrip = await BoundedSubprocess.performOffCooperativeExecutor {
             let transport = BoundedProcessTransport(request: .init(
                 executableURL: URL(fileURLWithPath: "/bin/sh"),

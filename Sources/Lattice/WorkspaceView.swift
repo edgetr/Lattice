@@ -473,7 +473,8 @@ struct SessionListView: View {
                             selected: state.selectedSessionID == session.id,
                             activityLane: lane,
                             onCancel: { state.cancelThreadActivity(session.id) },
-                            onAttention: { state.focusThreadAttention(session.id) }
+                            onAttention: { state.focusThreadAttention(session.id) },
+                            onPriorityChange: { state.setThreadPriority($0, sessionID: session.id) }
                         )
                         .tag(session.id)
                         .accessibilityIdentifier(LatticeAccessibilityID.sessionRow(session.id))
@@ -559,6 +560,7 @@ struct SessionRow: View {
     let activityLane: ThreadActivityLane
     let onCancel: () -> Void
     let onAttention: () -> Void
+    let onPriorityChange: (AgentTaskPriority) -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -594,6 +596,26 @@ struct SessionRow: View {
                         Text(statusText)
                             .lineLimit(1)
                         Spacer(minLength: 2)
+                        Menu {
+                            ForEach(AgentTaskPriority.allCases.reversed(), id: \.self) { priority in
+                                Button {
+                                    onPriorityChange(priority)
+                                } label: {
+                                    if priority == activityLane.priority {
+                                        Label(priority.label, systemImage: "checkmark")
+                                    } else {
+                                        Text(priority.label)
+                                    }
+                                }
+                            }
+                        } label: {
+                            Text(activityLane.priority.label)
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                        .accessibilityLabel("Priority for \(session.title)")
+                        .accessibilityValue(activityLane.priority.label)
+                        .help("Change queued task priority")
                         if activityLane.status.canCancel {
                             Button(action: onCancel) {
                                 Image(systemName: "stop.fill")
@@ -633,6 +655,10 @@ struct SessionRow: View {
         if activityLane.queuedCount > 0 {
             value += " · \(activityLane.queuedCount) queued"
         }
+        if let queuePosition = activityLane.queuePosition {
+            value += " · position \(queuePosition)"
+        }
+        value += " · \(activityLane.priority.label) priority"
         return value
     }
 

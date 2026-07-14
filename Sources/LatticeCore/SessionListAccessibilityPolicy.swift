@@ -11,6 +11,8 @@ public enum SessionListAccessibilityPolicy: Sendable {
         let pinnedPart = session.isPinned ? "Pinned" : "Not pinned"
         var parts = [messagePart, activityPart, pinnedPart]
         if activity.queuedCount > 0 { parts.append("\(activity.queuedCount) queued") }
+        if activity.status != .idle { parts.append("\(activity.priority.label) priority") }
+        if let queuePosition = activity.queuePosition { parts.append("Queue position \(queuePosition)") }
         if activity.hasUnreadActivity { parts.append("Unread activity") }
         if activity.requiresAttention { parts.append("Needs attention") }
         return parts.joined(separator: ", ")
