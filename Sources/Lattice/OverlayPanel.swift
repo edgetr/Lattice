@@ -652,7 +652,9 @@ struct OverlayView: View {
         }
         reserved += 12 // transcript → composer stack spacing
         if !state.attachments.isEmpty { reserved += 36 + 8 }
-        if commandSuggestionCount > 0 { reserved += Double(min(commandSuggestionCount, 8)) * 48 + 8 }
+        if commandSuggestionCount > 0 {
+            reserved += CommandSuggestionLayoutPolicy.height(resultCount: commandSuggestionCount) + 8
+        }
         if state.canContinueSelectedSession { reserved += 30 + 8 }
         if !state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            !state.canSendDraft,

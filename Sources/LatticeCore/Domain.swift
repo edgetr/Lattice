@@ -193,6 +193,18 @@ public enum LatticeAppCommandCatalog {
     }
 }
 
+/// Keeps slash-command discovery useful without allowing a large catalog to
+/// consume the conversation viewport. Results remain scrollable, not truncated.
+public enum CommandSuggestionLayoutPolicy {
+    public static let maximumVisibleRows = 7
+    public static let estimatedRowHeight = 54.0
+
+    public static func height(resultCount: Int) -> Double {
+        guard resultCount > 0 else { return 0 }
+        return Double(min(resultCount, maximumVisibleRows)) * estimatedRowHeight
+    }
+}
+
 public struct LatticeCommandPaletteItem: Identifiable, Hashable, Sendable {
     public let id: String
     public let title: String

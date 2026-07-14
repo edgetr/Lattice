@@ -118,4 +118,11 @@ struct CatalogPresentationPolicyTests {
         #expect(!LatticeOnboardingStep.welcome.body.isEmpty)
         #expect(LatticeOnboardingStep.ready.headingIdentifier.contains("3"))
     }
+
+    @Test func commandSuggestionsHaveABoundedScrollableViewport() {
+        #expect(CommandSuggestionLayoutPolicy.height(resultCount: 0) == 0)
+        #expect(CommandSuggestionLayoutPolicy.height(resultCount: 1) == CommandSuggestionLayoutPolicy.estimatedRowHeight)
+        #expect(CommandSuggestionLayoutPolicy.height(resultCount: 7) == 378)
+        #expect(CommandSuggestionLayoutPolicy.height(resultCount: 100) == 378)
+    }
 }

@@ -561,35 +561,39 @@ struct AppCommandSuggestionList: View {
     let choose: (LatticeAppCommand) -> Void
 
     var body: some View {
-        VStack(spacing: 0) {
-            ForEach(commands) { command in
-                Button { choose(command) } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: "slash.circle")
-                            .foregroundStyle(.pink)
-                            .frame(width: 18)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(command.invocation)
-                                .font(.system(.caption, design: .monospaced, weight: .semibold))
-                            Text(command.title)
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                ForEach(commands) { command in
+                    Button { choose(command) } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: "slash.circle")
+                                .foregroundStyle(.pink)
+                                .frame(width: 18)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(command.invocation)
+                                    .font(.system(.caption, design: .monospaced, weight: .semibold))
+                                Text(command.title)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            Spacer()
+                            Text(command.detail)
                                 .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
                         }
-                        Spacer()
-                        Text(command.detail)
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                            .lineLimit(1)
+                        .contentShape(Rectangle())
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 10)
                     }
-                    .contentShape(Rectangle())
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 10)
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("\(command.invocation), \(command.title)")
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("\(command.invocation), \(command.title)")
             }
         }
+        .scrollIndicators(commands.count > CommandSuggestionLayoutPolicy.maximumVisibleRows ? .visible : .hidden)
+        .frame(height: CGFloat(CommandSuggestionLayoutPolicy.height(resultCount: commands.count)))
         .latticeGlass(cornerRadius: 12, tint: .pink.opacity(0.12))
     }
 }
