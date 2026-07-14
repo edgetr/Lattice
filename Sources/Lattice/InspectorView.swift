@@ -175,6 +175,8 @@ struct ModelsView: View {
         isOllamaCatalogAuthoritative ? Set(state.ollamaModels.map(\.name)) : []
     }
 
+    private var displayedInstalledTags: Set<String> { Set(state.ollamaModels.map(\.name)) }
+
     private var isOllamaCatalogAuthoritative: Bool {
         state.ollamaCatalogStatus == .loaded || state.ollamaCatalogStatus == .empty
     }
@@ -182,89 +184,11 @@ struct ModelsView: View {
     var body: some View {
         AdaptiveCatalogPage { contentWidth in
             VStack(alignment: .leading, spacing: 20) {
-                PageHeader(title: "Models", subtitle: "\(state.hardware.chipName) · \(state.hardware.physicalMemoryGB) GB unified memory · \(state.hardware.thermalState)")
+                PageHeader(title: "Local Models", subtitle: "Recommended for \(state.hardware.chipName) · \(state.hardware.physicalMemoryGB) GB unified memory · \(state.hardware.thermalState)")
 
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Built into macOS").font(.headline)
                     appleIntelligenceCard
-                }
-
-                if state.isRefreshingConnections {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text("Refreshing connected provider models…")
-                            .foregroundStyle(.secondary)
-                    }
-                    .accessibilityElement(children: .combine)
-                    .accessibilityLabel("Refreshing connected provider models")
-                    .accessibilityAddTraits(.updatesFrequently)
-                } else if state.codexModels.isEmpty,
-                          state.grokModels.isEmpty,
-                          state.openCodeModels.isEmpty,
-                          state.antigravityModels.isEmpty,
-                          state.hasProviderCatalogProblem {
-                    catalogProblemState
-                } else if state.hasConnectedProviderCatalog
-                            || [state.codexCatalogStatus, state.grokCatalogStatus, state.openCodeCatalogStatus]
-                                .contains(where: { $0 == .loading || $0 == .failed }) {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("Connected provider models").font(.headline)
-                        if state.codexModels.isEmpty, state.codexCatalogStatus == .failed {
-                            ModelsCatalogNotice(provider: "Codex", state: state)
-                        }
-                        if state.grokModels.isEmpty, state.grokCatalogStatus == .failed {
-                            ModelsCatalogNotice(provider: "Grok", state: state)
-                        }
-                        if state.openCodeModels.isEmpty, state.openCodeCatalogStatus == .failed {
-                            ModelsCatalogNotice(provider: "OpenCode", state: state)
-                        }
-                        CatalogCardGrid(contentWidth: contentWidth, minimum: LatticeCatalogPageLayout.providerCardMinimum, maximum: LatticeCatalogPageLayout.providerCardMaximum) {
-                            if state.codexReady || state.codex.isInstalled || !state.codexModels.isEmpty {
-                                ProviderModelSection(
-                                    providerName: "Codex",
-                                    providerID: "codex",
-                                    models: state.codexModels,
-                                    ready: state.codexReady,
-                                    unavailableDetail: state.codex.isInstalled ? "Sign in required" : "Not installed",
-                                    state: state
-                                ) { .codex(model: $0.id) }
-                            }
-                            if state.grokReady || state.grok.isInstalled || !state.grokModels.isEmpty {
-                                ProviderModelSection(
-                                    providerName: "Grok",
-                                    providerID: "grok",
-                                    models: state.grokModels,
-                                    ready: state.grokReady,
-                                    unavailableDetail: state.grok.isInstalled ? "Sign in or ACP unavailable" : "Not installed",
-                                    state: state
-                                ) { .grok(model: $0.id) }
-                            }
-                            if state.openCodeReady || state.openCode.isInstalled || !state.openCodeModels.isEmpty {
-                                ProviderModelSection(
-                                    providerName: "OpenCode",
-                                    providerID: "opencode",
-                                    models: state.openCodeModels,
-                                    ready: state.openCodeReady,
-                                    unavailableDetail: state.openCode.isInstalled ? "Sign in or ACP unavailable" : "Not installed",
-                                    state: state
-                                ) { .openCode(model: $0.id) }
-                            }
-                            if state.antigravityAuthenticated || state.antigravityInstalled || !state.antigravityModels.isEmpty {
-                                ProviderModelSection(
-                                    providerName: "Antigravity",
-                                    providerID: "antigravity",
-                                    models: state.antigravityModels,
-                                    ready: state.antigravityAuthenticated,
-                                    unavailableDetail: state.antigravityInstalled ? "Sign in required" : "Not installed",
-                                    state: state
-                                ) { .antigravity(model: $0.id) }
-                            }
-                        }
-                    }
-                } else if state.hasProviderCatalogProblem {
-                    catalogProblemState
-                } else {
-                    catalogEmptyState
                 }
 
                 if !state.ollamaModels.isEmpty {
@@ -282,10 +206,10 @@ struct ModelsView: View {
                                         Text(ByteCountFormatter.string(fromByteCount: model.size, countStyle: .file)).font(.caption).foregroundStyle(.secondary)
                                     }
                                     Spacer(minLength: 8)
-                                    Button("Use") { state.useBackendInChat(backend) }
+                                    Button("Start Chat") { state.startNewChat(with: backend) }
                                         .disabled(!runnable)
-                                        .accessibilityHint(runnable ? "Use \(model.name) in a chat." : (state.backendUnavailableMessage(for: backend) ?? "This local model is unavailable."))
-                                        .help(runnable ? "Use \(model.name) in a chat." : (state.backendUnavailableMessage(for: backend) ?? "This local model is unavailable."))
+                                        .accessibilityHint(runnable ? "Start a new chat with \(model.name)." : (state.backendUnavailableMessage(for: backend) ?? "This local model is unavailable."))
+                                        .help(runnable ? "Start a new chat with \(model.name)." : (state.backendUnavailableMessage(for: backend) ?? "This local model is unavailable."))
                                 }
                                 .padding(LatticeMetrics.cardPadding)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -319,6 +243,7 @@ struct ModelsView: View {
 
                 ForEach(LocalModelCatalog.categories, id: \.self) { category in
                     let values = LocalModelCatalog.recommendations(for: state.hardware, category: category, fitOnly: showOnlyFittingLocalRecommendations)
+                        .filter { !displayedInstalledTags.contains($0.ollamaTag) }
                     let hiddenCount = LocalModelCatalog.hiddenOversizedRecommendationCount(for: state.hardware, category: category)
                     if !values.isEmpty {
                         VStack(alignment: .leading, spacing: 10) {
@@ -345,8 +270,8 @@ struct ModelsView: View {
                 }
             }
         }
-        .navigationTitle("Models")
-        .toolbar { Button { Task { await state.refreshConnections(refreshProviderCatalogs: true) } } label: { Label("Refresh", systemImage: "arrow.clockwise") } }
+        .navigationTitle("Local Models")
+        .toolbar { Button { Task { await state.refreshLocalModels() } } label: { Label("Refresh Local Models", systemImage: "arrow.clockwise") } }
     }
 
     private var catalogProblemState: some View {
@@ -397,10 +322,10 @@ struct ModelsView: View {
             if state.appleIntelligenceReady {
                 let backend = ChatBackend.appleIntelligence
                 let runnable = state.canUseBackendInNewChat(backend)
-                Button("Use") { state.useBackendInChat(backend) }
+                Button("Start Chat") { state.startNewChat(with: backend) }
                     .disabled(!runnable)
-                    .accessibilityHint(runnable ? "Use Apple Intelligence in a chat." : (state.backendUnavailableMessage(for: backend) ?? "Apple Intelligence is unavailable."))
-                    .help(runnable ? "Use Apple Intelligence in a chat." : (state.backendUnavailableMessage(for: backend) ?? "Apple Intelligence is unavailable."))
+                    .accessibilityHint(runnable ? "Start a new chat with Apple Intelligence." : (state.backendUnavailableMessage(for: backend) ?? "Apple Intelligence is unavailable."))
+                    .help(runnable ? "Start a new chat with Apple Intelligence." : (state.backendUnavailableMessage(for: backend) ?? "Apple Intelligence is unavailable."))
             }
         }
         .padding(LatticeMetrics.cardPadding)
@@ -422,7 +347,7 @@ struct ModelsView: View {
                 } else if !state.ollamaReady {
                     state.openOllama()
                 } else {
-                    Task { await state.refreshConnections(refreshProviderCatalogs: true) }
+                    Task { await state.refreshLocalModels() }
                 }
             }
         }

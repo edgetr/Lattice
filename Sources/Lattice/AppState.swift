@@ -1077,6 +1077,31 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Starts a distinct chat from a model catalog action. Unlike route switching,
+    /// this never repurposes the currently selected empty chat.
+    func startNewChat(with backend: ChatBackend) {
+        guard canUseBackendInNewChat(backend) else {
+            setError(backendUnavailableMessage(for: backend) ?? "Choose an available model.", sessionID: selectedSessionID)
+            return
+        }
+        let source = selectedSession
+        let harnessID = Self.defaultHarnessID(for: backend)
+        let session = LatticeSession(
+            title: "New chat",
+            backend: backend,
+            harnessID: harnessID,
+            reasoningEffort: defaultReasoning(for: backend, harnessID: harnessID),
+            workspacePath: source?.workspacePath ?? selectedWorkspacePath,
+            policy: source?.policy ?? policy,
+            privacyMode: source?.privacyMode ?? activePrivacyMode
+        )
+        sessions.insert(session, at: 0)
+        selectedSessionID = session.id
+        selectedSection = .conversations
+        clearError()
+        persist()
+    }
+
     func deleteSession(_ id: UUID) {
         let isStreaming = sessions.first(where: { $0.id == id })?.isStreaming == true
         switch SessionDeletionPolicy.decision(forStreamingTarget: id, isStreaming: isStreaming) {
