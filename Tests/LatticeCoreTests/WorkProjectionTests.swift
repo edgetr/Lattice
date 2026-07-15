@@ -560,7 +560,9 @@ struct WorkProjectionTests {
         #expect(!text.contains("secret-question-key"))
         #expect(!text.contains("/Users/secret/project/out/report.pdf"))
         #expect(!text.contains("artifactLocator"))
-        #expect(!text.contains("\"work\""))
+        // Avoid false positives from titles like "portable work".
+        #expect(!text.contains("\"work\":"))
+        #expect(!text.contains("\"work\" :"))
         #expect(!text.contains("should not export answer surface"))
 
         let plan = try SessionPortableArchiveImporter.prepareImport(data: data, existingSessions: [])

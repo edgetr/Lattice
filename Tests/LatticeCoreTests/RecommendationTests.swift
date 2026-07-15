@@ -241,7 +241,8 @@ struct RecommendationTests {
         #expect(ExecutionRoutePolicy.compatibleHarnessIDs(for: "antigravity") == ["antigravity"])
         #expect(ExecutionRoutePolicy.compatibleHarnessIDs(for: "ollama") == ["lattice"])
         #expect(ExecutionRoutePolicy.compatibleHarnessIDs(for: "apple") == ["lattice"])
-        #expect(ExecutionRoutePolicy.normalize(.init(engineID: "codex", harnessID: "lattice"), fallbackEngineID: "codex", fallbackHarnessID: "codex") == .init(engineID: "codex", harnessID: "codex"))
+        // Invalid lattice harness for codex normalizes to the declared default (pi).
+        #expect(ExecutionRoutePolicy.normalize(.init(engineID: "codex", harnessID: "lattice"), fallbackEngineID: "codex", fallbackHarnessID: "codex") == .init(engineID: "codex", harnessID: "pi"))
 
         let declared: [(ConversationMode, String, String?, String)] = [
             (.code, "codex", "gpt-5.5", "pi"),

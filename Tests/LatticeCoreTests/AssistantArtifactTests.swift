@@ -352,7 +352,10 @@ struct AssistantArtifactTests {
         #expect(viewArtifact.provenance.origin == .codexImageView)
         #expect(viewArtifact.provenance.eventID == "view-1")
         #expect(viewArtifact.mimeType == "image/png")
-        #expect(viewArtifact.canonicalPath == viewURL.path)
+        #expect(
+            URL(fileURLWithPath: viewArtifact.canonicalPath).resolvingSymlinksInPath().path
+                == viewURL.resolvingSymlinksInPath().path
+        )
 
         let imageGeneration: [String: Any] = [
             "method": "item/completed",
@@ -376,7 +379,10 @@ struct AssistantArtifactTests {
             return
         }
         #expect(genArtifact.provenance.origin == .codexImageGeneration)
-        #expect(genArtifact.canonicalPath == genURL.path)
+        #expect(
+            URL(fileURLWithPath: genArtifact.canonicalPath).resolvingSymlinksInPath().path
+                == genURL.resolvingSymlinksInPath().path
+        )
         #expect(genArtifact.canonicalPath != "THIS_IS_NOT_A_PATH_OR_FILE_AND_MUST_BE_IGNORED")
     }
 
