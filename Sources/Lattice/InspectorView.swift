@@ -62,6 +62,14 @@ struct InspectorView: View {
         }
     }
 
+    private var inspectorSessionModel: InspectorSessionModel? {
+        guard let session = state.selectedSession else { return nil }
+        return InspectorSessionModel(
+            session: session,
+            usesLegacyDirectOpenCode: state.selectedSessionUsesLegacyDirectOpenCode
+        )
+    }
+
     private var effectiveSurface: InspectorSurface {
         state.selectedSession?.executionRoute.mode == .code ? model.surface : .details
     }
@@ -80,12 +88,13 @@ struct InspectorView: View {
     private func inspectorShell(_ session: LatticeSession) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             InspectorOpaqueSection(title: "Route", systemImage: "point.3.connected.trianglepath.dotted") {
-                InspectorFactRow(title: "Mode", value: session.executionRoute.mode.displayName)
-                InspectorFactRow(title: "Provider", value: session.backend.harnessName)
-                InspectorFactRow(title: "Model", value: session.backend.displayName)
-                InspectorFactRow(title: "Runtime", value: session.executionRoute.runtimeID)
-                if let reasoning = session.reasoningEffort {
-                    InspectorFactRow(title: "Reasoning", value: reasoning.displayName)
+                let model = InspectorSessionModel(session: session, usesLegacyDirectOpenCode: state.selectedSessionUsesLegacyDirectOpenCode)
+                InspectorFactRow(title: "Mode", value: model.modeDisplayName)
+                InspectorFactRow(title: "Provider", value: model.providerDisplayName)
+                InspectorFactRow(title: "Model", value: model.modelDisplayName)
+                InspectorFactRow(title: "Runtime", value: model.runtimeID)
+                if let reasoning = model.reasoningDisplayName {
+                    InspectorFactRow(title: "Reasoning", value: reasoning)
                 }
                 Picker("Execution policy", selection: Binding(get: { session.policy }, set: { state.setSessionPolicy($0) })) {
                     ForEach(ExecutionPolicy.allCases, id: \.self) { Text($0.rawValue).tag($0) }
