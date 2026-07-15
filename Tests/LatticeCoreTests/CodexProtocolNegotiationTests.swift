@@ -50,7 +50,7 @@ struct CodexProtocolNegotiationTests {
 
         #expect(events.contains(.completed))
         let data = try Data(contentsOf: fixture.root.appendingPathComponent("turn.json"))
-        let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let object = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
         let params = try #require(object["params"] as? [String: Any])
         let input = try #require(params["input"] as? [[String: Any]])
         #expect(input.count == 2)

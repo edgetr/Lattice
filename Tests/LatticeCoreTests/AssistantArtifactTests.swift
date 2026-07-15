@@ -59,7 +59,7 @@ struct AssistantArtifactTests {
 
     @Test func legacyManifestJSONWithoutArtifactKeysDecodes() throws {
         let session = LatticeSession(title: "Old", backend: .codex(model: "gpt-5.4"))
-        var object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(session)) as? [String: Any])
+        var object = try #require(try JSONSerialization.jsonObject(with: JSONEncoder().encode(session)) as? [String: Any])
         object["artifacts"] = nil
         object["artifactStorage"] = nil
         let decoded = try JSONDecoder().decode(LatticeSession.self, from: JSONSerialization.data(withJSONObject: object))

@@ -54,7 +54,7 @@ struct ContextAttachmentMetadataTests {
         )
 
         let encoded = try JSONEncoder().encode(attachment)
-        let object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        let object = try #require(try JSONSerialization.jsonObject(with: encoded) as? [String: Any])
         #expect(object["id"] as? String == attachment.id.uuidString)
         #expect(object["path"] as? String == attachment.path)
         #expect(object["isMissing"] as? Bool == false)

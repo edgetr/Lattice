@@ -193,7 +193,7 @@ struct SessionInputOutboxTests {
 
     @Test func contextDecodeMigratesOlderAuthorityShape() throws {
         let encoded = try JSONEncoder().encode(context())
-        var object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        var object = try #require(try JSONSerialization.jsonObject(with: encoded) as? [String: Any])
         object["providerCredentialInjectionEnabled"] = nil
         let migrated = try JSONDecoder().decode(
             SessionInputOutboxContext.self,
@@ -583,16 +583,16 @@ struct SessionInputOutboxTests {
             into: &entries,
             date: fixedDate
         )
-        var ledger = SessionInputOutboxReceiptLedger()
+        let ledger = SessionInputOutboxReceiptLedger()
         let attempt = UUID()
-        #expect(
-            SessionInputOutboxPolicy.claimDispatch(
-                entryID: entries[0].id,
-                currentContext: live,
-                in: &entries,
-                attemptID: attempt
-            ) == .claimed(attemptID: attempt)
+        let claim = SessionInputOutboxPolicy.claimDispatch(
+            entryID: entries[0].id,
+            currentContext: live,
+            in: &entries,
+            attemptID: attempt
         )
+        #expect(claim == .claimed(attemptID: attempt))
+        _ = ledger
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]

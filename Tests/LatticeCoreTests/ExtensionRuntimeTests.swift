@@ -788,7 +788,7 @@ struct ExtensionRuntimeTests {
         #expect(decoded.appliedSkillSnapshots == [appliedSnapshot])
         #expect(decoded.appliedEnabled == true)
 
-        var legacyObject = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(job)) as? [String: Any])
+        var legacyObject = try #require(try JSONSerialization.jsonObject(with: JSONEncoder().encode(job)) as? [String: Any])
         legacyObject.removeValue(forKey: "previousEnabled")
         legacyObject.removeValue(forKey: "previousSkillSnapshots")
         legacyObject.removeValue(forKey: "previousDisabledSkillIDs")
@@ -948,7 +948,7 @@ struct ExtensionRuntimeTests {
         #expect(decoded.previousSkillSnapshots.isEmpty)
         #expect(decoded.previousDisabledSkillIDs == ["subagents"])
 
-        var legacyObject = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(preview)) as? [String: Any])
+        var legacyObject = try #require(try JSONSerialization.jsonObject(with: JSONEncoder().encode(preview)) as? [String: Any])
         legacyObject.removeValue(forKey: "previousEnabled")
         legacyObject.removeValue(forKey: "previousSkillSnapshots")
         legacyObject.removeValue(forKey: "previousDisabledSkillIDs")

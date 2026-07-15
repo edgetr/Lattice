@@ -7,9 +7,9 @@ struct BoundedProtocolReaderTests {
     @Test func preservesValidFramesAndEOFPartialFrame() throws {
         let reader = try makeReader(Data("{\"id\":1}\n{\"id\":2}".utf8))
 
-        let first = try #require(reader.next())
+        let first = try #require(try reader.next())
         #expect(first["id"] as? Int == 1)
-        let second = try #require(reader.next())
+        let second = try #require(try reader.next())
         #expect(second["id"] as? Int == 2)
         #expect(try reader.next() == nil)
     }

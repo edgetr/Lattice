@@ -227,7 +227,7 @@ struct DurableStoreRecoveryTests {
             summary: "Warm theme",
             previousManifestData: nil
         )
-        var object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(job)) as? [String: Any])
+        var object = try #require(try JSONSerialization.jsonObject(with: JSONEncoder().encode(job)) as? [String: Any])
         object.removeValue(forKey: "previousEnabled")
         object.removeValue(forKey: "previousSkillSnapshots")
         object.removeValue(forKey: "previousDisabledSkillIDs")

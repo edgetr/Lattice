@@ -443,7 +443,7 @@ struct SessionPersistenceTests {
 
     @Test func decodesLegacySessionWithoutActionsQueueOrPin() throws {
         let session = LatticeSession(title: "Legacy", backend: .codex(model: "gpt-5.4"))
-        var object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(session)) as? [String: Any])
+        var object = try #require(try JSONSerialization.jsonObject(with: JSONEncoder().encode(session)) as? [String: Any])
         object["actions"] = nil
         object["queuedFollowUps"] = nil
         object["isPinned"] = nil
@@ -471,7 +471,7 @@ struct SessionPersistenceTests {
         let encoded = try JSONEncoder().encode(message)
         #expect(try JSONDecoder().decode(ChatMessage.self, from: encoded).isPinned)
 
-        var object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        var object = try #require(try JSONSerialization.jsonObject(with: encoded) as? [String: Any])
         object["isPinned"] = nil
         let decodedLegacy = try JSONDecoder().decode(ChatMessage.self, from: JSONSerialization.data(withJSONObject: object))
         #expect(decodedLegacy.isPinned == false)
