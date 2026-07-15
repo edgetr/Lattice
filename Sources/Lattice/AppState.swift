@@ -44,43 +44,6 @@ enum WorkspaceSection: String, CaseIterable, Identifiable {
     }
 }
 
-struct EditableSelfEditSkillDraft: Equatable {
-    var title: String
-    var summary: String
-    var markdown: String
-}
-
-struct EditableSelfEditManifestDraft: Equatable {
-    var name: String
-    var version: String
-    var summary: String
-}
-
-struct EditableSelfEditStylePatchDraft: Equatable {
-    var tintHex: String
-    var accentHex: String
-    var cornerRadius: String
-}
-
-struct EditableSelfEditLayoutPatchDraft: Equatable {
-    var density: LatticeLayoutDensity
-}
-
-struct EditableSelfEditCopyPatchDraft: Equatable {
-    var text: String
-}
-
-struct EditableSelfEditPromptTemplateDraft: Equatable {
-    var invocation: String
-    var title: String
-    var detail: String
-    var prompt: String
-}
-
-struct EditableSelfEditOperationPreviewDraft: Equatable {
-    var summary: String
-    var detail: String
-}
 
 typealias ActivityItem = RunUIActivity
 
@@ -142,6 +105,32 @@ final class AppState: ObservableObject {
             if selectedSessionID != nil {
                 isTransientNewChat = false
                 composerSelectionMode = selectedSession?.executionRoute.mode
+        workspaceTools.workspacePathProvider = { [weak self] in
+            guard let self else { return "" }
+            return self.activeWorkspacePathForTools
+        }
+        workspaceTools.onWorkspaceActionMessage = { [weak self] message in
+            self?.workspaceActionMessage = message
+        }
+        // Forward nested tool updates into AppState for existing view bindings.
+        workspaceTools.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }.store(in: &cancellables)
+        selfEditDrafts.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }.store(in: &cancellables)
+        providerConnections.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }.store(in: &cancellables)
+        composer.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }.store(in: &cancellables)
+        sessionCatalog.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }.store(in: &cancellables)
+        runOrchestrator.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }.store(in: &cancellables)
                 composerSelectionBackend = selectedSession?.backend
             } else {
                 composerSelectionMode = nil
@@ -223,46 +212,34 @@ final class AppState: ObservableObject {
     /// When true, do not auto-change columns until the window is comfortably wide again.
     private var respectsUserColumnChoice = false
     @Published var selectedWorkspacePath: String
-    @Published private(set) var workspaceActionMessage: String?
-    // MARK: Work-loop surfaces (workspace-scoped; not chat transcript)
-    @Published var showFileBrowser = false
-    @Published var showWorkspaceTerminal = false
-    /// True when the terminal dock is preferred open but layout hid it to protect transcript height.
-    @Published private(set) var workspaceTerminalLayoutSuppressed = false
-    @Published private(set) var fileBrowserRootPath = ""
-    @Published private(set) var fileBrowserRelativeDirectory = ""
-    @Published private(set) var fileBrowserNodes: [WorkspaceFileNode] = []
-    @Published private(set) var fileBrowserSelectedPath: String?
-    @Published private(set) var fileBrowserPinnedPaths: [String] = []
-    @Published private(set) var fileBrowserPreview: WorkspaceFilePreview?
-    @Published private(set) var fileBrowserPreviewImage: NSImage?
-    @Published private(set) var fileBrowserIsLoading = false
-    @Published private(set) var fileBrowserPreviewLoading = false
-    @Published private(set) var fileBrowserTruncated = false
-    @Published private(set) var fileBrowserError: String?
-    @Published var terminalCommandDraft = ""
-    @Published private(set) var workspaceTerminalSnapshot: WorkspaceTerminalSnapshot?
-    @Published private(set) var workspaceTerminalIsRunning = false
-    private var fileBrowserListGeneration = 0
-    private var fileBrowserPreviewGeneration = 0
-    private var fileBrowserListTask: Task<Void, Never>?
-    private var fileBrowserPreviewTask: Task<Void, Never>?
-    private var workspaceTerminalStore = WorkspaceTerminalStore()
-    private var workspaceTerminalProcess: Process?
-    private var workspaceTerminalStdoutPipe: Pipe?
-    private var workspaceTerminalStderrPipe: Pipe?
-    /// Monotonic run identity so stale termination/read handlers cannot clobber a newer run.
-    private var workspaceTerminalRunID = UUID()
-    /// Worktree path for the currently tracked process (if any).
-    private var workspaceTerminalRunningWorktreePath: String?
-    private var workspaceTerminalProcessGroupID: pid_t?
-    private let fileLister = WorkspaceFileLister()
+    @Published var workspaceActionMessage: String?
+    // MARK: Work-loop surfaces (owned by WorkspaceToolsController)
+    let workspaceTools = WorkspaceToolsController()
+    let providerConnections = ProviderConnectionStore()
+    let composer = ComposerController()
+    let sessionCatalog = SessionCatalogStore()
+    let runOrchestrator = RunOrchestrator()
     /// New Chat setup stays transient until a message or attachment needs a durable session.
-    @Published private(set) var isTransientNewChat = false
-    @Published private(set) var composerSelectionMode: ConversationMode?
-    @Published private(set) var composerSelectionBackend: ChatBackend?
-    @Published var composerRoutePopoverPresented = false
-    @Published var composerModelSearchText = ""
+    var isTransientNewChat: Bool {
+        get { composer.isTransientNewChat }
+        set { composer.setTransientNewChat(newValue) }
+    }
+    var composerSelectionMode: ConversationMode? {
+        get { composer.selectionMode }
+        set { composer.setSelection(mode: newValue, backend: composer.selectionBackend) }
+    }
+    var composerSelectionBackend: ChatBackend? {
+        get { composer.selectionBackend }
+        set { composer.setSelection(mode: composer.selectionMode, backend: newValue) }
+    }
+    var composerRoutePopoverPresented: Bool {
+        get { composer.routePopoverPresented }
+        set { composer.routePopoverPresented = newValue }
+    }
+    var composerModelSearchText: String {
+        get { composer.modelSearchText }
+        set { composer.modelSearchText = newValue }
+    }
     @Published var includeScreenshotContext = false
     @Published private(set) var captureLifecycle = CaptureLifecycleState()
     @Published private(set) var computerFrameAccumulators: [UUID: ComputerFrameAccumulator] = [:]
@@ -340,8 +317,11 @@ final class AppState: ObservableObject {
     @Published var appleIntelligenceStatus = "Checking…"
     @Published var ollamaInstalled = false
     @Published var ollamaReady = false
-    /// Map-driven connection observations. Dual-written with legacy fields during migration.
-    @Published private(set) var providerSnapshots: [String: ProviderRuntimeSnapshot] = [:]
+    /// Map-driven connection observations (owned by ProviderConnectionStore).
+    var providerSnapshots: [String: ProviderRuntimeSnapshot] {
+        get { providerConnections.snapshots }
+        set { providerConnections.replaceAll(newValue) }
+    }
 
     @Published var grokUpdateStatus = ""
     @Published var extensions: [LatticeExtensionRecord] = []
@@ -349,15 +329,7 @@ final class AppState: ObservableObject {
     @Published var selfEditJobs: [LatticeExtensionJobRecord] = []
     @Published private(set) var folderActionMessage: String?
     @Published var selfEditPreviews: [LatticeExtensionPreviewRecord] = []
-    @Published var expandedSelfEditSkillPreviewIDs: Set<String> = []
-    @Published var expandedSelfEditReviewIDs: Set<UUID> = []
-    @Published var editableSelfEditManifestDrafts: [UUID: EditableSelfEditManifestDraft] = [:]
-    @Published var editableSelfEditSkillDrafts: [String: EditableSelfEditSkillDraft] = [:]
-    @Published var editableSelfEditStylePatchDrafts: [String: EditableSelfEditStylePatchDraft] = [:]
-    @Published var editableSelfEditLayoutPatchDrafts: [String: EditableSelfEditLayoutPatchDraft] = [:]
-    @Published var editableSelfEditCopyPatchDrafts: [String: EditableSelfEditCopyPatchDraft] = [:]
-    @Published var editableSelfEditPromptTemplateDrafts: [String: EditableSelfEditPromptTemplateDraft] = [:]
-    @Published var editableSelfEditOperationPreviewDrafts: [String: EditableSelfEditOperationPreviewDraft] = [:]
+    let selfEditDrafts = SelfEditDraftStore()
     /// Durable store load failures that require explicit, non-destructive recovery before saves resume.
     @Published var persistenceRecoveryIssues: [DurableStoreIssue] = []
     @Published var expandedPersistenceRecoveryDetailIDs: Set<String> = []
@@ -592,6 +564,32 @@ final class AppState: ObservableObject {
         recoverSchedulerMetadata()
         rebuildThreadActivityLanes()
         composerSelectionMode = selectedSession?.executionRoute.mode
+        workspaceTools.workspacePathProvider = { [weak self] in
+            guard let self else { return "" }
+            return self.activeWorkspacePathForTools
+        }
+        workspaceTools.onWorkspaceActionMessage = { [weak self] message in
+            self?.workspaceActionMessage = message
+        }
+        // Forward nested tool updates into AppState for existing view bindings.
+        workspaceTools.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }.store(in: &cancellables)
+        selfEditDrafts.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }.store(in: &cancellables)
+        providerConnections.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }.store(in: &cancellables)
+        composer.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }.store(in: &cancellables)
+        sessionCatalog.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }.store(in: &cancellables)
+        runOrchestrator.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }.store(in: &cancellables)
         composerSelectionBackend = selectedSession?.backend
         // Property observers do not run for assignments made during initialization, so load the
         // restored selection's durable draft explicitly for the workspace and overlay composers.
@@ -4466,11 +4464,11 @@ final class AppState: ObservableObject {
 
 
     private func providerSnapshot(for key: ProviderConnectionKey) -> ProviderRuntimeSnapshot {
-        ProviderRuntimeSnapshotStore.snapshot(in: providerSnapshots, key: key)
+        providerConnections.snapshot(for: key)
     }
 
     private func setProviderSnapshot(_ snapshot: ProviderRuntimeSnapshot, for key: ProviderConnectionKey) {
-        ProviderRuntimeSnapshotStore.upsert(&providerSnapshots, key: key, snapshot: snapshot)
+        providerConnections.setSnapshot(snapshot, for: key)
     }
 
     private func refreshCodexConnection(generation: UInt64) async {
@@ -5708,45 +5706,185 @@ Lattice self-edit rules:
         selfEditPreviews.filter { $0.sessionID == sessionID }
     }
 
+    // MARK: - Self-edit draft façade
+
+    var editableSelfEditManifestDrafts: [UUID: EditableSelfEditManifestDraft] {
+        get { selfEditDrafts.editableSelfEditManifestDrafts }
+        set { selfEditDrafts.editableSelfEditManifestDrafts = newValue }
+    }
+    var editableSelfEditSkillDrafts: [String: EditableSelfEditSkillDraft] {
+        get { selfEditDrafts.editableSelfEditSkillDrafts }
+        set { selfEditDrafts.editableSelfEditSkillDrafts = newValue }
+    }
+    var editableSelfEditStylePatchDrafts: [String: EditableSelfEditStylePatchDraft] {
+        get { selfEditDrafts.editableSelfEditStylePatchDrafts }
+        set { selfEditDrafts.editableSelfEditStylePatchDrafts = newValue }
+    }
+    var editableSelfEditLayoutPatchDrafts: [String: EditableSelfEditLayoutPatchDraft] {
+        get { selfEditDrafts.editableSelfEditLayoutPatchDrafts }
+        set { selfEditDrafts.editableSelfEditLayoutPatchDrafts = newValue }
+    }
+    var editableSelfEditCopyPatchDrafts: [String: EditableSelfEditCopyPatchDraft] {
+        get { selfEditDrafts.editableSelfEditCopyPatchDrafts }
+        set { selfEditDrafts.editableSelfEditCopyPatchDrafts = newValue }
+    }
+    var editableSelfEditPromptTemplateDrafts: [String: EditableSelfEditPromptTemplateDraft] {
+        get { selfEditDrafts.editableSelfEditPromptTemplateDrafts }
+        set { selfEditDrafts.editableSelfEditPromptTemplateDrafts = newValue }
+    }
+    var editableSelfEditOperationPreviewDrafts: [String: EditableSelfEditOperationPreviewDraft] {
+        get { selfEditDrafts.editableSelfEditOperationPreviewDrafts }
+        set { selfEditDrafts.editableSelfEditOperationPreviewDrafts = newValue }
+    }
+    var expandedSelfEditSkillPreviewIDs: Set<String> {
+        get { selfEditDrafts.expandedSelfEditSkillPreviewIDs }
+        set { selfEditDrafts.expandedSelfEditSkillPreviewIDs = newValue }
+    }
+    var expandedSelfEditReviewIDs: Set<UUID> {
+        get { selfEditDrafts.expandedSelfEditReviewIDs }
+        set { selfEditDrafts.expandedSelfEditReviewIDs = newValue }
+    }
+
     func editableSelfEditManifest(preview: LatticeExtensionPreviewRecord) -> LatticeExtensionManifest {
-        let draft = editableSelfEditManifestDraft(preview: preview)
-        return LatticeExtensionPreviewEditor.replacingMetadata(
-            in: preview,
-            name: draft.name,
-            version: draft.version,
-            summary: draft.summary
-        ).manifest
+        selfEditDrafts.editableSelfEditManifest(preview: preview)
     }
-
     func editableSelfEditManifestDraft(preview: LatticeExtensionPreviewRecord) -> EditableSelfEditManifestDraft {
-        editableSelfEditManifestDrafts[preview.id] ?? .init(
-            name: preview.manifest.name,
-            version: preview.manifest.version,
-            summary: preview.manifest.summary
-        )
+        selfEditDrafts.editableSelfEditManifestDraft(preview: preview)
     }
-
     func setEditableSelfEditManifestName(preview: LatticeExtensionPreviewRecord, name: String) {
-        updateEditableSelfEditManifestDraft(preview: preview) { $0.name = name }
+        selfEditDrafts.setEditableSelfEditManifestName(preview: preview, name: name)
     }
-
     func setEditableSelfEditManifestVersion(preview: LatticeExtensionPreviewRecord, version: String) {
-        updateEditableSelfEditManifestDraft(preview: preview) { $0.version = version }
+        selfEditDrafts.setEditableSelfEditManifestVersion(preview: preview, version: version)
     }
-
     func setEditableSelfEditManifestSummary(preview: LatticeExtensionPreviewRecord, summary: String) {
-        updateEditableSelfEditManifestDraft(preview: preview) { $0.summary = summary }
+        selfEditDrafts.setEditableSelfEditManifestSummary(preview: preview, summary: summary)
     }
-
     func isEditableSelfEditManifestDirty(preview: LatticeExtensionPreviewRecord) -> Bool {
-        let draft = editableSelfEditManifestDraft(preview: preview)
-        return draft.name != preview.manifest.name
-            || draft.version != preview.manifest.version
-            || draft.summary != preview.manifest.summary
+        selfEditDrafts.isEditableSelfEditManifestDirty(preview: preview)
     }
-
     func resetEditableSelfEditManifest(previewID: UUID) {
-        editableSelfEditManifestDrafts.removeValue(forKey: previewID)
+        selfEditDrafts.resetEditableSelfEditManifest(previewID: previewID)
+    }
+    func editableSelfEditStylePatch(previewID: UUID, index: Int, patch: LatticeStylePatch) -> LatticeStylePatch {
+        selfEditDrafts.editableSelfEditStylePatch(previewID: previewID, index: index, patch: patch)
+    }
+    func editableSelfEditStylePatchDraft(previewID: UUID, index: Int, patch: LatticeStylePatch) -> EditableSelfEditStylePatchDraft {
+        selfEditDrafts.editableSelfEditStylePatchDraft(previewID: previewID, index: index, patch: patch)
+    }
+    func setEditableSelfEditStyleTint(previewID: UUID, index: Int, patch: LatticeStylePatch, tintHex: String) {
+        selfEditDrafts.setEditableSelfEditStyleTint(previewID: previewID, index: index, patch: patch, tintHex: tintHex)
+    }
+    func setEditableSelfEditStyleAccent(previewID: UUID, index: Int, patch: LatticeStylePatch, accentHex: String) {
+        selfEditDrafts.setEditableSelfEditStyleAccent(previewID: previewID, index: index, patch: patch, accentHex: accentHex)
+    }
+    func setEditableSelfEditStyleRadius(previewID: UUID, index: Int, patch: LatticeStylePatch, cornerRadius: String) {
+        selfEditDrafts.setEditableSelfEditStyleRadius(previewID: previewID, index: index, patch: patch, cornerRadius: cornerRadius)
+    }
+    func isEditableSelfEditStylePatchDirty(previewID: UUID, index: Int, patch: LatticeStylePatch) -> Bool {
+        selfEditDrafts.isEditableSelfEditStylePatchDirty(previewID: previewID, index: index, patch: patch)
+    }
+    func resetEditableSelfEditStylePatch(previewID: UUID, index: Int) {
+        selfEditDrafts.resetEditableSelfEditStylePatch(previewID: previewID, index: index)
+    }
+    func editableSelfEditLayoutPatch(previewID: UUID, index: Int, patch: LatticeLayoutPatch) -> LatticeLayoutPatch {
+        selfEditDrafts.editableSelfEditLayoutPatch(previewID: previewID, index: index, patch: patch)
+    }
+    func editableSelfEditLayoutPatchDraft(previewID: UUID, index: Int, patch: LatticeLayoutPatch) -> EditableSelfEditLayoutPatchDraft {
+        selfEditDrafts.editableSelfEditLayoutPatchDraft(previewID: previewID, index: index, patch: patch)
+    }
+    func setEditableSelfEditLayoutDensity(previewID: UUID, index: Int, patch: LatticeLayoutPatch, density: LatticeLayoutDensity) {
+        selfEditDrafts.setEditableSelfEditLayoutDensity(previewID: previewID, index: index, patch: patch, density: density)
+    }
+    func isEditableSelfEditLayoutPatchDirty(previewID: UUID, index: Int, patch: LatticeLayoutPatch) -> Bool {
+        selfEditDrafts.isEditableSelfEditLayoutPatchDirty(previewID: previewID, index: index, patch: patch)
+    }
+    func resetEditableSelfEditLayoutPatch(previewID: UUID, index: Int) {
+        selfEditDrafts.resetEditableSelfEditLayoutPatch(previewID: previewID, index: index)
+    }
+    func editableSelfEditCopyPatch(previewID: UUID, patch: LatticeCopyPatch) -> LatticeCopyPatch {
+        selfEditDrafts.editableSelfEditCopyPatch(previewID: previewID, patch: patch)
+    }
+    func editableSelfEditCopyPatchDraft(previewID: UUID, patch: LatticeCopyPatch) -> EditableSelfEditCopyPatchDraft {
+        selfEditDrafts.editableSelfEditCopyPatchDraft(previewID: previewID, patch: patch)
+    }
+    func setEditableSelfEditCopyPatchText(previewID: UUID, patch: LatticeCopyPatch, text: String) {
+        selfEditDrafts.setEditableSelfEditCopyPatchText(previewID: previewID, patch: patch, text: text)
+    }
+    func isEditableSelfEditCopyPatchDirty(previewID: UUID, patch: LatticeCopyPatch) -> Bool {
+        selfEditDrafts.isEditableSelfEditCopyPatchDirty(previewID: previewID, patch: patch)
+    }
+    func resetEditableSelfEditCopyPatch(previewID: UUID, target: LatticeCopyTarget) {
+        selfEditDrafts.resetEditableSelfEditCopyPatch(previewID: previewID, target: target)
+    }
+    func editableSelfEditPromptTemplate(previewID: UUID, template: LatticePromptTemplate) -> LatticePromptTemplate {
+        selfEditDrafts.editableSelfEditPromptTemplate(previewID: previewID, template: template)
+    }
+    func editableSelfEditPromptTemplateDraft(previewID: UUID, template: LatticePromptTemplate) -> EditableSelfEditPromptTemplateDraft {
+        selfEditDrafts.editableSelfEditPromptTemplateDraft(previewID: previewID, template: template)
+    }
+    func setEditableSelfEditPromptTemplateInvocation(previewID: UUID, template: LatticePromptTemplate, invocation: String) {
+        selfEditDrafts.setEditableSelfEditPromptTemplateInvocation(previewID: previewID, template: template, invocation: invocation)
+    }
+    func setEditableSelfEditPromptTemplateTitle(previewID: UUID, template: LatticePromptTemplate, title: String) {
+        selfEditDrafts.setEditableSelfEditPromptTemplateTitle(previewID: previewID, template: template, title: title)
+    }
+    func setEditableSelfEditPromptTemplateDetail(previewID: UUID, template: LatticePromptTemplate, detail: String) {
+        selfEditDrafts.setEditableSelfEditPromptTemplateDetail(previewID: previewID, template: template, detail: detail)
+    }
+    func setEditableSelfEditPromptTemplatePrompt(previewID: UUID, template: LatticePromptTemplate, prompt: String) {
+        selfEditDrafts.setEditableSelfEditPromptTemplatePrompt(previewID: previewID, template: template, prompt: prompt)
+    }
+    func isEditableSelfEditPromptTemplateDirty(previewID: UUID, template: LatticePromptTemplate) -> Bool {
+        selfEditDrafts.isEditableSelfEditPromptTemplateDirty(previewID: previewID, template: template)
+    }
+    func resetEditableSelfEditPromptTemplate(previewID: UUID, invocation: String) {
+        selfEditDrafts.resetEditableSelfEditPromptTemplate(previewID: previewID, invocation: invocation)
+    }
+    func editableSelfEditOperationPreview(previewID: UUID, index: Int, preview: LatticeExtensionOperationPreview) -> LatticeExtensionOperationPreview {
+        selfEditDrafts.editableSelfEditOperationPreview(previewID: previewID, index: index, preview: preview)
+    }
+    func editableSelfEditOperationPreviewDraft(previewID: UUID, index: Int, preview: LatticeExtensionOperationPreview) -> EditableSelfEditOperationPreviewDraft {
+        selfEditDrafts.editableSelfEditOperationPreviewDraft(previewID: previewID, index: index, preview: preview)
+    }
+    func setEditableSelfEditOperationPreviewSummary(previewID: UUID, index: Int, preview: LatticeExtensionOperationPreview, summary: String) {
+        selfEditDrafts.setEditableSelfEditOperationPreviewSummary(previewID: previewID, index: index, preview: preview, summary: summary)
+    }
+    func setEditableSelfEditOperationPreviewDetail(previewID: UUID, index: Int, preview: LatticeExtensionOperationPreview, detail: String) {
+        selfEditDrafts.setEditableSelfEditOperationPreviewDetail(previewID: previewID, index: index, preview: preview, detail: detail)
+    }
+    func isEditableSelfEditOperationPreviewDirty(previewID: UUID, index: Int, preview: LatticeExtensionOperationPreview) -> Bool {
+        selfEditDrafts.isEditableSelfEditOperationPreviewDirty(previewID: previewID, index: index, preview: preview)
+    }
+    func resetEditableSelfEditOperationPreview(previewID: UUID, index: Int) {
+        selfEditDrafts.resetEditableSelfEditOperationPreview(previewID: previewID, index: index)
+    }
+    func editableSelfEditSkillPatch(previewID: UUID, skill: LatticeSkillPatch) -> LatticeSkillPatch {
+        selfEditDrafts.editableSelfEditSkillPatch(previewID: previewID, skill: skill)
+    }
+    func editableSelfEditSkillDraft(previewID: UUID, skill: LatticeSkillPatch) -> EditableSelfEditSkillDraft {
+        selfEditDrafts.editableSelfEditSkillDraft(previewID: previewID, skill: skill)
+    }
+    func setEditableSelfEditSkillTitle(previewID: UUID, skill: LatticeSkillPatch, title: String) {
+        selfEditDrafts.setEditableSelfEditSkillTitle(previewID: previewID, skill: skill, title: title)
+    }
+    func setEditableSelfEditSkillSummary(previewID: UUID, skill: LatticeSkillPatch, summary: String) {
+        selfEditDrafts.setEditableSelfEditSkillSummary(previewID: previewID, skill: skill, summary: summary)
+    }
+    func setEditableSelfEditSkillMarkdown(previewID: UUID, skill: LatticeSkillPatch, markdown: String) {
+        selfEditDrafts.setEditableSelfEditSkillMarkdown(previewID: previewID, skill: skill, markdown: markdown)
+    }
+    func isEditableSelfEditSkillDirty(previewID: UUID, skill: LatticeSkillPatch) -> Bool {
+        selfEditDrafts.isEditableSelfEditSkillDirty(previewID: previewID, skill: skill)
+    }
+    func resetEditableSelfEditSkill(previewID: UUID, skillID: String) {
+        selfEditDrafts.resetEditableSelfEditSkill(previewID: previewID, skillID: skillID)
+    }
+    func toggleSelfEditSkillPreview(previewID: UUID, skillID: String) {
+        selfEditDrafts.toggleSelfEditSkillPreview(previewID: previewID, skillID: skillID)
+    }
+    func isSelfEditSkillPreviewExpanded(previewID: UUID, skillID: String) -> Bool {
+        selfEditDrafts.isSelfEditSkillPreviewExpanded(previewID: previewID, skillID: skillID)
     }
 
     func saveEditableSelfEditManifest(previewID: UUID) {
@@ -5771,83 +5909,6 @@ Lattice self-edit rules:
         }
     }
 
-    private func updateEditableSelfEditManifestDraft(preview: LatticeExtensionPreviewRecord, mutate: (inout EditableSelfEditManifestDraft) -> Void) {
-        var draft = editableSelfEditManifestDraft(preview: preview)
-        mutate(&draft)
-        editableSelfEditManifestDrafts[preview.id] = draft
-    }
-
-    func hasUnsavedSelfEditPreviewEdits(_ preview: LatticeExtensionPreviewRecord) -> Bool {
-        if isEditableSelfEditManifestDirty(preview: preview) { return true }
-        for (index, patch) in preview.manifest.stylePatches.enumerated()
-        where isEditableSelfEditStylePatchDirty(previewID: preview.id, index: index, patch: patch) {
-            return true
-        }
-        for (index, patch) in preview.manifest.layoutPatches.enumerated()
-        where isEditableSelfEditLayoutPatchDirty(previewID: preview.id, index: index, patch: patch) {
-            return true
-        }
-        for patch in preview.manifest.copyPatches
-        where isEditableSelfEditCopyPatchDirty(previewID: preview.id, patch: patch) {
-            return true
-        }
-        for template in preview.manifest.promptTemplates
-        where isEditableSelfEditPromptTemplateDirty(previewID: preview.id, template: template) {
-            return true
-        }
-        for (index, operationPreview) in preview.manifest.operationPreviews.enumerated()
-        where isEditableSelfEditOperationPreviewDirty(previewID: preview.id, index: index, preview: operationPreview) {
-            return true
-        }
-        for skill in preview.manifest.skillPatches
-        where isEditableSelfEditSkillDirty(previewID: preview.id, skill: skill) {
-            return true
-        }
-        return false
-    }
-
-    func editableSelfEditStylePatch(previewID: UUID, index: Int, patch: LatticeStylePatch) -> LatticeStylePatch {
-        let draft = editableSelfEditStylePatchDraft(previewID: previewID, index: index, patch: patch)
-        return .init(
-            target: patch.target,
-            tintHex: optionalPatchString(draft.tintHex),
-            accentHex: optionalPatchString(draft.accentHex),
-            cornerRadius: Double(draft.cornerRadius.trimmingCharacters(in: .whitespacesAndNewlines))
-        )
-    }
-
-    func editableSelfEditStylePatchDraft(previewID: UUID, index: Int, patch: LatticeStylePatch) -> EditableSelfEditStylePatchDraft {
-        editableSelfEditStylePatchDrafts[selfEditStylePatchKey(previewID: previewID, index: index)] ?? .init(
-            tintHex: patch.tintHex ?? "",
-            accentHex: patch.accentHex ?? "",
-            cornerRadius: patch.cornerRadius.map { String(format: "%.0f", $0) } ?? ""
-        )
-    }
-
-    func setEditableSelfEditStyleTint(previewID: UUID, index: Int, patch: LatticeStylePatch, tintHex: String) {
-        updateEditableSelfEditStylePatchDraft(previewID: previewID, index: index, patch: patch) { $0.tintHex = tintHex }
-    }
-
-    func setEditableSelfEditStyleAccent(previewID: UUID, index: Int, patch: LatticeStylePatch, accentHex: String) {
-        updateEditableSelfEditStylePatchDraft(previewID: previewID, index: index, patch: patch) { $0.accentHex = accentHex }
-    }
-
-    func setEditableSelfEditStyleRadius(previewID: UUID, index: Int, patch: LatticeStylePatch, cornerRadius: String) {
-        updateEditableSelfEditStylePatchDraft(previewID: previewID, index: index, patch: patch) { $0.cornerRadius = cornerRadius }
-    }
-
-    func isEditableSelfEditStylePatchDirty(previewID: UUID, index: Int, patch: LatticeStylePatch) -> Bool {
-        editableSelfEditStylePatchDraft(previewID: previewID, index: index, patch: patch) != .init(
-            tintHex: patch.tintHex ?? "",
-            accentHex: patch.accentHex ?? "",
-            cornerRadius: patch.cornerRadius.map { String(format: "%.0f", $0) } ?? ""
-        )
-    }
-
-    func resetEditableSelfEditStylePatch(previewID: UUID, index: Int) {
-        editableSelfEditStylePatchDrafts.removeValue(forKey: selfEditStylePatchKey(previewID: previewID, index: index))
-    }
-
     func saveEditableSelfEditStylePatch(previewID: UUID, index: Int) {
         guard let preview = selfEditPreviews.first(where: { $0.id == previewID }),
               preview.manifest.stylePatches.indices.contains(index) else {
@@ -5870,8 +5931,8 @@ Lattice self-edit rules:
             let updatedPreview = try LatticeExtensionPreviewEditor.replacingStylePatch(
                 in: preview,
                 index: index,
-                tintHex: optionalPatchString(draft.tintHex),
-                accentHex: optionalPatchString(draft.accentHex),
+                tintHex: selfEditDrafts.optionalPatchString(draft.tintHex),
+                accentHex: selfEditDrafts.optionalPatchString(draft.accentHex),
                 cornerRadius: radius
             )
             guard validateEditedSelfEditPreview(updatedPreview, original: preview) else { return }
@@ -5881,27 +5942,6 @@ Lattice self-edit rules:
         } catch {
             setError(error.localizedDescription, sessionID: preview.sessionID)
         }
-    }
-
-    func editableSelfEditLayoutPatch(previewID: UUID, index: Int, patch: LatticeLayoutPatch) -> LatticeLayoutPatch {
-        let draft = editableSelfEditLayoutPatchDraft(previewID: previewID, index: index, patch: patch)
-        return .init(target: patch.target, density: draft.density)
-    }
-
-    func editableSelfEditLayoutPatchDraft(previewID: UUID, index: Int, patch: LatticeLayoutPatch) -> EditableSelfEditLayoutPatchDraft {
-        editableSelfEditLayoutPatchDrafts[selfEditLayoutPatchKey(previewID: previewID, index: index)] ?? .init(density: patch.density)
-    }
-
-    func setEditableSelfEditLayoutDensity(previewID: UUID, index: Int, patch: LatticeLayoutPatch, density: LatticeLayoutDensity) {
-        editableSelfEditLayoutPatchDrafts[selfEditLayoutPatchKey(previewID: previewID, index: index)] = .init(density: density)
-    }
-
-    func isEditableSelfEditLayoutPatchDirty(previewID: UUID, index: Int, patch: LatticeLayoutPatch) -> Bool {
-        editableSelfEditLayoutPatch(previewID: previewID, index: index, patch: patch) != patch
-    }
-
-    func resetEditableSelfEditLayoutPatch(previewID: UUID, index: Int) {
-        editableSelfEditLayoutPatchDrafts.removeValue(forKey: selfEditLayoutPatchKey(previewID: previewID, index: index))
     }
 
     func saveEditableSelfEditLayoutPatch(previewID: UUID, index: Int) {
@@ -5927,39 +5967,6 @@ Lattice self-edit rules:
         }
     }
 
-    private func updateEditableSelfEditStylePatchDraft(previewID: UUID, index: Int, patch: LatticeStylePatch, mutate: (inout EditableSelfEditStylePatchDraft) -> Void) {
-        let key = selfEditStylePatchKey(previewID: previewID, index: index)
-        var draft = editableSelfEditStylePatchDraft(previewID: previewID, index: index, patch: patch)
-        mutate(&draft)
-        editableSelfEditStylePatchDrafts[key] = draft
-    }
-
-    private func optionalPatchString(_ value: String) -> String? {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    func editableSelfEditCopyPatch(previewID: UUID, patch: LatticeCopyPatch) -> LatticeCopyPatch {
-        let draft = editableSelfEditCopyPatchDraft(previewID: previewID, patch: patch)
-        return .init(target: patch.target, text: draft.text)
-    }
-
-    func editableSelfEditCopyPatchDraft(previewID: UUID, patch: LatticeCopyPatch) -> EditableSelfEditCopyPatchDraft {
-        editableSelfEditCopyPatchDrafts[selfEditCopyPatchKey(previewID: previewID, target: patch.target)] ?? .init(text: patch.text)
-    }
-
-    func setEditableSelfEditCopyPatchText(previewID: UUID, patch: LatticeCopyPatch, text: String) {
-        editableSelfEditCopyPatchDrafts[selfEditCopyPatchKey(previewID: previewID, target: patch.target)] = .init(text: text)
-    }
-
-    func isEditableSelfEditCopyPatchDirty(previewID: UUID, patch: LatticeCopyPatch) -> Bool {
-        editableSelfEditCopyPatch(previewID: previewID, patch: patch) != patch
-    }
-
-    func resetEditableSelfEditCopyPatch(previewID: UUID, target: LatticeCopyTarget) {
-        editableSelfEditCopyPatchDrafts.removeValue(forKey: selfEditCopyPatchKey(previewID: previewID, target: target))
-    }
-
     func saveEditableSelfEditCopyPatch(previewID: UUID, target: LatticeCopyTarget) {
         guard let preview = selfEditPreviews.first(where: { $0.id == previewID }),
               let patch = preview.manifest.copyPatches.first(where: { $0.target == target }) else {
@@ -5980,44 +5987,6 @@ Lattice self-edit rules:
         } catch {
             setError(error.localizedDescription, sessionID: preview.sessionID)
         }
-    }
-
-    func editableSelfEditPromptTemplate(previewID: UUID, template: LatticePromptTemplate) -> LatticePromptTemplate {
-        let draft = editableSelfEditPromptTemplateDraft(previewID: previewID, template: template)
-        return .init(invocation: draft.invocation, title: draft.title, detail: draft.detail, prompt: draft.prompt)
-    }
-
-    func editableSelfEditPromptTemplateDraft(previewID: UUID, template: LatticePromptTemplate) -> EditableSelfEditPromptTemplateDraft {
-        editableSelfEditPromptTemplateDrafts[selfEditPromptTemplateKey(previewID: previewID, invocation: template.invocation)] ?? .init(
-            invocation: template.invocation,
-            title: template.title,
-            detail: template.detail,
-            prompt: template.prompt
-        )
-    }
-
-    func setEditableSelfEditPromptTemplateInvocation(previewID: UUID, template: LatticePromptTemplate, invocation: String) {
-        updateEditableSelfEditPromptTemplateDraft(previewID: previewID, template: template) { $0.invocation = invocation }
-    }
-
-    func setEditableSelfEditPromptTemplateTitle(previewID: UUID, template: LatticePromptTemplate, title: String) {
-        updateEditableSelfEditPromptTemplateDraft(previewID: previewID, template: template) { $0.title = title }
-    }
-
-    func setEditableSelfEditPromptTemplateDetail(previewID: UUID, template: LatticePromptTemplate, detail: String) {
-        updateEditableSelfEditPromptTemplateDraft(previewID: previewID, template: template) { $0.detail = detail }
-    }
-
-    func setEditableSelfEditPromptTemplatePrompt(previewID: UUID, template: LatticePromptTemplate, prompt: String) {
-        updateEditableSelfEditPromptTemplateDraft(previewID: previewID, template: template) { $0.prompt = prompt }
-    }
-
-    func isEditableSelfEditPromptTemplateDirty(previewID: UUID, template: LatticePromptTemplate) -> Bool {
-        editableSelfEditPromptTemplate(previewID: previewID, template: template) != template
-    }
-
-    func resetEditableSelfEditPromptTemplate(previewID: UUID, invocation: String) {
-        editableSelfEditPromptTemplateDrafts.removeValue(forKey: selfEditPromptTemplateKey(previewID: previewID, invocation: invocation))
     }
 
     func saveEditableSelfEditPromptTemplate(previewID: UUID, invocation: String) {
@@ -6045,46 +6014,6 @@ Lattice self-edit rules:
         }
     }
 
-    private func updateEditableSelfEditPromptTemplateDraft(previewID: UUID, template: LatticePromptTemplate, mutate: (inout EditableSelfEditPromptTemplateDraft) -> Void) {
-        let key = selfEditPromptTemplateKey(previewID: previewID, invocation: template.invocation)
-        var draft = editableSelfEditPromptTemplateDrafts[key] ?? .init(
-            invocation: template.invocation,
-            title: template.title,
-            detail: template.detail,
-            prompt: template.prompt
-        )
-        mutate(&draft)
-        editableSelfEditPromptTemplateDrafts[key] = draft
-    }
-
-    func editableSelfEditOperationPreview(previewID: UUID, index: Int, preview: LatticeExtensionOperationPreview) -> LatticeExtensionOperationPreview {
-        let draft = editableSelfEditOperationPreviewDraft(previewID: previewID, index: index, preview: preview)
-        return .init(targetSurfaceID: preview.targetSurfaceID, operation: preview.operation, summary: draft.summary, detail: draft.detail)
-    }
-
-    func editableSelfEditOperationPreviewDraft(previewID: UUID, index: Int, preview: LatticeExtensionOperationPreview) -> EditableSelfEditOperationPreviewDraft {
-        editableSelfEditOperationPreviewDrafts[selfEditOperationPreviewKey(previewID: previewID, index: index)] ?? .init(
-            summary: preview.summary,
-            detail: preview.detail
-        )
-    }
-
-    func setEditableSelfEditOperationPreviewSummary(previewID: UUID, index: Int, preview: LatticeExtensionOperationPreview, summary: String) {
-        updateEditableSelfEditOperationPreviewDraft(previewID: previewID, index: index, preview: preview) { $0.summary = summary }
-    }
-
-    func setEditableSelfEditOperationPreviewDetail(previewID: UUID, index: Int, preview: LatticeExtensionOperationPreview, detail: String) {
-        updateEditableSelfEditOperationPreviewDraft(previewID: previewID, index: index, preview: preview) { $0.detail = detail }
-    }
-
-    func isEditableSelfEditOperationPreviewDirty(previewID: UUID, index: Int, preview: LatticeExtensionOperationPreview) -> Bool {
-        editableSelfEditOperationPreview(previewID: previewID, index: index, preview: preview) != preview
-    }
-
-    func resetEditableSelfEditOperationPreview(previewID: UUID, index: Int) {
-        editableSelfEditOperationPreviewDrafts.removeValue(forKey: selfEditOperationPreviewKey(previewID: previewID, index: index))
-    }
-
     func saveEditableSelfEditOperationPreview(previewID: UUID, index: Int) {
         guard let preview = selfEditPreviews.first(where: { $0.id == previewID }),
               preview.manifest.operationPreviews.indices.contains(index) else {
@@ -6107,43 +6036,6 @@ Lattice self-edit rules:
         } catch {
             setError(error.localizedDescription, sessionID: preview.sessionID)
         }
-    }
-
-    private func updateEditableSelfEditOperationPreviewDraft(previewID: UUID, index: Int, preview: LatticeExtensionOperationPreview, mutate: (inout EditableSelfEditOperationPreviewDraft) -> Void) {
-        let key = selfEditOperationPreviewKey(previewID: previewID, index: index)
-        var draft = editableSelfEditOperationPreviewDrafts[key] ?? .init(summary: preview.summary, detail: preview.detail)
-        mutate(&draft)
-        editableSelfEditOperationPreviewDrafts[key] = draft
-    }
-
-    func editableSelfEditSkillPatch(previewID: UUID, skill: LatticeSkillPatch) -> LatticeSkillPatch {
-        let draft = editableSelfEditSkillDraft(previewID: previewID, skill: skill)
-        return .init(id: skill.id, title: draft.title, summary: draft.summary, markdown: draft.markdown)
-    }
-
-    func editableSelfEditSkillDraft(previewID: UUID, skill: LatticeSkillPatch) -> EditableSelfEditSkillDraft {
-        let key = selfEditSkillPreviewKey(previewID: previewID, skillID: skill.id)
-        return editableSelfEditSkillDrafts[key] ?? .init(title: skill.title, summary: skill.summary, markdown: skill.markdown)
-    }
-
-    func setEditableSelfEditSkillTitle(previewID: UUID, skill: LatticeSkillPatch, title: String) {
-        updateEditableSelfEditSkillDraft(previewID: previewID, skill: skill) { $0.title = title }
-    }
-
-    func setEditableSelfEditSkillSummary(previewID: UUID, skill: LatticeSkillPatch, summary: String) {
-        updateEditableSelfEditSkillDraft(previewID: previewID, skill: skill) { $0.summary = summary }
-    }
-
-    func setEditableSelfEditSkillMarkdown(previewID: UUID, skill: LatticeSkillPatch, markdown: String) {
-        updateEditableSelfEditSkillDraft(previewID: previewID, skill: skill) { $0.markdown = markdown }
-    }
-
-    func isEditableSelfEditSkillDirty(previewID: UUID, skill: LatticeSkillPatch) -> Bool {
-        editableSelfEditSkillPatch(previewID: previewID, skill: skill) != skill
-    }
-
-    func resetEditableSelfEditSkill(previewID: UUID, skillID: String) {
-        editableSelfEditSkillDrafts.removeValue(forKey: selfEditSkillPreviewKey(previewID: previewID, skillID: skillID))
     }
 
     func saveEditableSelfEditSkill(previewID: UUID, skillID: String) {
@@ -6170,62 +6062,6 @@ Lattice self-edit rules:
         }
     }
 
-    private func updateEditableSelfEditSkillDraft(previewID: UUID, skill: LatticeSkillPatch, mutate: (inout EditableSelfEditSkillDraft) -> Void) {
-        let key = selfEditSkillPreviewKey(previewID: previewID, skillID: skill.id)
-        var draft = editableSelfEditSkillDrafts[key] ?? .init(title: skill.title, summary: skill.summary, markdown: skill.markdown)
-        mutate(&draft)
-        editableSelfEditSkillDrafts[key] = draft
-    }
-
-    func isSelfEditSkillPreviewExpanded(previewID: UUID, skillID: String) -> Bool {
-        expandedSelfEditSkillPreviewIDs.contains(selfEditSkillPreviewKey(previewID: previewID, skillID: skillID))
-    }
-
-    func isSelfEditReviewExpanded(previewID: UUID) -> Bool {
-        expandedSelfEditReviewIDs.contains(previewID)
-    }
-
-    func setSelfEditReviewExpanded(previewID: UUID, isExpanded: Bool) {
-        if isExpanded {
-            expandedSelfEditReviewIDs.insert(previewID)
-        } else {
-            expandedSelfEditReviewIDs.remove(previewID)
-        }
-    }
-
-    func toggleSelfEditSkillPreview(previewID: UUID, skillID: String) {
-        let key = selfEditSkillPreviewKey(previewID: previewID, skillID: skillID)
-        if expandedSelfEditSkillPreviewIDs.contains(key) {
-            expandedSelfEditSkillPreviewIDs.remove(key)
-        } else {
-            expandedSelfEditSkillPreviewIDs.insert(key)
-        }
-    }
-
-    private func selfEditSkillPreviewKey(previewID: UUID, skillID: String) -> String {
-        "\(previewID.uuidString)::\(skillID)"
-    }
-
-    private func selfEditStylePatchKey(previewID: UUID, index: Int) -> String {
-        "\(previewID.uuidString)::style::\(index)"
-    }
-
-    private func selfEditLayoutPatchKey(previewID: UUID, index: Int) -> String {
-        "\(previewID.uuidString)::layout::\(index)"
-    }
-
-    private func selfEditCopyPatchKey(previewID: UUID, target: LatticeCopyTarget) -> String {
-        "\(previewID.uuidString)::copy::\(target.rawValue)"
-    }
-
-    private func selfEditPromptTemplateKey(previewID: UUID, invocation: String) -> String {
-        "\(previewID.uuidString)::template::\(invocation)"
-    }
-
-    private func selfEditOperationPreviewKey(previewID: UUID, index: Int) -> String {
-        "\(previewID.uuidString)::operation::\(index)"
-    }
-
     private func validateEditedSelfEditPreview(_ updatedPreview: LatticeExtensionPreviewRecord, original: LatticeExtensionPreviewRecord) -> Bool {
         let validation = extensionStore.validate(updatedPreview.manifest)
             + LatticeSelfEditGeneratedSkillValidationPolicy.validationMessages(for: updatedPreview.manifest)
@@ -6238,15 +6074,26 @@ Lattice self-edit rules:
 
     private func clearExpandedSkillPreviews(for preview: LatticeExtensionPreviewRecord) {
         let prefix = "\(preview.id.uuidString)::"
-        expandedSelfEditSkillPreviewIDs = expandedSelfEditSkillPreviewIDs.filter { !$0.hasPrefix(prefix) }
-        editableSelfEditSkillDrafts = editableSelfEditSkillDrafts.filter { !$0.key.hasPrefix(prefix) }
-        editableSelfEditStylePatchDrafts = editableSelfEditStylePatchDrafts.filter { !$0.key.hasPrefix(prefix) }
-        editableSelfEditLayoutPatchDrafts = editableSelfEditLayoutPatchDrafts.filter { !$0.key.hasPrefix(prefix) }
-        editableSelfEditCopyPatchDrafts = editableSelfEditCopyPatchDrafts.filter { !$0.key.hasPrefix(prefix) }
-        editableSelfEditPromptTemplateDrafts = editableSelfEditPromptTemplateDrafts.filter { !$0.key.hasPrefix(prefix) }
-        editableSelfEditOperationPreviewDrafts = editableSelfEditOperationPreviewDrafts.filter { !$0.key.hasPrefix(prefix) }
-        editableSelfEditManifestDrafts.removeValue(forKey: preview.id)
-        expandedSelfEditReviewIDs.remove(preview.id)
+        selfEditDrafts.expandedSelfEditSkillPreviewIDs = selfEditDrafts.expandedSelfEditSkillPreviewIDs.filter { !$0.hasPrefix(prefix) }
+        selfEditDrafts.editableSelfEditSkillDrafts = selfEditDrafts.editableSelfEditSkillDrafts.filter { !$0.key.hasPrefix(prefix) }
+        selfEditDrafts.editableSelfEditStylePatchDrafts = selfEditDrafts.editableSelfEditStylePatchDrafts.filter { !$0.key.hasPrefix(prefix) }
+        selfEditDrafts.editableSelfEditLayoutPatchDrafts = selfEditDrafts.editableSelfEditLayoutPatchDrafts.filter { !$0.key.hasPrefix(prefix) }
+        selfEditDrafts.editableSelfEditCopyPatchDrafts = selfEditDrafts.editableSelfEditCopyPatchDrafts.filter { !$0.key.hasPrefix(prefix) }
+        selfEditDrafts.editableSelfEditPromptTemplateDrafts = selfEditDrafts.editableSelfEditPromptTemplateDrafts.filter { !$0.key.hasPrefix(prefix) }
+        selfEditDrafts.editableSelfEditOperationPreviewDrafts = selfEditDrafts.editableSelfEditOperationPreviewDrafts.filter { !$0.key.hasPrefix(prefix) }
+        selfEditDrafts.editableSelfEditManifestDrafts.removeValue(forKey: preview.id)
+        selfEditDrafts.expandedSelfEditReviewIDs.remove(preview.id)
+    }
+
+
+    func hasUnsavedSelfEditPreviewEdits(_ preview: LatticeExtensionPreviewRecord) -> Bool {
+        selfEditDrafts.hasUnsavedSelfEditPreviewEdits(preview)
+    }
+    func isSelfEditReviewExpanded(previewID: UUID) -> Bool {
+        selfEditDrafts.isSelfEditReviewExpanded(previewID: previewID)
+    }
+    func setSelfEditReviewExpanded(previewID: UUID, isExpanded: Bool) {
+        selfEditDrafts.setSelfEditReviewExpanded(previewID: previewID, isExpanded: isExpanded)
     }
 
     func acceptSelfEditPreview(_ preview: LatticeExtensionPreviewRecord) {
@@ -6281,8 +6128,8 @@ Lattice self-edit rules:
             updated = try LatticeExtensionPreviewEditor.replacingStylePatch(
                 in: updated,
                 index: index,
-                tintHex: optionalPatchString(draft.tintHex),
-                accentHex: optionalPatchString(draft.accentHex),
+                tintHex: selfEditDrafts.optionalPatchString(draft.tintHex),
+                accentHex: selfEditDrafts.optionalPatchString(draft.accentHex),
                 cornerRadius: radiusText.isEmpty ? nil : Double(radiusText)
             )
         }
@@ -6680,47 +6527,31 @@ Lattice self-edit rules:
     }
 
     func tintColor(for target: LatticeStyleTarget) -> Color? {
-        stylePatch(for: target)?.tintHex.flatMap(Color.init(latticeHex:))
+        LatticeStylePresentation.tintColor(for: target, patches: activeStylePatches)
     }
 
     func cornerRadius(for target: LatticeStyleTarget, default value: CGFloat) -> CGFloat {
-        CGFloat(stylePatch(for: target)?.cornerRadius ?? Double(value))
-    }
-
-    private func stylePatch(for target: LatticeStyleTarget) -> LatticeStylePatch? {
-        activeStylePatches.reversed().first { $0.target == target || $0.target == .all }
+        LatticeStylePresentation.cornerRadius(for: target, default: value, patches: activeStylePatches)
     }
 
     func copyText(for target: LatticeCopyTarget, fallback: String) -> String {
-        activeCopyPatches.reversed().first { $0.target == target }?.text ?? fallback
+        LatticeStylePresentation.copyText(for: target, fallback: fallback, patches: activeCopyPatches)
     }
 
     func composerLayoutDensity() -> LatticeLayoutDensity {
-        activeLayoutPatches.reversed().first { $0.target == .composer }?.density ?? .comfortable
+        LatticeStylePresentation.composerLayoutDensity(patches: activeLayoutPatches)
     }
 
     func composerSpacing() -> CGFloat {
-        switch composerLayoutDensity() {
-        case .compact: 6
-        case .comfortable: 9
-        case .spacious: 13
-        }
+        LatticeStylePresentation.composerSpacing(patches: activeLayoutPatches)
     }
 
     func composerMaxWidth() -> CGFloat {
-        switch composerLayoutDensity() {
-        case .compact: 680
-        case .comfortable: 760
-        case .spacious: 840
-        }
+        LatticeStylePresentation.composerMaxWidth(patches: activeLayoutPatches)
     }
 
     func composerHorizontalPadding() -> CGFloat {
-        switch composerLayoutDensity() {
-        case .compact: 18
-        case .comfortable: 28
-        case .spacious: 36
-        }
+        LatticeStylePresentation.composerHorizontalPadding(patches: activeLayoutPatches)
     }
 
     func composerVerticalPadding() -> CGFloat {
@@ -8763,7 +8594,7 @@ Lattice self-edit rules:
         localModelStatus = reason
     }
 
-    // MARK: - File browser
+    // MARK: - Workspace tools façade
 
     var activeWorkspacePathForTools: String {
         let sessionPath = selectedSession?.workspacePath?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -8772,595 +8603,62 @@ Lattice self-edit rules:
     }
 
     private func rebindWorkLoopSurfacesAfterSelectionChange() {
-        let root = activeWorkspacePathForTools
-        if showFileBrowser {
-            if fileBrowserRootPath != root {
-                fileBrowserRelativeDirectory = ""
-                fileBrowserSelectedPath = nil
-                fileBrowserPreview = nil
-                fileBrowserPreviewImage = nil
-                fileBrowserPinnedPaths = []
-            }
-            refreshFileBrowserListing()
-        }
-        if showWorkspaceTerminal {
-            ensureWorkspaceTerminal()
-        }
+        workspaceTools.rebindAfterSelectionChange()
     }
 
-    /// Process is active for the displayed worktree when Process is live and snapshot is running or stopping.
-    private func isTerminalProcessActive(
-        forDisplayPath displayPath: String,
-        snapshotState: WorkspaceTerminalSessionState?
-    ) -> Bool {
-        let runningKey = workspaceTerminalRunningWorktreePath.map {
-            WorkspaceTerminalPolicy.sessionKey(forWorktreePath: $0)
-        }
-        let displayKey = WorkspaceTerminalPolicy.sessionKey(forWorktreePath: displayPath)
-        guard runningKey == displayKey, workspaceTerminalProcess?.isRunning == true else { return false }
-        switch snapshotState {
-        case .running, .stopping: return true
-        default: return false
-        }
+    var showFileBrowser: Bool {
+        get { workspaceTools.showFileBrowser }
+        set { workspaceTools.showFileBrowser = newValue }
     }
+    var showWorkspaceTerminal: Bool {
+        get { workspaceTools.showWorkspaceTerminal }
+        set { workspaceTools.showWorkspaceTerminal = newValue }
+    }
+    var workspaceTerminalLayoutSuppressed: Bool { workspaceTools.workspaceTerminalLayoutSuppressed }
+    var fileBrowserRootPath: String { workspaceTools.fileBrowserRootPath }
+    var fileBrowserRelativeDirectory: String { workspaceTools.fileBrowserRelativeDirectory }
+    var fileBrowserNodes: [WorkspaceFileNode] { workspaceTools.fileBrowserNodes }
+    var fileBrowserSelectedPath: String? { workspaceTools.fileBrowserSelectedPath }
+    var fileBrowserPinnedPaths: [String] { workspaceTools.fileBrowserPinnedPaths }
+    var fileBrowserPreview: WorkspaceFilePreview? { workspaceTools.fileBrowserPreview }
+    var fileBrowserPreviewImage: NSImage? { workspaceTools.fileBrowserPreviewImage }
+    var fileBrowserIsLoading: Bool { workspaceTools.fileBrowserIsLoading }
+    var fileBrowserPreviewLoading: Bool { workspaceTools.fileBrowserPreviewLoading }
+    var fileBrowserTruncated: Bool { workspaceTools.fileBrowserTruncated }
+    var fileBrowserError: String? { workspaceTools.fileBrowserError }
+    var terminalCommandDraft: String {
+        get { workspaceTools.terminalCommandDraft }
+        set { workspaceTools.terminalCommandDraft = newValue }
+    }
+    var workspaceTerminalSnapshot: WorkspaceTerminalSnapshot? { workspaceTools.workspaceTerminalSnapshot }
+    var workspaceTerminalIsRunning: Bool { workspaceTools.workspaceTerminalIsRunning }
 
     func setWorkspaceTerminalLayoutSuppressed(_ suppressed: Bool) {
-        if workspaceTerminalLayoutSuppressed != suppressed {
-            workspaceTerminalLayoutSuppressed = suppressed
-        }
+        workspaceTools.setWorkspaceTerminalLayoutSuppressed(suppressed)
     }
-
-    func toggleFileBrowser() {
-        showFileBrowser.toggle()
-        if showFileBrowser {
-            refreshFileBrowserListing()
-        }
-    }
-
-    func openFileBrowserPath(_ relativePath: String) {
-        showFileBrowser = true
-        let cleaned = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleaned.isEmpty else {
-            refreshFileBrowserListing()
-            return
-        }
-        // Accept absolute paths only when they resolve under the active workspace.
-        let root = activeWorkspacePathForTools
-        let relativeCandidate: String
-        if cleaned.hasPrefix("/") {
-            guard !root.isEmpty else {
-                fileBrowserError = "Choose a workspace before opening files."
-                return
-            }
-            let rootKey = (root as NSString).standardizingPath
-            let absolute = (cleaned as NSString).standardizingPath
-            guard absolute == rootKey || absolute.hasPrefix(rootKey + "/") else {
-                fileBrowserError = "Path is outside the workspace."
-                return
-            }
-            let stripped = String(absolute.dropFirst(rootKey.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            relativeCandidate = stripped
-        } else {
-            relativeCandidate = cleaned
-        }
-
-        switch WorkspaceFileListingPolicy.normalizeRelativePath(relativeCandidate) {
-        case .failure:
-            fileBrowserError = "Path escapes the workspace."
-            return
-        case .success(let normalized):
-            guard case .success = WorkspaceFileListingPolicy.resolveContainedPath(
-                rootPath: root,
-                relativePath: normalized
-            ) else {
-                fileBrowserError = "Path escapes the workspace."
-                return
-            }
-            if normalized.contains("/") {
-                let parent = (normalized as NSString).deletingLastPathComponent
-                fileBrowserRelativeDirectory = parent == "." ? "" : parent
-            } else {
-                fileBrowserRelativeDirectory = ""
-            }
-            fileBrowserSelectedPath = normalized
-            fileBrowserError = nil
-            refreshFileBrowserListing()
-            loadFileBrowserPreview(relativePath: normalized)
-        }
-    }
-
-    func refreshFileBrowserListing() {
-        let root = activeWorkspacePathForTools
-        fileBrowserRootPath = root
-        guard !root.isEmpty else {
-            fileBrowserNodes = []
-            fileBrowserError = nil
-            fileBrowserIsLoading = false
-            return
-        }
-        fileBrowserListTask?.cancel()
-        fileBrowserListGeneration += 1
-        let generation = fileBrowserListGeneration
-        fileBrowserIsLoading = true
-        fileBrowserError = nil
-        let relative = fileBrowserRelativeDirectory
-        let lister = fileLister
-        fileBrowserListTask = Task { [weak self] in
-            let cancelToken = WorkLoopCancelToken()
-            let outcome: Result<WorkspaceFileListingResult, Error> = await withTaskCancellationHandler {
-                await Task.detached(priority: .userInitiated) {
-                    Result {
-                        try lister.list(
-                            WorkspaceFileListingRequest(rootPath: root, relativeDirectory: relative),
-                            isCancelled: { cancelToken.isCancelled }
-                        )
-                    }
-                }.value
-            } onCancel: {
-                cancelToken.cancel()
-            }
-            guard let self, self.fileBrowserListGeneration == generation, !Task.isCancelled else { return }
-            switch outcome {
-            case .success(let result):
-                self.fileBrowserNodes = result.nodes
-                self.fileBrowserTruncated = result.truncated
-                self.fileBrowserIsLoading = false
-            case .failure(let error):
-                if (error as? WorkspaceFileListingError) == .cancelled { return }
-                self.fileBrowserNodes = []
-                self.fileBrowserIsLoading = false
-                self.fileBrowserError = (error as? WorkspaceFileListingError)?.errorDescription
-                    ?? error.localizedDescription
-            }
-        }
-    }
-
-    func fileBrowserNavigateUp() {
-        let current = fileBrowserRelativeDirectory
-        guard !current.isEmpty else { return }
-        let parent = (current as NSString).deletingLastPathComponent
-        fileBrowserRelativeDirectory = (parent == "." || parent == current) ? "" : parent
-        fileBrowserSelectedPath = nil
-        fileBrowserPreview = nil
-        fileBrowserPreviewImage = nil
-        refreshFileBrowserListing()
-    }
-
-    func selectFileBrowserNode(_ node: WorkspaceFileNode) {
-        if node.kind == .directory {
-            fileBrowserRelativeDirectory = node.relativePath
-            fileBrowserSelectedPath = nil
-            fileBrowserPreview = nil
-            fileBrowserPreviewImage = nil
-            refreshFileBrowserListing()
-            return
-        }
-        fileBrowserSelectedPath = node.relativePath
-        loadFileBrowserPreview(relativePath: node.relativePath)
-    }
-
-    func pinFileBrowserSelection() {
-        guard let path = fileBrowserSelectedPath, !path.isEmpty else { return }
-        if let index = fileBrowserPinnedPaths.firstIndex(of: path) {
-            fileBrowserPinnedPaths.remove(at: index)
-        } else {
-            fileBrowserPinnedPaths.append(path)
-            if fileBrowserPinnedPaths.count > 12 {
-                fileBrowserPinnedPaths.removeFirst(fileBrowserPinnedPaths.count - 12)
-            }
-        }
-    }
-
-    func revealFileBrowserSelectionInFinder() {
-        guard let relative = fileBrowserSelectedPath, !relative.isEmpty else { return }
-        let root = fileBrowserRootPath.isEmpty ? activeWorkspacePathForTools : fileBrowserRootPath
-        guard !root.isEmpty else { return }
-        do {
-            let absolute = try fileLister.containedAbsolutePath(rootPath: root, relativePath: relative)
-            let url = URL(fileURLWithPath: absolute)
-            if FileManager.default.fileExists(atPath: url.path) {
-                NSWorkspace.shared.activateFileViewerSelecting([url])
-            } else {
-                fileBrowserError = "File is missing on disk."
-            }
-        } catch {
-            fileBrowserError = (error as? WorkspaceFileListingError)?.errorDescription ?? "Path is outside the workspace."
-        }
-    }
-
-    private func loadFileBrowserPreview(relativePath: String) {
-        let root = fileBrowserRootPath.isEmpty ? activeWorkspacePathForTools : fileBrowserRootPath
-        guard !root.isEmpty else { return }
-        fileBrowserPreviewTask?.cancel()
-        fileBrowserPreviewGeneration += 1
-        let generation = fileBrowserPreviewGeneration
-        fileBrowserPreviewLoading = true
-        fileBrowserPreview = nil
-        fileBrowserPreviewImage = nil
-        let lister = fileLister
-        fileBrowserPreviewTask = Task { [weak self] in
-            let cancelToken = WorkLoopCancelToken()
-            let outcome: Result<(WorkspaceFilePreview, NSImage?), Error> = await withTaskCancellationHandler {
-                await Task.detached(priority: .userInitiated) {
-                    Result {
-                        let preview = try lister.preview(
-                            rootPath: root,
-                            relativePath: relativePath,
-                            isCancelled: { cancelToken.isCancelled }
-                        )
-                        var image: NSImage?
-                        if preview.kind == .image, let data = preview.data {
-                            image = NSImage(data: data)
-                        }
-                        return (preview, image)
-                    }
-                }.value
-            } onCancel: {
-                cancelToken.cancel()
-            }
-            guard let self, self.fileBrowserPreviewGeneration == generation, !Task.isCancelled else { return }
-            switch outcome {
-            case .success(let pair):
-                self.fileBrowserPreview = pair.0
-                self.fileBrowserPreviewImage = pair.1
-                self.fileBrowserPreviewLoading = false
-            case .failure(let error):
-                if (error as? WorkspaceFileListingError) == .cancelled { return }
-                self.fileBrowserPreview = WorkspaceFilePreview(
-                    relativePath: relativePath,
-                    kind: .missing,
-                    message: (error as? WorkspaceFileListingError)?.errorDescription ?? error.localizedDescription
-                )
-                self.fileBrowserPreviewLoading = false
-            }
-        }
-    }
-
-    // MARK: - Workspace terminal
-
-    func toggleWorkspaceTerminal() {
-        showWorkspaceTerminal.toggle()
-        if showWorkspaceTerminal {
-            ensureWorkspaceTerminal()
-        }
-    }
-
-    func ensureWorkspaceTerminal() {
-        let path = activeWorkspacePathForTools
-        guard !path.isEmpty else {
-            workspaceTerminalSnapshot = nil
-            workspaceTerminalIsRunning = false
-            return
-        }
-        let snapshot = workspaceTerminalStore.ensureSnapshot(forWorktreePath: path)
-        workspaceTerminalStore.update(snapshot)
-        workspaceTerminalSnapshot = snapshot
-        workspaceTerminalIsRunning = isTerminalProcessActive(forDisplayPath: path, snapshotState: snapshot.state)
-    }
-
-    func runWorkspaceTerminalCommand() {
-        guard let command = WorkspaceTerminalPolicy.sanitizeCommand(terminalCommandDraft) else { return }
-        let path = activeWorkspacePathForTools
-        guard !path.isEmpty else {
-            workspaceActionMessage = "Choose a workspace before running terminal commands."
-            return
-        }
-        // Refuse starting on another worktree while a process is tracked.
-        if let runningPath = workspaceTerminalRunningWorktreePath,
-           WorkspaceTerminalPolicy.sessionKey(forWorktreePath: runningPath)
-            != WorkspaceTerminalPolicy.sessionKey(forWorktreePath: path),
-           workspaceTerminalProcess?.isRunning == true {
-            workspaceActionMessage = "Stop the terminal in the other workspace before starting a new command here."
-            return
-        }
-        if workspaceTerminalIsRunning,
-           workspaceTerminalRunningWorktreePath.map({ WorkspaceTerminalPolicy.sessionKey(forWorktreePath: $0) })
-            == WorkspaceTerminalPolicy.sessionKey(forWorktreePath: path) {
-            return
-        }
-        guard let shell = WorkspaceTerminalPolicy.resolveShellExecutable() else {
-            var snapshot = workspaceTerminalStore.ensureSnapshot(forWorktreePath: path)
-            snapshot.state = .failed
-            snapshot.lastFailureSummary = "No shell executable found."
-            WorkspaceTerminalPolicy.appendLine(
-                .init(text: "No shell executable found on this Mac.", isError: true),
-                to: &snapshot
-            )
-            workspaceTerminalStore.update(snapshot)
-            workspaceTerminalSnapshot = snapshot
-            return
-        }
-
-        // Stop previous run (if any) and invalidate its handlers via a new run ID.
-        stopWorkspaceTerminal(invalidateRun: true)
-
-        let runID = UUID()
-        workspaceTerminalRunID = runID
-        workspaceTerminalRunningWorktreePath = path
-
-        var snapshot = workspaceTerminalStore.ensureSnapshot(forWorktreePath: path)
-        WorkspaceTerminalPolicy.appendLine(.init(text: "$ \(command)"), to: &snapshot)
-        snapshot.state = .running
-        snapshot.lastFailureSummary = nil
-        snapshot.lastExitStatus = nil
-        workspaceTerminalStore.update(snapshot)
-        workspaceTerminalSnapshot = snapshot
-        workspaceTerminalIsRunning = true
-        terminalCommandDraft = ""
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: shell)
-        // Non-interactive shell invocation: not the agent channel. Job control (-m) helps
-        // child pipelines share a process group with the shell when the shell becomes leader.
-        process.arguments = ["-lc", "set -m; " + command]
-        process.currentDirectoryURL = URL(fileURLWithPath: path, isDirectory: true)
-        var environment = ChildProcessEnvironmentPolicy.providerOwnedRuntime(
-            from: ProcessInfo.processInfo.environment,
-            temporaryDirectory: FileManager.default.temporaryDirectory
-        )
-        environment["TERM"] = environment["TERM"] ?? "xterm-256color"
-        process.environment = environment
-
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardOutput = stdout
-        process.standardError = stderr
-        workspaceTerminalProcess = process
-        workspaceTerminalStdoutPipe = stdout
-        workspaceTerminalStderrPipe = stderr
-
-        stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            let text = String(decoding: data, as: UTF8.self)
-            Task { @MainActor in
-                self?.appendTerminalOutput(text, isError: false, worktreePath: path, runID: runID)
-            }
-        }
-        stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            let text = String(decoding: data, as: UTF8.self)
-            Task { @MainActor in
-                self?.appendTerminalOutput(text, isError: true, worktreePath: path, runID: runID)
-            }
-        }
-        process.terminationHandler = { [weak self] proc in
-            let status = proc.terminationStatus
-            let pid = proc.processIdentifier
-            Task { @MainActor in
-                self?.handleTerminalTermination(
-                    status: status,
-                    worktreePath: path,
-                    runID: runID,
-                    processIdentifier: pid
-                )
-            }
-        }
-
-        do {
-            try process.run()
-            let pid = process.processIdentifier
-            // Only store a process-group id when the shell is the group leader (BoundedProcessTransport pattern).
-            // Never fall back to raw PID for kill(-pid) — that can signal Lattice's own group.
-            let group = getpgid(pid)
-            workspaceTerminalProcessGroupID = (group > 0 && group == pid) ? group : nil
-        } catch {
-            if workspaceTerminalRunID == runID {
-                workspaceTerminalIsRunning = false
-                workspaceTerminalProcess = nil
-                workspaceTerminalRunningWorktreePath = nil
-                workspaceTerminalProcessGroupID = nil
-            }
-            var failed = workspaceTerminalStore.ensureSnapshot(forWorktreePath: path)
-            failed.state = .failed
-            failed.lastFailureSummary = error.localizedDescription
-            WorkspaceTerminalPolicy.appendLine(
-                .init(text: "Launch failed: \(error.localizedDescription)", isError: true),
-                to: &failed
-            )
-            workspaceTerminalStore.update(failed)
-            workspaceTerminalSnapshot = failed
-        }
-    }
-
-    func stopWorkspaceTerminal(invalidateRun: Bool = false) {
-        let process = workspaceTerminalProcess
-        let groupID = workspaceTerminalProcessGroupID
-        let runningPath = workspaceTerminalRunningWorktreePath
-
-        if invalidateRun {
-            workspaceTerminalRunID = UUID()
-        }
-
-        if let process, process.isRunning {
-            // Prefer process-group signal only when we verified the shell is group leader.
-            if let groupID, groupID > 0 {
-                _ = kill(-groupID, SIGTERM)
-            }
-            process.terminate()
-            // Escalate after a short grace. If we recorded a process group (shell was leader),
-            // always SIGKILL the group so pipeline children die even when the shell PID is gone.
-            // Per-PID liveness gating only applies when there is no verified group id (PID-reuse safety).
-            let escalateGroup = groupID
-            let escalatePID = process.processIdentifier
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.35) {
-                if let escalateGroup, escalateGroup > 0 {
-                    _ = kill(-escalateGroup, SIGKILL)
-                    return
-                }
-                guard escalatePID > 0, kill(escalatePID, 0) == 0 else { return }
-                _ = kill(escalatePID, SIGKILL)
-            }
-        }
-
-        workspaceTerminalStdoutPipe?.fileHandleForReading.readabilityHandler = nil
-        workspaceTerminalStderrPipe?.fileHandleForReading.readabilityHandler = nil
-
-        if !invalidateRun {
-            // Keep Process retained until its own termination handler for the active run.
-            if let runningPath {
-                var snapshot = workspaceTerminalStore.ensureSnapshot(forWorktreePath: runningPath)
-                if snapshot.state == .running {
-                    snapshot.state = .stopping
-                    WorkspaceTerminalPolicy.appendLine(
-                        .init(text: "[stopping…]", isError: false),
-                        to: &snapshot
-                    )
-                    workspaceTerminalStore.update(snapshot)
-                    if WorkspaceTerminalPolicy.sessionKey(forWorktreePath: activeWorkspacePathForTools)
-                        == WorkspaceTerminalPolicy.sessionKey(forWorktreePath: runningPath) {
-                        workspaceTerminalSnapshot = snapshot
-                    }
-                }
-            }
-            workspaceTerminalIsRunning = isTerminalProcessActive(
-                forDisplayPath: activeWorkspacePathForTools,
-                snapshotState: workspaceTerminalSnapshot?.state
-            )
-        } else {
-            // Superseded/clear: always finalize the **running** worktree snapshot, not only the display path.
-            if let runningPath {
-                var killed = workspaceTerminalStore.ensureSnapshot(forWorktreePath: runningPath)
-                killed.state = .exited
-                killed.lastFailureSummary = nil
-                WorkspaceTerminalPolicy.appendLine(
-                    .init(text: "[stopped]", isError: false),
-                    to: &killed
-                )
-                workspaceTerminalStore.update(killed)
-                if WorkspaceTerminalPolicy.sessionKey(forWorktreePath: activeWorkspacePathForTools)
-                    == WorkspaceTerminalPolicy.sessionKey(forWorktreePath: runningPath) {
-                    workspaceTerminalSnapshot = killed
-                }
-            }
-            workspaceTerminalProcess = nil
-            workspaceTerminalStdoutPipe = nil
-            workspaceTerminalStderrPipe = nil
-            workspaceTerminalRunningWorktreePath = nil
-            workspaceTerminalProcessGroupID = nil
-            workspaceTerminalIsRunning = false
-        }
-    }
-
-    func clearWorkspaceTerminal() {
-        let runningPath = workspaceTerminalRunningWorktreePath
-        let displayPath = activeWorkspacePathForTools
-        // If a process belongs to another worktree, stop it and reset that worktree — don't only clear display.
-        stopWorkspaceTerminal(invalidateRun: true)
-        workspaceTerminalRunID = UUID()
-
-        if let runningPath,
-           WorkspaceTerminalPolicy.sessionKey(forWorktreePath: runningPath)
-            != WorkspaceTerminalPolicy.sessionKey(forWorktreePath: displayPath) {
-            // Reset the killed worktree buffer so it is not left `.running` after Clear on B.
-            let clearedRunning = WorkspaceTerminalSnapshot(worktreePath: runningPath)
-            workspaceTerminalStore.update(clearedRunning)
-        }
-
-        guard !displayPath.isEmpty else {
-            workspaceTerminalSnapshot = nil
-            return
-        }
-        let snapshot = WorkspaceTerminalSnapshot(worktreePath: displayPath)
-        workspaceTerminalStore.update(snapshot)
-        workspaceTerminalSnapshot = snapshot
-    }
-
+    func toggleFileBrowser() { workspaceTools.toggleFileBrowser() }
+    func openFileBrowserPath(_ relativePath: String) { workspaceTools.openFileBrowserPath(relativePath) }
+    func refreshFileBrowserListing() { workspaceTools.refreshFileBrowserListing() }
+    func selectFileBrowserNode(_ node: WorkspaceFileNode) { workspaceTools.selectFileBrowserNode(node) }
+    func pinFileBrowserSelection() { workspaceTools.pinFileBrowserSelection() }
+    func toggleWorkspaceTerminal() { workspaceTools.toggleWorkspaceTerminal() }
+    func ensureWorkspaceTerminal() { workspaceTools.ensureWorkspaceTerminal() }
+    func runWorkspaceTerminalCommand() { workspaceTools.runWorkspaceTerminalCommand() }
+    func stopWorkspaceTerminal(invalidateRun: Bool = false) { workspaceTools.stopWorkspaceTerminal(invalidateRun: invalidateRun) }
+    func clearWorkspaceTerminal() { workspaceTools.clearWorkspaceTerminal() }
+    func fileBrowserNavigateUp() { workspaceTools.fileBrowserNavigateUp() }
+    func revealFileBrowserSelectionInFinder() { workspaceTools.revealFileBrowserSelectionInFinder() }
     func attachTerminalOutputToComposer() {
-        guard let snapshot = workspaceTerminalSnapshot else { return }
-        let payload = WorkspaceTerminalPolicy.contextAttachmentText(from: snapshot)
+        guard let payload = workspaceTools.terminalOutputAttachmentText() else { return }
         draft = ReviewFollowUpPayloadPolicy.mergeIntoDraft(existingDraft: draft, payload: payload)
-        if case .compact = composerStateForBinding {
-            setVisibleComposerState(.expanded, for: selectedSession?.id)
+        if case .compact = composerState {
+            composerState = .expanded
         }
     }
-
-    func openTerminalForFailedTool(cwd: String? = nil) {
-        showWorkspaceTerminal = true
-        ensureWorkspaceTerminal()
-        if let cwd {
-            let standardized = WorkspaceTerminalPolicy.standardizedPath(cwd)
-            let workspace = activeWorkspacePathForTools
-            if !workspace.isEmpty {
-                let root = (workspace as NSString).standardizingPath
-                if standardized == root || standardized.hasPrefix(root + "/") {
-                    // Pre-fill a cd into the tool cwd when it is under the workspace.
-                    if standardized != root {
-                        let relative = String(standardized.dropFirst(root.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-                        if !relative.isEmpty {
-                            terminalCommandDraft = "cd \(relative.shellSingleQuoted) && "
-                        }
-                    }
-                } else if !standardized.isEmpty {
-                    workspaceActionMessage = "Tool working directory is outside this workspace; terminal stays workspace-scoped."
-                }
-            }
-        }
-    }
+    func openTerminalForFailedTool(cwd: String? = nil) { workspaceTools.openTerminalForFailedTool(cwd: cwd) }
 
     private var composerStateForBinding: MorphingControlState {
         selectedSession.map { visibleComposerState(for: $0.id) } ?? composerState
-    }
-
-    private func appendTerminalOutput(_ text: String, isError: Bool, worktreePath: String, runID: UUID) {
-        guard runID == workspaceTerminalRunID else { return }
-        let chunks = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        var snapshot = workspaceTerminalStore.ensureSnapshot(forWorktreePath: worktreePath)
-        // Don't flip stopping back to running on late output.
-        let preserveStopping = snapshot.state == .stopping
-        for (index, chunk) in chunks.enumerated() {
-            if chunk.isEmpty && index == chunks.count - 1 { continue }
-            WorkspaceTerminalPolicy.appendLine(.init(text: chunk, isError: isError), to: &snapshot)
-        }
-        if !preserveStopping {
-            snapshot.state = .running
-        }
-        workspaceTerminalStore.update(snapshot)
-        if WorkspaceTerminalPolicy.sessionKey(forWorktreePath: activeWorkspacePathForTools)
-            == WorkspaceTerminalPolicy.sessionKey(forWorktreePath: worktreePath) {
-            workspaceTerminalSnapshot = snapshot
-        }
-    }
-
-    private func handleTerminalTermination(
-        status: Int32,
-        worktreePath: String,
-        runID: UUID,
-        processIdentifier: Int32
-    ) {
-        // Ignore stale runs (superseded start/clear).
-        guard runID == workspaceTerminalRunID else { return }
-
-        workspaceTerminalStdoutPipe?.fileHandleForReading.readabilityHandler = nil
-        workspaceTerminalStderrPipe?.fileHandleForReading.readabilityHandler = nil
-        if workspaceTerminalProcess?.processIdentifier == processIdentifier {
-            workspaceTerminalProcess = nil
-        }
-        workspaceTerminalStdoutPipe = nil
-        workspaceTerminalStderrPipe = nil
-        if workspaceTerminalRunningWorktreePath.map({ WorkspaceTerminalPolicy.sessionKey(forWorktreePath: $0) })
-            == WorkspaceTerminalPolicy.sessionKey(forWorktreePath: worktreePath) {
-            workspaceTerminalRunningWorktreePath = nil
-            workspaceTerminalProcessGroupID = nil
-            workspaceTerminalIsRunning = false
-        }
-
-        var snapshot = workspaceTerminalStore.ensureSnapshot(forWorktreePath: worktreePath)
-        snapshot.state = status == 0 ? .exited : .failed
-        snapshot.lastExitStatus = status
-        if status != 0 {
-            snapshot.lastFailureSummary = "Exit \(status)"
-        }
-        WorkspaceTerminalPolicy.appendLine(
-            .init(text: "[exit \(status)]", isError: status != 0),
-            to: &snapshot
-        )
-        workspaceTerminalStore.update(snapshot)
-        if WorkspaceTerminalPolicy.sessionKey(forWorktreePath: activeWorkspacePathForTools)
-            == WorkspaceTerminalPolicy.sessionKey(forWorktreePath: worktreePath) {
-            workspaceTerminalSnapshot = snapshot
-        }
     }
 
     // MARK: - Review navigation
@@ -9414,7 +8712,7 @@ Lattice self-edit rules:
     }
 }
 
-private extension String {
+extension String {
     /// Minimal single-quote escape for pre-filling a shell `cd` path.
     var shellSingleQuoted: String {
         "'" + replacingOccurrences(of: "'", with: "'\\''") + "'"
@@ -9422,7 +8720,7 @@ private extension String {
 }
 
 /// Bridges cooperative cancel into `Task.detached` work that does not inherit Task cancellation.
-private final class WorkLoopCancelToken: @unchecked Sendable {
+final class WorkLoopCancelToken: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
 
