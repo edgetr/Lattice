@@ -31,12 +31,18 @@ final class ComposerController: ObservableObject {
         routePopoverPresented = false
     }
 
-    func markTransientNewChat(_ value: Bool = true) {
+    /// Single setter for the transient-new-chat flag (and optional mode/backend pair).
+    func setTransientNewChat(_ value: Bool, mode: ConversationMode? = nil, backend: ChatBackend? = nil) {
         isTransientNewChat = value
-    }
-
-    func setTransientNewChat(_ value: Bool) {
-        isTransientNewChat = value
+        if let mode {
+            selectionMode = mode
+        }
+        if let backend {
+            selectionBackend = backend
+        }
+        if !value {
+            // Clearing transient does not wipe mode/backend unless caller clears via clearTransientSelection.
+        }
     }
 
     func setSelection(mode: ConversationMode?, backend: ChatBackend?) {

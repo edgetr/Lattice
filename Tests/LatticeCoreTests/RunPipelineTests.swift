@@ -35,16 +35,16 @@ struct RunPipelineTests {
         #expect(!plan.resetsHarnessSession)
     }
 
-    @Test func plannerRecoveryWhenACPSessionExists() {
+    @Test func plannerRecoveryKeepsOrResetsThreadConsistently() {
         let session = LatticeSession(
             title: "t",
             messages: [
                 .init(role: .user, text: "first"),
-                .init(role: .assistant, text: "reply")
+                .init(role: .assistant, text: "reply with enough text for context")
             ],
             backend: .grok(model: "grok-4"),
             executionRoute: ExecutionRoute(mode: .code, providerID: "grok", modelID: "grok-4", runtimeID: "grok"),
-            harnessThreadID: "thread-1"
+            harnessThreadID: "thread-abc"
         )
         let plan = RunLaunchPlanner.plan(
             .init(
@@ -57,7 +57,11 @@ struct RunPipelineTests {
         )
         #expect(plan.usesPromptDrivenBackend)
         #expect(plan.recoveryPrompt != nil)
-        #expect(plan.routeThreadID == "thread-1" || plan.resetsHarnessSession)
+        if plan.resetsHarnessSession {
+            #expect(plan.routeThreadID == nil)
+        } else {
+            #expect(plan.routeThreadID == "thread-abc")
+        }
     }
 
     @Test func reducerFinalizesTerminalEvents() {
@@ -102,37 +106,6 @@ struct RunPipelineTests {
             Issue.record("Expected permissionDenied")
         }
     }
-}
-
-    @Test func plannerRecoveryKeepsOrResetsThreadConsistently() {
-        let session = LatticeSession(
-            title: "t",
-            messages: [
-                .init(role: .user, text: "first"),
-                .init(role: .assistant, text: "reply with enough text for context")
-            ],
-            backend: .grok(model: "grok-4"),
-            executionRoute: ExecutionRoute(mode: .code, providerID: "grok", modelID: "grok-4", runtimeID: "grok"),
-            harnessThreadID: "thread-abc"
-        )
-        let plan = RunLaunchPlanner.plan(
-            .init(
-                session: session,
-                submittedText: "follow-up",
-                additionalContext: "",
-                tokenLimit: 8_000,
-                effectiveRuntimeID: "grok"
-            )
-        )
-        #expect(plan.usesPromptDrivenBackend)
-        #expect(plan.recoveryPrompt != nil)
-        // Either keep the provider thread or explicitly reset; never invent a third state.
-        if plan.resetsHarnessSession {
-            #expect(plan.routeThreadID == nil)
-        } else {
-            #expect(plan.routeThreadID == "thread-abc")
-        }
-    }
 
     @Test func reducerNoOpsWhenNotStreamingOrNoAssistant() {
         let idle = SessionRunState(
@@ -162,8 +135,7 @@ struct RunPipelineTests {
             catalogStatus: .loaded,
             models: [],
             harnessModels: [],
-            runnableModelCount: 0,
-            ready: true // ignored — single formula wins
+            runnableModelCount: 0
         )
         #expect(!lying.ready)
         #expect(!lying.readiness.isRunnable)
@@ -178,3 +150,4 @@ struct RunPipelineTests {
         #expect(consistent.ready)
         #expect(consistent.ready == consistent.readiness.isRunnable)
     }
+}

@@ -612,6 +612,16 @@ extension AppState {
             Task { for await event in failedStream { apply(event, to: id, runID: runID) } }
             return
         }
+        // Full readiness recheck immediately before Keychain read / stream (not only at send).
+        guard canRunSession(session) else {
+            let detail = routeUnavailableMessage(for: session) ?? "Choose a connected model."
+            let failedStream = AsyncStream<AgentEvent> { continuation in
+                continuation.yield(.failed(detail))
+                continuation.finish()
+            }
+            Task { for await event in failedStream { apply(event, to: id, runID: runID) } }
+            return
+        }
         let isExtensionSelfEdit = isExtensionSelfEditThread(session, submittedText: submittedText)
         if isExtensionSelfEdit { selfEditRunIDs.insert(id) }
         else { selfEditRunIDs.remove(id) }

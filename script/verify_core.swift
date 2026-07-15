@@ -4595,6 +4595,22 @@ struct CoreVerification {
             ExecutionRoutePolicy.defaultHarnessID(for: "codex") == "pi",
             "defaultHarnessID for codex aligns with RouteRuntimeMap pi"
         )
+        expect(
+            SessionLaunchIntegrity.launchRejection(
+                backend: .grok(model: "grok-4"),
+                privacyMode: .cloudAllowed,
+                route: ExecutionRoute(mode: .code, providerID: "codex", modelID: "gpt-5.5", runtimeID: "pi")
+            ) == .declaredRouteBackendMismatch,
+            "declared route vs backend mismatch is rejected"
+        )
+        expect(
+            SessionLaunchIntegrity.importRejection(
+                backend: .codex(model: "gpt-5.5"),
+                privacyMode: .localOnly,
+                route: ExecutionRoute.legacy(for: .codex(model: "gpt-5.5"), harnessID: "codex")
+            ) == .privacyBlocksCloudBackend,
+            "v1-style importRejection rejects localOnly + cloud backend"
+        )
 
         print("Core verification passed: \(checks) checks")
     }

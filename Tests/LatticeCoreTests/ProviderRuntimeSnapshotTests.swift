@@ -48,7 +48,6 @@ struct ProviderRuntimeSnapshotTests {
             catalogStatus: .loaded,
             models: [ProviderModel(id: "gpt", name: "GPT")],
             cliVersion: "1.2.3",
-            ready: true
         )
         ProviderRuntimeSnapshotStore.upsert(&map, key: .codex, snapshot: snapshot)
         let read = ProviderRuntimeSnapshotStore.snapshot(in: map, key: .codex)
@@ -65,7 +64,6 @@ struct ProviderRuntimeSnapshotTests {
                 authenticated: true,
                 catalogStatus: .loaded,
                 models: [ProviderModel(id: "g", name: "G")],
-                ready: true
             )
         ]
         ProviderRuntimeSnapshotStore.markLoading(&map, key: .grok)

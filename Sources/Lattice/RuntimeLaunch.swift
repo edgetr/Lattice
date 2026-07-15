@@ -204,20 +204,38 @@ enum RuntimeLaunch: Equatable {
         }
 
         if launch.legacyHarnessID == "hermes" {
+            // Align with declared Hermes fail-closed: require provider + non-empty system identity.
+            let provider = launch.hermesProvider
+                ?? Self.defaultHermesProvider(for: launch.route.providerID)
+                ?? Self.defaultHermesProvider(for: {
+                    switch launch.backend {
+                    case .codex: "codex"
+                    case .grok: "grok"
+                    case .openCode: "opencode"
+                    default: ""
+                    }
+                }())
+            guard let provider else {
+                return .failed("The selected Hermes route is incomplete: provider is missing.")
+            }
+            guard let systemIdentity = launch.hermesSystemIdentity ?? launch.developerInstructions,
+                  !systemIdentity.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return .failed("The selected Hermes route is incomplete: system identity is missing.")
+            }
             return .acp(ACPRuntimeLaunch(
                 provider: .hermes,
                 sessionID: launch.sessionID,
                 prompt: launch.prompt,
                 threadID: launch.threadID,
                 workspace: launch.workspace,
-                requestedModel: launch.backend.displayName,
+                requestedModel: launch.route.modelID ?? launch.backend.displayName,
                 allowFileModification: launch.allowFileModification,
                 recoveryPrompt: launch.recoveryPrompt,
                 recoveryUsesVisibleTranscriptHandoff: launch.recoveryUsesVisibleTranscriptHandoff,
                 recoveryDeliveryIssue: launch.recoveryDeliveryIssue,
-                hermesProvider: nil,
-                hermesSystemIdentity: nil,
-                openCodeAPIKey: nil
+                hermesProvider: provider,
+                hermesSystemIdentity: systemIdentity,
+                openCodeAPIKey: launch.openCodeAPIKey
             ))
         }
 

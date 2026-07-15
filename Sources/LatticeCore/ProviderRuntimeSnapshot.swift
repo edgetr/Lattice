@@ -31,6 +31,8 @@ public struct ProviderRuntimeSnapshot: Equatable, Sendable {
     public var usage: ProviderUsage?
     public var updateInfo: CLIUpdateInfo?
 
+    /// - Note: `ready` is always derived from installed/authenticated/catalog/runnableModelCount.
+    ///   Callers cannot force a ready bit that disagrees with the formula.
     public init(
         installed: Bool = false,
         authenticated: Bool = false,
@@ -41,7 +43,6 @@ public struct ProviderRuntimeSnapshot: Equatable, Sendable {
         latestCLIVersion: String? = nil,
         protocolDetail: String? = nil,
         runnableModelCount: Int? = nil,
-        ready: Bool? = nil,
         usage: ProviderUsage? = nil,
         updateInfo: CLIUpdateInfo? = nil
     ) {
@@ -56,7 +57,6 @@ public struct ProviderRuntimeSnapshot: Equatable, Sendable {
         let count = runnableModelCount
             ?? max(models.count, harnessModels.count)
         self.runnableModelCount = max(0, count)
-        // Single formula: stored ready always matches readiness.isRunnable.
         self.ready = ProviderRuntimeSnapshotStore.computeReady(
             installed: installed,
             authenticated: authenticated,
@@ -149,8 +149,7 @@ public enum ProviderRuntimeSnapshotStore {
                 installed: entry.installed,
                 authenticated: entry.authenticated,
                 catalogStatus: .unknown,
-                runnableModelCount: 0,
-                ready: false
+                runnableModelCount: 0
             )
         }
         return result

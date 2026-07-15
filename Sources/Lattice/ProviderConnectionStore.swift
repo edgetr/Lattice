@@ -2,12 +2,12 @@ import Foundation
 import LatticeCore
 import Combine
 
-/// Owns provider runtime snapshots and connection-refresh presentation state.
+/// Owns the provider runtime snapshot map only.
+/// Refresh presentation (`isRefreshingConnections`, `connectionRefreshAction`) stays on AppState
+/// until a real ownership move; do not mirror those fields here.
 @MainActor
 final class ProviderConnectionStore: ObservableObject {
     @Published private(set) var snapshots: [String: ProviderRuntimeSnapshot] = [:]
-    @Published private(set) var isRefreshingConnections = false
-    @Published private(set) var connectionRefreshAction = ControlActionState()
 
     func snapshot(for key: ProviderConnectionKey) -> ProviderRuntimeSnapshot {
         ProviderRuntimeSnapshotStore.snapshot(in: snapshots, key: key)

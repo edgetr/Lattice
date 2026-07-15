@@ -1189,28 +1189,6 @@ public enum SessionPortableArchiveImporter {
             guard route.modelID == backendModel else {
                 throw SessionPortableArchive.ArchiveError.invalidField("chat.executionRoute.modelID")
             }
-            // Reject inconsistent privacy/backend/route triples at ingest, not only at launch.
-            let privacy = SessionPrivacyMode(rawValue: privacyMode) ?? .cloudAllowed
-            let backend: ChatBackend = {
-                switch backendRoute {
-                case "codex": return .codex(model: backendModel ?? "")
-                case "grok": return .grok(model: backendModel ?? "")
-                case "opencode": return .openCode(model: backendModel ?? "")
-                case "antigravity": return .antigravity(model: backendModel ?? "")
-                case "appleIntelligence": return .appleIntelligence
-                case "ollama": return .ollama(model: backendModel ?? "")
-                default: return .codex(model: backendModel ?? "")
-                }
-            }()
-            if let rejection = SessionLaunchIntegrity.importRejection(
-                backend: backend,
-                privacyMode: privacy,
-                route: route
-            ) {
-                throw SessionPortableArchive.ArchiveError.invalidField(
-                    "chat.privacyMode/backend/executionRoute (\(SessionLaunchIntegrity.userMessage(for: rejection)))"
-                )
-            }
             mode = decodedMode
             executionRoute = route
         } else {
@@ -1420,6 +1398,16 @@ public enum SessionPortableArchiveImporter {
         let executionRoute = chat.executionRoute ?? ExecutionRoute.legacy(for: backend, harnessID: chat.harnessID)
         let policy = ExecutionPolicy(rawValue: chat.policy) ?? .ask
         let privacy = SessionPrivacyMode(rawValue: chat.privacyMode) ?? .cloudAllowed
+        // v1 and v2: reject inconsistent privacy/backend/route triples at materialize (ingest).
+        if let rejection = SessionLaunchIntegrity.importRejection(
+            backend: backend,
+            privacyMode: privacy,
+            route: executionRoute
+        ) {
+            throw SessionPortableArchive.ArchiveError.invalidField(
+                "chat.privacyMode/backend/executionRoute (\(SessionLaunchIntegrity.userMessage(for: rejection)))"
+            )
+        }
         let reasoning = chat.reasoningEffort.flatMap(ReasoningEffort.init(rawValue:))
 
         var messageIDMap: [Int: UUID] = [:]

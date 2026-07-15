@@ -121,7 +121,6 @@ extension AppState {
                 latestCLIVersion: latest,
                 protocolDetail: snapshot.unavailableReason,
                 runnableModelCount: visibleCodexModels.count,
-                ready: codexReady,
                 usage: snapshot.usage
             ),
             for: .codex
@@ -166,7 +165,6 @@ extension AppState {
                 latestCLIVersion: update.latestVersion,
                 protocolDetail: update.detail,
                 runnableModelCount: runnableGrokModels.count,
-                ready: grokReady,
                 updateInfo: update
             ),
             for: .grok
@@ -229,7 +227,6 @@ extension AppState {
                 cliVersion: openCodeCLIVersion,
                 latestCLIVersion: latest,
                 runnableModelCount: runnableOpenCodeModels.count,
-                ready: openCodeReady
             ),
             for: .opencode
         )
@@ -272,7 +269,6 @@ extension AppState {
                 latestCLIVersion: latest,
                 protocolDetail: String(describing: protocolSupport),
                 runnableModelCount: models.count,
-                ready: authenticated && catalog.status == .loaded && !models.isEmpty
             ),
             for: .antigravity
         )
@@ -302,7 +298,6 @@ extension AppState {
                 cliVersion: version,
                 latestCLIVersion: latest,
                 runnableModelCount: catalog.count,
-                ready: piInstalled && !catalog.isEmpty
             ),
             for: .pi
         )
@@ -332,7 +327,6 @@ extension AppState {
                 latestCLIVersion: info.latestVersion,
                 protocolDetail: info.detail,
                 runnableModelCount: catalog.models.count,
-                ready: hermesInstalled && catalog.status == .loaded && !catalog.models.isEmpty,
                 updateInfo: info
             ),
             for: .hermes
@@ -366,7 +360,6 @@ extension AppState {
                 models: ollamaModels.map { ProviderModel(id: $0.name, name: $0.name) },
                 protocolDetail: nil,
                 runnableModelCount: ollamaModels.count,
-                ready: localReady && localCatalog.status == .loaded && !ollamaModels.isEmpty
             ),
             for: .ollama
         )
@@ -377,7 +370,6 @@ extension AppState {
                 catalogStatus: intelligenceReady ? .loaded : .empty,
                 protocolDetail: intelligenceStatus,
                 runnableModelCount: intelligenceReady ? 1 : 0,
-                ready: intelligenceReady
             ),
             for: .apple
         )
