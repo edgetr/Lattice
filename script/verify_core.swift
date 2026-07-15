@@ -443,6 +443,161 @@ struct CoreVerification {
         let queuedSession = LatticeSession(title: "Queued chat", messages: [.init(role: .user, text: "Start")], backend: .codex(model: "gpt-5.4"), queuedFollowUps: [queuedFollowUp])
         try! store.save([queuedSession])
         expect(store.load().first?.queuedFollowUps == [queuedFollowUp], "Queued follow-ups round trip with the session")
+        expect(queuedFollowUp.context == nil && queuedFollowUp.lifecycle == .blocked(.missingCapturedContext), "Legacy queued follow-ups without context require explicit review")
+
+        // Session input outbox: secret-free context, FIFO claim/dequeue, restart review, no auto-advance past head failure.
+        let outboxSecretSentinel = "sk-outbox-verify-secret-sentinel"
+        let outboxRoute = ExecutionRoute(mode: .code, providerID: "codex", modelID: "gpt-5.4", runtimeID: "codex")
+        let outboxContext = SessionInputOutboxContext.capture(
+            executionRoute: outboxRoute,
+            workspacePath: "/Users/dev/project",
+            policy: .ask,
+            privacyMode: .cloudAllowed,
+            reasoningEffort: .medium,
+            attachments: [ContextAttachment(path: "/Users/dev/project/a.swift")]
+        )
+        var outboxEntries: [QueuedFollowUp] = []
+        var outboxLedger = SessionInputOutboxReceiptLedger()
+        let outboxHeadID = UUID(), outboxTailID = UUID(), outboxAttempt = UUID()
+        SessionInputOutboxPolicy.enqueue(text: "head", context: outboxContext, into: &outboxEntries, id: outboxHeadID)
+        SessionInputOutboxPolicy.enqueue(text: "tail", context: outboxContext, into: &outboxEntries, id: outboxTailID)
+        expect(
+            SessionInputOutboxPolicy.automaticDispatchEligibility(of: outboxTailID, currentContext: outboxContext, in: outboxEntries) == .ineligible(.notHead),
+            "Outbox FIFO rejects non-head automatic dispatch"
+        )
+        expect(
+            SessionInputOutboxPolicy.claimDispatch(entryID: outboxHeadID, currentContext: outboxContext, in: &outboxEntries, attemptID: outboxAttempt) == .claimed(attemptID: outboxAttempt),
+            "Outbox claims the eligible head with a durable attempt id"
+        )
+        expect(
+            SessionInputOutboxPolicy.claimDispatch(entryID: outboxHeadID, currentContext: outboxContext, in: &outboxEntries, attemptID: UUID()) == .alreadyClaimed(attemptID: outboxAttempt),
+            "Outbox claim is duplicate-safe for an in-flight head"
+        )
+        let outboxFailure = QueuedFollowUpFailureReason(code: .providerUnavailable, detail: "route offline")
+        expect(
+            SessionInputOutboxPolicy.recordFailure(entryID: outboxHeadID, attemptID: outboxAttempt, reason: outboxFailure, in: &outboxEntries) == .applied,
+            "Outbox records typed failure without removing the FIFO head"
+        )
+        expect(
+            SessionInputOutboxPolicy.automaticDispatchEligibility(of: outboxTailID, currentContext: outboxContext, in: outboxEntries) == .ineligible(.notHead),
+            "Outbox head failure blocks automatic advancement"
+        )
+        expect(
+            SessionInputOutboxPolicy.acceptExplicitReview(entryID: outboxHeadID, currentContext: outboxContext, in: &outboxEntries) == .applied,
+            "Outbox explicit review re-arms a failed head with current context"
+        )
+        expect(
+            SessionInputOutboxPolicy.claimDispatch(entryID: outboxHeadID, currentContext: outboxContext, in: &outboxEntries, attemptID: outboxAttempt) == .claimed(attemptID: outboxAttempt),
+            "Outbox re-claims after explicit review"
+        )
+        expect(
+            SessionInputOutboxPolicy.completeLocalDequeue(entryID: outboxHeadID, attemptID: outboxAttempt, in: &outboxEntries, ledger: &outboxLedger) == .dequeued,
+            "Outbox completes exactly-once local dequeue"
+        )
+        expect(
+            SessionInputOutboxPolicy.completeLocalDequeue(entryID: outboxHeadID, attemptID: outboxAttempt, in: &outboxEntries, ledger: &outboxLedger) == .alreadyDequeued,
+            "Outbox local dequeue completion is idempotent via receipt ledger"
+        )
+        expect(outboxEntries.map(\.id) == [outboxTailID], "Outbox dequeue removes only the claimed head")
+        SessionInputOutboxPolicy.recoverAfterRestart(&outboxEntries)
+        expect(outboxEntries[0].lifecycle == .blocked(.restartRecovery), "Outbox restart recovery requires explicit review for pending work")
+        let mismatched = SessionInputOutboxContext(
+            executionRoute: outboxRoute,
+            workspacePath: "/tmp/elsewhere",
+            policy: .ask,
+            privacyMode: .cloudAllowed,
+            reasoningEffort: .medium,
+            attachmentPathIdentities: outboxContext.attachmentPathIdentities
+        )
+        var reviewEntries = outboxEntries
+        expect(
+            SessionInputOutboxPolicy.acceptExplicitReview(entryID: outboxTailID, currentContext: outboxContext, in: &reviewEntries) == .applied,
+            "Outbox review restores pending after restart recovery"
+        )
+        expect(
+            SessionInputOutboxPolicy.automaticDispatchEligibility(of: outboxTailID, currentContext: mismatched, in: reviewEntries) == .ineligible(.contextMismatch),
+            "Outbox eligibility rejects workspace path mismatch"
+        )
+        let credentialAuthorityChanged = SessionInputOutboxContext(
+            executionRoute: outboxRoute,
+            workspacePath: outboxContext.workspacePath,
+            policy: .ask,
+            privacyMode: .cloudAllowed,
+            reasoningEffort: .medium,
+            providerCredentialInjectionEnabled: true,
+            attachmentPathIdentities: outboxContext.attachmentPathIdentities
+        )
+        expect(
+            credentialAuthorityChanged != outboxContext,
+            "Outbox context detects changed provider credential-injection authority without storing credentials"
+        )
+        let hostileFailure = QueuedFollowUpFailureReason(
+            code: .providerUnavailable,
+            detail: "provider\u{0000}\n\t" + String(repeating: "x", count: 300)
+        )
+        let hostileFailureDecoded = try! JSONDecoder().decode(
+            QueuedFollowUpFailureReason.self,
+            from: JSONEncoder().encode(hostileFailure)
+        )
+        expect(
+            hostileFailureDecoded.detail?.contains("\n") == false
+                && (hostileFailureDecoded.detail?.count ?? 0) <= QueuedFollowUpFailureReason.maxDetailLength,
+            "Outbox failure details remain sanitized and bounded after decoding"
+        )
+        let legacyOutboxJSON = """
+        {"id":"\(UUID().uuidString)","text":"legacy queue","date":0}
+        """
+        let legacyOutboxDecoded = try! JSONDecoder().decode(QueuedFollowUp.self, from: Data(legacyOutboxJSON.utf8))
+        expect(legacyOutboxDecoded.context == nil && legacyOutboxDecoded.lifecycle == .blocked(.missingCapturedContext), "Legacy outbox JSON migrates into explicit review")
+        let outboxEncoded = try! JSONEncoder().encode(outboxContext)
+        let outboxEncodedText = String(decoding: outboxEncoded, as: UTF8.self)
+        expect(!outboxEncodedText.contains(outboxSecretSentinel), "Outbox context encoding never contains a supplied secret sentinel")
+        expect(!outboxEncodedText.contains("apiKey") && !outboxEncodedText.contains("providerSession"), "Outbox context encoding stays free of credential field names")
+        var olderContextObject = try! JSONSerialization.jsonObject(with: outboxEncoded) as! [String: Any]
+        olderContextObject["providerCredentialInjectionEnabled"] = nil
+        let migratedContext = try! JSONDecoder().decode(
+            SessionInputOutboxContext.self,
+            from: JSONSerialization.data(withJSONObject: olderContextObject)
+        )
+        expect(!migratedContext.providerCredentialInjectionEnabled, "Older outbox context JSON defaults new credential authority fields safely")
+
+        // Fast-switch projection cache: deterministic reuse and an objective local microbenchmark.
+        let projectionSessions = (0..<200).map { index in
+            LatticeSession(
+                title: "Projection \(index)",
+                backend: .codex(model: "gpt-5.4"),
+                lastUpdated: Date(timeIntervalSinceReferenceDate: TimeInterval(index))
+            )
+        }
+        var projectionCache = SessionProjectionCache()
+        let projectionIDs = projectionCache.orderedSessionIDs(for: projectionSessions)
+        let projectionStart = Date()
+        for _ in 0..<1_000 {
+            expect(
+                projectionCache.orderedSessionIDs(for: projectionSessions) == projectionIDs,
+                "Fast-switch projection cache preserves deterministic order"
+            )
+        }
+        let projectionElapsedMilliseconds = Date().timeIntervalSince(projectionStart) * 1_000
+        expect(projectionCache.rebuildCount == 1, "Fast-switch projection cache avoids unchanged rebuilds")
+        expect(projectionIDs.count == projectionSessions.count, "Fast-switch projection cache retains every session")
+        print(String(format: "Session projection benchmark: 1,000 refreshes / 200 sessions = %.2f ms, rebuilds = %d", projectionElapsedMilliseconds, projectionCache.rebuildCount))
+
+        var streamingProjection = LatticeSession(
+            title: "Streaming projection",
+            messages: [.init(role: .user, text: "Prompt"), .init(role: .assistant, text: "")],
+            backend: .codex(model: "gpt-5.4"),
+            isStreaming: true,
+            lastUpdated: Date(timeIntervalSinceReferenceDate: 1)
+        )
+        var streamingProjectionCache = SessionProjectionCache()
+        _ = streamingProjectionCache.refresh([streamingProjection])
+        for index in 0..<100 {
+            streamingProjection.messages[1].text += "x"
+            streamingProjection.lastUpdated = Date(timeIntervalSinceReferenceDate: TimeInterval(index + 2))
+            _ = streamingProjectionCache.refresh([streamingProjection])
+        }
+        expect(streamingProjectionCache.rebuildCount == 1, "Streaming token deltas do not rebuild session-list projections")
 
         let longMessages = (0..<350).map { ChatMessage(role: $0.isMultiple(of: 2) ? .user : .assistant, text: "lazy-message-\($0)") }
         let longSession = LatticeSession(title: "Long chat", messages: longMessages, backend: .codex(model: "gpt-5.4"))
