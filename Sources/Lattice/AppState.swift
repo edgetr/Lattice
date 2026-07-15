@@ -7322,7 +7322,7 @@ Lattice self-edit rules:
             reduceRunUI(.cancelled, for: id)
             threadActivityLanes.apply(.cancelled, to: id)
             handleSchedulerAdmissions(taskScheduler.finish(id))
-            if sessions[index].messages.last?.text.isEmpty == true {
+            if shouldRemoveEmptyTrailingAssistant(from: sessions[index]) {
                 sessions[index].messages.removeLast()
             }
             persist()
