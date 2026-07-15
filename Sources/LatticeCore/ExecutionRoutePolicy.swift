@@ -288,3 +288,119 @@ public enum LegacyOpenCodeBridgePolicy {
             && !ExecutionRouteResolver.isDeclared(route)
     }
 }
+
+/// Single table for runtime identity derived from ExecutionRoute.
+/// Prefer this over ad-hoc engine/harness parallel fields for readiness, cancel, and new writes.
+public enum RouteRuntimeMap {
+    /// Runtime used for cancel/permission/process ownership.
+    public static func cancelTarget(for route: ExecutionRoute, legacyHarnessID: String? = nil) -> String {
+        if ExecutionRouteResolver.isDeclared(route) {
+            return route.runtimeID
+        }
+        let legacy = legacyHarnessID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !legacy.isEmpty { return legacy }
+        return route.runtimeID
+    }
+
+    /// Runtime used for readiness probes and capability checks.
+    public static func readinessRuntimeID(for route: ExecutionRoute) -> String {
+        route.runtimeID
+    }
+
+    /// Declared default runtime for a mode/provider pair (no model).
+    /// Matches `ExecutionRouteResolver` templates so catalog and new writes share one authority.
+    public static func defaultRuntimeID(mode: ConversationMode, providerID: String) -> String? {
+        ExecutionRouteResolver.catalog().entries
+            .first { $0.route.mode == mode && $0.route.providerID == providerID }?
+            .route.runtimeID
+    }
+
+    /// Preferred declared route for a backend under a conversation mode.
+    public static func preferredRoute(mode: ConversationMode, backend: ChatBackend) -> ExecutionRoute? {
+        ExecutionRouteResolver.resolve(mode: mode, backend: backend)
+    }
+
+    /// Mode-aware write authority: prefer declared routes; fall back to legacy identity.
+    /// Use for new session construction and unlocked route mutation.
+    public static func writeRoute(
+        backend: ChatBackend,
+        mode: ConversationMode? = nil,
+        preferredRuntimeID: String? = nil
+    ) -> ExecutionRoute {
+        if let preferredRuntimeID {
+            let trimmed = preferredRuntimeID.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                let base = ExecutionRoute.legacy(for: backend, harnessID: trimmed)
+                if let mode {
+                    return ExecutionRoute(
+                        mode: mode,
+                        providerID: base.providerID,
+                        modelID: base.modelID,
+                        runtimeID: trimmed
+                    )
+                }
+                return base
+            }
+        }
+
+        let candidates: [ConversationMode]
+        if let mode {
+            candidates = [mode]
+        } else {
+            switch backend {
+            case .appleIntelligence, .ollama:
+                candidates = [.local, .code, .work]
+            default:
+                candidates = [.code, .work, .local]
+            }
+        }
+
+        for candidate in candidates {
+            if let route = ExecutionRouteResolver.resolve(mode: candidate, backend: backend) {
+                return route
+            }
+        }
+        return ExecutionRoute.legacy(for: backend, harnessID: nil)
+    }
+
+    /// Backend projection for UI/compat derived from route identity.
+    public static func backendProjection(for route: ExecutionRoute) -> ChatBackend? {
+        switch (route.providerID, route.modelID) {
+        case ("codex", let model?):
+            return .codex(model: model)
+        case ("grok", let model?):
+            return .grok(model: model)
+        case ("opencode", let model?):
+            return .openCode(model: model)
+        case ("antigravity", let model?):
+            return .antigravity(model: model)
+        case ("apple", nil):
+            return .appleIntelligence
+        case ("ollama", let model?):
+            return .ollama(model: model)
+        default:
+            return nil
+        }
+    }
+
+    /// Effective runtime for a session: executionRoute is sole authority.
+    public static func effectiveRuntimeID(for session: LatticeSession) -> String {
+        session.executionRoute.runtimeID
+    }
+
+    /// Provider id for scheduling / health, preferring declared route.
+    public static func providerID(for session: LatticeSession) -> String {
+        if ExecutionRouteResolver.isDeclared(session.executionRoute)
+            || !session.executionRoute.providerID.isEmpty {
+            return session.executionRoute.providerID
+        }
+        switch session.backend {
+        case .codex: return "codex"
+        case .grok: return "grok"
+        case .openCode: return "opencode"
+        case .antigravity: return "antigravity"
+        case .appleIntelligence: return "apple"
+        case .ollama: return "ollama"
+        }
+    }
+}

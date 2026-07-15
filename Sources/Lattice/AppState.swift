@@ -977,7 +977,14 @@ final class AppState: ObservableObject {
 
     var activeBackend: ChatBackend { selectedSession?.backend ?? composerSelectionBackend ?? defaultBackend }
     var activePrivacyMode: SessionPrivacyMode { selectedSession?.privacyMode ?? privacyMode }
-    var activeHarnessID: String { selectedSession.map(effectiveHarnessID(for:)) ?? selectedRouteHarnessID }
+    var activeHarnessID: String {
+        if let session = selectedSession { return effectiveHarnessID(for: session) }
+        if let mode = composerSelectionMode, let backend = composerSelectionBackend,
+           let route = ExecutionRouteResolver.resolve(mode: mode, backend: backend) {
+            return route.runtimeID
+        }
+        return selectedRouteHarnessID
+    }
     var activeConversationMode: ConversationMode? {
         if selectedSession != nil, !isSelectedSessionRouteLocked {
             return composerSelectionMode
@@ -1960,11 +1967,13 @@ final class AppState: ObservableObject {
             return
         }
         let backend = localBackendFallback()
-        let harnessID = Self.defaultHarnessID(for: backend)
+        let route = RouteRuntimeMap.writeRoute(backend: backend, mode: .local)
+        let harnessID = route.runtimeID
         let source = selectedSession
         let session = LatticeSession(
             title: "New local chat",
             backend: backend,
+            executionRoute: route,
             harnessID: harnessID,
             reasoningEffort: defaultReasoning(for: backend, harnessID: harnessID),
             workspacePath: source?.workspacePath ?? selectedWorkspacePath,
@@ -2006,10 +2015,15 @@ final class AppState: ObservableObject {
             return
         }
         let source = selectedSession
-        let harnessID = Self.defaultHarnessID(for: backend)
+        let route = RouteRuntimeMap.writeRoute(
+            backend: backend,
+            mode: composerSelectionMode ?? source?.executionRoute.mode
+        )
+        let harnessID = route.runtimeID
         let session = LatticeSession(
             title: "New chat",
             backend: backend,
+            executionRoute: route,
             harnessID: harnessID,
             reasoningEffort: defaultReasoning(for: backend, harnessID: harnessID),
             workspacePath: source?.workspacePath ?? selectedWorkspacePath,
@@ -2968,9 +2982,7 @@ final class AppState: ObservableObject {
         globalErrorMessage = nil
         let session = sessions[index]
         let harnessID = effectiveHarnessID(for: session)
-        let providerID = ExecutionRouteResolver.isDeclared(session.executionRoute)
-            ? session.executionRoute.providerID
-            : Self.engineID(for: session.backend)
+        let providerID = RouteRuntimeMap.providerID(for: session)
         let routeID = "\(harnessID)/\(providerID)"
         let isExtensionSelfEdit = isExtensionSelfEditThread(session, submittedText: submittedText)
         let sensitivity: AgentTaskRecoverySensitivity = isExtensionSelfEdit
@@ -3319,8 +3331,10 @@ final class AppState: ObservableObject {
         let valid = validBackend(backend, privacyMode: sessions[index].privacyMode)
         guard valid != backend else { return }
         sessions[index].backend = valid
-        sessions[index].harnessID = Self.defaultHarnessID(for: valid)
-        sessions[index].reasoningEffort = defaultReasoning(for: valid, harnessID: sessions[index].harnessID)
+        let route = RouteRuntimeMap.writeRoute(backend: valid, mode: sessions[index].executionRoute.mode)
+        sessions[index].executionRoute = route
+        sessions[index].harnessID = route.runtimeID
+        sessions[index].reasoningEffort = defaultReasoning(for: valid, harnessID: route.runtimeID)
         sessions[index].harnessThreadID = nil
         defaultBackend = valid
         saveDefaultBackend()
@@ -3916,10 +3930,16 @@ final class AppState: ObservableObject {
            !sessions[index].isStreaming,
            !sessions[index].messages.contains(where: { $0.role == .user }) {
             sessions[index].backend = backend
-            sessions[index].harnessID = shouldSyncExecutionRoute ? Self.defaultHarnessID(for: backend) : selectedRouteHarnessID
-            let sessionHarnessID = shouldSyncExecutionRoute ? Self.defaultHarnessID(for: backend) : selectedRouteHarnessID
-            sessions[index].executionRoute = ExecutionRoute.legacy(for: backend, harnessID: sessionHarnessID)
-            sessions[index].reasoningEffort = defaultReasoning(for: backend, harnessID: sessionHarnessID)
+            let route = RouteRuntimeMap.writeRoute(
+                backend: backend,
+                mode: sessions[index].executionRoute.mode == .local && backend.isLocal
+                    ? .local
+                    : (composerSelectionMode ?? sessions[index].executionRoute.mode),
+                preferredRuntimeID: shouldSyncExecutionRoute ? nil : selectedRouteHarnessID
+            )
+            sessions[index].executionRoute = route
+            sessions[index].harnessID = route.runtimeID
+            sessions[index].reasoningEffort = defaultReasoning(for: backend, harnessID: route.runtimeID)
             sessions[index].harnessThreadID = nil
             persist()
         }
@@ -3976,9 +3996,11 @@ final class AppState: ObservableObject {
            !sessions[index].messages.contains(where: { $0.role == .user }),
            !sessions[index].backend.isLocal {
             let local = localBackendFallback()
+            let route = RouteRuntimeMap.writeRoute(backend: local, mode: .local)
             sessions[index].backend = local
-            sessions[index].harnessID = Self.defaultHarnessID(for: local)
-            sessions[index].reasoningEffort = defaultReasoning(for: local, harnessID: sessions[index].harnessID)
+            sessions[index].executionRoute = route
+            sessions[index].harnessID = route.runtimeID
+            sessions[index].reasoningEffort = defaultReasoning(for: local, harnessID: route.runtimeID)
             sessions[index].harnessThreadID = nil
             syncExecutionRoute(from: local)
         }
@@ -7475,13 +7497,8 @@ Lattice self-edit rules:
     }
 
     private static func defaultHarnessID(for backend: ChatBackend) -> String {
-        switch backend {
-        case .codex: "codex"
-        case .grok: "grok"
-        case .openCode: "opencode"
-        case .appleIntelligence, .ollama: "lattice"
-        case .antigravity: "antigravity"
-        }
+        // Prefer declared Wave-1 runtimes (e.g. codex code → pi) over legacy direct harness IDs.
+        RouteRuntimeMap.writeRoute(backend: backend).runtimeID
     }
 
     func isRouteHarnessCompatible(engineID: String, harnessID: String) -> Bool {
@@ -7528,7 +7545,8 @@ Lattice self-edit rules:
     }
 
     private func effectiveHarnessID(for session: LatticeSession) -> String {
-        session.harnessID ?? Self.defaultHarnessID(for: session.backend)
+        // ExecutionRoute is sole runtime authority; harnessID is decode/migration only.
+        RouteRuntimeMap.effectiveRuntimeID(for: session)
     }
 
     private func piRoute(for backend: ChatBackend) -> (provider: String, model: String)? {

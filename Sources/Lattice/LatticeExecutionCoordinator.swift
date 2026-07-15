@@ -189,7 +189,7 @@ final class DefaultLatticeExecutionCoordinator: LatticeExecutionCoordinating {
         backend: ChatBackend,
         runtimes: LatticeExecutionRuntimes
     ) {
-        let runtimeID = ExecutionRouteResolver.isDeclared(route) ? route.runtimeID : legacyHarnessID
+        let runtimeID = RouteRuntimeMap.cancelTarget(for: route, legacyHarnessID: legacyHarnessID)
         switch runtimeID {
         case "pi": runtimes.pi.cancel(sessionID: sessionID)
         case "hermes": runtimes.hermes.cancel(sessionID: sessionID)
