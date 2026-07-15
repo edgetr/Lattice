@@ -97,14 +97,16 @@ struct InteractiveProcessRegistryTests {
             return
         }
         let permissionID = UUID()
-        #expect(registry.updateMetadata(secondOwner, sessionID: sessionID) {
+        let updated = registry.updateMetadata(secondOwner, sessionID: sessionID) {
             $0.threadID = "replacement-thread"
             $0.turnID = "replacement-turn"
             $0.providerSessionID = "replacement-acp"
             $0.pendingPermissionIDs = [permissionID]
-        })
+        }
+        #expect(updated)
 
-        #expect(!registry.unregister(firstOwner, sessionID: sessionID).removedCurrentOwner)
+        let unregister = registry.unregister(firstOwner, sessionID: sessionID)
+        #expect(!unregister.removedCurrentOwner)
         #expect(registry.metadata(for: secondOwner, sessionID: sessionID) == .init(
             threadID: "replacement-thread",
             turnID: "replacement-turn",

@@ -6,8 +6,10 @@ struct ControlActionStateTests {
     @Test func dispatchesOnceWhileRunning() {
         var state = ControlActionState()
 
-        #expect(state.begin(progressMessage: "Checking…"))
-        #expect(!state.begin(progressMessage: "Checking again…"))
+        let first = state.begin(progressMessage: "Checking…")
+        let second = state.begin(progressMessage: "Checking again…")
+        #expect(first)
+        #expect(!second)
         #expect(state.phase == .running)
         #expect(state.message == "Checking…")
     }
@@ -15,32 +17,37 @@ struct ControlActionStateTests {
     @Test func disabledPrerequisiteDoesNotDispatch() {
         var state = ControlActionState()
 
-        #expect(!state.begin(progressMessage: "Checking…", disabledReason: "Runtime is unavailable"))
+        let began = state.begin(progressMessage: "Checking…", disabledReason: "Runtime is unavailable")
+        #expect(!began)
         #expect(state.phase == .idle)
         #expect(state.message == nil)
     }
 
     @Test func reportsSuccessAndAllowsAnotherDispatch() {
         var state = ControlActionState()
-        #expect(state.begin(progressMessage: "Checking…"))
+        let first = state.begin(progressMessage: "Checking…")
+        #expect(first)
 
         state.succeed("Ready")
 
         #expect(state.phase == .succeeded)
         #expect(state.message == "Ready")
-        #expect(state.begin(progressMessage: "Checking again…"))
+        let second = state.begin(progressMessage: "Checking again…")
+        #expect(second)
         #expect(state.phase == .running)
     }
 
     @Test func reportsFailureAndRecoversOnRetry() {
         var state = ControlActionState()
-        #expect(state.begin(progressMessage: "Checking…"))
+        let first = state.begin(progressMessage: "Checking…")
+        #expect(first)
 
         state.fail("Catalog unavailable")
 
         #expect(state.phase == .failed)
         #expect(state.message == "Catalog unavailable")
-        #expect(state.begin(progressMessage: "Retrying…"))
+        let retry = state.begin(progressMessage: "Retrying…")
+        #expect(retry)
         state.succeed("Recovered")
         #expect(state.phase == .succeeded)
         #expect(state.message == "Recovered")

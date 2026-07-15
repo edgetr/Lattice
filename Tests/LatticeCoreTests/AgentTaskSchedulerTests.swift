@@ -32,12 +32,19 @@ struct AgentTaskSchedulerTests {
         let first = UUID(), sameWorkspace = UUID(), sameProvider = UUID()
         let local = UUID(), sameRoute = UUID(), independent = UUID()
 
-        #expect(scheduler.submit(request(first)) == [first])
-        #expect(scheduler.submit(request(sameWorkspace, provider: "grok", route: "grok/xai")).isEmpty)
-        #expect(scheduler.submit(request(sameProvider, workspace: "workspace-b")).isEmpty)
-        #expect(scheduler.submit(request(local, workspace: "workspace-c", provider: "ollama", route: "ollama/local")) == [local])
-        #expect(scheduler.submit(request(sameRoute, workspace: "workspace-d", provider: "ollama", route: "ollama/local")).isEmpty)
-        #expect(scheduler.submit(request(independent, workspace: "workspace-e", provider: "pi", route: "pi/local")) == [independent])
+        let admittedFirst = scheduler.submit(request(first))
+        let blockedWorkspace = scheduler.submit(request(sameWorkspace, provider: "grok", route: "grok/xai"))
+        let blockedProvider = scheduler.submit(request(sameProvider, workspace: "workspace-b"))
+        let admittedLocal = scheduler.submit(request(local, workspace: "workspace-c", provider: "ollama", route: "ollama/local"))
+        let blockedRoute = scheduler.submit(request(sameRoute, workspace: "workspace-d", provider: "ollama", route: "ollama/local"))
+        let admittedIndependent = scheduler.submit(request(independent, workspace: "workspace-e", provider: "pi", route: "pi/local"))
+
+        #expect(admittedFirst == [first])
+        #expect(blockedWorkspace.isEmpty)
+        #expect(blockedProvider.isEmpty)
+        #expect(admittedLocal == [local])
+        #expect(blockedRoute.isEmpty)
+        #expect(admittedIndependent == [independent])
         #expect(scheduler.snapshots.filter { $0.state == .running }.count == 3)
     }
 
@@ -45,14 +52,19 @@ struct AgentTaskSchedulerTests {
     func fairnessAgesLowPriority() {
         var scheduler = AgentTaskScheduler(limits: .init(global: 1, perWorkspace: 1), fairnessInterval: 1)
         let blocker = UUID(), low = UUID(), high1 = UUID(), high2 = UUID(), high3 = UUID()
-        #expect(scheduler.submit(request(blocker)) == [blocker])
-        scheduler.submit(request(low, priority: .low))
-        scheduler.submit(request(high1, priority: .high))
-        #expect(scheduler.finish(blocker) == [high1])
-        scheduler.submit(request(high2, priority: .high))
-        #expect(scheduler.finish(high1) == [high2])
-        scheduler.submit(request(high3, priority: .high))
-        #expect(scheduler.finish(high2) == [low])
+        let admittedBlocker = scheduler.submit(request(blocker))
+        _ = scheduler.submit(request(low, priority: .low))
+        _ = scheduler.submit(request(high1, priority: .high))
+        let afterBlocker = scheduler.finish(blocker)
+        _ = scheduler.submit(request(high2, priority: .high))
+        let afterHigh1 = scheduler.finish(high1)
+        _ = scheduler.submit(request(high3, priority: .high))
+        let afterHigh2 = scheduler.finish(high2)
+
+        #expect(admittedBlocker == [blocker])
+        #expect(afterBlocker == [high1])
+        #expect(afterHigh1 == [high2])
+        #expect(afterHigh2 == [low])
         #expect(scheduler.snapshot(for: high3)?.state == .queued)
     }
 
@@ -60,11 +72,14 @@ struct AgentTaskSchedulerTests {
     func reprioritization() {
         var scheduler = AgentTaskScheduler(limits: .init(global: 1, perWorkspace: 1))
         let blocker = UUID(), first = UUID(), promoted = UUID()
-        scheduler.submit(request(blocker))
-        scheduler.submit(request(first, priority: .normal))
-        scheduler.submit(request(promoted, priority: .low))
-        #expect(scheduler.reprioritize(promoted, to: .high).isEmpty)
-        #expect(scheduler.finish(blocker) == [promoted])
+        _ = scheduler.submit(request(blocker))
+        _ = scheduler.submit(request(first, priority: .normal))
+        _ = scheduler.submit(request(promoted, priority: .low))
+        let reprioritized = scheduler.reprioritize(promoted, to: .high)
+        let afterFinish = scheduler.finish(blocker)
+
+        #expect(reprioritized.isEmpty)
+        #expect(afterFinish == [promoted])
         #expect(scheduler.snapshot(for: first)?.queuePosition == 1)
     }
 
@@ -72,11 +87,12 @@ struct AgentTaskSchedulerTests {
     func cancellationIsIsolated() {
         var scheduler = AgentTaskScheduler(limits: .init(global: 2, perWorkspace: 2))
         let cancelled = UUID(), survivor = UUID(), queued = UUID()
-        scheduler.submit(request(cancelled))
-        scheduler.submit(request(survivor))
-        scheduler.submit(request(queued))
+        _ = scheduler.submit(request(cancelled))
+        _ = scheduler.submit(request(survivor))
+        _ = scheduler.submit(request(queued))
 
-        #expect(scheduler.cancel(cancelled) == [queued])
+        let afterCancel = scheduler.cancel(cancelled)
+        #expect(afterCancel == [queued])
         #expect(scheduler.snapshot(for: cancelled) == nil)
         #expect(scheduler.snapshot(for: survivor)?.state == .running)
         #expect(scheduler.snapshot(for: queued)?.state == .running)
@@ -86,23 +102,31 @@ struct AgentTaskSchedulerTests {
     func approvalTransitions() {
         var scheduler = AgentTaskScheduler(limits: .init(global: 1, perWorkspace: 1))
         let approval = UUID(), other = UUID()
-        scheduler.submit(request(approval))
-        scheduler.submit(request(other))
+        _ = scheduler.submit(request(approval))
+        _ = scheduler.submit(request(other))
 
-        #expect(scheduler.waitForApproval(approval, releasesExecutionSlot: true) == [other])
+        let afterWait = scheduler.waitForApproval(approval, releasesExecutionSlot: true)
+        #expect(afterWait == [other])
         #expect(scheduler.snapshot(for: approval)?.state == .waitingForApproval)
-        #expect(scheduler.resolveApproval(approval).isEmpty)
+
+        let afterResolve = scheduler.resolveApproval(approval)
+        #expect(afterResolve.isEmpty)
         #expect(scheduler.snapshot(for: approval)?.state == .queued)
         #expect(scheduler.snapshot(for: approval)?.isApprovalResume == true)
-        #expect(scheduler.finish(other) == [approval])
+
+        let afterFinish = scheduler.finish(other)
+        #expect(afterFinish == [approval])
 
         var held = AgentTaskScheduler(limits: .init(global: 1, perWorkspace: 1))
         let unsafeToRelease = UUID(), blocked = UUID()
-        held.submit(request(unsafeToRelease))
-        held.submit(request(blocked))
-        #expect(held.waitForApproval(unsafeToRelease, releasesExecutionSlot: false).isEmpty)
-        #expect(held.updateLimits(held.limits).isEmpty)
-        #expect(held.cancel(unsafeToRelease) == [blocked])
+        _ = held.submit(request(unsafeToRelease))
+        _ = held.submit(request(blocked))
+        let heldWait = held.waitForApproval(unsafeToRelease, releasesExecutionSlot: false)
+        let heldLimits = held.updateLimits(held.limits)
+        let heldCancel = held.cancel(unsafeToRelease)
+        #expect(heldWait.isEmpty)
+        #expect(heldLimits.isEmpty)
+        #expect(heldCancel == [blocked])
     }
 
     @Test("recovery holds every task and never replays sensitive work")
@@ -125,14 +149,17 @@ struct AgentTaskSchedulerTests {
     func updatedLimits() {
         var scheduler = AgentTaskScheduler(limits: .init(global: 1, perWorkspace: 1))
         let running = UUID(), queued = UUID()
-        #expect(scheduler.submit(request(running)) == [running])
-        #expect(scheduler.submit(request(queued, workspace: "workspace-b", provider: "grok")) == [])
+        let first = scheduler.submit(request(running))
+        let second = scheduler.submit(request(queued, workspace: "workspace-b", provider: "grok"))
+        let raised = scheduler.updateLimits(.init(global: 2, perWorkspace: 1))
+        let lowered = scheduler.updateLimits(.init(global: 1, perWorkspace: 1))
 
-        #expect(scheduler.updateLimits(.init(global: 2, perWorkspace: 1)) == [queued])
+        #expect(first == [running])
+        #expect(second == [])
+        #expect(raised == [queued])
         #expect(scheduler.snapshot(for: running)?.state == .running)
         #expect(scheduler.snapshot(for: queued)?.state == .running)
-
-        #expect(scheduler.updateLimits(.init(global: 1, perWorkspace: 1)) == [])
+        #expect(lowered == [])
         #expect(scheduler.snapshots.filter { $0.state == .running }.count == 2)
     }
 }

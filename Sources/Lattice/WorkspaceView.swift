@@ -7,6 +7,12 @@ struct WorkspaceView: View {
     @ObservedObject var layout: WorkspaceWindowLayout
 
     var body: some View {
+        // Split the modifier chain so Swift 6 type-checking on CI stays bounded.
+        workspaceChrome
+            .modifier(WorkspaceDialogsModifier(state: state))
+    }
+
+    private var workspaceChrome: some View {
         AnyView(
             workspaceLayout
             .background {
@@ -49,157 +55,53 @@ struct WorkspaceView: View {
                 }
             }
         }
-        .sheet(isPresented: $state.showCommandPalette) {
-            CommandPaletteView(state: state)
-        }
-        .sheet(item: $state.pendingRuntimeConfirmation, onDismiss: {
-            if state.pendingRuntimeConfirmation != nil { state.cancelRuntimeAction() }
-        }) { request in
-            RuntimeConfirmationSheet(state: state, request: request)
-        }
-        .alert("Delete chat?", isPresented: $state.showDeleteChatConfirmation) {
-            Button("Cancel", role: .cancel) { state.cancelPendingChatDeletion() }
-            Button("Delete", role: .destructive) { state.confirmPendingChatDeletion() }
-        } message: {
-            Text("This removes the conversation from this Mac.")
-        }
-        .alert("Delete from here?", isPresented: $state.showDeleteMessageConfirmation) {
-            Button("Cancel", role: .cancel) { state.cancelPendingMessageDeletion() }
-            Button("Delete", role: .destructive) { state.confirmPendingMessageDeletion() }
-        } message: {
-            Text("This removes this message and everything after it. This cannot be undone.")
-        }
-        .alert("Delete extension?", isPresented: $state.showDeleteExtensionConfirmation) {
-            Button("Cancel", role: .cancel) { state.cancelPendingExtensionDeletion() }
-            Button("Delete", role: .destructive) { state.confirmPendingExtensionDeletion() }
-        } message: {
-            let name = state.pendingDeleteExtensionRecord?.name ?? "this extension"
-            Text("This removes \(name) from Lattice’s managed Extensions folder and removes any skills owned by that extension.")
-        }
-        .alert("Delete skill?", isPresented: $state.showDeleteSkillConfirmation) {
-            Button("Cancel", role: .cancel) { state.cancelPendingSkillDeletion() }
-            Button("Delete", role: .destructive) { state.confirmPendingSkillDeletion() }
-        } message: {
-            if state.pendingDeleteSkillRecord?.source == .importedGlobal {
-                Text("This removes Lattice’s managed copy of this imported global skill. The original global skill file is left alone, and Lattice will remember not to import it again automatically.")
-            } else {
-                Text("This removes this generated skill from Lattice’s managed Skills folder. Extensions that own their own skills can recreate them when applied again.")
-            }
-        }
-        .alert("Delete local model?", isPresented: $state.showDeleteLocalModelConfirmation) {
-            Button("Cancel", role: .cancel) { state.cancelPendingLocalModelDeletion() }
-            Button("Delete", role: .destructive) { state.confirmPendingLocalModelDeletion() }
-        } message: {
-            Text("This removes \(state.pendingDeleteLocalModelName ?? "the model") from Ollama on this Mac. Existing chat history remains, but that route will be unavailable until reinstalled.")
-        }
-        .alert(
-            "Download \(state.pendingCLIInstallProvider.map(Self.cliDisplayName) ?? "CLI")?",
-            isPresented: Binding(
-                get: { state.pendingCLIInstallProvider != nil },
-                set: { if !$0 { state.cancelCLIInstall() } }
-            )
-        ) {
-            Button("Cancel", role: .cancel) { state.cancelCLIInstall() }
-            Button("Download and Install") { state.confirmCLIInstall() }
-        } message: {
-            Text("Lattice will use the provider-owned installer or package source shown by that provider. Availability is checked after installation; provenance and hash verification depend on the source.")
-        }
-        .alert(
-            "Provider tools bypass Lattice's broker",
-            isPresented: Binding(
-                get: { state.pendingUnsafeProviderRouteAcknowledgement != nil },
-                set: { if !$0 { state.dismissUnsafeProviderRouteAcknowledgement() } }
-            )
-        ) {
-            Button("Cancel", role: .cancel) {
-                state.dismissUnsafeProviderRouteAcknowledgement()
-            }
-            Button("Acknowledge") {
-                state.acknowledgeUnsafeProviderRoute()
-            }
-        } message: {
-            if let pending = state.pendingUnsafeProviderRouteAcknowledgement {
-                Text("\(pending.providerName) · \(pending.modelName)\n\n\(pending.detail)\n\nAcknowledge, then send again. Consent lasts until Lattice exits.")
-            } else {
-                Text("Provider-owned tool calls are not brokered by Lattice.")
-            }
-        }
         .safeAreaInset(edge: .top, spacing: 0) {
-            LatticeGlassGroup(spacing: 10) {
-                VStack(spacing: 8) {
-                    // Non-blocking save-failure status; load-recovery modal remains the exclusive recovery surface when present.
-                    if state.needsSessionSaveFailureAttention, !state.needsPersistenceRecovery {
-                        SessionSaveFailureView(state: state)
-                            .transition(.move(edge: .top).combined(with: .opacity))
-                    }
-                    if let status = state.exportChatStatusMessage {
-                        HStack(alignment: .top, spacing: 10) {
-                            Image(systemName: "checkmark.circle.fill")
-                                .foregroundStyle(.green)
-                            Text(status)
-                                .font(.callout)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .textSelection(.enabled)
-                            Button("Dismiss") {
-                                state.exportChatStatusMessage = nil
-                            }
-                            .buttonStyle(.borderless)
-                            .accessibilityLabel("Dismiss export or import status")
-                        }
-                        .padding(12)
-                        .latticeGlass(cornerRadius: 14, tint: Color.green.opacity(0.08))
-                        .accessibilityElement(children: .contain)
-                        .accessibilityLabel("Export or import status")
-                        .accessibilityValue(status)
-                        .accessibilityIdentifier("export-import-status")
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                    }
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.top, 10)
-            .padding(.bottom, 4)
+            workspaceStatusInset
         }
         .overlay {
             if state.needsPersistenceRecovery {
                 PersistenceRecoveryView(state: state)
             }
         }
-        .alert("Reset this store?", isPresented: $state.showPersistenceResetConfirmation) {
-            Button("Cancel", role: .cancel) {
-                state.cancelPersistenceStoreReset()
-            }
-            .keyboardShortcut(.cancelAction)
-            .accessibilityLabel("Cancel reset")
-            .accessibilityHint("Leaves the original file unchanged")
-            Button("Reset Store", role: .destructive) {
-                state.confirmPersistenceStoreReset()
-            }
-            .accessibilityLabel("Confirm reset store")
-            .accessibilityHint("Backs up the original, then creates a new empty store")
-        } message: {
-            if let issue = state.pendingPersistenceResetIssue {
-                Text("The original “\(issue.storeName)” file will be preserved as a collision-safe backup next to \(issue.fileURL.lastPathComponent). Lattice will then create a new empty store in its place. The original bytes are never deleted before that backup succeeds. This cannot be undone from inside Lattice.")
-            } else {
-                Text("The original file will be backed up and preserved first. Only after that backup succeeds will Lattice create a new empty store.")
+    }
+
+    @ViewBuilder
+    private var workspaceStatusInset: some View {
+        LatticeGlassGroup(spacing: 10) {
+            VStack(spacing: 8) {
+                // Non-blocking save-failure status; load-recovery modal remains the exclusive recovery surface when present.
+                if state.needsSessionSaveFailureAttention, !state.needsPersistenceRecovery {
+                    SessionSaveFailureView(state: state)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+                if let status = state.exportChatStatusMessage {
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                        Text(status)
+                            .font(.callout)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                        Button("Dismiss") {
+                            state.exportChatStatusMessage = nil
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityLabel("Dismiss export or import status")
+                    }
+                    .padding(12)
+                    .latticeGlass(cornerRadius: 14, tint: Color.green.opacity(0.08))
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel("Export or import status")
+                    .accessibilityValue(status)
+                    .accessibilityIdentifier("export-import-status")
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
             }
         }
-        .sheet(isPresented: $state.showExportChatSheet) {
-            ExportChatSheet(state: state)
-        }
-        .sheet(isPresented: $state.showImportChatPreview) {
-            ImportChatPreviewSheet(state: state)
-        }
-        .alert("Chat export/import", isPresented: $state.showImportChatError) {
-            Button("OK", role: .cancel) {
-                state.importChatErrorMessage = nil
-            }
-            .keyboardShortcut(.defaultAction)
-            .accessibilityLabel("Dismiss export or import error")
-        } message: {
-            Text(state.importChatErrorMessage ?? "Something went wrong. Existing chats were not changed.")
-        }
+        .padding(.horizontal, 16)
+        .padding(.top, 10)
+        .padding(.bottom, 4)
     }
 
     private var workspaceActionsMenu: some View {
@@ -245,6 +147,124 @@ struct WorkspaceView: View {
         .accessibilityLabel("More workspace actions")
     }
 
+/// Dialogs/sheets extracted so `WorkspaceView.body` stays type-checkable under Swift 6.
+private struct WorkspaceDialogsModifier: ViewModifier {
+    @ObservedObject var state: AppState
+
+    func body(content: Content) -> some View {
+        content
+            .sheet(isPresented: $state.showCommandPalette) {
+                CommandPaletteView(state: state)
+            }
+            .sheet(item: $state.pendingRuntimeConfirmation, onDismiss: {
+                if state.pendingRuntimeConfirmation != nil { state.cancelRuntimeAction() }
+            }) { request in
+                RuntimeConfirmationSheet(state: state, request: request)
+            }
+            .alert("Delete chat?", isPresented: $state.showDeleteChatConfirmation) {
+                Button("Cancel", role: .cancel) { state.cancelPendingChatDeletion() }
+                Button("Delete", role: .destructive) { state.confirmPendingChatDeletion() }
+            } message: {
+                Text("This removes the conversation from this Mac.")
+            }
+            .alert("Delete from here?", isPresented: $state.showDeleteMessageConfirmation) {
+                Button("Cancel", role: .cancel) { state.cancelPendingMessageDeletion() }
+                Button("Delete", role: .destructive) { state.confirmPendingMessageDeletion() }
+            } message: {
+                Text("This removes this message and everything after it. This cannot be undone.")
+            }
+            .alert("Delete extension?", isPresented: $state.showDeleteExtensionConfirmation) {
+                Button("Cancel", role: .cancel) { state.cancelPendingExtensionDeletion() }
+                Button("Delete", role: .destructive) { state.confirmPendingExtensionDeletion() }
+            } message: {
+                let name = state.pendingDeleteExtensionRecord?.name ?? "this extension"
+                Text("This removes \(name) from Lattice’s managed Extensions folder and removes any skills owned by that extension.")
+            }
+            .alert("Delete skill?", isPresented: $state.showDeleteSkillConfirmation) {
+                Button("Cancel", role: .cancel) { state.cancelPendingSkillDeletion() }
+                Button("Delete", role: .destructive) { state.confirmPendingSkillDeletion() }
+            } message: {
+                if state.pendingDeleteSkillRecord?.source == .importedGlobal {
+                    Text("This removes Lattice’s managed copy of this imported global skill. The original global skill file is left alone, and Lattice will remember not to import it again automatically.")
+                } else {
+                    Text("This removes this generated skill from Lattice’s managed Skills folder. Extensions that own their own skills can recreate them when applied again.")
+                }
+            }
+            .alert("Delete local model?", isPresented: $state.showDeleteLocalModelConfirmation) {
+                Button("Cancel", role: .cancel) { state.cancelPendingLocalModelDeletion() }
+                Button("Delete", role: .destructive) { state.confirmPendingLocalModelDeletion() }
+            } message: {
+                Text("This removes \(state.pendingDeleteLocalModelName ?? "the model") from Ollama on this Mac. Existing chat history remains, but that route will be unavailable until reinstalled.")
+            }
+            .alert(
+                "Download \(state.pendingCLIInstallProvider.map(WorkspaceView.cliDisplayName) ?? "CLI")?",
+                isPresented: Binding(
+                    get: { state.pendingCLIInstallProvider != nil },
+                    set: { if !$0 { state.cancelCLIInstall() } }
+                )
+            ) {
+                Button("Cancel", role: .cancel) { state.cancelCLIInstall() }
+                Button("Download and Install") { state.confirmCLIInstall() }
+            } message: {
+                Text("Lattice will use the provider-owned installer or package source shown by that provider. Availability is checked after installation; provenance and hash verification depend on the source.")
+            }
+            .alert(
+                "Provider tools bypass Lattice's broker",
+                isPresented: Binding(
+                    get: { state.pendingUnsafeProviderRouteAcknowledgement != nil },
+                    set: { if !$0 { state.dismissUnsafeProviderRouteAcknowledgement() } }
+                )
+            ) {
+                Button("Cancel", role: .cancel) {
+                    state.dismissUnsafeProviderRouteAcknowledgement()
+                }
+                Button("Acknowledge") {
+                    state.acknowledgeUnsafeProviderRoute()
+                }
+            } message: {
+                if let pending = state.pendingUnsafeProviderRouteAcknowledgement {
+                    Text("\(pending.providerName) · \(pending.modelName)\n\n\(pending.detail)\n\nAcknowledge, then send again. Consent lasts until Lattice exits.")
+                } else {
+                    Text("Provider-owned tool calls are not brokered by Lattice.")
+                }
+            }
+            .alert("Reset this store?", isPresented: $state.showPersistenceResetConfirmation) {
+                Button("Cancel", role: .cancel) {
+                    state.cancelPersistenceStoreReset()
+                }
+                .keyboardShortcut(.cancelAction)
+                .accessibilityLabel("Cancel reset")
+                .accessibilityHint("Leaves the original file unchanged")
+                Button("Reset Store", role: .destructive) {
+                    state.confirmPersistenceStoreReset()
+                }
+                .accessibilityLabel("Confirm reset store")
+                .accessibilityHint("Backs up the original, then creates a new empty store")
+            } message: {
+                if let issue = state.pendingPersistenceResetIssue {
+                    Text("The original “\(issue.storeName)” file will be preserved as a collision-safe backup next to \(issue.fileURL.lastPathComponent). Lattice will then create a new empty store in its place. The original bytes are never deleted before that backup succeeds. This cannot be undone from inside Lattice.")
+                } else {
+                    Text("The original file will be backed up and preserved first. Only after that backup succeeds will Lattice create a new empty store.")
+                }
+            }
+            .sheet(isPresented: $state.showExportChatSheet) {
+                ExportChatSheet(state: state)
+            }
+            .sheet(isPresented: $state.showImportChatPreview) {
+                ImportChatPreviewSheet(state: state)
+            }
+            .alert("Chat export/import", isPresented: $state.showImportChatError) {
+                Button("OK", role: .cancel) {
+                    state.importChatErrorMessage = nil
+                }
+                .keyboardShortcut(.defaultAction)
+                .accessibilityLabel("Dismiss export or import error")
+            } message: {
+                Text(state.importChatErrorMessage ?? "Something went wrong. Existing chats were not changed.")
+            }
+    }
+}
+
     private func noteSelectedSectionChanged(_ section: WorkspaceSection) {
         guard section == .conversations else { return }
         layout.applyAdaptiveColumnVisibilityIfNeeded()
@@ -272,7 +292,7 @@ struct WorkspaceView: View {
         }
     }
 
-    private static func cliDisplayName(_ provider: String) -> String {
+    fileprivate static func cliDisplayName(_ provider: String) -> String {
         switch provider {
         case "codex": "Codex CLI"
         case "grok": "Grok CLI"

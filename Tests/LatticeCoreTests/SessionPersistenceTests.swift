@@ -522,9 +522,11 @@ struct SessionPersistenceTests {
         let action = SessionAction(messageID: response.id, kind: .reasoning, title: "Reasoning summary", detail: "Inspect", status: .running)
         var actions = [action]
 
-        #expect(SessionActionTrail.appendDetail(id: action.id, delta: " then verify", in: &actions))
+        let appended = SessionActionTrail.appendDetail(id: action.id, delta: " then verify", in: &actions)
+        let ignored = SessionActionTrail.appendDetail(id: UUID(), delta: "ignored", in: &actions)
+        #expect(appended)
         #expect(actions[0].detail == "Inspect then verify")
-        #expect(!SessionActionTrail.appendDetail(id: UUID(), delta: "ignored", in: &actions))
+        #expect(!ignored)
     }
 
     @Test func codexProjectsPlansAndSafeReasoningSummaries() {
