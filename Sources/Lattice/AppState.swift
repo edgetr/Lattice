@@ -354,6 +354,7 @@ final class AppState: ObservableObject {
     let extensionPreviewStore = LatticeExtensionPreviewStore()
     let policyEngine = DeterministicPolicyEngine()
     private let persistence = SessionPersistence()
+    private var sessionProjectionCache = SessionProjectionCache()
     private let sessionSaveCoordinator: SessionSaveCoordinator
     private var sessionSearchIndex = SessionSearchIndex()
     private var transcriptRenderWindows = TranscriptRenderWindowCache()
@@ -472,6 +473,11 @@ final class AppState: ObservableObject {
             for index in loadedSessions.indices where loadedSessions[index].intent == nil && Self.isLegacySelfEditSession(loadedSessions[index]) {
                 loadedSessions[index].intent = .selfEdit
                 migratedSessions = true
+            }
+            for index in loadedSessions.indices {
+                let before = loadedSessions[index].queuedFollowUps
+                SessionInputOutboxPolicy.recoverAfterRestart(&loadedSessions[index].queuedFollowUps)
+                if loadedSessions[index].queuedFollowUps != before { migratedSessions = true }
             }
         case .failed(let issue):
             sessionStoreInRecovery = true
@@ -641,7 +647,11 @@ final class AppState: ObservableObject {
                 candidates.remove(session.id)
             }
         }
-        return LatticeSessionListOrdering.sorted(sessions.filter { candidates.contains($0.id) })
+        let sessionsByID = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
+        return sessionProjectionCache.orderedSessionIDs(for: sessions).compactMap { id in
+            guard candidates.contains(id) else { return nil }
+            return sessionsByID[id]
+        }
     }
 
     func visibleMessages(for session: LatticeSession) -> [ChatMessage] {
@@ -770,7 +780,7 @@ final class AppState: ObservableObject {
     var activeReasoningOptions: [ReasoningOption] { reasoningOptions(for: activeBackend, harnessID: activeHarnessID) }
     var activeReasoningEffort: ReasoningEffort? { selectedSession?.reasoningEffort ?? defaultReasoning(for: activeBackend, harnessID: activeHarnessID) }
     var isSelectedSessionRouteLocked: Bool {
-        selectedSession?.messages.contains(where: { $0.role == .user }) == true
+        selectedSession.map { $0.totalMessageCount > 0 || !$0.isTranscriptLoaded } == true
     }
 
     var composerModeOptions: [(mode: ConversationMode, icon: String, detail: String)] {
@@ -2150,9 +2160,10 @@ final class AppState: ObservableObject {
             return
         }
         if selectedSession?.isStreaming == true {
-            // Capture text first, then clear/persist only this chat's ordinary draft.
-            draft = ComposerSessionDraftTransition.clearingOrdinaryDraft()
-            queueFollowUp(text)
+            // Keep the composer intact unless the context-bound outbox entry is durably saved.
+            if queueFollowUp(text) {
+                draft = ComposerSessionDraftTransition.clearingOrdinaryDraft()
+            }
             return
         }
         if editingMessageID != nil {
@@ -2269,7 +2280,12 @@ final class AppState: ObservableObject {
     }
 
     @discardableResult
-    private func startPreparedSubmission(_ submission: PreparedSubmission, for id: UUID, at index: Int) -> Bool {
+    private func startPreparedSubmission(
+        _ submission: PreparedSubmission,
+        for id: UUID,
+        at index: Int,
+        sourceOutboxID: UUID? = nil
+    ) -> Bool {
         normalizeSessionBackendBeforeRun(at: index)
         guard canRunSession(sessions[index]) else {
             setError(routeUnavailableMessage(for: sessions[index]) ?? "Choose a connected model.", sessionID: id)
@@ -2284,6 +2300,7 @@ final class AppState: ObservableObject {
             return false
         }
         guard ensureUnsafeProviderRouteAcknowledged(for: sessions[index]) else { return false }
+        let beforeSubmission = sessions[index]
         markConversationOutgoingAction(for: id)
         if submission.startsSelfEdit {
             sessions[index].intent = .selfEdit
@@ -2291,11 +2308,15 @@ final class AppState: ObservableObject {
         } else if sessions[index].title == "New chat" {
             sessions[index].title = String(submission.userText.prefix(48))
         }
-        sessions[index].messages.append(.init(role: .user, text: submission.userText))
+        sessions[index].messages.append(.init(id: sourceOutboxID ?? UUID(), role: .user, text: submission.userText))
         sessions[index].messages.append(.init(role: .assistant, text: ""))
         submittedRequests[id] = submission.runText
         retryableRequests[id] = nil
-        startRun(for: id, at: index, submittedText: submission.runText)
+        guard startRun(for: id, at: index, submittedText: submission.runText) else {
+            sessions[index] = beforeSubmission
+            submittedRequests[id] = nil
+            return false
+        }
         return true
     }
 
@@ -2342,15 +2363,26 @@ final class AppState: ObservableObject {
         startRun(for: id, at: index, submittedText: submission.runText)
     }
 
-    private func queueFollowUp(_ text: String) {
+    @discardableResult
+    private func queueFollowUp(_ text: String) -> Bool {
         guard let id = selectedSessionID,
               let index = sessions.firstIndex(where: { $0.id == id }),
-              sessions[index].isStreaming else { return }
-        sessions[index].queuedFollowUps.append(.init(text: text))
+              sessions[index].isStreaming else { return false }
+        let previous = sessions[index]
+        SessionInputOutboxPolicy.enqueue(
+            text: text,
+            context: inputOutboxContext(for: sessions[index]),
+            into: &sessions[index].queuedFollowUps
+        )
         threadActivityLanes.apply(.queued(sessions[index].queuedFollowUps.count), to: id)
         sessions[index].lastUpdated = .now
         clearError()
-        persist()
+        guard persist() == .saved else {
+            sessions[index] = previous
+            threadActivityLanes.apply(.queued(previous.queuedFollowUps.count), to: id)
+            return false
+        }
+        return true
     }
 
     private func markConversationOutgoingAction(for sessionID: UUID) {
@@ -2361,32 +2393,18 @@ final class AppState: ObservableObject {
         guard let id = selectedSessionID,
               let index = sessions.firstIndex(where: { $0.id == id }),
               let queuedIndex = sessions[index].queuedFollowUps.firstIndex(where: { $0.id == queuedID }) else { return }
-        sessions[index].queuedFollowUps.remove(at: queuedIndex)
-        threadActivityLanes.apply(.queued(sessions[index].queuedFollowUps.count), to: id)
-        sessions[index].lastUpdated = .now
-        persist()
-    }
-
-    func sendQueuedFollowUp(_ queuedID: UUID) {
-        guard let id = selectedSessionID,
-              let index = sessions.firstIndex(where: { $0.id == id }),
-              !sessions[index].isStreaming,
-              let queuedIndex = sessions[index].queuedFollowUps.firstIndex(where: { $0.id == queuedID }) else { return }
-        let followUp = sessions[index].queuedFollowUps.remove(at: queuedIndex)
-        threadActivityLanes.apply(.queued(sessions[index].queuedFollowUps.count), to: id)
-        guard let submission = prepareSubmission(followUp.text) else {
+        guard case .dispatching = sessions[index].queuedFollowUps[queuedIndex].lifecycle else {
+            sessions[index].queuedFollowUps.remove(at: queuedIndex)
+            threadActivityLanes.apply(.queued(sessions[index].queuedFollowUps.count), to: id)
             sessions[index].lastUpdated = .now
             persist()
             return
         }
-        if !startPreparedSubmission(submission, for: id, at: index) {
-            if let refreshedIndex = sessions.firstIndex(where: { $0.id == id }) {
-                sessions[refreshedIndex].queuedFollowUps.insert(followUp, at: min(queuedIndex, sessions[refreshedIndex].queuedFollowUps.count))
-                threadActivityLanes.apply(.queued(sessions[refreshedIndex].queuedFollowUps.count), to: id)
-                sessions[refreshedIndex].lastUpdated = .now
-                persist()
-            }
-        }
+    }
+
+    func sendQueuedFollowUp(_ queuedID: UUID) {
+        guard let selectedSessionID else { return }
+        _ = dispatchQueuedFollowUp(queuedID, sessionID: selectedSessionID, afterExplicitReview: true)
     }
 
     @discardableResult
@@ -2394,23 +2412,209 @@ final class AppState: ObservableObject {
         guard let index = sessions.firstIndex(where: { $0.id == id }),
               !sessions[index].isStreaming,
               let followUp = sessions[index].queuedFollowUps.first else { return false }
-        sessions[index].queuedFollowUps.removeFirst()
-        threadActivityLanes.apply(.queued(sessions[index].queuedFollowUps.count), to: id)
-        guard let submission = prepareSubmission(followUp.text) else {
+        return dispatchQueuedFollowUp(followUp.id, sessionID: id, afterExplicitReview: false)
+    }
+
+    /// Claims the FIFO head durably before it can reach a provider. Local dequeue is committed
+    /// only after provider completion; an interrupted claim is review-required on restart.
+    @discardableResult
+    private func dispatchQueuedFollowUp(
+        _ queuedID: UUID,
+        sessionID id: UUID,
+        afterExplicitReview: Bool
+    ) -> Bool {
+        guard let index = sessions.firstIndex(where: { $0.id == id }),
+              !sessions[index].isStreaming,
+              let entryIndex = sessions[index].queuedFollowUps.firstIndex(where: { $0.id == queuedID }),
+              entryIndex == sessions[index].queuedFollowUps.startIndex else { return false }
+
+        // Resolve legacy/runtime route normalization before comparing the captured authority.
+        // A normalization that changes execution context must block auto-send like any user change.
+        normalizeSessionBackendBeforeRun(at: index)
+        let context = inputOutboxContext(for: sessions[index])
+        if afterExplicitReview {
+            switch SessionInputOutboxPolicy.automaticDispatchEligibility(
+                of: queuedID,
+                currentContext: context,
+                in: sessions[index].queuedFollowUps
+            ) {
+            case .eligible:
+                break
+            case .ineligible(.contextMismatch):
+                sessions[index].queuedFollowUps[entryIndex].lifecycle = .blocked(.contextMismatch)
+                fallthrough
+            case .ineligible:
+                guard SessionInputOutboxPolicy.acceptExplicitReview(
+                    entryID: queuedID,
+                    currentContext: context,
+                    in: &sessions[index].queuedFollowUps
+                ) == .applied else { return false }
+            }
+        } else {
+            guard SessionInputOutboxPolicy.automaticDispatchEligibility(
+                of: queuedID,
+                currentContext: context,
+                in: sessions[index].queuedFollowUps
+            ) == .eligible else {
+                if sessions[index].queuedFollowUps[entryIndex].context != context,
+                   sessions[index].queuedFollowUps[entryIndex].context != nil {
+                    sessions[index].queuedFollowUps[entryIndex].lifecycle = .blocked(.contextMismatch)
+                    sessions[index].lastUpdated = .now
+                    persist()
+                }
+                return false
+            }
+        }
+
+        let beforeClaim = sessions[index]
+        let attemptID = UUID()
+        guard SessionInputOutboxPolicy.claimDispatch(
+            entryID: queuedID,
+            currentContext: context,
+            in: &sessions[index].queuedFollowUps,
+            attemptID: attemptID
+        ) == .claimed(attemptID: attemptID) else { return false }
+        sessions[index].lastUpdated = .now
+        guard persist() == .saved else {
+            sessions[index] = beforeClaim
+            return false
+        }
+
+        guard let followUp = sessions[index].queuedFollowUps.first(where: { $0.id == queuedID }),
+              let submission = prepareSubmission(followUp.text) else {
+            _ = SessionInputOutboxPolicy.recordFailure(
+                entryID: queuedID,
+                attemptID: attemptID,
+                reason: .init(code: .localValidationFailed, detail: "The queued input is no longer valid."),
+                in: &sessions[index].queuedFollowUps
+            )
             sessions[index].lastUpdated = .now
             persist()
-            return runNextQueuedFollowUpIfPossible(for: id)
+            return false
         }
-        if startPreparedSubmission(submission, for: id, at: index) {
-            return true
+
+        let accepted: Bool
+        if sessions[index].messages.contains(where: { $0.id == queuedID && $0.role == .user }) {
+            accepted = restartAcceptedOutboxSubmission(submission, for: id, at: index)
+        } else {
+            accepted = startPreparedSubmission(submission, for: id, at: index, sourceOutboxID: queuedID)
         }
-        if let refreshedIndex = sessions.firstIndex(where: { $0.id == id }) {
-            sessions[refreshedIndex].queuedFollowUps.insert(followUp, at: 0)
-            threadActivityLanes.apply(.queued(sessions[refreshedIndex].queuedFollowUps.count), to: id)
-            sessions[refreshedIndex].lastUpdated = .now
-            persist()
+        guard accepted else {
+            if let refreshedIndex = sessions.firstIndex(where: { $0.id == id }) {
+                _ = SessionInputOutboxPolicy.recordFailure(
+                    entryID: queuedID,
+                    attemptID: attemptID,
+                    reason: .init(code: .providerUnavailable, detail: "The selected route is unavailable."),
+                    in: &sessions[refreshedIndex].queuedFollowUps
+                )
+                sessions[refreshedIndex].lastUpdated = .now
+                persist()
+            }
+            return false
         }
-        return false
+
+        // Keep the durable claim until the provider reaches a terminal outcome. The queued
+        // input ID is also the local user-message ID, so a reviewed retry never duplicates it.
+        return true
+    }
+
+    private func restartAcceptedOutboxSubmission(
+        _ submission: PreparedSubmission,
+        for id: UUID,
+        at index: Int
+    ) -> Bool {
+        guard canRunSession(sessions[index]) else {
+            setError(routeUnavailableMessage(for: sessions[index]) ?? "Choose a connected model.", sessionID: id)
+            return false
+        }
+        guard ensureUnsafeProviderRouteAcknowledged(for: sessions[index]) else { return false }
+        let beforeSubmission = sessions[index]
+        markConversationOutgoingAction(for: id)
+        sessions[index].messages.append(.init(role: .assistant, text: ""))
+        submittedRequests[id] = submission.runText
+        retryableRequests[id] = nil
+        guard startRun(for: id, at: index, submittedText: submission.runText) else {
+            sessions[index] = beforeSubmission
+            submittedRequests[id] = nil
+            return false
+        }
+        return true
+    }
+
+    private func dispatchingOutboxAttempt(for id: UUID) -> (entryID: UUID, attemptID: UUID)? {
+        guard let session = sessions.first(where: { $0.id == id }),
+              let entry = session.queuedFollowUps.first else { return nil }
+        guard case .dispatching(let attemptID) = entry.lifecycle else { return nil }
+        return (entry.id, attemptID)
+    }
+
+    @discardableResult
+    private func completeDispatchingOutbox(for id: UUID) -> Bool {
+        guard let index = sessions.firstIndex(where: { $0.id == id }),
+              let attempt = dispatchingOutboxAttempt(for: id) else { return true }
+        let beforeDequeue = sessions[index]
+        var outbox = sessions[index].queuedFollowUps
+        var receipts = sessions[index].inputOutboxReceipts
+        let result = SessionInputOutboxPolicy.completeLocalDequeue(
+            entryID: attempt.entryID,
+            attemptID: attempt.attemptID,
+            in: &outbox,
+            ledger: &receipts
+        )
+        guard result == .dequeued || result == .alreadyDequeued else { return false }
+        sessions[index].queuedFollowUps = outbox
+        sessions[index].inputOutboxReceipts = receipts
+        sessions[index].lastUpdated = .now
+        threadActivityLanes.apply(.queued(sessions[index].queuedFollowUps.count), to: id)
+        guard persist() == .saved else {
+            sessions[index] = beforeDequeue
+            _ = SessionInputOutboxPolicy.recordFailure(
+                entryID: attempt.entryID,
+                attemptID: attempt.attemptID,
+                reason: .init(
+                    code: .dispatchRejected,
+                    detail: "The provider completed, but local dequeue could not be saved. Remove it after confirming the response, or review before retrying."
+                ),
+                in: &sessions[index].queuedFollowUps
+            )
+            threadActivityLanes.apply(.queued(sessions[index].queuedFollowUps.count), to: id)
+            return false
+        }
+        return true
+    }
+
+    private func failDispatchingOutbox(for id: UUID, reason: QueuedFollowUpFailureReason) {
+        guard let index = sessions.firstIndex(where: { $0.id == id }),
+              let attempt = dispatchingOutboxAttempt(for: id) else { return }
+        _ = SessionInputOutboxPolicy.recordFailure(
+            entryID: attempt.entryID,
+            attemptID: attempt.attemptID,
+            reason: reason,
+            in: &sessions[index].queuedFollowUps
+        )
+        sessions[index].lastUpdated = .now
+        threadActivityLanes.apply(.queued(sessions[index].queuedFollowUps.count), to: id)
+    }
+
+    private func inputOutboxContext(for session: LatticeSession) -> SessionInputOutboxContext {
+        let rawWorkspace = session.workspacePath ?? ""
+        let workspacePath = (try? HarnessSandbox.canonicalDirectory(URL(fileURLWithPath: rawWorkspace)).path)
+            ?? SessionInputOutboxContext.standardizedPath(rawWorkspace)
+        let trusted = !workspacePath.isEmpty
+            && workspaceInstructionsAreTrusted(for: URL(fileURLWithPath: workspacePath))
+        return SessionInputOutboxContext.capture(
+            executionRoute: session.executionRoute,
+            workspacePath: workspacePath,
+            policy: session.policy,
+            privacyMode: session.privacyMode,
+            reasoningEffort: session.reasoningEffort,
+            workspaceInstructionsTrusted: trusted,
+            providerCredentialInjectionEnabled: OpenCodeCredentialPolicy.allowsKeychainCredential(
+                for: session.executionRoute,
+                enabledModes: openCodeCredentialEnabledModes
+            ),
+            attachments: session.attachments
+        )
     }
 
     private func workspaceInstructionsAreTrusted(for workspace: URL) -> Bool {
@@ -2468,13 +2672,14 @@ final class AppState: ObservableObject {
         return allowed.contains(provider) ? provider : nil
     }
 
-    private func startRun(for id: UUID, at index: Int, submittedText: String) {
+    @discardableResult
+    private func startRun(for id: UUID, at index: Int, submittedText: String) -> Bool {
         // Defense in depth: every provider stream launch stays behind the same
         // acknowledgement check, even if a future caller skips send validation.
         guard ensureUnsafeProviderRouteAcknowledged(for: sessions[index]) else {
             sessions[index].isStreaming = false
             setError("Provider route blocked until its unsafe-route acknowledgement is accepted.", sessionID: id)
-            return
+            return false
         }
         sessions[index].isStreaming = true
         inlineImagePayloadSuppression.remove(id)
@@ -2506,10 +2711,18 @@ final class AppState: ObservableObject {
         }
         let admitted = taskScheduler.submit(request)
         threadActivityLanes.apply(.queued(1 + session.queuedFollowUps.count), to: id)
-        persist()
+        guard persist() == .saved else {
+            sessions[index].isStreaming = false
+            let newlyAdmitted = taskScheduler.cancel(id)
+            persistSchedulerMetadata()
+            handleSchedulerAdmissions(newlyAdmitted)
+            refreshSchedulerLanes()
+            return false
+        }
         persistSchedulerMetadata()
         handleSchedulerAdmissions(admitted)
         refreshSchedulerLanes()
+        return true
     }
 
     private func launchScheduledRun(for id: UUID) {
@@ -3437,7 +3650,10 @@ final class AppState: ObservableObject {
         let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false; panel.prompt = "Choose"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         selectedWorkspacePath = url.path
-        if let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }), sessions[index].messages.isEmpty {
+        if let id = selectedSessionID,
+           let index = sessions.firstIndex(where: { $0.id == id }),
+           sessions[index].totalMessageCount == 0,
+           sessions[index].isTranscriptLoaded {
             sessions[index].workspacePath = url.path; persist()
         }
     }
@@ -7060,6 +7276,7 @@ Lattice self-edit rules:
             sessions[index].lastUpdated = .now
             scheduleStreamingPersist()
         case .completed:
+            let completedOutbox = dispatchingOutboxAttempt(for: id) != nil
             activeRunIDs[id] = nil
             inlineImagePayloadSuppression.remove(id)
             harnessPermissionNotices[id] = nil
@@ -7075,10 +7292,16 @@ Lattice self-edit rules:
             submittedRequests[id] = nil
             retryableRequests[id] = nil
             handleSchedulerAdmissions(taskScheduler.finish(id))
+            if completedOutbox, !completeDispatchingOutbox(for: id) {
+                persist()
+                scheduleIdleUnloadIfNeeded(for: backend)
+                return
+            }
             if runNextQueuedFollowUpIfPossible(for: id) { return }
             persist()
             scheduleIdleUnloadIfNeeded(for: backend)
         case .cancelled:
+            let cancelledOutbox = dispatchingOutboxAttempt(for: id) != nil
             activeRunIDs[id] = nil
             inlineImagePayloadSuppression.remove(id)
             harnessPermissionNotices[id] = nil
@@ -7086,19 +7309,39 @@ Lattice self-edit rules:
             finishPendingActions(status: .cancelled, at: index)
             recordWorkOutcome(.cancelled, title: "Work stopped", detail: "The run was cancelled before every item finished.", at: index)
             sessions[index].isStreaming = false
-            if let request = submittedRequests[id] { retryableRequests[id] = request }
+            if cancelledOutbox {
+                failDispatchingOutbox(
+                    for: id,
+                    reason: .init(code: .cancelled, detail: "The provider run was cancelled before completion.")
+                )
+                retryableRequests[id] = nil
+            } else if let request = submittedRequests[id] {
+                retryableRequests[id] = request
+            }
             submittedRequests[id] = nil
             reduceRunUI(.cancelled, for: id)
             threadActivityLanes.apply(.cancelled, to: id)
             handleSchedulerAdmissions(taskScheduler.finish(id))
+            if sessions[index].messages.last?.text.isEmpty == true {
+                sessions[index].messages.removeLast()
+            }
             persist()
             scheduleIdleUnloadIfNeeded(for: backend)
         case .failed(let message):
+            let failedOutbox = dispatchingOutboxAttempt(for: id) != nil
             activeRunIDs[id] = nil
             inlineImagePayloadSuppression.remove(id)
             harnessPermissionNotices[id] = nil
             selfEditRunIDs.remove(id)
-            if let request = submittedRequests[id] { retryableRequests[id] = request }
+            if failedOutbox {
+                failDispatchingOutbox(
+                    for: id,
+                    reason: .init(code: .providerUnavailable, detail: message)
+                )
+                retryableRequests[id] = nil
+            } else if let request = submittedRequests[id] {
+                retryableRequests[id] = request
+            }
             submittedRequests[id] = nil
             let timedOut = message == "Permission request timed out."
             finishPendingActions(
@@ -7373,16 +7616,18 @@ Lattice self-edit rules:
     }
 
     /// Immediate durable write at a safe boundary. Cancels/absorbs any pending debounced draft write.
-    private func persist() {
+    @discardableResult
+    private func persist() -> SessionSaveAttemptResult {
         refreshSearchIndexForLoadedSessions()
         // Coordinator enforces the load-recovery write gate and reports real save failures.
-        _ = sessionSaveCoordinator.saveNow(sessions)
+        let result = sessionSaveCoordinator.saveNow(sessions)
         // Keep published failure in sync for synchronous MainActor paths (observer may be async).
         sessionSaveFailure = sessionSaveCoordinator.currentFailure
-        if sessionSaveFailure == nil {
+        if result == .saved {
             expandedSessionSaveFailureDetails = false
             synchronizeTranscriptReferencesAfterSuccessfulSave()
         }
+        return result
     }
 
     private func prepareTranscriptSelection(selectedID: UUID?) {

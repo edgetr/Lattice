@@ -81,7 +81,12 @@ struct ConversationView: View {
                                             }
                                         }
                                         ForEach(session.queuedFollowUps) { followUp in
-                                            QueuedFollowUpRow(followUp: followUp, sessionIsStreaming: session.isStreaming, state: state)
+                                            QueuedFollowUpRow(
+                                                followUp: followUp,
+                                                isFIFOHead: session.queuedFollowUps.first?.id == followUp.id,
+                                                sessionIsStreaming: session.isStreaming,
+                                                state: state
+                                            )
                                                 .id(followUp.id)
                                         }
                                         ForEach(state.visibleSelfEditPreviews(for: session.id)) { preview in
@@ -427,33 +432,104 @@ private struct JumpToLatestControl: View {
 
 private struct QueuedFollowUpRow: View {
     let followUp: QueuedFollowUp
+    let isFIFOHead: Bool
     let sessionIsStreaming: Bool
     @ObservedObject var state: AppState
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "text.line.first.and.arrowtriangle.forward")
-                .foregroundStyle(.purple)
+            Image(systemName: icon)
+                .foregroundStyle(tint)
                 .frame(width: 22)
             VStack(alignment: .leading, spacing: 4) {
-                Text("Queued follow-up")
+                Text(title)
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(tint)
                 Text(followUp.text)
                     .font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
+                if let statusDetail {
+                    Text(statusDetail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             Spacer(minLength: 12)
-            if !sessionIsStreaming {
-                Button("Send now") { state.sendQueuedFollowUp(followUp.id) }
+            if !sessionIsStreaming, isFIFOHead, canSend {
+                Button(actionTitle) { state.sendQueuedFollowUp(followUp.id) }
             }
-            Button("Remove") { state.removeQueuedFollowUp(followUp.id) }
+            if canRemove {
+                Button("Remove") { state.removeQueuedFollowUp(followUp.id) }
+            }
         }
         .padding(12)
-        .latticeGlass(cornerRadius: 14, tint: .purple.opacity(0.08))
+        .latticeGlass(cornerRadius: 14, tint: tint.opacity(0.08))
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Queued follow-up")
+        .accessibilityLabel(title)
+        .accessibilityValue(accessibilityValue)
+    }
+
+    private var title: String {
+        switch followUp.lifecycle {
+        case .pending: "Pending follow-up"
+        case .dispatching: "Sending follow-up"
+        case .blocked(.contextMismatch): "Review changed context"
+        case .blocked(.restartRecovery): "Review after restart"
+        case .blocked(.missingCapturedContext): "Review imported follow-up"
+        case .blocked(.awaitingExplicitReview): "Review follow-up"
+        case .failed: "Follow-up failed"
+        }
+    }
+
+    private var icon: String {
+        switch followUp.lifecycle {
+        case .pending: "clock"
+        case .dispatching: "arrow.up.circle"
+        case .blocked: "exclamationmark.shield"
+        case .failed: "exclamationmark.arrow.triangle.2.circlepath"
+        }
+    }
+
+    private var tint: Color {
+        switch followUp.lifecycle {
+        case .pending, .dispatching: .purple
+        case .blocked: .orange
+        case .failed: .red
+        }
+    }
+
+    private var canSend: Bool {
+        if case .dispatching = followUp.lifecycle { return false }
+        return true
+    }
+
+    private var canRemove: Bool {
+        if case .dispatching = followUp.lifecycle { return false }
+        return true
+    }
+
+    private var statusDetail: String? {
+        guard case .failed(let reason) = followUp.lifecycle else { return nil }
+        return reason.detail
+    }
+
+    private var actionTitle: String {
+        switch followUp.lifecycle {
+        case .pending: "Send now"
+        case .blocked, .failed: "Review & retry"
+        case .dispatching: "Sending"
+        }
+    }
+
+    private var accessibilityValue: String {
+        switch followUp.lifecycle {
+        case .pending: "Pending in FIFO outbox"
+        case .dispatching: "Durably claimed for local dispatch"
+        case .blocked: "Automatic sending is blocked until reviewed"
+        case .failed(let reason): reason.detail ?? "Dispatch failed and requires retry"
+        }
     }
 }
 

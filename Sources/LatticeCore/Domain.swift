@@ -102,11 +102,62 @@ public struct QueuedFollowUp: Identifiable, Hashable, Codable, Sendable {
     public let id: UUID
     public var text: String
     public let date: Date
+    /// Secret-free dispatch context captured at enqueue. Absent on legacy decoded entries.
+    public var context: SessionInputOutboxContext?
+    public var lifecycle: QueuedFollowUpLifecycle
 
-    public init(id: UUID = UUID(), text: String, date: Date = .now) {
+    public init(
+        id: UUID = UUID(),
+        text: String,
+        date: Date = .now,
+        context: SessionInputOutboxContext? = nil,
+        lifecycle: QueuedFollowUpLifecycle? = nil
+    ) {
         self.id = id
         self.text = text
         self.date = date
+        self.context = context
+        if let lifecycle {
+            self.lifecycle = lifecycle
+        } else if context == nil {
+            // Legacy-style entries without context require explicit review and are never auto-dispatched.
+            self.lifecycle = .blocked(.missingCapturedContext)
+        } else {
+            self.lifecycle = .pending
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, text, date, context, lifecycle
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        text = try container.decode(String.self, forKey: .text)
+        date = try container.decodeIfPresent(Date.self, forKey: .date) ?? .distantPast
+        context = try container.decodeIfPresent(SessionInputOutboxContext.self, forKey: .context)
+        if let decodedLifecycle = try container.decodeIfPresent(QueuedFollowUpLifecycle.self, forKey: .lifecycle) {
+            // Context absence always forces review, even if a lifecycle was written.
+            if context == nil {
+                lifecycle = .blocked(.missingCapturedContext)
+            } else {
+                lifecycle = decodedLifecycle
+            }
+        } else if context == nil {
+            lifecycle = .blocked(.missingCapturedContext)
+        } else {
+            lifecycle = .pending
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(text, forKey: .text)
+        try container.encode(date, forKey: .date)
+        try container.encodeIfPresent(context, forKey: .context)
+        try container.encode(lifecycle, forKey: .lifecycle)
     }
 }
 
@@ -1197,6 +1248,8 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
     public var intent: LatticeSessionIntent?
     public var actions: [SessionAction]
     public var queuedFollowUps: [QueuedFollowUp]
+    /// Bounded, secret-free receipts for exactly-once local outbox dequeue callbacks.
+    public var inputOutboxReceipts: SessionInputOutboxReceiptLedger
     /// Unsent ordinary composer text for this chat. Never stores transient message-edit text.
     public var draft: String
     public var isPinned: Bool
@@ -1228,6 +1281,7 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         intent: LatticeSessionIntent? = nil,
         actions: [SessionAction] = [],
         queuedFollowUps: [QueuedFollowUp] = [],
+        inputOutboxReceipts: SessionInputOutboxReceiptLedger = .init(),
         draft: String = "",
         isPinned: Bool = false,
         isStreaming: Bool = false,
@@ -1247,13 +1301,14 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         self.reasoningEffort = reasoningEffort
         self.harnessThreadID = harnessThreadID; self.workspacePath = workspacePath; self.attachments = attachments
         self.policy = policy; self.privacyMode = privacyMode; self.intent = intent; self.actions = actions; self.queuedFollowUps = queuedFollowUps
+        self.inputOutboxReceipts = inputOutboxReceipts
         self.draft = draft
         self.isPinned = isPinned; self.isStreaming = isStreaming; self.lastUpdated = lastUpdated
         self.portableArchiveFingerprint = portableArchiveFingerprint
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, messages, transcriptStorage, artifacts, artifactStorage, backend, executionRoute, harnessID, reasoningEffort, harnessThreadID, workspacePath, attachments, policy, privacyMode, intent, actions, queuedFollowUps, draft, isPinned, isStreaming, lastUpdated, portableArchiveFingerprint
+        case id, title, messages, transcriptStorage, artifacts, artifactStorage, backend, executionRoute, harnessID, reasoningEffort, harnessThreadID, workspacePath, attachments, policy, privacyMode, intent, actions, queuedFollowUps, inputOutboxReceipts, draft, isPinned, isStreaming, lastUpdated, portableArchiveFingerprint
     }
 
     public init(from decoder: Decoder) throws {
@@ -1290,6 +1345,7 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         intent = try container.decodeIfPresent(LatticeSessionIntent.self, forKey: .intent)
         actions = try container.decodeIfPresent([SessionAction].self, forKey: .actions) ?? []
         queuedFollowUps = try container.decodeIfPresent([QueuedFollowUp].self, forKey: .queuedFollowUps) ?? []
+        inputOutboxReceipts = try container.decodeIfPresent(SessionInputOutboxReceiptLedger.self, forKey: .inputOutboxReceipts) ?? .init()
         draft = try container.decodeIfPresent(String.self, forKey: .draft) ?? ""
         isPinned = try container.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
         isStreaming = try container.decodeIfPresent(Bool.self, forKey: .isStreaming) ?? false
@@ -1322,6 +1378,7 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         try container.encodeIfPresent(intent, forKey: .intent)
         try container.encode(actions, forKey: .actions)
         try container.encode(queuedFollowUps, forKey: .queuedFollowUps)
+        try container.encode(inputOutboxReceipts, forKey: .inputOutboxReceipts)
         try container.encode(draft, forKey: .draft)
         try container.encode(isPinned, forKey: .isPinned)
         try container.encode(isStreaming, forKey: .isStreaming)
