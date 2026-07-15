@@ -148,6 +148,7 @@ final class AppState: ObservableObject {
                 composerSelectionBackend = nil
             }
             threadActivityLanes.select(selectedSessionID)
+            refreshSelectedCheckpointReview()
         }
     }
     @Published var sessions: [LatticeSession]
@@ -160,6 +161,7 @@ final class AppState: ObservableObject {
     }
     @Published var searchText = ""
     @Published var showInspector = false
+    @Published private(set) var checkpointReviewStates: [UUID: WorkspaceCheckpointReviewState] = [:]
     @Published var showCommandPalette = false
     @Published var showsOnboarding: Bool
     @Published var onboardingStep: LatticeOnboardingStep = .welcome
@@ -344,6 +346,7 @@ final class AppState: ObservableObject {
     var pi = PiRPCHarness()
     var hermes = ACPHarness()
     private let executionCoordinator: any LatticeExecutionCoordinating
+    private let checkpointClient: WorkspaceCheckpointClient
     private var runtimeInstallTasks: [LatticeRuntimeID: Task<Void, Never>] = [:]
     let appleIntelligence = AppleIntelligenceClient()
     let ollama = OllamaClient()
@@ -448,8 +451,14 @@ final class AppState: ObservableObject {
         openWorkspaceAction?()
     }
 
-    init(executionCoordinator: (any LatticeExecutionCoordinating)? = nil) {
+    init(
+        executionCoordinator: (any LatticeExecutionCoordinating)? = nil,
+        checkpointService: WorkspaceCheckpointService? = nil
+    ) {
         self.executionCoordinator = executionCoordinator ?? DefaultLatticeExecutionCoordinator()
+        self.checkpointClient = WorkspaceCheckpointClient(
+            service: checkpointService ?? WorkspaceCheckpointService(store: .defaultStore())
+        )
         sessionSaveCoordinator = SessionSaveCoordinator(persistence: persistence)
         LatticeApplicationSupport.migrateLegacyProductDataIfNeeded()
         LatticeApplicationSupport.migrateLegacyUserDefaultsIfNeeded()
@@ -629,6 +638,187 @@ final class AppState: ObservableObject {
     var selectedSession: LatticeSession? {
         guard let id = selectedSessionID else { return nil }
         return sessions.first { $0.id == id }
+    }
+
+    var selectedCheckpointReview: WorkspaceCheckpointReviewState? {
+        guard let selectedSessionID else { return nil }
+        return checkpointReviewStates[selectedSessionID]
+    }
+
+    func refreshSelectedCheckpointReview() {
+        guard let sessionID = selectedSessionID,
+              selectedSession?.executionRoute.mode == .code else { return }
+        // Never clobber a live capture/revert cycle with a durable-store reload.
+        if let existing = checkpointReviewStates[sessionID],
+           existing.activity == .capturingBefore
+            || existing.activity == .running
+            || existing.activity == .capturingAfter
+            || existing.isPreparingRevert
+            || existing.isApplyingRevert {
+            return
+        }
+        let client = checkpointClient
+        Task { [weak self] in
+            do {
+                let checkpoints = try await client.checkpoints(sessionID: sessionID)
+                let grouped = Dictionary(grouping: checkpoints, by: { $0.ownership.runID })
+                guard let latest = grouped.values
+                    .sorted(by: { ($0.map(\.createdAt).max() ?? .distantPast) > ($1.map(\.createdAt).max() ?? .distantPast) })
+                    .first,
+                    let representative = latest.max(by: { $0.createdAt < $1.createdAt }) else { return }
+                // Re-check after the await so a run started during reload is preserved.
+                if let existing = self?.checkpointReviewStates[sessionID],
+                   existing.activity == .capturingBefore
+                    || existing.activity == .running
+                    || existing.activity == .capturingAfter
+                    || existing.isPreparingRevert
+                    || existing.isApplyingRevert {
+                    return
+                }
+                let before = latest.first(where: { $0.boundary == .beforeRun })
+                let after = latest.first(where: { $0.boundary == .afterRun })
+                let restoredActivity: WorkspaceCheckpointActivity = {
+                    if before?.status == .captured, after?.status == .captured {
+                        return .ready
+                    }
+                    if before?.status == .failed || after?.status == .failed {
+                        return .failed
+                    }
+                    if before != nil || after != nil {
+                        return .failed
+                    }
+                    return .idle
+                }()
+                var restored = WorkspaceCheckpointReviewState(
+                    sessionID: sessionID,
+                    runID: representative.ownership.runID,
+                    worktreePath: representative.ownership.worktreePath,
+                    activity: restoredActivity,
+                    beforeCheckpoint: before,
+                    afterCheckpoint: after,
+                    issue: (after ?? before)?.failureSummary
+                )
+                if let before, let after,
+                   before.status == .captured, after.status == .captured {
+                    restored.changes = try? await client.changes(
+                        beforeCheckpointID: before.id,
+                        afterCheckpointID: after.id
+                    )
+                    restored.notes = (try? await client.reviewNotes(checkpointID: after.id)) ?? []
+                    if restored.changes == nil {
+                        restored.activity = .failed
+                        restored.issue = restored.issue ?? "Could not load the review diff for this checkpoint pair."
+                    }
+                }
+                guard self?.selectedSessionID == sessionID else { return }
+                if let existing = self?.checkpointReviewStates[sessionID],
+                   existing.activity == .capturingBefore
+                    || existing.activity == .running
+                    || existing.activity == .capturingAfter
+                    || existing.isPreparingRevert
+                    || existing.isApplyingRevert {
+                    return
+                }
+                self?.checkpointReviewStates[sessionID] = restored
+            } catch {
+                guard self?.selectedSessionID == sessionID else { return }
+                if let existing = self?.checkpointReviewStates[sessionID],
+                   existing.activity == .capturingBefore
+                    || existing.activity == .running
+                    || existing.activity == .capturingAfter
+                    || existing.isPreparingRevert
+                    || existing.isApplyingRevert {
+                    return
+                }
+                self?.checkpointReviewStates[sessionID] = WorkspaceCheckpointReviewState(
+                    sessionID: sessionID,
+                    runID: UUID(),
+                    worktreePath: self?.selectedSession?.workspacePath ?? "",
+                    activity: .failed,
+                    issue: self?.checkpointMessage(for: error)
+                )
+            }
+        }
+    }
+
+    func addSelectedCheckpointReviewNote(
+        path: String,
+        body: String,
+        kind: WorkspaceReviewNoteKind,
+        lineRange: WorkspaceReviewLineRange?,
+        hunkHeader: String?
+    ) {
+        guard let sessionID = selectedSessionID,
+              let checkpointID = checkpointReviewStates[sessionID]?.afterCheckpoint?.id else { return }
+        let client = checkpointClient
+        Task { [weak self] in
+            do {
+                let note = try await client.addReviewNote(
+                    checkpointID: checkpointID,
+                    path: path,
+                    body: body,
+                    kind: kind,
+                    lineRange: lineRange,
+                    hunkHeader: hunkHeader
+                )
+                guard self?.checkpointReviewStates[sessionID]?.afterCheckpoint?.id == checkpointID else { return }
+                self?.checkpointReviewStates[sessionID]?.notes.append(note)
+                self?.checkpointReviewStates[sessionID]?.issue = nil
+            } catch {
+                self?.checkpointReviewStates[sessionID]?.issue = self?.checkpointMessage(for: error)
+            }
+        }
+    }
+
+    func previewSelectedCheckpointRevert() {
+        guard let sessionID = selectedSessionID,
+              let checkpointID = checkpointReviewStates[sessionID]?.afterCheckpoint?.id,
+              checkpointReviewStates[sessionID]?.ownsCompletePair == true,
+              checkpointReviewStates[sessionID]?.isPreparingRevert != true,
+              checkpointReviewStates[sessionID]?.isApplyingRevert != true,
+              selectedSession?.isStreaming != true else { return }
+        checkpointReviewStates[sessionID]?.isPreparingRevert = true
+        checkpointReviewStates[sessionID]?.revertPreview = nil
+        checkpointReviewStates[sessionID]?.revertStatus = nil
+        let client = checkpointClient
+        Task { [weak self] in
+            do {
+                let preview = try await client.previewRevert(afterCheckpointID: checkpointID)
+                guard self?.checkpointReviewStates[sessionID]?.afterCheckpoint?.id == checkpointID else { return }
+                self?.checkpointReviewStates[sessionID]?.revertPreview = preview
+            } catch {
+                self?.checkpointReviewStates[sessionID]?.revertStatus = self?.checkpointMessage(for: error)
+            }
+            self?.checkpointReviewStates[sessionID]?.isPreparingRevert = false
+        }
+    }
+
+    func confirmSelectedCheckpointRevert() {
+        guard let sessionID = selectedSessionID,
+              let preview = checkpointReviewStates[sessionID]?.revertPreview,
+              checkpointReviewStates[sessionID]?.isApplyingRevert != true,
+              selectedSession?.isStreaming != true else { return }
+        checkpointReviewStates[sessionID]?.isApplyingRevert = true
+        checkpointReviewStates[sessionID]?.revertStatus = nil
+        let client = checkpointClient
+        Task { [weak self] in
+            do {
+                let result = try await client.confirmRevert(
+                    afterCheckpointID: preview.afterCheckpointID,
+                    confirmationToken: preview.confirmationToken
+                )
+                guard self?.checkpointReviewStates[sessionID]?.revertPreview?.confirmationToken == preview.confirmationToken else { return }
+                self?.checkpointReviewStates[sessionID]?.revertStatus = result.summary
+                self?.checkpointReviewStates[sessionID]?.revertPreview = nil
+            } catch {
+                self?.checkpointReviewStates[sessionID]?.revertStatus = self?.checkpointMessage(for: error)
+            }
+            self?.checkpointReviewStates[sessionID]?.isApplyingRevert = false
+        }
+    }
+
+    private func checkpointMessage(for error: Error) -> String {
+        (error as? WorkspaceCheckpointError)?.message ?? error.localizedDescription
     }
 
     var isSelectedTranscriptLoading: Bool {
@@ -1766,6 +1956,7 @@ final class AppState: ObservableObject {
         submittedRequests[id] = nil
         retryableRequests[id] = nil
         providerSessionHealth[id] = nil
+        checkpointReviewStates[id] = nil
         clearConversationScrollState(for: id)
         selectedSessionID = LatticeSessionListOrdering.sorted(sessions).first?.id
         persist()
@@ -2729,6 +2920,51 @@ final class AppState: ObservableObject {
         guard let index = sessions.firstIndex(where: { $0.id == id }),
               let submittedText = submittedRequests[id],
               taskScheduler.snapshot(for: id)?.state == .running else { return }
+        let session = sessions[index]
+        let runID = UUID()
+        activeRunIDs[id] = runID
+        guard session.executionRoute.mode == .code else {
+            launchScheduledProviderRun(for: id, runID: runID)
+            return
+        }
+
+        let isExtensionSelfEdit = isExtensionSelfEditThread(session, submittedText: submittedText)
+        let workspace = workspaceURL(for: session, isExtensionSelfEdit: isExtensionSelfEdit)
+        checkpointReviewStates[id] = WorkspaceCheckpointReviewState(
+            sessionID: id,
+            runID: runID,
+            worktreePath: workspace.standardizedFileURL.path,
+            activity: .capturingBefore
+        )
+        let client = checkpointClient
+        Task { [weak self] in
+            do {
+                let checkpoint = try await client.capture(
+                    worktreeURL: workspace,
+                    sessionID: id,
+                    runID: runID,
+                    boundary: .beforeRun
+                )
+                guard self?.activeRunIDs[id] == runID,
+                      self?.taskScheduler.snapshot(for: id)?.state == .running else { return }
+                self?.checkpointReviewStates[id]?.beforeCheckpoint = checkpoint
+                self?.checkpointReviewStates[id]?.activity = .running
+                self?.checkpointReviewStates[id]?.issue = nil
+            } catch {
+                guard self?.activeRunIDs[id] == runID,
+                      self?.taskScheduler.snapshot(for: id)?.state == .running else { return }
+                self?.checkpointReviewStates[id]?.activity = .running
+                self?.checkpointReviewStates[id]?.issue = self?.checkpointMessage(for: error)
+            }
+            self?.launchScheduledProviderRun(for: id, runID: runID)
+        }
+    }
+
+    private func launchScheduledProviderRun(for id: UUID, runID: UUID) {
+        guard activeRunIDs[id] == runID,
+              let index = sessions.firstIndex(where: { $0.id == id }),
+              let submittedText = submittedRequests[id],
+              taskScheduler.snapshot(for: id)?.state == .running else { return }
         threadActivityLanes.apply(.started, to: id)
         reduceRunUI(.started, for: id)
 
@@ -2786,8 +3022,6 @@ final class AppState: ObservableObject {
             setActivity([.init(icon: contextPlan.didCompact ? "arrow.triangle.2.circlepath" : "doc.text.magnifyingglass", title: contextPlan.didCompact ? "Context compacted" : "Context handoff", detail: statusDetail)], sessionID: id)
         }
         if let deliveryIssue = contextPlan.deliveryIssue {
-            let runID = UUID()
-            activeRunIDs[id] = runID
             let failedStream = AsyncStream<AgentEvent> { continuation in
                 continuation.yield(.failed(deliveryIssue))
                 continuation.finish()
@@ -2846,9 +3080,70 @@ final class AppState: ObservableObject {
             ),
             runtimes: executionRuntimes
         )
-        let runID = UUID()
-        activeRunIDs[id] = runID
         Task { for await event in stream { apply(event, to: id, runID: runID) } }
+    }
+
+    private func finishSchedulerRunAfterCheckpoint(
+        sessionID id: UUID,
+        runID: UUID,
+        completion: @escaping @MainActor () -> Void
+    ) {
+        guard let review = checkpointReviewStates[id],
+              review.runID == runID,
+              sessions.first(where: { $0.id == id })?.executionRoute.mode == .code else {
+            completion()
+            return
+        }
+        checkpointReviewStates[id]?.activity = .capturingAfter
+        let workspace = URL(fileURLWithPath: review.worktreePath, isDirectory: true)
+        let client = checkpointClient
+        Task { [weak self] in
+            defer { completion() }
+            do {
+                let after = try await client.capture(
+                    worktreeURL: workspace,
+                    sessionID: id,
+                    runID: runID,
+                    boundary: .afterRun
+                )
+                guard self?.checkpointReviewStates[id]?.runID == runID else { return }
+                self?.checkpointReviewStates[id]?.afterCheckpoint = after
+                // A stop can clear the active run while the before capture is still
+                // finishing. Recover the durable before record instead of reporting a
+                // false incomplete pair when the actor already persisted it.
+                var before = self?.checkpointReviewStates[id]?.beforeCheckpoint
+                if before == nil {
+                    if let checkpoints = try? await client.checkpoints(sessionID: id) {
+                        before = checkpoints.first(where: { $0.ownership.runID == runID && $0.boundary == .beforeRun })
+                    }
+                    self?.checkpointReviewStates[id]?.beforeCheckpoint = before
+                }
+                if let before, before.status == .captured, after.status == .captured {
+                    do {
+                        let changes = try await client.changes(
+                            beforeCheckpointID: before.id,
+                            afterCheckpointID: after.id
+                        )
+                        self?.checkpointReviewStates[id]?.changes = changes
+                        self?.checkpointReviewStates[id]?.notes = (try? await client.reviewNotes(checkpointID: after.id)) ?? []
+                        self?.checkpointReviewStates[id]?.activity = .ready
+                        self?.checkpointReviewStates[id]?.issue = nil
+                    } catch {
+                        self?.checkpointReviewStates[id]?.activity = .failed
+                        self?.checkpointReviewStates[id]?.issue = self?.checkpointMessage(for: error)
+                    }
+                } else {
+                    self?.checkpointReviewStates[id]?.activity = .failed
+                    if self?.checkpointReviewStates[id]?.issue == nil {
+                        self?.checkpointReviewStates[id]?.issue = "The before-run checkpoint was not captured, so this run cannot be reviewed or reverted."
+                    }
+                }
+            } catch {
+                guard self?.checkpointReviewStates[id]?.runID == runID else { return }
+                self?.checkpointReviewStates[id]?.activity = .failed
+                self?.checkpointReviewStates[id]?.issue = self?.checkpointMessage(for: error)
+            }
+        }
     }
 
     private func handleSchedulerAdmissions(_ admitted: [UUID]) {
@@ -3360,6 +3655,7 @@ final class AppState: ObservableObject {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
         let session = sessions[index]
         let schedulerState = taskScheduler.snapshot(for: id)?.state
+        let terminalRunID = activeRunIDs[id]
         if let request = submittedRequests[id] { retryableRequests[id] = request }
         activeRunIDs[id] = nil
         inlineImagePayloadSuppression.remove(id)
@@ -3377,8 +3673,17 @@ final class AppState: ObservableObject {
         if schedulerState == .running || schedulerState == .waitingForApproval {
             cancelHarnessProcess(for: session, sessionID: id)
         }
-        handleSchedulerAdmissions(taskScheduler.cancel(id))
         persist()
+        if let terminalRunID,
+           (schedulerState == .running || schedulerState == .waitingForApproval) {
+            finishSchedulerRunAfterCheckpoint(sessionID: id, runID: terminalRunID) { [weak self] in
+                guard let self else { return }
+                self.handleSchedulerAdmissions(self.taskScheduler.cancel(id))
+                self.persist()
+            }
+        } else {
+            handleSchedulerAdmissions(taskScheduler.cancel(id))
+        }
     }
 
     private func cancelHarnessProcess(for session: LatticeSession, sessionID id: UUID) {
@@ -3435,6 +3740,7 @@ final class AppState: ObservableObject {
         guard forwardHarnessPermission(notice, optionID: option.id) else {
             setError("This permission request is no longer active.", sessionID: notice.sessionID)
             harnessPermissionNotices[notice.sessionID] = nil
+            let terminalRunID = activeRunIDs[notice.sessionID]
             if let sessionIndex = sessions.firstIndex(where: { $0.id == notice.sessionID }) {
                 updateApprovalProvenance(
                     id: notice.request.id,
@@ -3452,8 +3758,16 @@ final class AppState: ObservableObject {
             updateSessionAction(id: notice.request.id, status: .cancelled, sessionID: notice.sessionID)
             reduceRunUI(.failed("The provider could not resume this approval request."), for: notice.sessionID)
             threadActivityLanes.apply(.failed("The provider could not resume this approval request."), to: notice.sessionID)
-            handleSchedulerAdmissions(taskScheduler.finish(notice.sessionID))
             persist()
+            if let terminalRunID {
+                finishSchedulerRunAfterCheckpoint(sessionID: notice.sessionID, runID: terminalRunID) { [weak self] in
+                    guard let self else { return }
+                    self.handleSchedulerAdmissions(self.taskScheduler.finish(notice.sessionID))
+                    self.persist()
+                }
+            } else {
+                handleSchedulerAdmissions(taskScheduler.finish(notice.sessionID))
+            }
             return
         }
         harnessPermissionNotices[notice.sessionID] = nil
@@ -7136,8 +7450,12 @@ Lattice self-edit rules:
                     reduceRunUI(.failed("The provider rejected Lattice's automatic permission decision."), for: id)
                     threadActivityLanes.apply(.failed("The provider rejected Lattice's automatic permission decision."), to: id)
                     cancelHarnessProcess(for: sessions[index], sessionID: id)
-                    handleSchedulerAdmissions(taskScheduler.finish(id))
                     persist()
+                    finishSchedulerRunAfterCheckpoint(sessionID: id, runID: runID) { [weak self] in
+                        guard let self else { return }
+                        self.handleSchedulerAdmissions(self.taskScheduler.finish(id))
+                        self.persist()
+                    }
                     return
                 }
                 updateApprovalProvenance(
@@ -7168,8 +7486,12 @@ Lattice self-edit rules:
                 reduceRunUI(.failed("Blocked by Lattice policy: \(reason)"), for: id)
                 threadActivityLanes.apply(.failed("Blocked by Lattice policy: \(reason)"), to: id)
                 cancelHarnessProcess(for: sessions[index], sessionID: id)
-                handleSchedulerAdmissions(taskScheduler.finish(id))
                 persist()
+                finishSchedulerRunAfterCheckpoint(sessionID: id, runID: runID) { [weak self] in
+                    guard let self else { return }
+                    self.handleSchedulerAdmissions(self.taskScheduler.finish(id))
+                    self.persist()
+                }
             case .requestUser:
                 harnessPermissionNotices[id] = notice
                 setActivity([.init(icon: "hand.raised.fill", title: request.title, detail: "Waiting for your decision")], sessionID: id)
@@ -7291,15 +7613,24 @@ Lattice self-edit rules:
             }
             submittedRequests[id] = nil
             retryableRequests[id] = nil
-            handleSchedulerAdmissions(taskScheduler.finish(id))
             if completedOutbox, !completeDispatchingOutbox(for: id) {
                 persist()
-                scheduleIdleUnloadIfNeeded(for: backend)
+                finishSchedulerRunAfterCheckpoint(sessionID: id, runID: runID) { [weak self] in
+                    guard let self else { return }
+                    self.handleSchedulerAdmissions(self.taskScheduler.finish(id))
+                    self.persist()
+                    self.scheduleIdleUnloadIfNeeded(for: backend)
+                }
                 return
             }
-            if runNextQueuedFollowUpIfPossible(for: id) { return }
             persist()
-            scheduleIdleUnloadIfNeeded(for: backend)
+            finishSchedulerRunAfterCheckpoint(sessionID: id, runID: runID) { [weak self] in
+                guard let self else { return }
+                self.handleSchedulerAdmissions(self.taskScheduler.finish(id))
+                if self.runNextQueuedFollowUpIfPossible(for: id) { return }
+                self.persist()
+                self.scheduleIdleUnloadIfNeeded(for: backend)
+            }
         case .cancelled:
             let cancelledOutbox = dispatchingOutboxAttempt(for: id) != nil
             activeRunIDs[id] = nil
@@ -7321,12 +7652,16 @@ Lattice self-edit rules:
             submittedRequests[id] = nil
             reduceRunUI(.cancelled, for: id)
             threadActivityLanes.apply(.cancelled, to: id)
-            handleSchedulerAdmissions(taskScheduler.finish(id))
             if shouldRemoveEmptyTrailingAssistant(from: sessions[index]) {
                 sessions[index].messages.removeLast()
             }
             persist()
-            scheduleIdleUnloadIfNeeded(for: backend)
+            finishSchedulerRunAfterCheckpoint(sessionID: id, runID: runID) { [weak self] in
+                guard let self else { return }
+                self.handleSchedulerAdmissions(self.taskScheduler.finish(id))
+                self.persist()
+                self.scheduleIdleUnloadIfNeeded(for: backend)
+            }
         case .failed(let message):
             let failedOutbox = dispatchingOutboxAttempt(for: id) != nil
             activeRunIDs[id] = nil
@@ -7353,11 +7688,17 @@ Lattice self-edit rules:
             sessions[index].isStreaming = false
             reduceRunUI(.failed(message), for: id)
             threadActivityLanes.apply(.failed(message), to: id)
-            handleSchedulerAdmissions(taskScheduler.finish(id))
-            if shouldRemoveEmptyTrailingAssistant(from: sessions[index]) { sessions[index].messages.removeLast() }
+            if shouldRemoveEmptyTrailingAssistant(from: sessions[index]) {
+                sessions[index].messages.removeLast()
+            }
             recordWorkOutcome(.failed, title: "Work failed", detail: message, at: index)
             persist()
-            scheduleIdleUnloadIfNeeded(for: backend)
+            finishSchedulerRunAfterCheckpoint(sessionID: id, runID: runID) { [weak self] in
+                guard let self else { return }
+                self.handleSchedulerAdmissions(self.taskScheduler.finish(id))
+                self.persist()
+                self.scheduleIdleUnloadIfNeeded(for: backend)
+            }
         }
     }
 

@@ -1,8 +1,16 @@
 import SwiftUI
 import LatticeCore
 
+@MainActor
+private final class InspectorViewModel: ObservableObject {
+    @Published var surface: InspectorSurface = .details
+}
+
 struct InspectorView: View {
     @ObservedObject var state: AppState
+    /// StateObject (not `@State`) so CLT builds avoid the external State macro and
+    /// surface selection survives AppState publishes.
+    @StateObject private var model = InspectorViewModel()
 
     var body: some View {
         ScrollView {
@@ -11,7 +19,19 @@ struct InspectorView: View {
                     Text("Inspector")
                         .font(.title3.weight(.semibold))
                         .accessibilityAddTraits(.isHeader)
-                    inspectorShell(session)
+                    if session.executionRoute.mode == .code {
+                        Picker("Inspector surface", selection: $model.surface) {
+                            Text("Details").tag(InspectorSurface.details)
+                            Text("Review").tag(InspectorSurface.review)
+                        }
+                        .pickerStyle(.segmented)
+                        .accessibilityHint("Switch between route details and checkpoint change review.")
+                    }
+                    if model.surface == .review && session.executionRoute.mode == .code {
+                        CheckpointReviewView(state: state)
+                    } else {
+                        inspectorShell(session)
+                    }
                 }
                 .padding(12)
             } else {
@@ -193,7 +213,12 @@ struct InspectorView: View {
     }
 }
 
-private struct InspectorOpaqueSection<Content: View>: View {
+private enum InspectorSurface: Hashable {
+    case details
+    case review
+}
+
+struct InspectorOpaqueSection<Content: View>: View {
     let title: String
     let systemImage: String
     @ViewBuilder let content: Content
@@ -211,7 +236,7 @@ private struct InspectorOpaqueSection<Content: View>: View {
     }
 }
 
-private struct InspectorOpaqueDisclosure<Content: View>: View {
+struct InspectorOpaqueDisclosure<Content: View>: View {
     let title: String
     let systemImage: String
     @ViewBuilder let content: Content
@@ -261,7 +286,7 @@ private struct ModeInstructionEditor: View {
     }
 }
 
-private struct InspectorFactRow: View {
+struct InspectorFactRow: View {
     let title: String
     let value: String
     var body: some View {

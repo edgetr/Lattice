@@ -3889,6 +3889,287 @@ struct CoreVerification {
         expect(!LatticeResponsiveLayoutPolicy.usesSideBySideSections(forContentWidth: 1_039), "Secondary sections stay stacked before the wide breakpoint")
         expect(LatticeResponsiveLayoutPolicy.canFitMultipleCards(contentWidth: 694, minimumCardWidth: 340), "Card collections split only when both minimum widths fit")
 
+        // Workspace checkpoint service (Git plumbing, durable store, guarded revert).
+        do {
+            func expectThrowsInvalidPath(_ path: String, _ message: String) {
+                do {
+                    _ = try WorkspaceCheckpointValidation.validateRepoRelativePath(path)
+                    expect(false, message)
+                } catch let error as WorkspaceCheckpointError {
+                    if case .invalidRepoRelativePath = error {
+                        checks += 1
+                    } else {
+                        expect(false, message)
+                    }
+                } catch {
+                    expect(false, message)
+                }
+            }
+            expectThrowsInvalidPath("/abs", "Absolute review paths are rejected")
+            expectThrowsInvalidPath("../escape", "Parent-escaping review paths are rejected")
+            do {
+                try WorkspaceCheckpointValidation.validateLineRange(.init(start: 0, end: 2))
+                expect(false, "Non-positive line ranges are rejected")
+            } catch let error as WorkspaceCheckpointError {
+                if case .invalidLineRange = error { checks += 1 } else { expect(false, "Non-positive line ranges are rejected") }
+            } catch {
+                expect(false, "Non-positive line ranges are rejected")
+            }
+
+            let storeRoot = FileManager.default.temporaryDirectory
+                .appendingPathComponent("lattice-verify-checkpoint-store-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: storeRoot, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: storeRoot) }
+            let storeURL = storeRoot.appendingPathComponent("workspace-checkpoints.json")
+            let ownership = WorkspaceCheckpointOwnership(
+                worktreePath: "/tmp/example",
+                worktreeIdentity: "identity",
+                sessionID: UUID(),
+                runID: UUID()
+            )
+            let legacyID = UUID()
+            let legacy: [String: Any] = [
+                "version": 1,
+                "checkpoints": [[
+                    "id": legacyID.uuidString,
+                    "ownership": [
+                        "worktreePath": ownership.worktreePath,
+                        "worktreeIdentity": ownership.worktreeIdentity,
+                        "sessionID": ownership.sessionID.uuidString,
+                        "runID": ownership.runID.uuidString
+                    ],
+                    "boundary": "beforeRun",
+                    "status": "captured",
+                    "createdAt": "2024-01-01T00:00:00Z",
+                    "treeOID": "deadbeef"
+                ]]
+            ]
+            try JSONSerialization.data(withJSONObject: legacy, options: [.sortedKeys]).write(to: storeURL)
+            let store = WorkspaceCheckpointStore(fileURL: storeURL)
+            let migrated = try store.load()
+            expect(migrated.version == WorkspaceCheckpointStoreDocument.currentVersion, "Legacy checkpoint store migrates to current version")
+            expect(migrated.notes.isEmpty, "Legacy checkpoint store without notes migrates empty notes")
+            expect(migrated.checkpoints.count == 1 && migrated.checkpoints[0].id == legacyID, "Legacy checkpoint rows survive migration")
+            expect(migrated.checkpoints[0].untrackedFiles.isEmpty, "Missing untracked metadata defaults empty on migration")
+            expect(migrated.checkpoints[0].hasTrackedDirtiness == false, "Missing dirtiness defaults false on migration")
+
+            guard let gitURL = ExecutableDiscovery.locate("git") else {
+                expect(false, "Git executable is required for checkpoint verification")
+                throw WorkspaceCheckpointError.gitExecutableUnavailable
+            }
+
+            func runGit(_ directory: URL, _ args: [String]) async throws -> String {
+                var env = ProcessInfo.processInfo.environment
+                env["GIT_TERMINAL_PROMPT"] = "0"
+                let result = await BoundedSubprocess.run(
+                    BoundedSubprocessRequest(
+                        executableURL: gitURL,
+                        arguments: args,
+                        currentDirectoryURL: directory,
+                        environment: env,
+                        deadline: 30
+                    )
+                )
+                guard result.isSuccess else {
+                    let detail = String(data: result.stderr + result.stdout, encoding: .utf8) ?? "git failed"
+                    throw WorkspaceCheckpointError.subprocessFailed(operation: args.joined(separator: " "), detail: detail)
+                }
+                return String(data: result.stdout, encoding: .utf8) ?? ""
+            }
+
+            let repo = FileManager.default.temporaryDirectory
+                .appendingPathComponent("lattice-verify-checkpoint-repo-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: repo) }
+            _ = try await runGit(repo, ["init"])
+            _ = try await runGit(repo, ["config", "user.email", "verify@lattice.local"])
+            _ = try await runGit(repo, ["config", "user.name", "Lattice Verify"])
+            _ = try await runGit(repo, ["config", "commit.gpgsign", "false"])
+            try "hello\n".write(to: repo.appendingPathComponent("tracked.txt"), atomically: true, encoding: .utf8)
+            _ = try await runGit(repo, ["add", "tracked.txt"])
+            _ = try await runGit(repo, ["commit", "-m", "init"])
+
+            let liveStoreURL = storeRoot.appendingPathComponent("live-checkpoints.json")
+            let liveStore = WorkspaceCheckpointStore(fileURL: liveStoreURL)
+            let service = WorkspaceCheckpointService(store: liveStore, gitExecutableURL: gitURL, deadline: 30)
+            let sessionID = UUID()
+            let runID = UUID()
+
+            let clean = try await service.capture(
+                worktreeURL: repo,
+                sessionID: sessionID,
+                runID: runID,
+                boundary: .beforeRun
+            )
+            expect(clean.status == .captured && clean.hasTrackedDirtiness == false, "Clean worktree checkpoint reports no tracked dirtiness")
+            expect(clean.refName?.hasPrefix("refs/lattice/checkpoints/") == true, "Checkpoint refs use Lattice namespace")
+            expect(clean.refName?.contains(sessionID.uuidString.lowercased()) == true, "Checkpoint refs embed session ownership")
+            expect(clean.refName?.contains(runID.uuidString.lowercased()) == true, "Checkpoint refs embed run ownership")
+            let resolvedRef = try await runGit(repo, ["rev-parse", clean.refName!]).trimmingCharacters(in: .whitespacesAndNewlines)
+            expect(resolvedRef == clean.snapshotCommitOID, "Checkpoint ref resolves to snapshot commit")
+
+            try "dirty\n".write(to: repo.appendingPathComponent("tracked.txt"), atomically: true, encoding: .utf8)
+            let secret = "verify-secret-\(UUID().uuidString)\n"
+            try secret.write(to: repo.appendingPathComponent("scratch.secret"), atomically: true, encoding: .utf8)
+            try "staged addition\n".write(to: repo.appendingPathComponent("staged-new.txt"), atomically: true, encoding: .utf8)
+            _ = try await runGit(repo, ["add", "staged-new.txt"])
+            let outsideSecret = storeRoot.appendingPathComponent("outside-secret.txt")
+            let outsidePayload = "must-not-be-read-through-symlink-\(UUID().uuidString)"
+            try outsidePayload.write(to: outsideSecret, atomically: true, encoding: .utf8)
+            try FileManager.default.createSymbolicLink(
+                at: repo.appendingPathComponent("outside-link"),
+                withDestinationURL: outsideSecret
+            )
+            let dirty = try await service.capture(
+                worktreeURL: repo,
+                sessionID: sessionID,
+                runID: UUID(),
+                boundary: .beforeRun
+            )
+            expect(dirty.hasTrackedDirtiness == true, "Tracked dirty checkpoint is truthful")
+            expect(dirty.untrackedFiles.contains(where: { $0.path == "scratch.secret" }), "Untracked metadata records non-ignored paths")
+            expect(dirty.untrackedFiles.allSatisfy({ $0.canRestoreContent == false }), "Untracked contents are explicitly unrestorable")
+            let stagedSnapshot = try await runGit(repo, ["show", "\(dirty.treeOID!):staged-new.txt"])
+            expect(stagedSnapshot == "staged addition\n", "Checkpoint tree includes staged additions")
+            let symlinkMetadata = dirty.untrackedFiles.first(where: { $0.path == "outside-link" })
+            expect(symlinkMetadata?.isSymbolicLink == true, "Untracked symlink is recorded without following its target")
+            expect(symlinkMetadata?.contentOID.hasPrefix("symlink-sha256:") == true, "Untracked symlink hashes link text, not target content")
+            let storeBody = try String(contentsOf: liveStoreURL, encoding: .utf8)
+            expect(!storeBody.contains("verify-secret-"), "Durable store never retains untracked contents")
+            expect(!storeBody.contains("must-not-be-read-through-symlink"), "Durable store never reads symlink target contents")
+            if let oid = dirty.untrackedFiles.first(where: { $0.path == "scratch.secret" })?.contentOID {
+                let cat = await BoundedSubprocess.run(
+                    BoundedSubprocessRequest(
+                        executableURL: gitURL,
+                        arguments: ["cat-file", "-t", oid],
+                        currentDirectoryURL: repo,
+                        deadline: 10
+                    )
+                )
+                expect(!cat.isSuccess, "Untracked hash-object does not write objects into the repository")
+            } else {
+                expect(false, "Untracked hash-object does not write objects into the repository")
+            }
+
+            // Restore clean content then exercise before/after + guarded revert.
+            try "hello\n".write(to: repo.appendingPathComponent("tracked.txt"), atomically: true, encoding: .utf8)
+            try FileManager.default.removeItem(at: repo.appendingPathComponent("scratch.secret"))
+            let pairSession = UUID()
+            let pairRun = UUID()
+            let before = try await service.capture(
+                worktreeURL: repo,
+                sessionID: pairSession,
+                runID: pairRun,
+                boundary: .beforeRun
+            )
+            try "mutated\n".write(to: repo.appendingPathComponent("tracked.txt"), atomically: true, encoding: .utf8)
+            try "created\n".write(to: repo.appendingPathComponent("agent-temp.txt"), atomically: true, encoding: .utf8)
+            let after = try await service.capture(
+                worktreeURL: repo,
+                sessionID: pairSession,
+                runID: pairRun,
+                boundary: .afterRun
+            )
+            let changes = try await service.changes(beforeCheckpointID: before.id, afterCheckpointID: after.id)
+            expect(changes.files.contains(where: { $0.path == "tracked.txt" }), "Before/after diff lists modified tracked files")
+            expect(changes.files.contains(where: { $0.path == "tracked.txt" && !$0.hunks.isEmpty }), "Before/after diff includes parsed hunks")
+
+            let note = try service.addReviewNote(
+                checkpointID: after.id,
+                path: "tracked.txt",
+                body: "Follow up on mutation",
+                kind: .followUpPrompt,
+                lineRange: .init(start: 1, end: 1),
+                hunkHeader: "@@ -1 +1 @@"
+            )
+            expect(note.sessionID == pairSession && note.runID == pairRun, "Review notes bind session and run ownership")
+            let persistedNotes = try service.reviewNotes(checkpointID: after.id)
+            expect(persistedNotes.count == 1, "Review notes persist outside the repository")
+
+            let preview = try await service.previewRevert(afterCheckpointID: after.id)
+            expect(preview.confirmationToken.hasPrefix("lattice-revert-v1:"), "Revert confirmation tokens are bound to preview inputs")
+            do {
+                _ = try await service.confirmRevert(afterCheckpointID: after.id, confirmationToken: "lattice-revert-v1:stale")
+                expect(false, "Stale revert confirmation is refused")
+            } catch let error as WorkspaceCheckpointError {
+                expect(error == .revertConfirmationStale, "Stale revert confirmation is refused")
+            } catch {
+                expect(false, "Stale revert confirmation is refused")
+            }
+            _ = try await service.confirmRevert(afterCheckpointID: after.id, confirmationToken: preview.confirmationToken)
+            let restored = try String(contentsOf: repo.appendingPathComponent("tracked.txt"), encoding: .utf8)
+            expect(restored == "hello\n", "Guarded revert restores tracked content via reverse apply")
+            let agentTempExists = FileManager.default.fileExists(atPath: repo.appendingPathComponent("agent-temp.txt").path)
+            expect(!agentTempExists, "Guarded revert deletes exact run-created untracked files")
+
+            // Divergence refusal after after-run.
+            let divergeSession = UUID()
+            let divergeRun = UUID()
+            _ = try await service.capture(worktreeURL: repo, sessionID: divergeSession, runID: divergeRun, boundary: .beforeRun)
+            try "after\n".write(to: repo.appendingPathComponent("tracked.txt"), atomically: true, encoding: .utf8)
+            let divergeAfter = try await service.capture(worktreeURL: repo, sessionID: divergeSession, runID: divergeRun, boundary: .afterRun)
+            try "newer\n".write(to: repo.appendingPathComponent("tracked.txt"), atomically: true, encoding: .utf8)
+            do {
+                _ = try await service.previewRevert(afterCheckpointID: divergeAfter.id)
+                expect(false, "Revert preview refuses target-path divergence from after-run state")
+            } catch let error as WorkspaceCheckpointError {
+                if case .revertDivergence = error { checks += 1 } else { expect(false, "Revert preview refuses target-path divergence from after-run state") }
+            } catch {
+                expect(false, "Revert preview refuses target-path divergence from after-run state")
+            }
+
+            // Parallel worktree ownership / ref collision freedom.
+            try "hello\n".write(to: repo.appendingPathComponent("tracked.txt"), atomically: true, encoding: .utf8)
+            let worktree = repo.deletingLastPathComponent()
+                .appendingPathComponent("lattice-verify-wt-\(UUID().uuidString)", isDirectory: true)
+            _ = try await runGit(repo, ["worktree", "add", "--detach", worktree.path, "HEAD"])
+            defer {
+                try? FileManager.default.removeItem(at: worktree)
+                let prune = Process()
+                prune.executableURL = gitURL
+                prune.arguments = ["-C", repo.path, "worktree", "prune"]
+                try? prune.run()
+                prune.waitUntilExit()
+            }
+            let primaryCapture = try await service.capture(
+                worktreeURL: repo,
+                sessionID: UUID(),
+                runID: UUID(),
+                boundary: .beforeRun
+            )
+            let linkedCapture = try await service.capture(
+                worktreeURL: worktree,
+                sessionID: UUID(),
+                runID: UUID(),
+                boundary: .beforeRun
+            )
+            expect(primaryCapture.ownership.worktreeIdentity != linkedCapture.ownership.worktreeIdentity, "Parallel worktrees get distinct identities")
+            expect(primaryCapture.refName != linkedCapture.refName, "Parallel worktrees get collision-free Lattice refs")
+
+            let numstat = WorkspaceCheckpointService.parseNumstat("1\t0\tfile.txt\n2\t3\tother.txt\n")
+            expect(numstat.filesChanged == 2, "Numstat parser counts changed files")
+            expect(numstat.additions == 3, "Numstat parser aggregates additions")
+            expect(numstat.deletions == 3, "Numstat parser aggregates deletions")
+            let samplePatch = """
+            diff --git a/file.txt b/file.txt
+            --- a/file.txt
+            +++ b/file.txt
+            @@ -1 +1,2 @@
+             hello
+            +world
+            """
+            let hunks = WorkspaceCheckpointService.parseUnifiedDiffHunks(samplePatch)
+            let fileHunks = hunks["file.txt"] ?? []
+            expect(fileHunks.first?.newStart == 1, "Unified diff parser extracts hunk line ranges")
+            let hasWorldAddition = fileHunks.first?.lines.contains(where: { line in
+                line.kind == .addition && line.text == "world"
+            }) == true
+            expect(hasWorldAddition, "Unified diff parser retains addition lines for review UI")
+        } catch {
+            fputs("FAILED: Workspace checkpoint verification threw \(error)\n", stderr)
+            exit(1)
+        }
+
         print("Core verification passed: \(checks) checks")
     }
 }
