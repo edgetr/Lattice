@@ -12,6 +12,11 @@ struct MorphingControl: View {
     var onStop: () -> Void = {}
     var onChooseFiles: () -> Void = {}
     var onDropFiles: ([URL]) -> Void = { _ in }
+    var onDropImageData: (Data) -> Void = { _ in }
+    var onPasteImage: () -> Void = {}
+    var onCaptureRegion: () -> Void = {}
+    var onCaptureWindow: () -> Void = {}
+    var includeScreenshotContext: Binding<Bool> = .constant(false)
     var onDismissContext: () -> Void = {}
     var isSubmitEnabled: Bool = true
     var isStopEnabled: Bool = true
@@ -107,6 +112,20 @@ struct MorphingControl: View {
                         .layoutPriority(1)
                     Spacer()
                     Button("Files…", action: onChooseFiles).buttonStyle(.borderedProminent)
+                    Button("Paste Image", action: onPasteImage)
+                        .buttonStyle(.bordered)
+                        .accessibilityHint("Attach an image currently on the clipboard")
+                    Menu {
+                        Button("Screen Region…", action: onCaptureRegion)
+                        Button("App Window", action: onCaptureWindow)
+                        Divider()
+                        Toggle("Include app/window context", isOn: includeScreenshotContext)
+                        Text("Context is added only with your opt-in and macOS permission.")
+                    } label: {
+                        Label("Capture", systemImage: "camera.viewfinder")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .accessibilityHint("Deliberately capture one region or app window; continuous capture is not supported")
                     if let dismiss = presentation.secondaryAction {
                         Button(action: onDismissContext) {
                             Image(systemName: dismiss.systemImage)
@@ -237,10 +256,10 @@ struct MorphingControl: View {
             interactive: presentation.usesInteractiveGlass,
             tint: resolvedSurfaceTint
         )
-        .onDrop(of: [UTType.fileURL.identifier], isTargeted: .constant(false)) { providers in
-            // Claim success only when at least one provider can yield a file URL.
-            loadDroppedFileURLs(from: providers)
+        .onDrop(of: [UTType.fileURL.identifier, UTType.image.identifier], isTargeted: .constant(false)) { providers in
+            handleDrop(providers)
         }
+        .onPasteCommand(of: [.image]) { _ in onPasteImage() }
         // Animate only discrete phase identity — not progress fraction or status copy.
         .animation(phaseAnimation, value: presentation.animationIdentity)
     }
@@ -319,6 +338,31 @@ struct MorphingControl: View {
             await MainActor.run { onDropFiles(urls) }
         }
         return true
+    }
+
+    private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        let acceptedFiles = loadDroppedFileURLs(from: providers)
+        let imageProviders = providers.filter {
+            !$0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+                && $0.hasItemConformingToTypeIdentifier(UTType.image.identifier)
+        }
+        guard !imageProviders.isEmpty else { return acceptedFiles }
+        Task {
+            for provider in imageProviders {
+                if let data = await Self.loadImageData(from: provider) {
+                    await MainActor.run { onDropImageData(data) }
+                }
+            }
+        }
+        return true
+    }
+
+    private static func loadImageData(from provider: NSItemProvider) async -> Data? {
+        await withCheckedContinuation { continuation in
+            provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
+                continuation.resume(returning: data)
+            }
+        }
     }
 
     private static func loadFileURL(from provider: NSItemProvider) async -> URL? {

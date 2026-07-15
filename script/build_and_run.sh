@@ -200,9 +200,8 @@ ensure_core_library() {
 }
 
 verify_fallback_test_inventory() {
-  local expected_files=56
-  local expected_tests=600
-
+  local expected_files=57
+  local expected_tests=625
   local test_sources=("$ROOT_DIR"/Tests/LatticeCoreTests/*.swift)
   if [[ ! -e "${test_sources[0]}" ]]; then
     echo "FAIL: fallback test inventory missing Tests/LatticeCoreTests/*.swift" >&2
@@ -341,6 +340,8 @@ package_app() {
 <key>LSMinimumSystemVersion</key><string>$MIN_SYSTEM_VERSION</string>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 <key>NSHighResolutionCapable</key><true/>
+<key>NSScreenCaptureUsageDescription</key><string>Lattice captures a screen region or app window only when you explicitly choose Capture.</string>
+<key>NSAccessibilityUsageDescription</key><string>Lattice can include bounded app and window text with a screenshot only when you opt in.</string>
 </dict></plist>
 PLIST
 
@@ -427,6 +428,8 @@ verify_bundle() {
   expect_eq "CFBundleShortVersionString" "$(plist_print CFBundleShortVersionString)" "$APP_VERSION" || failures=$((failures + 1))
   expect_eq "CFBundleVersion" "$(plist_print CFBundleVersion)" "$APP_BUILD" || failures=$((failures + 1))
   expect_eq "LSMinimumSystemVersion" "$(plist_print LSMinimumSystemVersion)" "$MIN_SYSTEM_VERSION" || failures=$((failures + 1))
+  expect_eq "NSScreenCaptureUsageDescription" "$(plist_print NSScreenCaptureUsageDescription)" "Lattice captures a screen region or app window only when you explicitly choose Capture." || failures=$((failures + 1))
+  expect_eq "NSAccessibilityUsageDescription" "$(plist_print NSAccessibilityUsageDescription)" "Lattice can include bounded app and window text with a screenshot only when you opt in." || failures=$((failures + 1))
 
   local arch_info
   arch_info="$(/usr/bin/lipo -info "$APP_BINARY" 2>/dev/null || /usr/bin/file "$APP_BINARY")"

@@ -816,6 +816,35 @@ public final class CodexExecHarness: @unchecked Sendable {
                 probe: imageProbe,
                 artifactID: HarnessToolEventDecoder.stableID(for: "codex:artifact:imageGeneration:\(externalID)")
             )
+        case "dynamicToolCall":
+            let tool = item["tool"] as? String ?? "Provider tool"
+            let isComputerTool = tool.lowercased().contains("computer")
+            if completed, isComputerTool,
+               let content = item["contentItems"] as? [[String: Any]],
+               let imagePath = content.compactMap({ value -> String? in
+                   guard value["type"] as? String == "inputImage",
+                         let raw = value["imageUrl"] as? String,
+                         ComputerFrame.validatedFileURL(from: raw) != nil else { return nil }
+                   return raw
+               }).last {
+                return .computerFrame(.init(
+                    id: id,
+                    provider: "Codex",
+                    imagePath: imagePath,
+                    sourceIdentity: externalID
+                ))
+            }
+            if completed { return terminalToolProgress(id: id, status: item["status"]) }
+            return .toolRequested(.init(
+                id: id,
+                kind: isComputerTool ? .automation : .unknown,
+                title: isComputerTool ? "Codex computer activity" : "Codex is using \(tool)",
+                detail: isComputerTool
+                    ? "Provider-owned computer tool. Lattice will display only structured frames the provider supplies."
+                    : tool,
+                workspaceScoped: false,
+                reversible: false
+            ))
         default:
             return HarnessToolEventDecoder.diagnostic(provider: "Codex", object: item, reason: "Unsupported item event.")
         }
@@ -887,8 +916,7 @@ public final class CodexExecHarness: @unchecked Sendable {
             let inputModalities = (value["inputModalities"] as? [String]).map { values in
                 Set(values.compactMap(ModelInputModality.init(rawValue:)))
             }
-            return ProviderModel(id: id, name: name, description: value["description"] as? String ?? "", reasoningOptions: options, defaultReasoningEffort: defaultEffort, contextWindow: ProviderModelMetadata.contextWindow(from: value), isDefault: value["isDefault"] as? Bool ?? false, inputModalities: inputModalities)
-        }
+            return ProviderModel(id: id, name: name, description: value["description"] as? String ?? "", reasoningOptions: options, defaultReasoningEffort: defaultEffort, contextWindow: ProviderModelMetadata.contextWindow(from: value), isDefault: value["isDefault"] as? Bool ?? false, inputModalities: inputModalities)        }
     }
 
     fileprivate static func parseUsage(_ response: [String: Any]) -> ProviderUsage? {

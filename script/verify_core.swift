@@ -4187,6 +4187,142 @@ struct CoreVerification {
         } catch {
             fputs("FAILED: Workspace checkpoint verification threw \(error)\n", stderr)
             exit(1)
+
+        // Screenshot / Appshot LatticeCore foundation (migration, transport, frames, storage, permissions).
+        let legacyAttachmentJSON = Data(#"{"id":"00000000-0000-0000-0000-0000000000aa","path":"/tmp/note.txt","isMissing":false}"#.utf8)
+        if let legacyAttachment = try? JSONDecoder().decode(ContextAttachment.self, from: legacyAttachmentJSON) {
+            expect(legacyAttachment.imageMetadata == nil && legacyAttachment.path == "/tmp/note.txt", "Legacy ContextAttachment JSON decodes without image metadata")
+        } else {
+            expect(false, "Legacy ContextAttachment JSON decodes without image metadata")
+        }
+        let defaultAttachment = ContextAttachment(path: "/tmp/shot.png", isMissing: false)
+        expect(defaultAttachment.isImage && defaultAttachment.imageMetadata == nil, "ContextAttachment(path:isMissing:) remains available")
+        let unauthorizedMeta = ContextAttachmentImageMetadata(
+            isLatticeManaged: true,
+            source: .regionCapture,
+            accessibilityTextAuthorized: false,
+            accessibilityText: "SECRET",
+            imageOnlyFallback: .imageOnly(reason: "not authorized")
+        )
+        expect(unauthorizedMeta.accessibilityText == nil && unauthorizedMeta.imageOnlyFallback.isImageOnly, "Unauthorized accessibility text is never retained")
+        let legacyModelJSON = Data(#"{"id":"gpt-test","name":"GPT Test","description":"","reasoningOptions":[],"isDefault":false}"#.utf8)
+        if let legacyModel = try? JSONDecoder().decode(ProviderModel.self, from: legacyModelJSON) {
+            // Nil means the runtime never advertised modalities; never invent image support.
+            expect(legacyModel.inputModalities == nil && !legacyModel.acceptsImages, "Missing ProviderModel modalities fail closed as unknown (no image support)")
+        } else {
+            expect(false, "Missing ProviderModel modalities fail closed as unknown (no image support)")
+        }
+        expect(ProviderModelMetadata.inputModalities(from: ["inputModalities": ["text", "image"]]) == [.text, .image], "Structured model metadata parses advertised image input")
+        expect(ProviderModelMetadata.inputModalities(from: [:]) == [.text], "Missing input modalities fail closed to text")
+        let textOnlyModel = ProviderModel(id: "t", name: "Text Only")
+        if case .blocked = AttachmentTransportPolicy.evaluate(attachments: [ContextAttachment(path: "/tmp/a.png")], model: textOnlyModel) {
+            expect(true, "Transport policy blocks images when models do not advertise image input")
+        } else {
+            expect(false, "Transport policy blocks images when models do not advertise image input")
+        }
+        let visionModel = ProviderModel(id: "v", name: "Vision", inputModalities: [.text, .image])
+        expect(AttachmentTransportPolicy.evaluate(attachments: [ContextAttachment(path: "/tmp/a.png")], model: visionModel) == .allowed, "Transport policy allows images when advertised")
+
+        var frameAccumulator = ComputerFrameAccumulator(minimumInterval: 1, recentCapacity: 2)
+        let frameT0 = Date(timeIntervalSince1970: 2_000)
+        expect(frameAccumulator.offer(ComputerFrame(provider: "codex", imagePath: "https://example.com/x.png"), observedAt: frameT0) == .rejectedInvalidPath, "Frame accumulator rejects non-file URLs")
+        expect(frameAccumulator.offer(ComputerFrame(provider: "codex", imagePath: "/tmp/f1.png"), observedAt: frameT0) == .accepted, "Frame accumulator accepts local file paths")
+        expect(frameAccumulator.offer(ComputerFrame(provider: "codex", imagePath: "/tmp/f2.png"), observedAt: frameT0.addingTimeInterval(0.2)) == .rejectedRateLimited, "Frame accumulator rate-limits excess frames")
+        expect(frameAccumulator.offer(ComputerFrame(provider: "codex", imagePath: "/tmp/f3.png"), observedAt: frameT0.addingTimeInterval(1.0)) == .accepted, "Frame accumulator accepts frames after interval")
+        frameAccumulator.stop()
+        expect(frameAccumulator.offer(ComputerFrame(provider: "codex", imagePath: "/tmp/f4.png"), observedAt: frameT0.addingTimeInterval(3.0)) == .rejectedStopped, "Stopped frame accumulator rejects new frames")
+        let framePresentation = ComputerFramePresentationPolicy.presentation(for: frameAccumulator)
+        expect(framePresentation.isStopped && framePresentation.controlsRemainProviderOwned, "Frame presentation marks stopped streams and provider-owned controls")
+        let frameID = UUID(uuidString: "00000000-0000-0000-0000-0000000000cf")!
+        let typedFrame = ComputerFrame(id: frameID, provider: "codex", timestamp: Date(timeIntervalSince1970: 1), imagePath: "/tmp/f.png")
+        expect(AgentEvent.computerFrame(typedFrame) == .computerFrame(typedFrame), "AgentEvent.computerFrame is typed and equatable")
+        let codexComputerEvent = CodexExecHarness.appServerEvent(from: [
+            "method": "item/completed",
+            "params": ["item": [
+                "type": "dynamicToolCall", "id": "computer-1", "tool": "computer_use", "status": "completed",
+                "contentItems": [["type": "inputImage", "imageUrl": "file:///tmp/provider-frame.png"]]
+            ]]
+        ], workspace: URL(fileURLWithPath: "/tmp"))
+        if case .computerFrame(let frame)? = codexComputerEvent {
+            expect(frame.imageURL?.path == "/tmp/provider-frame.png" && frame.controlBoundary.state == .observeOnly, "Codex maps only structured local computer image output to observe-only frames")
+        } else {
+            expect(false, "Codex maps only structured local computer image output to observe-only frames")
+        }
+
+        let captureRoot = FileManager.default.temporaryDirectory.appendingPathComponent("lattice-verify-captures-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: captureRoot) }
+        final class CaptureClock: @unchecked Sendable {
+            var value = Date(timeIntervalSince1970: 3_000)
+        }
+        let captureClock = CaptureClock()
+        let captureStore = CaptureStorage(
+            rootURL: captureRoot,
+            configuration: .init(maxCaptureCount: 1, maxAge: 50),
+            now: { captureClock.value }
+        )
+        if let written = try? captureStore.writeCapture(
+            imageData: Data([0x89, 0x50]),
+            imageExtension: "png",
+            metadata: CaptureSidecarMetadata(
+                source: .regionCapture,
+                capturedAt: captureClock.value,
+                accessibilityTextAuthorized: false,
+                accessibilityText: "nope",
+                imageOnlyFallback: .imageOnly(reason: "denied"),
+                imageFileName: "x.png"
+            )
+        ) {
+            expect(written.attachment.isLatticeManagedCapture && written.attachment.imageMetadata?.accessibilityText == nil, "Capture storage writes managed attachments without unauthorized text")
+            captureClock.value = captureClock.value.addingTimeInterval(10)
+            _ = try? captureStore.writeCapture(
+                imageData: Data([0x01]),
+                imageExtension: "png",
+                metadata: CaptureSidecarMetadata(source: .clipboard, capturedAt: captureClock.value, imageFileName: "y.png")
+            )
+            expect(!FileManager.default.fileExists(atPath: written.imageURL.path), "Capture storage enforces bounded capture count")
+            do {
+                try captureStore.removeCapture(at: captureRoot.deletingLastPathComponent().appendingPathComponent("escape.png"))
+                expect(false, "Capture storage rejects out-of-root deletion")
+            } catch {
+                expect(true, "Capture storage rejects out-of-root deletion")
+            }
+        } else {
+            expect(false, "Capture storage writes managed attachments without unauthorized text")
+        }
+
+        let needsRecording = ScreenCapturePermissionPolicy.capability(
+            screenRecording: .notDetermined,
+            accessibility: .authorized,
+            includeAccessibilityText: true
+        )
+        expect(needsRecording == .needsScreenRecordingPermission && !needsRecording.allowsImageCapture, "Screen Recording is required and distinct from Accessibility")
+        let imageOnlyCapability = ScreenCapturePermissionPolicy.capability(
+            screenRecording: .authorized,
+            accessibility: .denied,
+            includeAccessibilityText: true
+        )
+        expect(imageOnlyCapability.allowsImageCapture && !imageOnlyCapability.allowsAuthorizedAccessibilityText, "Denied Accessibility falls back to image-only capture")
+        expect(!CaptureLifecyclePolicy.allowsHiddenOrContinuousCapture(), "Capture policy never allows hidden or continuous capture")
+        var lifecycle = CaptureLifecycleState()
+        if case .applied(let userStarted) = CaptureLifecyclePolicy.reduce(.userInitiatedCapture(includeAccessibilityText: false), into: lifecycle) {
+            lifecycle = userStarted
+            expect(lifecycle.phase == .userInitiated, "Capture lifecycle starts only from explicit user initiation")
+            if case .rejected = CaptureLifecyclePolicy.reduce(.userInitiatedCapture(includeAccessibilityText: true), into: lifecycle) {
+                expect(true, "Active capture cannot stack into continuous capture")
+            } else {
+                expect(false, "Active capture cannot stack into continuous capture")
+            }
+            if case .applied(let capturing) = CaptureLifecyclePolicy.reduce(.captureStarted, into: lifecycle) {
+                if case .applied(let completed) = CaptureLifecyclePolicy.reduce(.completedImageOnly, into: capturing) {
+                    expect(completed.phase == .completedImageOnly && completed.isTerminal, "Image-only completion is a terminal lifecycle state")
+                } else {
+                    expect(false, "Image-only completion is a terminal lifecycle state")
+                }
+            } else {
+                expect(false, "Capture can start after user initiation")
+            }
+        } else {
+            expect(false, "Capture lifecycle starts only from explicit user initiation")
         }
 
         print("Core verification passed: \(checks) checks")

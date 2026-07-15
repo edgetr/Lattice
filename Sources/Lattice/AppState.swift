@@ -219,12 +219,15 @@ final class AppState: ObservableObject {
     private var respectsUserColumnChoice = false
     @Published var selectedWorkspacePath: String
     @Published private(set) var workspaceActionMessage: String?
-    /// New Chat setup lives in memory until first send. No placeholder session or route is persisted.
+    /// New Chat setup stays transient until a message or attachment needs a durable session.
     @Published private(set) var isTransientNewChat = false
     @Published private(set) var composerSelectionMode: ConversationMode?
     @Published private(set) var composerSelectionBackend: ChatBackend?
     @Published var composerRoutePopoverPresented = false
     @Published var composerModelSearchText = ""
+    @Published var includeScreenshotContext = false
+    @Published private(set) var captureLifecycle = CaptureLifecycleState()
+    @Published private(set) var computerFrameAccumulators: [UUID: ComputerFrameAccumulator] = [:]
     @Published private(set) var codeInstructionAddOn: String
     @Published private(set) var workInstructionAddOn: String
     @Published private(set) var trustedWorkspacePaths: Set<String>
@@ -381,6 +384,8 @@ final class AppState: ObservableObject {
         providerCaps: ["codex": 2, "grok": 2, "opencode": 2, "antigravity": 1, "apple": 1, "ollama": 1],
         routeCaps: ["lattice/ollama": 1, "lattice/apple": 1]
     ))
+    private let captureStorage = CaptureStorage.applicationSupportStore()
+    private let screenshotCaptureService = ScreenshotCaptureService()
     private var pendingApprovalResponses: [UUID: (notice: HarnessPermissionNotice, option: ApprovalOption)] = [:]
     private var lastAutomaticConnectionRefreshRequest = Date.distantPast
     @Published private var runUIStates: [UUID: RunUIState] = [:]
@@ -495,6 +500,22 @@ final class AppState: ObservableObject {
             loadedSessions = []
         }
 
+        let protectedCaptureIDs = Set(
+            loadedSessions
+                .flatMap(\.attachments)
+                .filter(\.isLatticeManagedCapture)
+                .map(\.id)
+        )
+        _ = try? captureStorage.cleanup(protectedCaptureIDs: protectedCaptureIDs)
+        for sessionIndex in loadedSessions.indices {
+            for attachmentIndex in loadedSessions[sessionIndex].attachments.indices {
+                let attachment = loadedSessions[sessionIndex].attachments[attachmentIndex]
+                if attachment.isLatticeManagedCapture,
+                   !FileManager.default.fileExists(atPath: attachment.path) {
+                    loadedSessions[sessionIndex].attachments[attachmentIndex].isMissing = true
+                }
+            }
+        }
         sessions = loadedSessions
         showsOnboarding = UserDefaults.standard.integer(forKey: Self.onboardingCompletedVersionKey) < Self.onboardingVersion
         disabledModelIDs = Set(UserDefaults.standard.stringArray(forKey: "disabledModelIDs") ?? [])
@@ -1224,6 +1245,7 @@ final class AppState: ObservableObject {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return false }
         guard !isSelectedTranscriptLoading else { return false }
+        guard imageAttachmentSendBlockReason == nil else { return false }
         if !isSelectedSessionRouteLocked {
             guard let mode = composerSelectionMode,
                   let backend = composerSelectionBackend,
@@ -1257,6 +1279,7 @@ final class AppState: ObservableObject {
                 ? "Type a follow-up to queue"
                 : "Type a message to send"
         }
+        if let imageAttachmentSendBlockReason { return imageAttachmentSendBlockReason }
         if selectedSession?.isStreaming == true, editingMessageID != nil {
             return "Finish editing before queuing a follow-up"
         }
@@ -1266,6 +1289,19 @@ final class AppState: ObservableObject {
                 : "Selected model is unavailable"
         }
         return activeRouteStatusText ?? "Send is unavailable"
+    }
+
+    private var imageAttachmentSendBlockReason: String? {
+        let images = attachments.filter { !$0.isMissing && $0.isImage }
+        guard !images.isEmpty else { return nil }
+        guard case .codex(let modelID)? = activeComposerBackend,
+              let model = codexModels.first(where: { $0.id == modelID }) else {
+            return "This route does not advertise image attachment transport. Remove the image or choose an image-capable route."
+        }
+        if case .blocked(let reason) = AttachmentTransportPolicy.evaluate(attachments: images, model: model) {
+            return reason
+        }
+        return "Image attachments are prepared, but this Lattice build does not yet transport image bytes to Codex. Remove the image to send."
     }
     var canContinueSelectedSession: Bool {
         guard editingMessageID == nil,
@@ -1413,6 +1449,11 @@ final class AppState: ObservableObject {
     func visibleActivity(for sessionID: UUID) -> [ActivityItem] {
         runUIStates[sessionID]?.activity ?? []
     }
+    func computerFramePresentation(for sessionID: UUID) -> ComputerFrameViewerPresentation {
+        ComputerFramePresentationPolicy.presentation(
+            for: computerFrameAccumulators[sessionID] ?? ComputerFrameAccumulator()
+        )
+    }
     func visibleComposerState(for sessionID: UUID) -> MorphingControlState {
         runUIStates[sessionID]?.composerState ?? .expanded
     }
@@ -1458,7 +1499,11 @@ final class AppState: ObservableObject {
     }
 
     func setVisibleComposerState(_ state: MorphingControlState, for sessionID: UUID?) {
-        guard let sessionID else { return }
+        guard let sessionID else {
+            guard materializeTransientSession(), let materializedID = selectedSessionID else { return }
+            reduceRunUI(.setComposerState(state), for: materializedID)
+            return
+        }
         reduceRunUI(.setComposerState(state), for: sessionID)
     }
 
@@ -2875,6 +2920,7 @@ final class AppState: ObservableObject {
         sessions[index].isStreaming = true
         inlineImagePayloadSuppression.remove(id)
         sessions[index].lastUpdated = .now
+        computerFrameAccumulators[id] = ComputerFrameAccumulator(minimumInterval: 0.35, recentCapacity: 4)
         globalErrorMessage = nil
         let session = sessions[index]
         let harnessID = effectiveHarnessID(for: session)
@@ -3924,12 +3970,13 @@ final class AppState: ObservableObject {
     }
 
     func chooseAttachments() {
-        guard selectedSessionID != nil else {
+        guard ensureAttachmentSession() else {
             setError("Choose a mode and model before adding attachments.", sessionID: nil)
             return
         }
         let panel = NSOpenPanel()
         panel.canChooseFiles = true; panel.canChooseDirectories = true; panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = [.image, .pdf, .plainText, .sourceCode, .json, .folder]
         panel.prompt = "Add"
         guard panel.runModal() == .OK else { composerState = .expanded; overlayControlState = .expanded; overlayMode = .prompt; return }
         addAttachments(panel.urls, source: .picker)
@@ -3957,7 +4004,158 @@ final class AppState: ObservableObject {
 
     func removeAttachment(_ id: UUID) {
         guard let sessionID = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
+        if let attachment = sessions[index].attachments.first(where: { $0.id == id }), attachment.isLatticeManagedCapture {
+            try? captureStorage.removeCapture(attachment: attachment)
+        }
         sessions[index].attachments.removeAll { $0.id == id }; persist()
+    }
+
+    func pasteImageFromClipboard() {
+        guard ensureAttachmentSession() else {
+            setError("Choose a mode and model before pasting an image.", sessionID: nil)
+            return
+        }
+        let pasteboard = NSPasteboard.general
+        let data: Data?
+        if let png = pasteboard.data(forType: .png) {
+            data = png
+        } else if let tiff = pasteboard.data(forType: .tiff),
+                  let image = NSImage(data: tiff),
+                  let representation = NSBitmapImageRep(data: image.tiffRepresentation ?? Data()) {
+            data = representation.representation(using: .png, properties: [:])
+        } else {
+            data = nil
+        }
+        guard let data else {
+            setError("The clipboard does not contain a supported image.", sessionID: selectedSessionID)
+            return
+        }
+        addManagedImage(data, source: .clipboard, context: nil)
+    }
+
+    func addDroppedImageData(_ data: Data) {
+        guard ensureAttachmentSession() else {
+            setError("Choose a mode and model before attaching an image.", sessionID: nil)
+            return
+        }
+        addManagedImage(data, source: .clipboard, context: nil)
+    }
+
+    func captureScreenRegion() { beginScreenshotCapture(windowOnly: false) }
+    func captureAppWindow() { beginScreenshotCapture(windowOnly: true) }
+
+    func openScreenRecordingSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func beginScreenshotCapture(windowOnly: Bool) {
+        guard ensureAttachmentSession() else {
+            setError("Choose a mode and model before capturing a screenshot.", sessionID: nil)
+            return
+        }
+        let targetSessionID = selectedSessionID
+        let captureIncludeContext = includeScreenshotContext
+        if case .applied(let next) = CaptureLifecyclePolicy.reduce(
+            .userInitiatedCapture(includeAccessibilityText: captureIncludeContext),
+            into: captureLifecycle
+        ) { captureLifecycle = next } else { return }
+
+        if screenshotCaptureService.screenRecordingStatus != .authorized {
+            if case .applied(let requesting) = CaptureLifecyclePolicy.reduce(.permissionRequestStarted, into: captureLifecycle) {
+                captureLifecycle = requesting
+            }
+            let granted = screenshotCaptureService.requestScreenRecordingPermission()
+            if !granted {
+                if case .applied(let failed) = CaptureLifecyclePolicy.reduce(.failed(ScreenCapturePermissionPolicy.screenRecordingRequiredReason), into: captureLifecycle) {
+                    captureLifecycle = failed
+                }
+                setError("Screen Recording permission is required. Enable it in System Settings → Privacy & Security → Screen & System Audio Recording.", sessionID: selectedSessionID)
+                return
+            }
+        }
+
+        if captureIncludeContext, screenshotCaptureService.accessibilityStatus != .authorized {
+            _ = screenshotCaptureService.requestAccessibilityPermission()
+        }
+        if case .applied(let capturing) = CaptureLifecyclePolicy.reduce(.captureStarted, into: captureLifecycle) {
+            captureLifecycle = capturing
+        }
+        Task {
+            do {
+                let result = try await (windowOnly
+                    ? screenshotCaptureService.captureFrontmostWindow(includeContext: captureIncludeContext)
+                    : screenshotCaptureService.captureRegion(includeContext: captureIncludeContext))
+                addManagedImage(
+                    result.data,
+                    source: result.source,
+                    context: result.context,
+                    sessionID: targetSessionID,
+                    includeContext: captureIncludeContext
+                )
+                let event: CaptureLifecycleEvent = result.context.accessibilityAuthorized && result.context.accessibilityText != nil
+                    ? .completedWithAuthorizedContext : .completedImageOnly
+                if case .applied(let completed) = CaptureLifecyclePolicy.reduce(event, into: captureLifecycle) { captureLifecycle = completed }
+            } catch ScreenshotCaptureServiceError.cancelled {
+                if case .applied(let cancelled) = CaptureLifecyclePolicy.reduce(.cancelled, into: captureLifecycle) { captureLifecycle = cancelled }
+            } catch {
+                if case .applied(let failed) = CaptureLifecyclePolicy.reduce(.failed(error.localizedDescription), into: captureLifecycle) { captureLifecycle = failed }
+                setError(error.localizedDescription, sessionID: targetSessionID)
+            }
+        }
+    }
+
+    private func addManagedImage(
+        _ data: Data,
+        source: ContextAttachmentImageSource,
+        context: ScreenshotCaptureContext?,
+        sessionID: UUID? = nil,
+        includeContext: Bool? = nil
+    ) {
+        let targetID = sessionID ?? selectedSessionID
+        guard let id = targetID, let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        let contextAuthorized = (includeContext ?? includeScreenshotContext) && context != nil
+        let accessibilityAuthorized = contextAuthorized && context?.accessibilityAuthorized == true
+        let fallbackReason: String = {
+            if !contextAuthorized { return "App/window context was not included by the user." }
+            if !accessibilityAuthorized { return "Accessibility permission is unavailable; image-only context was attached." }
+            return "No accessibility text was available for the captured window."
+        }()
+        do {
+            let protectedCaptureIDs = Set(
+                sessions
+                    .flatMap(\.attachments)
+                    .filter(\.isLatticeManagedCapture)
+                    .map(\.id)
+            )
+            let result = try captureStorage.writeCapture(
+                imageData: data,
+                imageExtension: "png",
+                metadata: CaptureSidecarMetadata(
+                    source: source,
+                    contextMetadataAuthorized: contextAuthorized,
+                    frontmostApplicationName: context?.applicationName,
+                    frontmostApplicationBundleID: context?.bundleIdentifier,
+                    frontmostWindowTitle: context?.windowTitle,
+                    accessibilityTextAuthorized: accessibilityAuthorized,
+                    accessibilityText: context?.accessibilityText,
+                    imageOnlyFallback: .imageOnly(reason: fallbackReason),
+                    imageFileName: "capture.png"
+                ),
+                protectedCaptureIDs: protectedCaptureIDs
+            )
+            sessions[index].attachments.append(result.attachment)
+            composerState = .expanded; overlayControlState = .expanded; overlayMode = .prompt
+            persist()
+        } catch {
+            setError("Could not store screenshot: \(error.localizedDescription)", sessionID: id)
+        }
+    }
+
+    @discardableResult
+    private func ensureAttachmentSession() -> Bool {
+        if selectedSessionID != nil { return true }
+        return materializeTransientSession()
     }
 
     func chooseWorkspace() {
@@ -7597,7 +7795,13 @@ Lattice self-edit rules:
             AssistantArtifactTrail.upsert(observation.bound(to: messageID), in: &sessions[index].artifacts)
             sessions[index].lastUpdated = .now
             scheduleStreamingPersist()
+        case .computerFrame(let frame):
+            var accumulator = computerFrameAccumulators[id] ?? ComputerFrameAccumulator(minimumInterval: 0.35, recentCapacity: 4)
+            _ = accumulator.offer(frame)
+            computerFrameAccumulators[id] = accumulator
+            updateSessionAction(id: frame.id, status: .completed, at: index)
         case .completed:
+            computerFrameAccumulators[id]?.stop()
             let completedOutbox = dispatchingOutboxAttempt(for: id) != nil
             activeRunIDs[id] = nil
             inlineImagePayloadSuppression.remove(id)
@@ -7632,6 +7836,7 @@ Lattice self-edit rules:
                 self.scheduleIdleUnloadIfNeeded(for: backend)
             }
         case .cancelled:
+            computerFrameAccumulators[id]?.cancel()
             let cancelledOutbox = dispatchingOutboxAttempt(for: id) != nil
             activeRunIDs[id] = nil
             inlineImagePayloadSuppression.remove(id)
@@ -7663,6 +7868,7 @@ Lattice self-edit rules:
                 self.scheduleIdleUnloadIfNeeded(for: backend)
             }
         case .failed(let message):
+            computerFrameAccumulators[id]?.stop()
             let failedOutbox = dispatchingOutboxAttempt(for: id) != nil
             activeRunIDs[id] = nil
             inlineImagePayloadSuppression.remove(id)
