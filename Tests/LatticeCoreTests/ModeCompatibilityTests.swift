@@ -248,8 +248,9 @@ struct ModeCompatibilityTests {
 
     @Test func grokAndAntigravityUseVisibleTaskLabelNotSystemPrompt() throws {
         let sourceURL = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
+            .deletingLastPathComponent() // LatticeCoreTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // repo root
             .appendingPathComponent("Sources/Lattice/AppState.swift")
         let source = try String(contentsOf: sourceURL, encoding: .utf8)
         #expect(source.contains("Lattice task context (visible task guidance; not a system prompt):"))
@@ -259,8 +260,9 @@ struct ModeCompatibilityTests {
 
     @Test func modeAndModelLockAfterFirstUserMessage() throws {
         let sourceURL = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
+            .deletingLastPathComponent() // LatticeCoreTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // repo root
             .appendingPathComponent("Sources/Lattice/AppState.swift")
         let source = try String(contentsOf: sourceURL, encoding: .utf8)
         #expect(source.contains("var isSelectedSessionRouteLocked"))

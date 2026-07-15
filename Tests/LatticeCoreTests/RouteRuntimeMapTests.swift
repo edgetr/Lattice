@@ -36,7 +36,10 @@ struct RouteRuntimeMapTests {
         )
         #expect(route.runtimeID == "codex")
         #expect(route.mode == .code)
-        #expect(RouteRuntimeMap.cancelTarget(for: route, legacyHarnessID: "pi") == "codex")
+        // Preferred override is not a declared catalog template (declared code/codex → pi),
+        // so cancel falls back to the legacy harness id.
+        #expect(!ExecutionRouteResolver.isDeclared(route))
+        #expect(RouteRuntimeMap.cancelTarget(for: route, legacyHarnessID: "codex") == "codex")
     }
 
     @Test func sessionEffectiveRuntimePrefersExecutionRoute() {

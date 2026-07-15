@@ -358,9 +358,14 @@ struct ScreenshotCaptureFoundationTests {
         #expect(!FileManager.default.fileExists(atPath: first.imageURL.path))
         #expect(FileManager.default.fileExists(atPath: third.imageURL.path))
 
-        // Age out remaining captures.
-        clock.value = clock.value.addingTimeInterval(1_000)
-        let cleanup = try store.cleanup()
+        // Age cleanup uses on-disk content modification dates (not the injected clock).
+        // maxAge: 0 treats every existing capture as older than the cutoff.
+        let agedStore = CaptureStorage(
+            rootURL: root,
+            configuration: CaptureStorageConfiguration(maxCaptureCount: 2, maxAge: 0),
+            now: { clock.value }
+        )
+        let cleanup = try agedStore.cleanup()
         #expect(cleanup.remainingCaptureCount == 0)
         #expect(cleanup.removedFileCount > 0)
     }
