@@ -76,7 +76,8 @@ final class WorkspaceWindowLayout: ObservableObject {
     private let store: WorkspaceLayoutStore
     private var window: NSWindow?
     private var lastNonMaximizedFrame: WorkspaceWindowFrame?
-    private var windowObservers: [NSObjectProtocol] = []
+    /// NotificationCenter tokens are not Sendable; deinit must tear them down off the actor.
+    nonisolated(unsafe) private var windowObservers: [NSObjectProtocol] = []
     private var restoringWindow = false
     private var lastMeasuredWorkspaceWidth: CGFloat = 0
     private var lastAutoAppliedColumnVisibility: NavigationSplitViewVisibility?
