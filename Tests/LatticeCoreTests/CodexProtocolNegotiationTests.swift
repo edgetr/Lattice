@@ -222,10 +222,12 @@ struct CodexProtocolNegotiationTests {
     }
 
     private func failure(in events: [AgentEvent]) -> String? {
-        events.compactMap { event in
-            guard case .failed(let message) = event else { return nil }
-            return message
-        }.first
+        for event in events {
+            if case .failed(let message) = event {
+                return message
+            }
+        }
+        return nil
     }
 }
 

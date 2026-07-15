@@ -46,7 +46,7 @@ struct WorkspaceTerminalPolicyTests {
         #expect(text.contains("empty"))
     }
 
-    @Test func sanitizeCommandRejectsEmptyAndBoundsLength() {
+    @Test func sanitizeCommandRejectsEmptyAndBoundsLength() throws {
         #expect(WorkspaceTerminalPolicy.sanitizeCommand("   ") == nil)
         #expect(WorkspaceTerminalPolicy.sanitizeCommand("ls") == "ls")
         let long = String(repeating: "a", count: WorkspaceTerminalPolicy.maximumCommandLength + 50)

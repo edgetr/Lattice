@@ -50,7 +50,9 @@ final class ScreenshotCaptureService {
     }
 
     func requestAccessibilityPermission() -> Bool {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        // Use the documented CFString key value rather than the non-Sendable global
+        // `kAXTrustedCheckOptionPrompt` (Swift 6 concurrency diagnostics on CI).
+        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
         return AXIsProcessTrustedWithOptions(options)
     }
 

@@ -636,8 +636,10 @@ struct SessionInputOutboxTests {
             if index == 0 {
                 firstEvicted = (entryID, attemptID)
             }
-            #expect(ledger.record(entryID: entryID, attemptID: attemptID))
-            #expect(!ledger.record(entryID: entryID, attemptID: attemptID))
+            let firstInsert = ledger.record(entryID: entryID, attemptID: attemptID)
+            let duplicateInsert = ledger.record(entryID: entryID, attemptID: attemptID)
+            #expect(firstInsert)
+            #expect(!duplicateInsert)
         }
         #expect(ledger.receipts.count == SessionInputOutboxReceiptLedger.maxReceipts)
         if let firstEvicted {

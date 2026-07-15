@@ -123,7 +123,7 @@ struct WorkProjectionTests {
         #expect(liveQuestion.actionable?.id == questionID)
     }
 
-    @Test func markConfirmOnlyUserOwnedTaskSteps() {
+    @Test func markConfirmOnlyUserOwnedTaskSteps() throws {
         let task = userTask()
         let plan = SessionAction(
             id: UUID(),
@@ -373,7 +373,7 @@ struct WorkProjectionTests {
 
     // MARK: - Restore reconciliation
 
-    @Test func restoreInterruptsProviderLiveStateButKeepsUserTasksAndTerminals() {
+    @Test func restoreInterruptsProviderLiveStateButKeepsUserTasksAndTerminals() throws {
         let pendingTask = userTask(status: .waiting, createdAt: fixed)
         let liveApproval = waitingApproval(createdAt: fixed.addingTimeInterval(1))
         let liveQuestion = waitingQuestion(createdAt: fixed.addingTimeInterval(2))

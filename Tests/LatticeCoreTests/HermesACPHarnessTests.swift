@@ -243,7 +243,7 @@ struct HermesACPHarnessTests {
         let executable = root.appendingPathComponent("hermes")
         try Data("#!/bin/sh\nexit 0\n".utf8).write(to: executable)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
-        let harness = HermesACPHarness(executableURL: executable, hermesProfile: profile, sandboxExecutableURL: nil)
+        let harness = HermesACPHarness(executableURL: executable, sandboxExecutableURL: nil, hermesProfile: profile)
         let readiness = harness.hermesReadiness()
         #expect(readiness.runtimePresent)
         #expect(!readiness.profileConfigured)

@@ -242,8 +242,8 @@ struct AssistantArtifactTests {
         }())
 
         let oversizePath = env.workspace.appendingPathComponent("big.png").path
-        var header = oneByOnePNG
         // Keep PNG magic so detection happens, but report a huge size via probe.
+        let header = oneByOnePNG
         let probe = AssistantImageArtifactPolicy.FileProbe(
             fileExists: { $0 == oversizePath },
             isSymbolicLink: { _ in false },
@@ -263,7 +263,6 @@ struct AssistantArtifactTests {
             if case .rejected(.oversize) = oversized { return true }
             return false
         }())
-        _ = header
     }
 
     @Test func missingAuthorizedPathBecomesMissingAndRevalidatesWhenPresent() throws {

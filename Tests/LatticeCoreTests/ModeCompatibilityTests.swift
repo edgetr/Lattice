@@ -296,7 +296,7 @@ struct ModeCompatibilityTests {
             LatticeSession(title: "interrupted", backend: .codex(model: "gpt"), actions: [running, waiting], isStreaming: true)
         ])
         #expect(restored.first?.isStreaming == false)
-        #expect(restored.first?.actions.allSatisfy { $0.status == .interrupted })
+        #expect(restored.first?.actions.allSatisfy { $0.status == .interrupted } == true)
 
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("lattice-rollback-" + UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }

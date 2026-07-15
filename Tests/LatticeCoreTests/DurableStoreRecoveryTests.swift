@@ -491,7 +491,7 @@ struct DurableStoreRecoveryTests {
         }
 
         #expect((try Data(contentsOf: url)) == original)
-        let backups = try FileManager.default.contentsOfDirectory(at: root.path)
+        let backups = try FileManager.default.contentsOfDirectory(atPath: root.path)
             .filter { $0.hasSuffix(".backup") }
         #expect(backups.count == 1)
         if let backup = backups.first {
