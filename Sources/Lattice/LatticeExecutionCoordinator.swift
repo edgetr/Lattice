@@ -12,6 +12,7 @@ struct LatticeExecutionRuntimes {
     let ollama: OllamaClient
 }
 
+/// Transitional bag still assembled by AppState; resolved to `RuntimeLaunch` at the coordinator boundary.
 struct LatticeExecutionLaunch {
     let sessionID: UUID
     let route: ExecutionRoute
@@ -48,137 +49,128 @@ protocol LatticeExecutionCoordinating {
 @MainActor
 final class DefaultLatticeExecutionCoordinator: LatticeExecutionCoordinating {
     func stream(_ launch: LatticeExecutionLaunch, runtimes: LatticeExecutionRuntimes) -> AsyncStream<AgentEvent> {
-        if ExecutionRouteResolver.isDeclared(launch.route) {
-            switch launch.route.runtimeID {
-            case "pi":
-                guard let model = launch.route.modelID,
-                      let envelope = launch.instructionEnvelope else {
-                    return failure("The selected Pi route is incomplete.")
-                }
+        stream(RuntimeLaunch.resolve(from: launch), runtimes: runtimes)
+    }
+
+    func stream(_ launch: RuntimeLaunch, runtimes: LatticeExecutionRuntimes) -> AsyncStream<AgentEvent> {
+        switch launch {
+        case .failed(let message):
+            return failure(message)
+        case .pi(let pi):
+            if let envelope = pi.instructionEnvelope {
                 return runtimes.pi.stream(
-                    prompt: launch.prompt,
-                    sessionID: launch.sessionID,
-                    threadID: launch.threadID,
-                    workspace: launch.workspace,
-                    provider: launch.route.providerID,
-                    model: model,
-                    reasoningEffort: launch.reasoningEffort,
-                    allowFileModification: launch.allowFileModification,
-                    mode: .code,
+                    prompt: pi.prompt,
+                    sessionID: pi.sessionID,
+                    threadID: pi.threadID,
+                    workspace: pi.workspace,
+                    provider: pi.provider,
+                    model: pi.model,
+                    reasoningEffort: pi.reasoningEffort,
+                    allowFileModification: pi.allowFileModification,
+                    mode: pi.mode,
                     workspaceInstructionsTrusted: envelope.workspaceInstructionsTrusted,
                     instructionEnvelope: envelope,
-                    openCodeAPIKey: launch.openCodeAPIKey
+                    openCodeAPIKey: pi.openCodeAPIKey
                 )
-            case "hermes":
-                guard let provider = launch.hermesProvider,
-                      let model = launch.route.modelID,
-                      let systemIdentity = launch.hermesSystemIdentity else {
-                    return failure("The selected Hermes route is incomplete.")
+            }
+            return runtimes.pi.stream(
+                prompt: pi.prompt,
+                sessionID: pi.sessionID,
+                threadID: pi.threadID,
+                workspace: pi.workspace,
+                provider: pi.provider,
+                model: pi.model,
+                reasoningEffort: pi.reasoningEffort,
+                allowFileModification: pi.allowFileModification
+            )
+        case .codex(let codex):
+            return runtimes.codex.stream(
+                prompt: codex.prompt,
+                sessionID: codex.sessionID,
+                threadID: codex.threadID,
+                workspace: codex.workspace,
+                model: codex.model,
+                reasoningEffort: codex.reasoningEffort,
+                policy: codex.policy,
+                workspaceWrite: codex.workspaceWrite,
+                developerInstructions: codex.developerInstructions,
+                attachments: codex.attachments,
+                imageInputCapability: codex.imageInputCapability
+            )
+        case .antigravity(let ag):
+            return runtimes.antigravity.stream(
+                prompt: ag.prompt,
+                sessionID: ag.sessionID,
+                threadID: ag.threadID,
+                workspace: ag.workspace,
+                model: ag.model,
+                policy: ag.policy
+            )
+        case .apple(let apple):
+            return runtimes.appleIntelligence.stream(prompt: apple.transcript, sessionID: apple.sessionID)
+        case .ollama(let ollama):
+            return runtimes.ollama.stream(
+                messages: ollama.messages,
+                model: ollama.model,
+                sessionID: ollama.sessionID,
+                keepAliveSeconds: ollama.keepAliveSeconds
+            )
+        case .acp(let acp):
+            switch acp.provider {
+            case .hermes:
+                if let provider = acp.hermesProvider,
+                   let systemIdentity = acp.hermesSystemIdentity {
+                    return runtimes.hermes.stream(
+                        prompt: acp.prompt,
+                        sessionID: acp.sessionID,
+                        threadID: acp.threadID,
+                        workspace: acp.workspace,
+                        provider: provider,
+                        model: acp.requestedModel,
+                        systemIdentity: systemIdentity,
+                        opencodeAPIKey: acp.openCodeAPIKey,
+                        allowFileModification: acp.allowFileModification,
+                        recoveryPrompt: acp.recoveryPrompt,
+                        recoveryUsesVisibleTranscriptHandoff: acp.recoveryUsesVisibleTranscriptHandoff,
+                        recoveryDeliveryIssue: acp.recoveryDeliveryIssue
+                    )
                 }
                 return runtimes.hermes.stream(
-                    prompt: launch.prompt,
-                    sessionID: launch.sessionID,
-                    threadID: launch.threadID,
-                    workspace: launch.workspace,
-                    provider: provider,
-                    model: model,
-                    systemIdentity: systemIdentity,
-                    opencodeAPIKey: launch.openCodeAPIKey,
-                    allowFileModification: launch.allowFileModification,
-                    recoveryPrompt: launch.recoveryPrompt,
-                    recoveryUsesVisibleTranscriptHandoff: launch.recoveryUsesVisibleTranscriptHandoff,
-                    recoveryDeliveryIssue: launch.recoveryDeliveryIssue
+                    prompt: acp.prompt,
+                    sessionID: acp.sessionID,
+                    threadID: acp.threadID,
+                    workspace: acp.workspace,
+                    requestedModel: acp.requestedModel,
+                    allowFileModification: acp.allowFileModification,
+                    recoveryPrompt: acp.recoveryPrompt,
+                    recoveryUsesVisibleTranscriptHandoff: acp.recoveryUsesVisibleTranscriptHandoff,
+                    recoveryDeliveryIssue: acp.recoveryDeliveryIssue
                 )
-            default:
-                break
+            case .grok:
+                return runtimes.grok.stream(
+                    prompt: acp.prompt,
+                    sessionID: acp.sessionID,
+                    threadID: acp.threadID,
+                    workspace: acp.workspace,
+                    requestedModel: acp.requestedModel,
+                    allowFileModification: acp.allowFileModification,
+                    recoveryPrompt: acp.recoveryPrompt,
+                    recoveryUsesVisibleTranscriptHandoff: acp.recoveryUsesVisibleTranscriptHandoff,
+                    recoveryDeliveryIssue: acp.recoveryDeliveryIssue
+                )
+            case .openCode:
+                return runtimes.openCode.stream(
+                    prompt: acp.prompt,
+                    sessionID: acp.sessionID,
+                    threadID: acp.threadID,
+                    workspace: acp.workspace,
+                    requestedModel: acp.requestedModel,
+                    allowFileModification: acp.allowFileModification,
+                    recoveryPrompt: acp.recoveryPrompt,
+                    recoveryUsesVisibleTranscriptHandoff: acp.recoveryUsesVisibleTranscriptHandoff,
+                    recoveryDeliveryIssue: acp.recoveryDeliveryIssue
+                )
             }
-        }
-
-        if launch.legacyHarnessID == "pi", let route = legacyPiRoute(for: launch.backend) {
-            return runtimes.pi.stream(
-                prompt: launch.prompt,
-                sessionID: launch.sessionID,
-                threadID: launch.threadID,
-                workspace: launch.workspace,
-                provider: route.provider,
-                model: route.model,
-                reasoningEffort: launch.reasoningEffort,
-                allowFileModification: launch.allowFileModification
-            )
-        }
-        if launch.legacyHarnessID == "hermes" {
-            return runtimes.hermes.stream(
-                prompt: launch.prompt,
-                sessionID: launch.sessionID,
-                threadID: launch.threadID,
-                workspace: launch.workspace,
-                requestedModel: launch.backend.displayName,
-                allowFileModification: launch.allowFileModification,
-                recoveryPrompt: launch.recoveryPrompt,
-                recoveryUsesVisibleTranscriptHandoff: launch.recoveryUsesVisibleTranscriptHandoff,
-                recoveryDeliveryIssue: launch.recoveryDeliveryIssue
-            )
-        }
-
-        switch launch.backend {
-        case .codex(let model):
-            return runtimes.codex.stream(
-                prompt: launch.prompt,
-                sessionID: launch.sessionID,
-                threadID: launch.threadID,
-                workspace: launch.workspace,
-                model: model,
-                reasoningEffort: launch.reasoningEffort,
-                policy: launch.policy,
-                workspaceWrite: launch.workspaceWrite,
-                developerInstructions: launch.developerInstructions,
-                attachments: launch.attachments,
-                imageInputCapability: launch.imageInputCapability
-            )
-        case .grok(let model):
-            return runtimes.grok.stream(
-                prompt: launch.prompt,
-                sessionID: launch.sessionID,
-                threadID: launch.threadID,
-                workspace: launch.workspace,
-                requestedModel: model,
-                allowFileModification: launch.allowFileModification,
-                recoveryPrompt: launch.recoveryPrompt,
-                recoveryUsesVisibleTranscriptHandoff: launch.recoveryUsesVisibleTranscriptHandoff,
-                recoveryDeliveryIssue: launch.recoveryDeliveryIssue
-            )
-        case .openCode(let model):
-            return runtimes.openCode.stream(
-                prompt: launch.prompt,
-                sessionID: launch.sessionID,
-                threadID: launch.threadID,
-                workspace: launch.workspace,
-                requestedModel: model,
-                allowFileModification: launch.allowFileModification,
-                recoveryPrompt: launch.recoveryPrompt,
-                recoveryUsesVisibleTranscriptHandoff: launch.recoveryUsesVisibleTranscriptHandoff,
-                recoveryDeliveryIssue: launch.recoveryDeliveryIssue
-            )
-        case .appleIntelligence:
-            guard let transcript = launch.appleTranscript else { return failure("Apple Intelligence transcript is unavailable.") }
-            return runtimes.appleIntelligence.stream(prompt: transcript, sessionID: launch.sessionID)
-        case .antigravity(let model):
-            return runtimes.antigravity.stream(
-                prompt: launch.prompt,
-                sessionID: launch.sessionID,
-                threadID: launch.threadID,
-                workspace: launch.workspace,
-                model: model,
-                policy: launch.policy
-            )
-        case .ollama(let model):
-            guard let messages = launch.ollamaMessages else { return failure("Ollama messages are unavailable.") }
-            return runtimes.ollama.stream(
-                messages: messages,
-                model: model,
-                sessionID: launch.sessionID,
-                keepAliveSeconds: launch.localModelKeepAliveSeconds
-            )
         }
     }
 
@@ -204,16 +196,6 @@ final class DefaultLatticeExecutionCoordinator: LatticeExecutionCoordinating {
             default: break
             }
         default: break
-        }
-    }
-
-    private func legacyPiRoute(for backend: ChatBackend) -> (provider: String, model: String)? {
-        switch backend {
-        case .codex(let model): return ("openai-codex", model)
-        case .openCode(let model):
-            let parts = model.split(separator: "/", maxSplits: 1).map(String.init)
-            return parts.count == 2 ? (parts[0], parts[1]) : nil
-        default: return nil
         }
     }
 

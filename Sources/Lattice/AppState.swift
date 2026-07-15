@@ -3083,50 +3083,28 @@ final class AppState: ObservableObject {
         let tokenLimit = contextTokenLimit(for: session)
         let stream: AsyncStream<AgentEvent>
         let harnessID = effectiveHarnessID(for: session)
-        let usesPromptDrivenBackend: Bool = {
-            if harnessID == "pi" || harnessID == "hermes" { return true }
-            switch session.backend {
-            case .codex, .grok, .openCode:
-                return true
-            case .appleIntelligence, .ollama:
-                return false
-            case .antigravity:
-                return false
-            }
-        }()
-        let contextPlan = LatticeContextHandoffPlanner.plan(
-            session: session,
-            submittedText: submittedText,
-            additionalContext: additionalContext,
-            tokenLimit: tokenLimit,
-            existingHarnessThreadID: usesPromptDrivenBackend ? session.harnessThreadID : "structured-message-list",
-            managementMode: usesPromptDrivenBackend ? .providerManagedSession : .latticeManagedVisibleTranscript
-        )
-        let supportsACPRecovery = ["grok", "opencode", "hermes"].contains(harnessID)
-        let hasPersistedACPSession = supportsACPRecovery && session.harnessThreadID != nil
-        let recoveryPlan = hasPersistedACPSession
-            ? LatticeContextHandoffPlanner.plan(
+        let launchPlan = RunLaunchPlanner.plan(
+            .init(
                 session: session,
                 submittedText: submittedText,
                 additionalContext: additionalContext,
                 tokenLimit: tokenLimit,
-                existingHarnessThreadID: nil,
-                managementMode: .providerManagedSession
+                effectiveRuntimeID: harnessID
             )
-            : contextPlan
-        let recoveryPrompt = hasPersistedACPSession ? recoveryPlan.prompt : nil
-        let recoveryUsesVisibleTranscriptHandoff = hasPersistedACPSession && recoveryPlan.usesVisibleTranscriptHandoff
-        let recoveryDeliveryIssue = hasPersistedACPSession ? recoveryPlan.deliveryIssue : nil
-        let prompt = contextPlan.prompt
-        let routeThreadID: String? = contextPlan.resetsHarnessSession ? nil : session.harnessThreadID
-        if contextPlan.resetsHarnessSession {
+        )
+        let recoveryPrompt = launchPlan.recoveryPrompt
+        let recoveryUsesVisibleTranscriptHandoff = launchPlan.recoveryUsesVisibleTranscriptHandoff
+        let recoveryDeliveryIssue = launchPlan.recoveryDeliveryIssue
+        let prompt = launchPlan.prompt
+        let routeThreadID = launchPlan.routeThreadID
+        if launchPlan.resetsHarnessSession {
             sessions[index].harnessThreadID = nil
             persist()
         }
-        if let statusDetail = contextPlan.statusDetail {
-            setActivity([.init(icon: contextPlan.didCompact ? "arrow.triangle.2.circlepath" : "doc.text.magnifyingglass", title: contextPlan.didCompact ? "Context compacted" : "Context handoff", detail: statusDetail)], sessionID: id)
+        if let statusDetail = launchPlan.statusDetail {
+            setActivity([.init(icon: launchPlan.didCompact ? "arrow.triangle.2.circlepath" : "doc.text.magnifyingglass", title: launchPlan.didCompact ? "Context compacted" : "Context handoff", detail: statusDetail)], sessionID: id)
         }
-        if let deliveryIssue = contextPlan.deliveryIssue {
+        if let deliveryIssue = launchPlan.deliveryIssue {
             let failedStream = AsyncStream<AgentEvent> { continuation in
                 continuation.yield(.failed(deliveryIssue))
                 continuation.finish()
@@ -3147,14 +3125,29 @@ final class AppState: ObservableObject {
         )
             ? KeychainStore.read(account: OpenCodeCredentialPolicy.keychainAccount)
             : nil
+        let localContextPlan: LatticeContextHandoffPlan? = {
+            switch session.backend {
+            case .appleIntelligence, .ollama:
+                return LatticeContextHandoffPlanner.plan(
+                    session: session,
+                    submittedText: submittedText,
+                    additionalContext: additionalContext,
+                    tokenLimit: tokenLimit,
+                    existingHarnessThreadID: "structured-message-list",
+                    managementMode: .latticeManagedVisibleTranscript
+                )
+            default:
+                return nil
+            }
+        }()
         let appleTranscript: String? = session.backend == .appleIntelligence
-            ? LatticeBackendMessageBuilder.transcript(session: session, submittedText: submittedText, additionalContext: additionalContext, contextPlan: contextPlan)
+            ? LatticeBackendMessageBuilder.transcript(session: session, submittedText: submittedText, additionalContext: additionalContext, contextPlan: localContextPlan)
             : nil
         let ollamaMessages: [ChatMessage]? = {
             guard case .ollama(let model) = session.backend else { return nil }
             cancelLocalModelIdleUnload()
             localModelStatus = "Loaded \(model)"
-            return LatticeBackendMessageBuilder.structuredMessages(session: session, submittedText: submittedText, additionalContext: additionalContext, contextPlan: contextPlan)
+            return LatticeBackendMessageBuilder.structuredMessages(session: session, submittedText: submittedText, additionalContext: additionalContext, contextPlan: localContextPlan)
         }()
         stream = executionCoordinator.stream(
             LatticeExecutionLaunch(
@@ -7710,18 +7703,22 @@ Lattice self-edit rules:
             setActivity([.init(icon: "arrow.triangle.2.circlepath", title: "Provider session recovery", detail: detail)], sessionID: id)
             persist()
         case .assistantDelta(let delta):
-            guard sessions[index].isStreaming,
+            let reduceState = SessionRunState(
+                isStreaming: sessions[index].isStreaming,
+                lastAssistantText: sessions[index].messages.last?.role == .assistant
+                    ? sessions[index].messages.last!.text
+                    : "",
+                hasAssistantMessage: sessions[index].messages.last?.role == .assistant,
+                isSuppressingInlineImagePayload: inlineImagePayloadSuppression.contains(id)
+            )
+            let reduced = SessionRunReducer.reduce(state: reduceState, event: .assistantDelta(delta))
+            guard let assistantText = reduced.assistantText,
                   sessions[index].messages.last?.role == .assistant else { return }
             let messageIndex = sessions[index].messages.count - 1
-            let filtered = AssistantTranscriptMediaPolicy.appending(
-                delta,
-                to: sessions[index].messages[messageIndex].text,
-                isSuppressingPayload: inlineImagePayloadSuppression.contains(id)
-            )
-            sessions[index].messages[messageIndex].text = filtered.text
-            if filtered.isSuppressingPayload {
+            sessions[index].messages[messageIndex].text = assistantText
+            if reduced.isSuppressingInlineImagePayload == true {
                 inlineImagePayloadSuppression.insert(id)
-            } else {
+            } else if reduced.isSuppressingInlineImagePayload == false {
                 inlineImagePayloadSuppression.remove(id)
             }
             sessions[index].lastUpdated = .now
@@ -8001,11 +7998,38 @@ Lattice self-edit rules:
             computerFrameAccumulators[id] = accumulator
             updateSessionAction(id: frame.id, status: .completed, at: index)
         case .completed:
+            finalizeRun(.completed, sessionID: id, runID: runID, sessionIndex: index, backend: backend)
+        case .cancelled:
+            finalizeRun(.cancelled, sessionID: id, runID: runID, sessionIndex: index, backend: backend)
+        case .failed(let message):
+            finalizeRun(.failed(message), sessionID: id, runID: runID, sessionIndex: index, backend: backend)
+        }
+    }
+
+    /// Single terminal ladder for completed / cancelled / failed / permission-denied runs.
+    private func finalizeRun(
+        _ terminal: SessionRunTerminal,
+        sessionID id: UUID,
+        runID: UUID,
+        sessionIndex index: Int,
+        backend: ChatBackend
+    ) {
+        switch terminal {
+        case .completed:
             computerFrameAccumulators[id]?.stop()
-            let completedOutbox = dispatchingOutboxAttempt(for: id) != nil
-            activeRunIDs[id] = nil
-            inlineImagePayloadSuppression.remove(id)
-            harnessPermissionNotices[id] = nil
+        case .cancelled, .permissionDenied:
+            computerFrameAccumulators[id]?.cancel()
+        case .failed:
+            computerFrameAccumulators[id]?.stop()
+        }
+
+        let hadOutbox = dispatchingOutboxAttempt(for: id) != nil
+        activeRunIDs[id] = nil
+        inlineImagePayloadSuppression.remove(id)
+        harnessPermissionNotices[id] = nil
+
+        switch terminal {
+        case .completed:
             finishCompletedTurnActions(at: index)
             recordWorkOutcome(.succeeded, title: "Work completed", detail: "", at: index)
             sessions[index].isStreaming = false
@@ -8017,7 +8041,7 @@ Lattice self-edit rules:
             }
             submittedRequests[id] = nil
             retryableRequests[id] = nil
-            if completedOutbox, !completeDispatchingOutbox(for: id) {
+            if hadOutbox, !completeDispatchingOutbox(for: id) {
                 persist()
                 finishSchedulerRunAfterCheckpoint(sessionID: id, runID: runID) { [weak self] in
                     guard let self else { return }
@@ -8035,17 +8059,13 @@ Lattice self-edit rules:
                 self.persist()
                 self.scheduleIdleUnloadIfNeeded(for: backend)
             }
+
         case .cancelled:
-            computerFrameAccumulators[id]?.cancel()
-            let cancelledOutbox = dispatchingOutboxAttempt(for: id) != nil
-            activeRunIDs[id] = nil
-            inlineImagePayloadSuppression.remove(id)
-            harnessPermissionNotices[id] = nil
             selfEditRunIDs.remove(id)
             finishPendingActions(status: .cancelled, at: index)
             recordWorkOutcome(.cancelled, title: "Work stopped", detail: "The run was cancelled before every item finished.", at: index)
             sessions[index].isStreaming = false
-            if cancelledOutbox {
+            if hadOutbox {
                 failDispatchingOutbox(
                     for: id,
                     reason: .init(code: .cancelled, detail: "The provider run was cancelled before completion.")
@@ -8067,14 +8087,10 @@ Lattice self-edit rules:
                 self.persist()
                 self.scheduleIdleUnloadIfNeeded(for: backend)
             }
-        case .failed(let message):
-            computerFrameAccumulators[id]?.stop()
-            let failedOutbox = dispatchingOutboxAttempt(for: id) != nil
-            activeRunIDs[id] = nil
-            inlineImagePayloadSuppression.remove(id)
-            harnessPermissionNotices[id] = nil
+
+        case .failed(let message), .permissionDenied(let message):
             selfEditRunIDs.remove(id)
-            if failedOutbox {
+            if hadOutbox {
                 failDispatchingOutbox(
                     for: id,
                     reason: .init(code: .providerUnavailable, detail: message)
