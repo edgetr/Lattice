@@ -4,11 +4,17 @@ import Testing
 
 @Suite("Hermes ACP path scope")
 struct HermesACPHarnessTests {
-    @Test(arguments: ["Sources/App.swift", "./Sources/App.swift", "Sources/../Sources/App.swift"])
+    @Test(arguments: ["Sources/App.swift", "./Sources/App.swift"])
     func validRelativePOSIXPathsStayScoped(_ path: String) throws {
         let workspace = try makeWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace.deletingLastPathComponent()) }
         #expect(WorkspacePathScope.isWorkspaceScoped(path, workspace: workspace))
+    }
+
+    @Test func relativePathsThatTraverseParentSegmentsFailClosed() throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.deletingLastPathComponent()) }
+        #expect(!WorkspacePathScope.isWorkspaceScoped("Sources/../Sources/App.swift", workspace: workspace))
     }
 
     @Test func absolutePathInsideWorkspaceStaysScoped() throws {

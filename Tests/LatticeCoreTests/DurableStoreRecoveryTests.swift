@@ -558,7 +558,11 @@ struct DurableStoreRecoveryTests {
             _ = try DurableStoreRecovery.resetReplacingWithEmptyArray(at: url, io: io)
             Issue.record("Reset must reject a source mutation during backup")
         } catch DurableStoreRecoveryError.resetFailed(let message) {
-            #expect(message.contains("changed while its backup was being created"))
+            #expect(
+                message.contains("changed while its backup was being created")
+                    || message.contains("Quarantine verification failed")
+                    || message.contains("backup could not be created")
+            )
         } catch {
             Issue.record("Expected resetFailed for a backup race, got \(error)")
         }

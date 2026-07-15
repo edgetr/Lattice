@@ -229,7 +229,13 @@ struct TranscriptPerformanceTests {
 
         let storage = SessionTranscriptStorage(fileName: "\(ids[4].uuidString.lowercased())-safe.json", messageCount: 1, contentFingerprint: "safe")
         let request = TranscriptHydrationRequest(sessionID: ids[4], storage: storage)
-        var unloaded = LatticeSession(title: "Unloaded", transcriptStorage: storage, isTranscriptLoaded: false, backend: .codex(model: "gpt-5.4"))
+        var unloaded = LatticeSession(
+            id: ids[4],
+            title: "Unloaded",
+            transcriptStorage: storage,
+            isTranscriptLoaded: false,
+            backend: .codex(model: "gpt-5.4")
+        )
         #expect(TranscriptHydrationApplyPolicy.shouldApply(request: request, selectedSessionID: ids[4], currentSession: unloaded))
         unloaded.messages = [.init(role: .user, text: "unsaved in-memory edit")]
         #expect(!TranscriptHydrationApplyPolicy.shouldApply(request: request, selectedSessionID: ids[4], currentSession: unloaded))

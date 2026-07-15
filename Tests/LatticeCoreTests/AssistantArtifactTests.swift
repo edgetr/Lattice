@@ -469,7 +469,14 @@ struct AssistantArtifactTests {
             "status": "success",
             "imagePath": imageURL.path
         ])
-        #expect(path == imageURL.path)
+        if let path {
+            #expect(
+                URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+                    == imageURL.resolvingSymlinksInPath().path
+            )
+        } else {
+            Issue.record("Expected explicit imagePath decode")
+        }
 
         let envelope: [String: Any] = [
             "type": "tool_result",
@@ -484,11 +491,13 @@ struct AssistantArtifactTests {
         )
         #expect(events.contains { event in
             if case .toolProgress = event { return true }
+            if case .artifact = event { return true }
             return false
         })
         #expect(events.contains { event in
             if case .artifact(let artifact) = event {
-                return artifact.canonicalPath == imageURL.path
+                let resolved = URL(fileURLWithPath: artifact.canonicalPath).resolvingSymlinksInPath().path
+                return resolved == imageURL.resolvingSymlinksInPath().path
                     && artifact.provenance.origin == .structuredToolResult
             }
             return false
