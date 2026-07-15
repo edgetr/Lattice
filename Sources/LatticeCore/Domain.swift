@@ -862,12 +862,6 @@ public struct ReasoningOption: Identifiable, Hashable, Codable, Sendable {
     }
 }
 
-/// Advertised model input modalities. Missing persisted values fail closed to text only.
-public enum ModelInputModality: String, Codable, Sendable, Hashable, CaseIterable {
-    case text
-    case image
-}
-
 public struct ProviderModel: Identifiable, Hashable, Codable, Sendable {
     public let id: String
     public let name: String

@@ -110,7 +110,7 @@ struct ScreenshotCaptureFoundationTests {
         {"id":"gpt-test","name":"GPT Test","description":"","reasoningOptions":[],"isDefault":false,"inputModalities":[]}
         """
         let model = try JSONDecoder().decode(ProviderModel.self, from: Data(json.utf8))
-        #expect(model.inputModalities?.isEmpty != false || model.inputModalities == [])
+        #expect(model.inputModalities?.isEmpty == true)
         #expect(!model.acceptsImages)
     }
 

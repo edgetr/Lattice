@@ -4136,9 +4136,12 @@ struct CoreVerification {
             } catch {
                 expect(false, "Revert preview refuses unresolved index conflicts")
             }
+            // Restore a clean index so later capture/worktree steps are not poisoned
+            // by the intentional stage 1/2/3 conflict fixture above.
+            _ = try await runGit(repo, ["read-tree", "HEAD"])
+            try "hello\n".write(to: repo.appendingPathComponent("tracked.txt"), atomically: true, encoding: .utf8)
 
             // Parallel worktree ownership / ref collision freedom.
-            try "hello\n".write(to: repo.appendingPathComponent("tracked.txt"), atomically: true, encoding: .utf8)
             let worktree = repo.deletingLastPathComponent()
                 .appendingPathComponent("lattice-verify-wt-\(UUID().uuidString)", isDirectory: true)
             _ = try await runGit(repo, ["worktree", "add", "--detach", worktree.path, "HEAD"])
@@ -4187,6 +4190,7 @@ struct CoreVerification {
         } catch {
             fputs("FAILED: Workspace checkpoint verification threw \(error)\n", stderr)
             exit(1)
+        }
 
         // Screenshot / Appshot LatticeCore foundation (migration, transport, frames, storage, permissions).
         let legacyAttachmentJSON = Data(#"{"id":"00000000-0000-0000-0000-0000000000aa","path":"/tmp/note.txt","isMissing":false}"#.utf8)
