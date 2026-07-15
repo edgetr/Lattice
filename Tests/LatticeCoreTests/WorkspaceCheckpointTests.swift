@@ -32,7 +32,8 @@ struct WorkspaceCheckpointTests {
         _ git: URL,
         in directory: URL,
         _ arguments: [String],
-        environment: [String: String]? = nil
+        environment: [String: String]? = nil,
+        input: Data? = nil
     ) async throws -> String {
         var env = ProcessInfo.processInfo.environment
         if let environment {
@@ -45,6 +46,7 @@ struct WorkspaceCheckpointTests {
             BoundedSubprocessRequest(
                 executableURL: git,
                 arguments: arguments,
+                stdinData: input,
                 currentDirectoryURL: directory,
                 environment: env,
                 deadline: 30,
@@ -399,6 +401,39 @@ struct WorkspaceCheckpointTests {
         } catch let error as WorkspaceCheckpointError {
             guard case .revertDivergence = error else {
                 Issue.record("Expected revertDivergence, got \(error)")
+                return
+            }
+        }
+
+        // An unresolved index conflict is a separate refusal path from a newer
+        // worktree edit. Populate stages 1/2/3 directly in this disposable repo.
+        let baseOID = try await runGit(repo.git, in: repo.root, ["rev-parse", "HEAD:tracked.txt"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let oursOID = try await runGit(
+            repo.git,
+            in: repo.root,
+            ["hash-object", "-w", "--stdin"],
+            input: Data("ours\n".utf8)
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let theirsOID = try await runGit(
+            repo.git,
+            in: repo.root,
+            ["hash-object", "-w", "--stdin"],
+            input: Data("theirs\n".utf8)
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let indexInfo = "100644 \(baseOID) 1\ttracked.txt\n100644 \(oursOID) 2\ttracked.txt\n100644 \(theirsOID) 3\ttracked.txt\n"
+        _ = try await runGit(
+            repo.git,
+            in: repo.root,
+            ["update-index", "--index-info"],
+            input: Data(indexInfo.utf8)
+        )
+        do {
+            _ = try await service.previewRevert(afterCheckpointID: after.id)
+            Issue.record("Preview must refuse unresolved index conflicts")
+        } catch let error as WorkspaceCheckpointError {
+            guard case .revertDivergence(let detail) = error,
+                  detail.contains("unresolved conflicts") else {
+                Issue.record("Expected unresolved conflict refusal, got \(error)")
                 return
             }
         }

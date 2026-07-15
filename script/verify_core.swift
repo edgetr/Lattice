@@ -3958,14 +3958,15 @@ struct CoreVerification {
                 throw WorkspaceCheckpointError.gitExecutableUnavailable
             }
 
-            func runGit(_ directory: URL, _ args: [String]) async throws -> String {
+            func runGit(_ directory: URL, _ args: [String], input: Data? = nil) async throws -> String {
                 var env = ProcessInfo.processInfo.environment
                 env["GIT_TERMINAL_PROMPT"] = "0"
                 let result = await BoundedSubprocess.run(
                     BoundedSubprocessRequest(
-                        executableURL: gitURL,
-                        arguments: args,
-                        currentDirectoryURL: directory,
+                    executableURL: gitURL,
+                    arguments: args,
+                    stdinData: input,
+                    currentDirectoryURL: directory,
                         environment: env,
                         deadline: 30
                     )
@@ -4116,6 +4117,24 @@ struct CoreVerification {
                 if case .revertDivergence = error { checks += 1 } else { expect(false, "Revert preview refuses target-path divergence from after-run state") }
             } catch {
                 expect(false, "Revert preview refuses target-path divergence from after-run state")
+            }
+
+            let baseOID = try await runGit(repo, ["rev-parse", "HEAD:tracked.txt"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let oursOID = try await runGit(repo, ["hash-object", "-w", "--stdin"], input: Data("ours\n".utf8)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let theirsOID = try await runGit(repo, ["hash-object", "-w", "--stdin"], input: Data("theirs\n".utf8)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let indexInfo = "100644 \(baseOID) 1\ttracked.txt\n100644 \(oursOID) 2\ttracked.txt\n100644 \(theirsOID) 3\ttracked.txt\n"
+            _ = try await runGit(repo, ["update-index", "--index-info"], input: Data(indexInfo.utf8))
+            do {
+                _ = try await service.previewRevert(afterCheckpointID: divergeAfter.id)
+                expect(false, "Revert preview refuses unresolved index conflicts")
+            } catch let error as WorkspaceCheckpointError {
+                if case .revertDivergence(let detail) = error, detail.contains("unresolved conflicts") {
+                    checks += 1
+                } else {
+                    expect(false, "Revert preview refuses unresolved index conflicts")
+                }
+            } catch {
+                expect(false, "Revert preview refuses unresolved index conflicts")
             }
 
             // Parallel worktree ownership / ref collision freedom.
