@@ -110,6 +110,8 @@ public struct ThreadActivityLaneStore: Equatable, Sendable {
             lane.queuePosition = nil
             lane.requiresAttention = false
             lane.failureMessage = nil
+            // Restarting work clears prior unread when the thread is selected.
+            if isSelected { lane.hasUnreadActivity = false }
         case .approvalRequested:
             lane.status = .waitingForApproval
             lane.requiresAttention = true
