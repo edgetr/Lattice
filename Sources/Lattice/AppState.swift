@@ -340,6 +340,9 @@ final class AppState: ObservableObject {
     @Published var appleIntelligenceStatus = "Checking…"
     @Published var ollamaInstalled = false
     @Published var ollamaReady = false
+    /// Map-driven connection observations. Dual-written with legacy fields during migration.
+    @Published private(set) var providerSnapshots: [String: ProviderRuntimeSnapshot] = [:]
+
     @Published var grokUpdateStatus = ""
     @Published var extensions: [LatticeExtensionRecord] = []
     @Published var skills: [LatticeSkillRecord] = []
@@ -4468,6 +4471,15 @@ final class AppState: ObservableObject {
         !Task.isCancelled && connectionRefreshGeneration.isCurrent(generation)
     }
 
+
+    private func providerSnapshot(for key: ProviderConnectionKey) -> ProviderRuntimeSnapshot {
+        ProviderRuntimeSnapshotStore.snapshot(in: providerSnapshots, key: key)
+    }
+
+    private func setProviderSnapshot(_ snapshot: ProviderRuntimeSnapshot, for key: ProviderConnectionKey) {
+        ProviderRuntimeSnapshotStore.upsert(&providerSnapshots, key: key, snapshot: snapshot)
+    }
+
     private func refreshCodexConnection(generation: UInt64) async {
         let executable = ExecutableDiscovery.locate("codex")
         guard canApplyCatalogRefresh(generation) else { return }
@@ -4491,10 +4503,29 @@ final class AppState: ObservableObject {
         case .unknown: codexImageInputProtocolSupport = .unknown
         }
         codexModels = snapshot.models
-        codexReady = ProviderReadinessSnapshot(installed: codex.isInstalled, authenticated: auth, catalogStatus: snapshot.catalogStatus, runnableModelCount: visibleCodexModels.count).isRunnable
+        codexReady = ProviderRuntimeSnapshotStore.computeReady(
+            installed: codex.isInstalled,
+            authenticated: auth,
+            catalogStatus: snapshot.catalogStatus,
+            runnableModelCount: visibleCodexModels.count
+        )
         codexUsage = snapshot.usage
         codexCLIVersion = version
         codexLatestCLIVersion = latest
+        setProviderSnapshot(
+            ProviderRuntimeSnapshot(
+                installed: codex.isInstalled,
+                authenticated: auth,
+                catalogStatus: snapshot.catalogStatus,
+                models: snapshot.models,
+                cliVersion: version,
+                latestCLIVersion: latest,
+                protocolDetail: snapshot.unavailableReason,
+                ready: codexReady,
+                usage: snapshot.usage
+            ),
+            for: .codex
+        )
     }
 
     private func refreshGrokConnection(generation: UInt64) async {
@@ -4516,9 +4547,29 @@ final class AppState: ObservableObject {
         grokACPModels = acpCatalog.models
         grokCatalogStatus = ProviderCatalogStatus.combined(cliCatalog.status, acpCatalog.status)
         grokModels = cliCatalog.models.isEmpty ? acpCatalog.models.map { ProviderModel(id: $0.id, name: $0.name) } : cliCatalog.models
-        grokReady = ProviderReadinessSnapshot(installed: grok.isInstalled, authenticated: auth, catalogStatus: grokCatalogStatus, runnableModelCount: runnableGrokModels.count).isRunnable
+        grokReady = ProviderRuntimeSnapshotStore.computeReady(
+            installed: grok.isInstalled,
+            authenticated: auth,
+            catalogStatus: grokCatalogStatus,
+            runnableModelCount: runnableGrokModels.count
+        )
         grokCLIInfo = update
         grokUpdateStatus = grokCLIInfo.statusText
+        setProviderSnapshot(
+            ProviderRuntimeSnapshot(
+                installed: grok.isInstalled,
+                authenticated: auth,
+                catalogStatus: grokCatalogStatus,
+                models: grokModels,
+                harnessModels: grokACPModels,
+                cliVersion: update.currentVersion,
+                latestCLIVersion: update.latestVersion,
+                protocolDetail: update.detail,
+                ready: grokReady,
+                updateInfo: update
+            ),
+            for: .grok
+        )
     }
 
     private func refreshOpenCodeConnection(refreshCatalog: Bool = false, generation: UInt64) async {
@@ -4559,9 +4610,27 @@ final class AppState: ObservableObject {
         openCodeACPModels = acpCatalog.models
         openCodeCatalogStatus = ProviderCatalogStatus.combined(catalog.status, acpCatalog.status)
         openCodeModels = catalog.models
-        openCodeReady = ProviderReadinessSnapshot(installed: openCode.isInstalled, authenticated: openCodeAuthenticated, catalogStatus: openCodeCatalogStatus, runnableModelCount: runnableOpenCodeModels.count).isRunnable
+        openCodeReady = ProviderRuntimeSnapshotStore.computeReady(
+            installed: openCode.isInstalled,
+            authenticated: openCodeAuthenticated,
+            catalogStatus: openCodeCatalogStatus,
+            runnableModelCount: runnableOpenCodeModels.count
+        )
         openCodeCLIVersion = detectedVersion ?? installedVersion
         openCodeLatestCLIVersion = latest
+        setProviderSnapshot(
+            ProviderRuntimeSnapshot(
+                installed: openCode.isInstalled,
+                authenticated: openCodeAuthenticated,
+                catalogStatus: openCodeCatalogStatus,
+                models: openCodeModels,
+                harnessModels: openCodeACPModels,
+                cliVersion: openCodeCLIVersion,
+                latestCLIVersion: latest,
+                ready: openCodeReady
+            ),
+            for: .opencode
+        )
     }
 
     private func refreshAntigravityConnection(generation: UInt64) async {
@@ -4591,6 +4660,19 @@ final class AppState: ObservableObject {
         antigravityModels = models
         antigravityCLIVersion = CLIVersionDisplayPolicy.normalizedVersion(version)
         antigravityLatestCLIVersion = latest
+        setProviderSnapshot(
+            ProviderRuntimeSnapshot(
+                installed: antigravityInstalled,
+                authenticated: authenticated,
+                catalogStatus: catalog.status,
+                models: models,
+                cliVersion: antigravityCLIVersion,
+                latestCLIVersion: latest,
+                protocolDetail: String(describing: protocolSupport),
+                ready: authenticated && catalog.status == .loaded && !models.isEmpty
+            ),
+            for: .antigravity
+        )
     }
 
     private func refreshPiConnection(generation: UInt64) async {
@@ -4608,6 +4690,18 @@ final class AppState: ObservableObject {
         piCLIVersion = version
         piModelIDs = catalog
         piLatestCLIVersion = latest
+        setProviderSnapshot(
+            ProviderRuntimeSnapshot(
+                installed: piInstalled,
+                authenticated: piInstalled,
+                catalogStatus: catalog.isEmpty ? .empty : .loaded,
+                models: catalog.sorted().map { ProviderModel(id: $0, name: $0) },
+                cliVersion: version,
+                latestCLIVersion: latest,
+                ready: piInstalled && !catalog.isEmpty
+            ),
+            for: .pi
+        )
     }
 
     private func refreshHermesConnection(generation: UInt64) async {
@@ -4624,6 +4718,20 @@ final class AppState: ObservableObject {
         hermesCatalogStatus = catalog.status
         hermesModels = catalog.models
         hermesCLIInfo = info
+        setProviderSnapshot(
+            ProviderRuntimeSnapshot(
+                installed: hermesInstalled,
+                authenticated: hermesInstalled,
+                catalogStatus: catalog.status,
+                harnessModels: catalog.models,
+                cliVersion: info.currentVersion,
+                latestCLIVersion: info.latestVersion,
+                protocolDetail: info.detail,
+                ready: hermesInstalled && catalog.status == .loaded && !catalog.models.isEmpty,
+                updateInfo: info
+            ),
+            for: .hermes
+        )
     }
 
     private func refreshLocalConnection(generation: UInt64, localGeneration: UInt64) async {
@@ -4645,6 +4753,27 @@ final class AppState: ObservableObject {
         ollamaReady = localReady
         ollamaCatalogStatus = localCatalog.status
         if localCatalog.status != .failed { ollamaModels = localCatalog.models }
+        setProviderSnapshot(
+            ProviderRuntimeSnapshot(
+                installed: localInstalled,
+                authenticated: localReady,
+                catalogStatus: localCatalog.status,
+                models: ollamaModels.map { ProviderModel(id: $0.name, name: $0.name) },
+                protocolDetail: nil,
+                ready: localReady && localCatalog.status == .loaded && !ollamaModels.isEmpty
+            ),
+            for: .ollama
+        )
+        setProviderSnapshot(
+            ProviderRuntimeSnapshot(
+                installed: intelligenceReady,
+                authenticated: intelligenceReady,
+                catalogStatus: intelligenceReady ? .loaded : .empty,
+                protocolDetail: intelligenceStatus,
+                ready: intelligenceReady
+            ),
+            for: .apple
+        )
     }
 
     func connectCodex() {
