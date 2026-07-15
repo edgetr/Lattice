@@ -32,6 +32,7 @@ struct ConversationView: View {
                             )
                             let messageRowWidth = min(
                                 CGFloat(LatticeMessageRowLayoutPolicy.transcriptMaxWidth),
+                                LatticeTypography.transcriptMaxReadableWidth,
                                 max(0, geometry.size.width - (horizontalPadding * 2))
                             )
 
@@ -69,7 +70,7 @@ struct ConversationView: View {
                                             .id(message.id)
                                             let messageActions = session.actions.filter { $0.messageID == message.id }
                                             if session.executionRoute.mode != .work, !messageActions.isEmpty {
-                                                AssistantActivityDisclosure(actions: messageActions)
+                                                AssistantActivityDisclosure(actions: messageActions, state: state)
                                             }
                                         }
                                         if session.executionRoute.mode == .work {
@@ -197,6 +198,12 @@ struct ConversationView: View {
                             state.workOriginJumpTarget = target
                         }
                     }
+                    if session.executionRoute.mode == .code,
+                       let review = state.selectedCheckpointReview,
+                       review.activity == .ready,
+                       review.changes != nil {
+                        CodeCheckpointReviewStrip(state: state, review: review)
+                    }
                     ComposerView(state: state)
                 }
             } else if state.isTransientNewChat {
@@ -205,11 +212,13 @@ struct ConversationView: View {
                     ComposerView(state: state)
                 }
             } else {
-                ContentUnavailableView {
-                    Label("Start a chat", systemImage: "bubble.left.and.bubble.right")
-                } description: {
-                    Text("Create one from the New chat button in the toolbar.")
-                }
+                LatticeEmptyState(
+                    title: "Start a chat",
+                    message: "Create one from the New chat button in the toolbar.",
+                    systemImage: "bubble.left.and.bubble.right",
+                    primaryActionTitle: "New chat",
+                    primaryAction: { state.newSession() }
+                )
             }
         }
         .navigationTitle(state.selectedSession?.title ?? "Chats")
@@ -444,20 +453,23 @@ private struct QueuedFollowUpRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: icon)
-                .foregroundStyle(tint)
+            Image(systemName: semantic.systemImage)
+                .foregroundStyle(semantic.color)
                 .frame(width: 22)
             VStack(alignment: .leading, spacing: 4) {
-                Text(title)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(tint)
+                HStack(spacing: 8) {
+                    Text(title)
+                        .font(LatticeTypography.captionStrong)
+                        .foregroundStyle(semantic.color)
+                    LatticeStatusChip(semantic: semantic, title: chipTitle)
+                }
                 Text(followUp.text)
-                    .font(.callout)
+                    .font(LatticeTypography.callout)
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
                 if let statusDetail {
                     Text(statusDetail)
-                        .font(.caption)
+                        .font(LatticeTypography.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -465,21 +477,29 @@ private struct QueuedFollowUpRow: View {
             Spacer(minLength: 12)
             if !sessionIsStreaming, isFIFOHead, canSend {
                 Button(actionTitle) { state.sendQueuedFollowUp(followUp.id) }
+                    .buttonStyle(LatticePrimaryButtonStyle())
+                    .accessibilityHint(actionHint)
             }
             if canRemove {
                 Button("Remove") { state.removeQueuedFollowUp(followUp.id) }
+                    .buttonStyle(LatticeGhostButtonStyle())
             }
         }
         .padding(12)
-        .latticeGlass(cornerRadius: 14, tint: tint.opacity(0.08))
+        .latticeContentSurface(cornerRadius: LatticeMetrics.controlRadius)
+        .overlay(
+            RoundedRectangle(cornerRadius: LatticeMetrics.controlRadius, style: .continuous)
+                .strokeBorder(semantic.color.opacity(0.22), lineWidth: 1)
+        )
         .accessibilityElement(children: .contain)
+        .accessibilityIdentifier(LatticeAccessibilityID.outboxStrip)
         .accessibilityLabel(title)
         .accessibilityValue(accessibilityValue)
     }
 
     private var title: String {
         switch followUp.lifecycle {
-        case .pending: "Pending follow-up"
+        case .pending: "Queued follow-up"
         case .dispatching: "Sending follow-up"
         case .blocked(.contextMismatch): "Review changed context"
         case .blocked(.restartRecovery): "Review after restart"
@@ -489,20 +509,22 @@ private struct QueuedFollowUpRow: View {
         }
     }
 
-    private var icon: String {
+    private var chipTitle: String {
         switch followUp.lifecycle {
-        case .pending: "clock"
-        case .dispatching: "arrow.up.circle"
-        case .blocked: "exclamationmark.shield"
-        case .failed: "exclamationmark.arrow.triangle.2.circlepath"
+        case .pending: "Queued"
+        case .dispatching: "Sending"
+        case .blocked(.restartRecovery): "After restart"
+        case .blocked: "Needs review"
+        case .failed: "Failed"
         }
     }
 
-    private var tint: Color {
+    private var semantic: LatticeStatusSemantic {
         switch followUp.lifecycle {
-        case .pending, .dispatching: .purple
-        case .blocked: .orange
-        case .failed: .red
+        case .pending: .queued
+        case .dispatching: .running
+        case .blocked: .approval
+        case .failed: .failed
         }
     }
 
@@ -517,25 +539,96 @@ private struct QueuedFollowUpRow: View {
     }
 
     private var statusDetail: String? {
-        guard case .failed(let reason) = followUp.lifecycle else { return nil }
-        return reason.detail
+        switch followUp.lifecycle {
+        case .failed(let reason):
+            return reason.detail ?? "Could not send. Review and retry when ready."
+        case .blocked(.restartRecovery):
+            return "Lattice restarted before this could send. Review once, then send."
+        case .blocked(.contextMismatch):
+            return "Route, workspace, or attachments changed since it was queued."
+        case .blocked(.missingCapturedContext):
+            return "Imported without send context. Review before sending."
+        case .blocked(.awaitingExplicitReview):
+            return "Waiting for your review before send."
+        case .pending:
+            return isFIFOHead ? "Next in queue." : "Waiting behind earlier follow-ups."
+        case .dispatching:
+            return "Sending now…"
+        }
     }
 
     private var actionTitle: String {
         switch followUp.lifecycle {
         case .pending: "Send now"
-        case .blocked, .failed: "Review & retry"
+        case .blocked(.restartRecovery): "Review & send"
+        case .blocked, .failed: "Retry"
         case .dispatching: "Sending"
+        }
+    }
+
+    private var actionHint: String {
+        switch followUp.lifecycle {
+        case .blocked(.restartRecovery):
+            "One-click review after restart, then send"
+        case .blocked, .failed:
+            "Send after reviewing the blocked or failed follow-up"
+        default:
+            "Send this queued follow-up now"
         }
     }
 
     private var accessibilityValue: String {
         switch followUp.lifecycle {
-        case .pending: "Pending in FIFO outbox"
-        case .dispatching: "Durably claimed for local dispatch"
-        case .blocked: "Automatic sending is blocked until reviewed"
-        case .failed(let reason): reason.detail ?? "Dispatch failed and requires retry"
+        case .pending: "Queued and waiting"
+        case .dispatching: "Sending"
+        case .blocked: "Blocked until you review"
+        case .failed(let reason): reason.detail ?? "Failed — retry available"
         }
+    }
+}
+
+/// Composer-adjacent strip that promotes post-run checkpoint review for Code mode.
+private struct CodeCheckpointReviewStrip: View {
+    @ObservedObject var state: AppState
+    let review: WorkspaceCheckpointReviewState
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "doc.text.magnifyingglass")
+                .foregroundStyle(LatticeStatusSemantic.success.color)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Run changes ready for review")
+                    .font(LatticeTypography.captionStrong)
+                if let changes = review.changes {
+                    Text("\(changes.stats.filesChanged) files · +\(changes.stats.additions) / −\(changes.stats.deletions)")
+                        .font(LatticeTypography.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 8)
+            Button("Open Files") {
+                if let path = review.changes?.files.first?.path {
+                    state.openFileBrowserPath(path)
+                } else {
+                    state.showFileBrowser = true
+                    state.refreshFileBrowserListing()
+                }
+            }
+            .buttonStyle(LatticeSecondaryButtonStyle())
+            Button("Review") {
+                state.openCheckpointReview()
+            }
+            .buttonStyle(LatticePrimaryButtonStyle())
+            .accessibilityHint("Opens the inspector Review tab for this run")
+        }
+        .padding(12)
+        .latticeContentSurface(cornerRadius: LatticeMetrics.controlRadius)
+        .padding(.horizontal, state.composerHorizontalPadding())
+        .padding(.top, 8)
+        .frame(maxWidth: state.composerMaxWidth())
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Checkpoint review available")
     }
 }
 
@@ -593,14 +686,15 @@ struct SelfEditPreviewRow: View {
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer()
                 Button("Discard") { state.discardSelfEditPreview(preview) }
+                    .buttonStyle(LatticeSecondaryButtonStyle())
                 Button("Apply") { state.acceptSelfEditPreview(preview) }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(LatticePrimaryButtonStyle())
                     .disabled(!review.hasChanges)
                     .help(review.hasChanges ? "Apply this Lattice change" : "There are no changes to apply")
             }
         }
         .padding(14)
-        .latticeGlass(cornerRadius: 16, tint: .pink.opacity(0.08))
+        .latticeContentSurface(cornerRadius: LatticeMetrics.glassRadius)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(LatticeAccessibilityID.selfEditReview)
         .accessibilityLabel("Review Lattice change")
@@ -615,14 +709,11 @@ struct EmptyConversationView: View {
                 .padding(.leading, 24)
                 .padding(.top, 22)
 
-            VStack(spacing: 10) {
-                Text(state.copyText(for: .emptyChatTitle, fallback: "What can I help with?"))
-                    .font(.title2)
-                    .fontWeight(.semibold)
-                    .accessibilityAddTraits(.isHeader)
-                Text(state.activeBackend.displayName).foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            LatticeEmptyState(
+                title: state.copyText(for: .emptyChatTitle, fallback: "What can I help with?"),
+                message: "Send a prompt or attach context to begin. Route: \(state.activeBackend.displayName).",
+                systemImage: "sparkles"
+            )
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -632,22 +723,12 @@ private struct NewChatShellView: View {
     @ObservedObject var state: AppState
 
     var body: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "bubble.left.and.bubble.right")
-                .font(.system(size: 30, weight: .medium))
-                .foregroundStyle(.secondary)
-            Text("New chat")
-                .font(.title2.weight(.semibold))
-            Text(state.activeConversationMode.map { "\($0.displayName) mode" } ?? "Choose a mode and model to begin")
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            if state.activeComposerBackend == nil {
-                Text("Nothing is saved until you send or attach context.")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        LatticeEmptyState(
+            title: "New chat",
+            message: state.activeConversationMode.map { "\($0.displayName) mode — nothing is saved until you send or attach context." }
+                ?? "Choose a mode and model to begin. Nothing is saved until you send.",
+            systemImage: "bubble.left.and.bubble.right"
+        )
         .accessibilityElement(children: .combine)
         .accessibilityLabel("New chat setup")
         .accessibilityValue(state.activeComposerBackend?.displayName ?? "Choose a mode and model")
@@ -790,8 +871,7 @@ struct ComposerView: View {
             } label: {
                 Label("Continue", systemImage: "arrow.turn.down.right")
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
+            .buttonStyle(LatticeSecondaryButtonStyle())
             .help("Ask the current chat to continue from the last assistant response")
         }
     }
@@ -1669,34 +1749,37 @@ private struct WorkActionDock: View {
                 let options = state.availableHarnessPermissionOptions(for: notice)
                 ForEach(options.filter(\.isReject)) { option in
                     Button(option.name) { state.respondToHarnessPermission(notice, option: option) }
+                        .buttonStyle(LatticeSecondaryButtonStyle())
                 }
                 if options.filter(\.isReject).isEmpty {
                     Button("Stop") { state.stop(sessionID: session.id) }
+                        .buttonStyle(LatticeSecondaryButtonStyle())
                 }
                 ForEach(options.filter(\.isAllow)) { option in
                     Button(option.name) { state.respondToHarnessPermission(notice, option: option) }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(LatticePrimaryButtonStyle())
                         .accessibilityIdentifier(LatticeAccessibilityID.workPrimaryAction(request.id))
                 }
             }
         case .liveQuestion:
             Button("Send answer") { sendAnswer(request) }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(LatticePrimaryButtonStyle())
                 .disabled(answerText(for: request.id).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 .keyboardShortcut(.return, modifiers: [.command])
                 .accessibilityIdentifier(LatticeAccessibilityID.workPrimaryAction(request.id))
         case .userTaskConfirmation:
             Button("Confirm task") { state.confirmWorkTask(actionID: request.id) }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(LatticePrimaryButtonStyle())
                 .accessibilityIdentifier(LatticeAccessibilityID.workPrimaryAction(request.id))
         case .retryableFailure:
             Button("Retry turn") { state.retryWorkItem(actionID: request.id) }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(LatticePrimaryButtonStyle())
                 .accessibilityIdentifier(LatticeAccessibilityID.workPrimaryAction(request.id))
         case .artifactOperation:
             Button("Reveal in Finder") { state.revealWorkArtifact(actionID: request.id) }
+                .buttonStyle(LatticeSecondaryButtonStyle())
             Button("Open artifact") { state.openWorkArtifact(actionID: request.id) }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(LatticePrimaryButtonStyle())
                 .disabled(!artifactCanOpen)
                 .help(artifactCanOpen ? "Open this safe workspace document" : "Reveal only: this artifact is not a safe workspace document")
                 .accessibilityIdentifier(LatticeAccessibilityID.workPrimaryAction(request.id))
@@ -1723,6 +1806,7 @@ private struct WorkActionDock: View {
 
 struct AssistantActivityDisclosure: View {
     let actions: [SessionAction]
+    @ObservedObject var state: AppState
 
     private var summaryTitle: String {
         if actions.count == 1 { return actions[0].title }
@@ -1730,11 +1814,11 @@ struct AssistantActivityDisclosure: View {
     }
 
     private var summaryStatus: (label: String, color: Color) {
-        if actions.contains(where: { $0.status == .waiting }) { return ("Waiting", .orange) }
-        if actions.contains(where: { $0.status == .running }) { return ("Working", .blue) }
-        if actions.contains(where: { $0.status == .failed || $0.status == .denied }) { return ("Needs attention", .red) }
-        if actions.contains(where: { $0.status == .cancelled || $0.status == .interrupted }) { return ("Incomplete", .secondary) }
-        return ("Done", .green)
+        if actions.contains(where: { $0.status == .waiting }) { return ("Waiting", LatticeStatusSemantic.approval.color) }
+        if actions.contains(where: { $0.status == .running }) { return ("Working", LatticeStatusSemantic.running.color) }
+        if actions.contains(where: { $0.status == .failed || $0.status == .denied }) { return ("Needs attention", LatticeStatusSemantic.failed.color) }
+        if actions.contains(where: { $0.status == .cancelled || $0.status == .interrupted }) { return ("Incomplete", LatticeStatusSemantic.neutral.color) }
+        return ("Done", LatticeStatusSemantic.success.color)
     }
 
     private var summaryIcon: String {
@@ -1748,7 +1832,11 @@ struct AssistantActivityDisclosure: View {
         DisclosureGroup {
             VStack(alignment: .leading, spacing: 12) {
                 ForEach(actions) { action in
-                    SessionActionDetailRow(action: action)
+                    SessionActionDetailRow(
+                        action: action,
+                        onOpenPath: { path in state.openFileBrowserPath(path) },
+                        onOpenTerminal: { cwd in state.openTerminalForFailedTool(cwd: cwd) }
+                    )
                     if action.id != actions.last?.id { Divider() }
                 }
             }
@@ -1770,7 +1858,7 @@ struct AssistantActivityDisclosure: View {
             .contentShape(Rectangle())
         }
         .padding(11)
-        .latticeGlass(cornerRadius: 12, interactive: true)
+        .latticeGlass(cornerRadius: LatticeMetrics.compactRadius, interactive: true)
         .accessibilityLabel("Model activity, \(summaryTitle), \(summaryStatus.label)")
         .accessibilityHint("Expand or collapse model activity and reasoning summaries")
         .accessibilityIdentifier(
@@ -1783,6 +1871,8 @@ struct AssistantActivityDisclosure: View {
 
 private struct SessionActionDetailRow: View {
     let action: SessionAction
+    var onOpenPath: ((String) -> Void)?
+    var onOpenTerminal: ((String?) -> Void)?
 
     private var icon: String {
         switch action.kind {
@@ -1818,34 +1908,69 @@ private struct SessionActionDetailRow: View {
         }
     }
 
-    private var statusColor: Color {
+    private var statusSemantic: LatticeStatusSemantic {
         switch action.status {
-        case .completed, .allowed: .green
-        case .failed, .denied: .red
-        case .cancelled, .interrupted: .secondary
-        case .running: .blue
-        case .waiting: .orange
+        case .completed, .allowed: .success
+        case .failed, .denied: .failed
+        case .cancelled, .interrupted: .neutral
+        case .running: .running
+        case .waiting: .approval
         }
+    }
+
+    private var filePathCandidate: String? {
+        guard action.kind == .tool,
+              action.toolKind == .write || action.toolKind == .read || action.toolKind == .none else {
+            return nil
+        }
+        let detail = action.detail.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !detail.isEmpty else { return nil }
+        // Prefer first path-looking token in the detail line.
+        let first = detail.split(whereSeparator: { $0.isWhitespace || $0 == "," }).map(String.init).first ?? detail
+        return first
+    }
+
+    /// Best-effort cwd from failed command detail (absolute path or `cwd:` / `in ` prefixes).
+    private var failedToolCwdCandidate: String? {
+        let detail = action.detail
+        let patterns = ["cwd:", "cwd=", "working directory:", "in "]
+        let lower = detail.lowercased()
+        for pattern in patterns {
+            if let range = lower.range(of: pattern) {
+                let after = detail[range.upperBound...]
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let token = after.split(whereSeparator: { $0.isWhitespace || $0 == ";" || $0 == "," })
+                    .map(String.init)
+                    .first ?? ""
+                if token.hasPrefix("/") { return token }
+            }
+        }
+        // Absolute path token in detail may be the command cwd for shell tools.
+        let tokens = detail.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        if let abs = tokens.first(where: { $0.hasPrefix("/") && !$0.contains("://") }) {
+            // Prefer directories: if it looks like a file, use parent.
+            if abs.hasSuffix("/") { return abs }
+            if abs.contains(".") {
+                return (abs as NSString).deletingLastPathComponent
+            }
+            return abs
+        }
+        return nil
     }
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: icon)
-                .foregroundStyle(statusColor)
+                .foregroundStyle(statusSemantic.color)
                 .frame(width: 20)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
                     Text(action.title).fontWeight(.medium)
-                    Text(statusLabel)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(statusColor)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(statusColor.opacity(0.12), in: Capsule())
+                    LatticeStatusChip(semantic: statusSemantic, title: statusLabel)
                 }
                 if !action.detail.isEmpty {
                     Text(action.detail)
-                        .font(.caption)
+                        .font(LatticeTypography.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
@@ -1855,12 +1980,26 @@ private struct SessionActionDetailRow: View {
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
+                HStack(spacing: 8) {
+                    if let path = filePathCandidate, let onOpenPath {
+                        Button("Preview in files") { onOpenPath(path) }
+                            .buttonStyle(LatticeGhostButtonStyle())
+                            .accessibilityLabel("Preview \(path) in files")
+                    }
+                    if action.status == .failed,
+                       (action.toolKind == .command || action.kind == .harness),
+                       let onOpenTerminal {
+                        Button("Open terminal") { onOpenTerminal(failedToolCwdCandidate) }
+                            .buttonStyle(LatticeGhostButtonStyle())
+                            .accessibilityLabel("Open workspace terminal for failed command")
+                    }
+                }
             }
             Spacer(minLength: 0)
         }
         .font(.caption)
         .padding(.horizontal, 2)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier(
             action.kind == .approval
                 ? LatticeAccessibilityID.activityApproval
@@ -1877,12 +2016,15 @@ struct HarnessPermissionNoticeRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: "hand.raised.fill")
-                .foregroundStyle(.orange)
+            Image(systemName: LatticeStatusSemantic.approval.systemImage)
+                .foregroundStyle(LatticeStatusSemantic.approval.color)
             VStack(alignment: .leading, spacing: 5) {
-                Text(notice.request.title).fontWeight(.semibold)
+                HStack(spacing: 8) {
+                    Text(notice.request.title).fontWeight(.semibold)
+                    LatticeStatusChip(semantic: .approval, title: "Approval")
+                }
                 Text(notice.request.detail)
-                    .font(.caption)
+                    .font(LatticeTypography.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(6)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1891,31 +2033,37 @@ struct HarnessPermissionNoticeRow: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
-            Spacer()
+            Spacer(minLength: 8)
             let options = state.availableHarnessPermissionOptions(for: notice)
             let rejects = options.filter(\.isReject)
             let allows = options.filter(\.isAllow)
             if let reject = rejects.first {
                 Button(reject.name) { state.respondToHarnessPermission(notice, option: reject) }
+                    .buttonStyle(LatticeSecondaryButtonStyle())
             } else {
                 Button("Stop", action: state.stop)
+                    .buttonStyle(LatticeSecondaryButtonStyle())
             }
             if allows.count == 1, let allow = allows.first {
                 Button(allow.name) { state.respondToHarnessPermission(notice, option: allow) }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(LatticePrimaryButtonStyle())
             } else if !allows.isEmpty {
                 Menu("Allow") {
                     ForEach(allows) { option in
                         Button(option.name) { state.respondToHarnessPermission(notice, option: option) }
                     }
                 }
-                .menuStyle(.button)
-                .buttonStyle(.borderedProminent)
+                .menuStyle(.borderlessButton)
+                .buttonStyle(LatticePrimaryButtonStyle())
             }
         }
         .padding(12)
-        .latticeGlass(cornerRadius: 14, interactive: true)
-        .accessibilityIdentifier(LatticeAccessibilityID.permissionNotice)
+        .latticeContentSurface(cornerRadius: LatticeMetrics.controlRadius)
+        .overlay(
+            RoundedRectangle(cornerRadius: LatticeMetrics.controlRadius, style: .continuous)
+                .strokeBorder(LatticeStatusSemantic.approval.color.opacity(0.28), lineWidth: 1)
+        )
+        .accessibilityIdentifier(LatticeAccessibilityID.approvalStrip)
         .accessibilityLabel("\(notice.request.title), pending approval")
         .accessibilityValue(notice.request.detail)
     }
@@ -1932,18 +2080,18 @@ struct ErrorRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.red)
+            Image(systemName: LatticeStatusSemantic.failed.systemImage)
+                .foregroundStyle(LatticeStatusSemantic.failed.color)
                 .frame(width: 18)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
                 Text(presentation.headline)
                     .font(.callout.weight(.semibold))
-                    .foregroundStyle(.red)
+                    .foregroundStyle(LatticeStatusSemantic.failed.color)
                     .fixedSize(horizontal: false, vertical: true)
                 if let detail = presentation.detail {
                     Text(detail)
-                        .font(.caption)
+                        .font(LatticeTypography.caption)
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1952,13 +2100,16 @@ struct ErrorRow: View {
             Spacer(minLength: 0)
             if canRetry {
                 Button("Retry", action: onRetry)
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
+                    .buttonStyle(LatticePrimaryButtonStyle())
                     .accessibilityLabel("Retry request")
             }
         }
         .padding(12)
-        .latticeGlass(cornerRadius: 12, tint: .red.opacity(0.08))
+        .latticeContentSurface(cornerRadius: LatticeMetrics.controlRadius)
+        .overlay(
+            RoundedRectangle(cornerRadius: LatticeMetrics.controlRadius, style: .continuous)
+                .strokeBorder(LatticeStatusSemantic.failed.color.opacity(0.28), lineWidth: 1)
+        )
         .accessibilityElement(children: .contain)
     }
 }

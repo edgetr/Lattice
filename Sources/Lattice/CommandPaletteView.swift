@@ -52,7 +52,12 @@ struct CommandPaletteView: View {
             .padding(14)
 
             if results.isEmpty {
-                ContentUnavailableView("No matches", systemImage: "magnifyingglass", description: Text("Try a different chat, workspace, or command name."))
+                LatticeEmptyState(
+                    title: "No matches",
+                    message: "Try a different chat, workspace, or command name.",
+                    systemImage: "magnifyingglass",
+                    density: .compact
+                )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollViewReader { proxy in

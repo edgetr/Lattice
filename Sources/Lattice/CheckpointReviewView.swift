@@ -13,6 +13,7 @@ private final class CheckpointReviewViewModel: ObservableObject {
     @Published var noteKind: WorkspaceReviewNoteKind = .note
     @Published var noteBody = ""
     @Published var showsRevertConfirmation = false
+    @Published var expandedPaths: Set<String> = []
 }
 
 struct CheckpointReviewView: View {
@@ -30,20 +31,20 @@ struct CheckpointReviewView: View {
                     savedNotes(review.notes)
                     revertSection(review)
                 } else if review.activity != .capturingBefore && review.activity != .capturingAfter && review.activity != .running {
-                    ContentUnavailableView(
-                        "No Review Diff",
+                    LatticeEmptyState(
+                        title: "No review diff yet",
+                        message: "A captured before/after pair is required before changes can be reviewed or reverted.",
                         systemImage: "doc.text.magnifyingglass",
-                        description: Text("A captured before/after pair is required before changes can be reviewed or reverted.")
+                        density: .compact
                     )
-                    .frame(maxWidth: .infinity)
                 }
             } else {
-                ContentUnavailableView(
-                    "No Code Checkpoint",
+                LatticeEmptyState(
+                    title: "No Code checkpoint",
+                    message: "Lattice creates checkpoints when the next Code run begins and ends. After a run finishes, review opens here by default.",
                     systemImage: "clock.arrow.circlepath",
-                    description: Text("Lattice creates checkpoints when the next Code run begins and ends.")
+                    density: .compact
                 )
-                .frame(maxWidth: .infinity)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -80,7 +81,7 @@ struct CheckpointReviewView: View {
             if let issue = review.issue {
                 Label(issue, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(LatticeStatusSemantic.approval.color)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityLabel("Checkpoint issue: \(issue)")
             }
@@ -91,8 +92,8 @@ struct CheckpointReviewView: View {
         InspectorOpaqueSection(title: "Run Changes", systemImage: "plus.forwardslash.minus") {
             HStack(spacing: 12) {
                 stat("Files", changes.stats.filesChanged, color: .primary)
-                stat("Added", changes.stats.additions, color: .green)
-                stat("Deleted", changes.stats.deletions, color: .red)
+                stat("Added", changes.stats.additions, color: LatticeStatusSemantic.success.color)
+                stat("Deleted", changes.stats.deletions, color: LatticeStatusSemantic.failed.color)
             }
             .accessibilityElement(children: .combine)
             .accessibilityLabel("\(changes.stats.filesChanged) changed files, \(changes.stats.additions) additions, \(changes.stats.deletions) deletions")
@@ -107,7 +108,7 @@ struct CheckpointReviewView: View {
                     .foregroundStyle(.secondary)
             }
             ForEach(changes.files) { file in
-                DisclosureGroup {
+                DisclosureGroup(isExpanded: expansionBinding(for: file.path)) {
                     if file.isUntracked {
                         Text("Untracked content was not captured. Only privacy-preserving file metadata is available.")
                             .font(.caption2)
@@ -120,7 +121,7 @@ struct CheckpointReviewView: View {
                                 select(file: file, hunk: hunk)
                             } label: {
                                 Text(hunk.header)
-                                    .font(.caption2.monospaced())
+                                    .font(LatticeTypography.monoSmall)
                                     .lineLimit(2)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }
@@ -133,24 +134,36 @@ struct CheckpointReviewView: View {
                         .padding(.vertical, 4)
                     }
                 } label: {
-                    Button {
-                        model.selectedPath = file.path
-                        model.selectedHunkHeader = nil
-                        model.selectedStartLine = nil
-                        model.selectedEndLine = nil
-                    } label: {
+                    LatticeRow(isSelected: model.selectedPath == file.path) {
                         HStack(spacing: 6) {
                             Image(systemName: fileIcon(file.status))
-                                .foregroundStyle(file.isUntracked ? .orange : .secondary)
-                            Text(file.path).lineLimit(1).truncationMode(.middle)
-                            Spacer(minLength: 4)
-                            Text("+\(file.additions)").foregroundStyle(.green)
-                            Text("−\(file.deletions)").foregroundStyle(.red)
+                                .foregroundStyle(file.isUntracked ? LatticeStatusSemantic.warning.color : .secondary)
+                            Text(file.path)
+                                .font(LatticeTypography.mono)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    model.selectedPath = file.path
+                                    model.selectedHunkHeader = nil
+                                    model.selectedStartLine = nil
+                                    model.selectedEndLine = nil
+                                }
+                                .accessibilityAddTraits(.isButton)
+                                .accessibilityLabel("Select \(file.path), \(file.additions) additions, \(file.deletions) deletions")
+                            Text("+\(file.additions)").foregroundStyle(LatticeStatusSemantic.success.color)
+                            Text("−\(file.deletions)").foregroundStyle(LatticeStatusSemantic.failed.color)
+                            Button {
+                                state.openFileBrowserPath(file.path)
+                            } label: {
+                                Image(systemName: "doc.text.magnifyingglass")
+                            }
+                            .buttonStyle(LatticeIconButtonStyle(size: .compact))
+                            .accessibilityLabel("Preview \(file.path) in files")
                         }
-                        .font(.caption)
+                        .font(LatticeTypography.caption)
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Select \(file.path), \(file.additions) additions, \(file.deletions) deletions")
                 }
             }
         }
@@ -166,7 +179,7 @@ struct CheckpointReviewView: View {
             .accessibilityHint("Choose whether to save an observation or a follow-up prompt.")
             Text(targetDescription)
                 .font(.caption2.monospaced())
-                .foregroundStyle(model.selectedPath == nil ? .orange : .secondary)
+                .foregroundStyle(model.selectedPath == nil ? LatticeStatusSemantic.approval.color : .secondary)
                 .fixedSize(horizontal: false, vertical: true)
             if model.selectedPath != nil {
                 HStack {
@@ -179,22 +192,16 @@ struct CheckpointReviewView: View {
                 .scrollContentBackground(.hidden)
                 .frame(minHeight: 64, maxHeight: 120)
                 .padding(5)
-                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.secondary.opacity(0.25)))
-                .accessibilityLabel(model.noteKind == .note ? "Review note" : "Follow-up prompt")
-            Button(model.noteKind == .note ? "Save Note" : "Save Follow-up") {
-                guard let selectedPath = model.selectedPath else { return }
-                state.addSelectedCheckpointReviewNote(
-                    path: selectedPath,
-                    body: model.noteBody,
-                    kind: model.noteKind,
-                    lineRange: validLineRange,
-                    hunkHeader: model.selectedHunkHeader
+                .background(
+                    Color(nsColor: .textBackgroundColor),
+                    in: RoundedRectangle(cornerRadius: LatticeMetrics.compactRadius, style: .continuous)
                 )
-                model.noteBody = ""
-            }
-            .disabled(model.selectedPath == nil || model.noteBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || invalidLineRange)
-            .accessibilityHint(model.selectedPath == nil ? "Select a file or hunk first." : "Persists this item with the selected repository path and line range.")
+                .overlay(
+                    RoundedRectangle(cornerRadius: LatticeMetrics.compactRadius, style: .continuous)
+                        .strokeBorder(Color.secondary.opacity(0.25))
+                )
+                .accessibilityLabel(model.noteKind == .note ? "Review note" : "Follow-up prompt")
+            noteComposerActions
         }
     }
 
@@ -203,13 +210,30 @@ struct CheckpointReviewView: View {
         if !notes.isEmpty {
             InspectorOpaqueDisclosure(title: "Saved Review Items (\(notes.count))", systemImage: "tray.full") {
                 ForEach(notes) { note in
-                    VStack(alignment: .leading, spacing: 3) {
-                        Label(note.kind == .note ? "Note" : "Follow-up", systemImage: note.kind == .note ? "text.bubble" : "arrowshape.turn.up.right")
-                            .font(.caption.weight(.semibold))
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Label(note.kind == .note ? "Note" : "Follow-up", systemImage: note.kind == .note ? "text.bubble" : "arrowshape.turn.up.right")
+                                .font(.caption.weight(.semibold))
+                            Spacer(minLength: 4)
+                            Button("Add to follow-up") {
+                                state.addReviewNoteToComposer(note)
+                            }
+                            .buttonStyle(LatticeGhostButtonStyle())
+                            .help("Insert this saved review into the composer. Explicit action only.")
+                        }
                         Text(note.path + rangeSuffix(note.lineRange))
-                            .font(.caption2.monospaced())
+                            .font(LatticeTypography.monoSmall)
                             .foregroundStyle(.secondary)
-                        Text(note.body).font(.caption).textSelection(.enabled)
+                        Text(note.body).font(LatticeTypography.caption).textSelection(.enabled)
+                        if note.kind == .followUpPrompt || !note.body.isEmpty {
+                            Button {
+                                state.openFileBrowserPath(note.path)
+                            } label: {
+                                Label("Open in files", systemImage: "folder")
+                                    .font(LatticeTypography.caption)
+                            }
+                            .buttonStyle(LatticeGhostButtonStyle())
+                        }
                     }
                     .padding(.vertical, 3)
                     .accessibilityElement(children: .combine)
@@ -239,7 +263,7 @@ struct CheckpointReviewView: View {
                     ForEach(preview.warnings, id: \.self) { warning in
                         Label(warning, systemImage: "exclamationmark.triangle")
                             .font(.caption2)
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(LatticeStatusSemantic.approval.color)
                     }
                     Button(review.isApplyingRevert ? "Reverting…" : "Confirm Revert…", role: .destructive) {
                         model.showsRevertConfirmation = true
@@ -248,12 +272,15 @@ struct CheckpointReviewView: View {
                     .accessibilityHint("Opens a final destructive confirmation. Current files are checked again before anything is applied.")
                 }
                 .padding(8)
-                .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .background(
+                    LatticeStatusSemantic.approval.color.opacity(0.08),
+                    in: RoundedRectangle(cornerRadius: LatticeMetrics.compactRadius, style: .continuous)
+                )
             }
             if let status = review.revertStatus {
                 Label(status, systemImage: "info.circle")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(LatticeStatusSemantic.approval.color)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityLabel("Revert status: \(status)")
             }
@@ -305,11 +332,77 @@ struct CheckpointReviewView: View {
         return selectedPath + rangeSuffix(validLineRange)
     }
 
+    @ViewBuilder
+    private var noteComposerActions: some View {
+        let disabled = model.selectedPath == nil
+            || model.noteBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || invalidLineRange
+        HStack(spacing: 8) {
+            if model.noteKind == .note {
+                Button("Save Note") { saveCurrentNote() }
+                    .buttonStyle(LatticePrimaryButtonStyle())
+                    .disabled(disabled)
+                    .accessibilityHint(model.selectedPath == nil ? "Select a file or hunk first." : "Persists this item with the selected repository path and line range.")
+                Button("Add to follow-up") { addCurrentNoteToComposer() }
+                    .buttonStyle(LatticeSecondaryButtonStyle())
+                    .disabled(disabled)
+                    .help("Insert this review into the composer draft. Notes never enter the composer automatically.")
+            } else {
+                Button("Save Follow-up") { saveCurrentNote() }
+                    .buttonStyle(LatticeSecondaryButtonStyle())
+                    .disabled(disabled)
+                    .accessibilityHint(model.selectedPath == nil ? "Select a file or hunk first." : "Persists this item with the selected repository path and line range.")
+                Button("Add to follow-up") { addCurrentNoteToComposer() }
+                    .buttonStyle(LatticePrimaryButtonStyle())
+                    .disabled(disabled)
+                    .help("Insert this review into the composer draft. Notes never enter the composer automatically.")
+                    .accessibilityHint("Explicitly adds this review text to the chat composer.")
+            }
+        }
+    }
+
+    private func saveCurrentNote() {
+        guard let selectedPath = model.selectedPath else { return }
+        state.addSelectedCheckpointReviewNote(
+            path: selectedPath,
+            body: model.noteBody,
+            kind: model.noteKind,
+            lineRange: validLineRange,
+            hunkHeader: model.selectedHunkHeader
+        )
+        model.noteBody = ""
+    }
+
+    private func addCurrentNoteToComposer() {
+        guard let selectedPath = model.selectedPath else { return }
+        state.addReviewSelectionToComposer(
+            path: selectedPath,
+            body: model.noteBody,
+            kind: model.noteKind,
+            lineRange: validLineRange,
+            hunkHeader: model.selectedHunkHeader
+        )
+    }
+
     private func select(file: WorkspaceCheckpointFileChange, hunk: WorkspaceCheckpointHunk) {
         model.selectedPath = file.path
         model.selectedHunkHeader = hunk.header
         model.selectedStartLine = max(1, hunk.newStart)
         model.selectedEndLine = max(1, hunk.newStart + max(0, hunk.newCount - 1))
+    }
+
+    private func expansionBinding(for path: String) -> Binding<Bool> {
+        Binding(
+            get: { model.selectedPath == path || model.expandedPaths.contains(path) },
+            set: { expanded in
+                if expanded {
+                    model.expandedPaths.insert(path)
+                    model.selectedPath = path
+                } else {
+                    model.expandedPaths.remove(path)
+                }
+            }
+        )
     }
 
     private func stat(_ title: String, _ value: Int, color: Color) -> some View {
@@ -329,7 +422,11 @@ struct CheckpointReviewView: View {
         switch kind { case .context: " "; case .addition: "+"; case .deletion: "−" }
     }
     private func lineBackground(_ kind: WorkspaceCheckpointDiffLineKind) -> Color {
-        switch kind { case .context: .clear; case .addition: .green.opacity(0.10); case .deletion: .red.opacity(0.10) }
+        switch kind {
+        case .context: .clear
+        case .addition: LatticeStatusSemantic.success.color.opacity(0.10)
+        case .deletion: LatticeStatusSemantic.failed.color.opacity(0.10)
+        }
     }
     private func statusIcon(_ activity: WorkspaceCheckpointActivity) -> String {
         switch activity {

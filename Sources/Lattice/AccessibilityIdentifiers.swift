@@ -34,6 +34,11 @@ enum LatticeAccessibilityID {
     static let workOriginJumpPrefix = "lattice.work.jump."
     static let brandingTitle = "lattice.branding.title"
     static let companionMark = "lattice.companion-mark"
+    static let fileBrowser = "lattice.files.browser"
+    static let terminalPanel = "lattice.terminal.panel"
+    static let terminalCommand = "lattice.terminal.command"
+    static let outboxStrip = "lattice.outbox.strip"
+    static let approvalStrip = "lattice.approval.strip"
 
     static func sessionRow(_ id: UUID) -> String { sessionRowPrefix + id.uuidString.lowercased() }
     static func recoveryIssue(_ storeID: String) -> String { recoveryIssuePrefix + storeID }

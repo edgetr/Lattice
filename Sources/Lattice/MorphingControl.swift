@@ -110,10 +110,12 @@ struct MorphingControl: View {
                         .fontWeight(.medium)
                         .fixedSize(horizontal: false, vertical: true)
                         .layoutPriority(1)
-                    Spacer()
-                    Button("Files…", action: onChooseFiles).buttonStyle(.borderedProminent)
+                    Spacer(minLength: 8)
+                    Button("Files…", action: onChooseFiles)
+                        .buttonStyle(LatticeChipButtonStyle(isProminent: true))
+                        .accessibilityLabel("Attach files")
                     Button("Paste Image", action: onPasteImage)
-                        .buttonStyle(.bordered)
+                        .buttonStyle(LatticeChipButtonStyle())
                         .accessibilityHint("Attach an image currently on the clipboard")
                     Menu {
                         Button("Screen Region…", action: onCaptureRegion)
@@ -123,6 +125,12 @@ struct MorphingControl: View {
                         Text("Context is added only with your opt-in and macOS permission.")
                     } label: {
                         Label("Capture", systemImage: "camera.viewfinder")
+                            .font(.system(.caption, weight: .semibold))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .foregroundStyle(.primary)
+                            .background(Color.primary.opacity(0.08), in: Capsule())
+                            .contentShape(Capsule())
                     }
                     .menuStyle(.borderlessButton)
                     .accessibilityHint("Deliberately capture one region or app window; continuous capture is not supported")
@@ -303,9 +311,9 @@ struct MorphingControl: View {
     private func semanticColor(_ semantic: MorphingControlPresentationPolicy.Semantic?) -> Color? {
         switch semantic {
         case .accent: return .pink
-        case .success: return .green
-        case .warning: return .orange
-        case .danger: return .red
+        case .success: return LatticeStatusSemantic.success.color
+        case .warning: return LatticeStatusSemantic.warning.color
+        case .danger: return LatticeStatusSemantic.failed.color
         case .neutral, .none: return nil
         }
     }

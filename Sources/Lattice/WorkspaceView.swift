@@ -30,6 +30,17 @@ struct WorkspaceView: View {
             ToolbarItemGroup {
                 if layout.selectedSection == .conversations {
                     Button { state.newSession() } label: { Label("New chat", systemImage: "square.and.pencil") }
+                    Button { state.toggleFileBrowser() } label: {
+                        Label("Files", systemImage: state.showFileBrowser ? "folder.fill" : "folder")
+                    }
+                    .help(state.showFileBrowser ? "Hide workspace files" : "Show workspace files")
+                    Button { state.toggleWorkspaceTerminal() } label: {
+                        Label(
+                            "Terminal",
+                            systemImage: terminalToolbarSymbol
+                        )
+                    }
+                    .help(terminalToolbarHelp)
                     Button { layout.showInspector.toggle() } label: { Label("Inspector", systemImage: "sidebar.trailing") }
                         .help(layout.showInspector ? "Hide chat inspector" : "Show chat inspector")
                     workspaceActionsMenu
@@ -239,6 +250,20 @@ struct WorkspaceView: View {
         layout.applyAdaptiveColumnVisibilityIfNeeded()
     }
 
+    private var terminalToolbarSymbol: String {
+        if state.showWorkspaceTerminal, state.workspaceTerminalLayoutSuppressed {
+            return "terminal"
+        }
+        return state.showWorkspaceTerminal ? "terminal.fill" : "terminal"
+    }
+
+    private var terminalToolbarHelp: String {
+        if state.showWorkspaceTerminal, state.workspaceTerminalLayoutSuppressed {
+            return "Terminal hidden — window too short to show dock without crushing chat"
+        }
+        return state.showWorkspaceTerminal ? "Hide workspace terminal" : "Show workspace terminal"
+    }
+
     @ViewBuilder private var workspaceLayout: some View {
         if layout.selectedSection == .conversations {
             ConversationWorkspaceLayout(state: state, layout: layout)
@@ -369,7 +394,7 @@ private struct ConversationWorkspaceLayout: View {
             if state.isOverlayVisible {
                 Color.clear
             } else {
-                ConversationView(state: state)
+                ConversationDetailShell(state: state)
                     .inspector(isPresented: $layout.showInspector) {
                         InspectorView(state: state)
                             .inspectorColumnWidth(min: 300, ideal: min(max(layout.inspectorWidth, 300), 420), max: 420)
@@ -379,6 +404,79 @@ private struct ConversationWorkspaceLayout: View {
         }
         // Prefer a usable transcript over keeping every column open at narrow widths.
         .navigationSplitViewStyle(.prominentDetail)
+    }
+}
+
+/// Transcript-first detail with optional file browser and workspace terminal docks.
+private struct ConversationDetailShell: View {
+    @ObservedObject var state: AppState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private let minimumTranscriptHeight: CGFloat = 220
+
+    var body: some View {
+        GeometryReader { geometry in
+            let terminalHeight: CGFloat = state.showWorkspaceTerminal
+                ? min(320, max(140, geometry.size.height * 0.28))
+                : 0
+            let availableForTranscript = geometry.size.height - terminalHeight
+            // Prefer transcript plane: if both docks would crush chat, collapse terminal first.
+            let showTerminal = state.showWorkspaceTerminal && availableForTranscript >= minimumTranscriptHeight
+            let suppressed = state.showWorkspaceTerminal && !showTerminal
+
+            VStack(spacing: 0) {
+                Group {
+                    if state.showFileBrowser {
+                        HSplitView {
+                            ConversationView(state: state)
+                                .frame(minWidth: 360, minHeight: minimumTranscriptHeight)
+                            FileBrowserPanel(state: state)
+                                .frame(minWidth: 280, idealWidth: 360, maxWidth: 520)
+                        }
+                    } else {
+                        ConversationView(state: state)
+                            .frame(minHeight: minimumTranscriptHeight)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                if showTerminal {
+                    Divider()
+                    TerminalPanelView(state: state)
+                        .frame(height: terminalHeight)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                } else if suppressed {
+                    Divider()
+                    HStack(spacing: 8) {
+                        Image(systemName: "terminal")
+                            .foregroundStyle(.secondary)
+                        Text("Terminal hidden — window too short")
+                            .font(LatticeTypography.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 4)
+                        Button("Hide") { state.toggleWorkspaceTerminal() }
+                            .buttonStyle(LatticeGhostButtonStyle())
+                            .accessibilityLabel("Hide terminal preference")
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color(nsColor: .windowBackgroundColor))
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Terminal dock suppressed because the window is too short")
+                }
+            }
+            .onAppear {
+                state.setWorkspaceTerminalLayoutSuppressed(suppressed)
+            }
+            .onChange(of: suppressed) { _, value in
+                state.setWorkspaceTerminalLayoutSuppressed(value)
+            }
+            .onChange(of: state.showWorkspaceTerminal) { _, _ in
+                state.setWorkspaceTerminalLayoutSuppressed(suppressed)
+            }
+        }
+        .animation(LatticeMotion.panelSpring(reduceMotion: reduceMotion), value: state.showFileBrowser)
+        .animation(LatticeMotion.panelSpring(reduceMotion: reduceMotion), value: state.showWorkspaceTerminal)
     }
 }
 
@@ -534,38 +632,28 @@ struct SessionListView: View {
     }
 
     private var sessionListEmptyState: some View {
-        ContentUnavailableView {
-            Label("No Chats", systemImage: "bubble.left.and.bubble.right")
-        } description: {
-            Text("Use New chat in the toolbar to start your first conversation.")
-                .multilineTextAlignment(.center)
-        }
+        LatticeEmptyState(
+            title: "No chats",
+            message: "Use New chat in the toolbar to start your first conversation.",
+            systemImage: "bubble.left.and.bubble.right",
+            primaryActionTitle: "New chat",
+            primaryAction: { state.newSession() }
+        )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(.horizontal, 12)
-        .accessibilityElement(children: .contain)
         .accessibilityIdentifier(LatticeAccessibilityID.sessionList)
     }
 
     private var sessionListNoSearchMatches: some View {
-        ContentUnavailableView {
-            Label("No Matches", systemImage: "magnifyingglass")
-        } description: {
-            Text("No chats match your search.")
-                .multilineTextAlignment(.center)
-        } actions: {
-            Button {
-                state.searchText = ""
-            } label: {
-                Text("Clear Search")
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.regular)
-            .accessibilityLabel("Clear Search")
-            .accessibilityHint("Clear the chat search field")
-        }
+        LatticeEmptyState(
+            title: "No matches",
+            message: "No chats match your search.",
+            systemImage: "magnifyingglass",
+            primaryActionTitle: "Clear search",
+            primaryAction: { state.searchText = "" }
+        )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(.horizontal, 12)
-        .accessibilityElement(children: .contain)
         .accessibilityIdentifier(LatticeAccessibilityID.sessionList)
     }
 
@@ -837,8 +925,7 @@ struct ProjectsView: View {
             } label: {
                 Label("Choose Workspace…", systemImage: "folder.badge.plus")
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.regular)
+            .buttonStyle(LatticePrimaryButtonStyle())
             .keyboardShortcut(.defaultAction)
             .accessibilityLabel("Choose Workspace")
             .accessibilityHint("Opens a folder picker to set the current workspace")
@@ -918,7 +1005,7 @@ struct ProjectsView: View {
             } label: {
                 Label("Choose Workspace…", systemImage: "folder.badge.plus")
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(LatticePrimaryButtonStyle())
             .accessibilityLabel("Choose Workspace")
             .accessibilityHint("Opens a folder picker to change the current workspace")
 
@@ -927,7 +1014,7 @@ struct ProjectsView: View {
             } label: {
                 Label("Reveal in Finder", systemImage: "folder")
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(LatticeSecondaryButtonStyle())
             .disabled(!hasWorkspace)
             .accessibilityLabel("Reveal in Finder")
             .accessibilityHint("Shows the workspace folder in Finder without changing it")
@@ -937,7 +1024,7 @@ struct ProjectsView: View {
             } label: {
                 Label("Copy Path", systemImage: "doc.on.doc")
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(LatticeGhostButtonStyle())
             .disabled(!hasWorkspace)
             .accessibilityLabel("Copy Path")
             .accessibilityHint("Copies the workspace path to the clipboard")

@@ -4329,6 +4329,142 @@ struct CoreVerification {
             expect(false, "Capture lifecycle starts only from explicit user initiation")
         }
 
+        // Workspace terminal is worktree-scoped and survives chat switches.
+        expect(
+            WorkspaceTerminalPolicy.survivesSessionSwitch(
+                terminalWorktreePath: "/tmp/ws",
+                previousSessionWorkspace: "/tmp/ws",
+                nextSessionWorkspace: "/tmp/other"
+            ),
+            "Workspace terminal survives chat switch"
+        )
+        expect(!WorkspaceTerminalPolicy.survivesSessionSwitch(terminalWorktreePath: ""), "Empty worktree key does not survive")
+        expect(
+            WorkspaceTerminalPolicy.shouldRemapTerminal(terminalWorktreePath: "/tmp/a", selectedWorkspacePath: "/tmp/b"),
+            "Terminal remaps when selected workspace changes"
+        )
+        expect(WorkspaceTerminalPolicy.sanitizeCommand("  ") == nil, "Terminal sanitize rejects empty commands")
+        expect(WorkspaceTerminalPolicy.sanitizeCommand(String(repeating: "a", count: 9_000))?.count == WorkspaceTerminalPolicy.maximumCommandLength, "Terminal sanitize bounds command length")
+        expect(WorkspaceTerminalPolicy.statusSemanticForExit(0) == "success" && WorkspaceTerminalPolicy.statusSemanticForExit(2) == "failed", "Terminal exit semantics distinguish zero vs non-zero")
+        var terminalStore = WorkspaceTerminalStore()
+        var terminalSnapshot = terminalStore.ensureSnapshot(forWorktreePath: "/tmp/ws")
+        WorkspaceTerminalPolicy.appendLine(.init(text: "hello"), to: &terminalSnapshot)
+        terminalStore.update(terminalSnapshot)
+        expect(terminalStore.snapshot(forWorktreePath: "/tmp/ws")?.lines.count == 1, "Workspace terminal store retains lines across logical reselection")
+        expect(
+            WorkspaceTerminalPolicy.contextAttachmentText(from: terminalSnapshot).contains("hello"),
+            "Terminal context attach builds user-initiated payload from last output"
+        )
+        expect(
+            WorkspaceTerminalPolicy.contextAttachmentText(from: WorkspaceTerminalSnapshot(worktreePath: "/tmp/ws")).contains("empty"),
+            "Empty terminal output attachment is honest"
+        )
+
+        // File listing bounds, path escape, ignore, and secret path policy.
+        expect(
+            {
+                if case .failure(let error) = WorkspaceFileListingPolicy.normalizeRelativeDirectory("../escape") {
+                    return error == .pathEscapesRoot
+                }
+                return false
+            }(),
+            "File listing rejects path escape"
+        )
+        expect(
+            WorkspaceFileListingPolicy.isSecretPath(relativePath: ".env", name: ".env"),
+            "File listing marks .env as secret"
+        )
+        expect(
+            !WorkspaceFileListingPolicy.isSecretPath(relativePath: "Sources/Tokenizer.swift", name: "Tokenizer.swift"),
+            "Tokenizer.swift is not a secret false-positive"
+        )
+        expect(
+            !WorkspaceFileListingPolicy.isSecretPath(relativePath: "Sources/App.swift", name: "App.swift"),
+            "Ordinary sources are not secret paths"
+        )
+        let listingRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lattice-verify-files-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: listingRoot) }
+        try? FileManager.default.createDirectory(at: listingRoot, withIntermediateDirectories: true)
+        for index in 0..<8 {
+            try? "x\(index)".write(
+                to: listingRoot.appendingPathComponent("f\(index).txt"),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+        try? "SECRET=1".write(to: listingRoot.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
+        let nodeModules = listingRoot.appendingPathComponent("node_modules", isDirectory: true)
+        try? FileManager.default.createDirectory(at: nodeModules, withIntermediateDirectories: true)
+        try? "pkg".write(to: nodeModules.appendingPathComponent("x.js"), atomically: true, encoding: .utf8)
+        if let listing = try? WorkspaceFileLister().list(
+            WorkspaceFileListingRequest(rootPath: listingRoot.path, maximumEntries: 3)
+        ) {
+            expect(listing.nodes.count == 3 && listing.truncated, "File listing respects entry bound")
+            expect(!listing.nodes.contains(where: { $0.name == "node_modules" }), "File listing ignores node_modules by default")
+        } else {
+            expect(false, "File listing respects entry bound")
+        }
+        if let secretPreview = try? WorkspaceFileLister().preview(rootPath: listingRoot.path, relativePath: ".env") {
+            expect(secretPreview.kind == .secretBlocked && secretPreview.text == nil, "Secret paths never open for preview")
+        } else {
+            expect(false, "Secret paths never open for preview")
+        }
+        // Intermediate symlink escape.
+        let outside = listingRoot.deletingLastPathComponent().appendingPathComponent("lattice-verify-outside-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: outside) }
+        try? FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try? "leak".write(to: outside.appendingPathComponent("secret.txt"), atomically: true, encoding: .utf8)
+        let vendorLink = listingRoot.appendingPathComponent("vendor")
+        try? FileManager.default.createSymbolicLink(at: vendorLink, withDestinationURL: outside)
+        do {
+            _ = try WorkspaceFileLister().list(WorkspaceFileListingRequest(rootPath: listingRoot.path, relativeDirectory: "vendor"))
+            expect(false, "Intermediate symlink listing is rejected")
+        } catch let error as WorkspaceFileListingError {
+            expect(error == .pathEscapesRoot, "Intermediate symlink listing is rejected")
+        } catch {
+            expect(false, "Intermediate symlink listing is rejected")
+        }
+
+        // Review notes enter composer only via explicit payload construction.
+        let followUpPayload = ReviewFollowUpPayloadPolicy.compose(
+            path: "Sources/App.swift",
+            body: "Fix the guard",
+            lineRange: WorkspaceReviewLineRange(start: 4, end: 8),
+            kind: .followUpPrompt
+        )
+        expect(followUpPayload.contains("Sources/App.swift:4-8") && followUpPayload.contains("Fix the guard"), "Review follow-up payload includes path and body")
+        let mergedDraft = ReviewFollowUpPayloadPolicy.mergeIntoDraft(
+            existingDraft: "keep",
+            payload: followUpPayload
+        )
+        expect(mergedDraft.contains("keep") && mergedDraft.contains("Fix the guard"), "Review payload merges into draft without overwrite")
+        let emptyInsert = ReviewFollowUpPayloadPolicy.mergeIntoDraft(existingDraft: "", payload: followUpPayload)
+        expect(emptyInsert == followUpPayload, "Empty draft becomes payload only")
+        expect(
+            ReviewFollowUpPayloadPolicy.mergeIntoDraft(existingDraft: emptyInsert, payload: followUpPayload) == emptyInsert,
+            "Remerge of identical payload is idempotent"
+        )
+        let hugeBody = String(repeating: "x", count: ReviewFollowUpPayloadPolicy.maximumBodyCharacters + 40)
+        expect(ReviewFollowUpPayloadPolicy.sanitizeBody(hugeBody).count == ReviewFollowUpPayloadPolicy.maximumBodyCharacters, "Review body is capped")
+
+        // Context breakdown is an estimate and separates categories.
+        let budgetSession = LatticeSession(
+            title: "Budget",
+            messages: [
+                .init(role: .user, text: "Hello from the user"),
+                .init(role: .assistant, text: "Hello from the assistant")
+            ],
+            backend: .appleIntelligence,
+            executionRoute: ExecutionRoute(mode: .code, providerID: "apple", runtimeID: "apple"),
+            attachments: [ContextAttachment(path: "/tmp/notes.md")]
+        )
+        let breakdown = LatticeContextBudgetEstimator.breakdown(session: budgetSession, draft: "draft text")
+        expect(breakdown.isEstimate && breakdown.providerReportedTotalTokens == nil, "Context breakdown labels itself as a local estimate")
+        expect(breakdown.tokens(for: .user) > 0 && breakdown.tokens(for: .draft) > 0, "Context breakdown categorizes user and draft tokens")
+        expect(breakdown.tokens(for: .attachment) > 0, "Context breakdown includes attachment estimate")
+        expect(breakdown.estimatedTotal == breakdown.slices.reduce(0) { $0 + $1.estimatedTokens }, "Context breakdown total equals slice sum")
+
         print("Core verification passed: \(checks) checks")
     }
 }

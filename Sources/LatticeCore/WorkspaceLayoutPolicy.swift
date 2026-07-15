@@ -55,8 +55,8 @@ public enum LatticeMessageRowLayoutPolicy: Sendable {
     /// Maximum bubble content width on wide transcripts.
     public static let bubbleMaxWidth: Double = 580
 
-    /// Maximum readable transcript content width on wide detail columns.
-    public static let transcriptMaxWidth: Double = 760
+    /// Maximum readable transcript content width on wide detail columns (~72–80ch).
+    public static let transcriptMaxWidth: Double = 720
 
     /// Whether message actions should use a single overflow menu.
     public static func usesCompactActions(availableWidth: Double, isUser: Bool) -> Bool {

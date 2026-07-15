@@ -20,14 +20,14 @@ struct InspectorView: View {
                         .font(.title3.weight(.semibold))
                         .accessibilityAddTraits(.isHeader)
                     if session.executionRoute.mode == .code {
-                        Picker("Inspector surface", selection: $model.surface) {
+                        Picker("Inspector surface", selection: inspectorSurfaceBinding) {
                             Text("Details").tag(InspectorSurface.details)
                             Text("Review").tag(InspectorSurface.review)
                         }
                         .pickerStyle(.segmented)
                         .accessibilityHint("Switch between route details and checkpoint change review.")
                     }
-                    if model.surface == .review && session.executionRoute.mode == .code {
+                    if effectiveSurface == .review && session.executionRoute.mode == .code {
                         CheckpointReviewView(state: state)
                     } else {
                         inspectorShell(session)
@@ -35,11 +35,45 @@ struct InspectorView: View {
                 }
                 .padding(12)
             } else {
-                ContentUnavailableView("No Chat Selected", systemImage: "bubble.left", description: Text("Select a chat to inspect its route, workspace, and context."))
-                    .padding(20)
+                LatticeEmptyState(
+                    title: "No chat selected",
+                    message: "Select a chat to inspect its route, workspace, and context.",
+                    systemImage: "bubble.left"
+                )
+                .padding(20)
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .onAppear {
+            model.surface = state.preferredInspectorSurface
+        }
+        .onChange(of: state.preferredInspectorSurface) { _, surface in
+            model.surface = surface
+        }
+        .onChange(of: state.selectedCheckpointReview?.activity) { _, activity in
+            if activity == .ready, let review = state.selectedCheckpointReview {
+                state.maybeAutoPromoteCheckpointReview(for: review)
+            }
+        }
+        .onChange(of: state.selectedCheckpointReview?.runID) { _, _ in
+            if let review = state.selectedCheckpointReview, review.activity == .ready {
+                state.maybeAutoPromoteCheckpointReview(for: review)
+            }
+        }
+    }
+
+    private var effectiveSurface: InspectorSurface {
+        state.selectedSession?.executionRoute.mode == .code ? model.surface : .details
+    }
+
+    private var inspectorSurfaceBinding: Binding<InspectorSurface> {
+        Binding(
+            get: { model.surface },
+            set: { newValue in
+                model.surface = newValue
+                state.preferredInspectorSurface = newValue
+            }
+        )
     }
 
     @ViewBuilder
@@ -121,17 +155,26 @@ struct InspectorView: View {
             }
 
             InspectorOpaqueDisclosure(title: "Context", systemImage: "paperclip") {
-                if let estimate = state.selectedContextBudgetEstimate { ContextBudgetMeter(estimate: estimate) }
+                if let estimate = state.selectedContextBudgetEstimate {
+                    ContextBudgetMeter(estimate: estimate)
+                    if let breakdown = state.selectedContextBudgetBreakdown {
+                        ContextBudgetBreakdownView(breakdown: breakdown)
+                    }
+                }
                 if session.attachments.isEmpty {
                     Text("No attached paths. Drag files or use paperclip to add context.")
-                        .font(.caption)
+                        .font(LatticeTypography.caption)
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(session.attachments) { attachment in
                         HStack(spacing: 8) {
                             Label(attachment.name, systemImage: attachment.isImage ? "photo" : "doc").lineLimit(1)
                             Spacer(minLength: 4)
-                            if attachment.isMissing { Text("Missing").font(.caption2).foregroundStyle(.orange) }
+                            if attachment.isMissing {
+                                Text("Missing")
+                                    .font(LatticeTypography.caption)
+                                    .foregroundStyle(LatticeStatusSemantic.warning.color)
+                            }
                             Button { state.removeAttachment(attachment.id) } label: { Image(systemName: "xmark") }
                                 .buttonStyle(LatticeIconButtonStyle(size: .compact))
                                 .accessibilityLabel("Remove \(attachment.name)")
@@ -213,7 +256,7 @@ struct InspectorView: View {
     }
 }
 
-private enum InspectorSurface: Hashable {
+enum InspectorSurface: String, Hashable, Sendable {
     case details
     case review
 }

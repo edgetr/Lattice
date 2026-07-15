@@ -61,45 +61,83 @@ struct ContextBudgetMeter: View {
             .accessibilityHidden(true)
     }
 
-    private var statusSymbol: String {
+    private var statusSemantic: LatticeStatusSemantic {
         switch estimate.status {
-        case .comfortable: "checkmark.circle.fill"
-        case .tight: "exclamationmark.circle.fill"
-        case .nearLimit: "exclamationmark.triangle.fill"
-        case .overLimit: "xmark.octagon.fill"
+        case .comfortable: .success
+        case .tight: .warning
+        case .nearLimit: .approval
+        case .overLimit: .failed
         }
     }
 
-    /// Accent used for progress and glass tint (semantic system colors).
-    private var statusAccent: Color {
-        switch estimate.status {
-        case .comfortable: Color(nsColor: .systemGreen)
-        case .tight: Color(nsColor: .systemYellow)
-        case .nearLimit: Color(nsColor: .systemOrange)
-        case .overLimit: Color(nsColor: .systemRed)
-        }
-    }
+    private var statusSymbol: String { statusSemantic.systemImage }
+
+    /// Accent used for progress and glass tint (shared semantic map).
+    private var statusAccent: Color { statusSemantic.color }
 
     private var statusBackground: Color {
-        let baseOpacity: Double
-        switch estimate.status {
-        case .comfortable: baseOpacity = increasedContrast ? 0.22 : 0.14
-        case .tight: baseOpacity = increasedContrast ? 0.24 : 0.16
-        case .nearLimit: baseOpacity = increasedContrast ? 0.26 : 0.18
-        case .overLimit: baseOpacity = increasedContrast ? 0.28 : 0.18
-        }
+        let baseOpacity = increasedContrast ? 0.22 : statusSemantic.fillOpacity
         // Slightly lift fill in light mode so warning chips remain readable on glass.
         let schemeBoost = (colorScheme == .light && !increasedContrast) ? 0.02 : 0
         return statusAccent.opacity(baseOpacity + schemeBoost)
     }
 
     private var statusBorder: Color {
-        statusAccent.opacity(increasedContrast ? 0.55 : 0.28)
+        statusAccent.opacity(increasedContrast ? 0.55 : statusSemantic.borderOpacity)
     }
 
     static func format(_ tokens: Int) -> String {
         if tokens >= 1_000_000 { return "\(tokens / 1_000_000)M" }
         if tokens >= 1_000 { return "\(tokens / 1_000)K" }
         return "\(tokens)"
+    }
+}
+
+/// OpenCode-style category breakdown. All values are local estimates unless a
+/// provider-reported total is present separately.
+struct ContextBudgetBreakdownView: View {
+    let breakdown: LatticeContextBudgetBreakdown
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Text("Breakdown")
+                    .font(LatticeTypography.captionStrong)
+                Text(breakdown.isEstimate ? "local estimate" : "reported")
+                    .font(LatticeTypography.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 4)
+                if let providerTotal = breakdown.providerReportedTotalTokens {
+                    Text("Provider: \(ContextBudgetMeter.format(providerTotal))")
+                        .font(LatticeTypography.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+            }
+            ForEach(breakdown.slices.filter { $0.estimatedTokens > 0 }, id: \.category) { slice in
+                HStack(spacing: 8) {
+                    Text(slice.category.displayName)
+                        .font(LatticeTypography.caption)
+                    Spacer(minLength: 4)
+                    Text(ContextBudgetMeter.format(slice.estimatedTokens))
+                        .font(LatticeTypography.mono)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+            }
+            Text("Estimates use a local heuristic. Provider tokenizers may differ.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.top, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Context category breakdown")
+        .accessibilityValue(
+            breakdown.slices
+                .filter { $0.estimatedTokens > 0 }
+                .map { "\($0.category.displayName) \(ContextBudgetMeter.format($0.estimatedTokens))" }
+                .joined(separator: ", ")
+        )
     }
 }
