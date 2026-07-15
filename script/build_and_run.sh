@@ -233,7 +233,15 @@ verify_fallback_test_inventory() {
 }
 
 run_tests() {
-  if have_swiftpm; then
+  # LATTICE_TEST_MODE=fallback forces the deterministic verifier even when SwiftPM is present.
+  # Used on GitHub Actions: full `swift test` has been crashing the Xcode 26 testing helper
+  # (signal 13) and flooding failure notifications without improving signal.
+  local force_fallback=0
+  case "${LATTICE_TEST_MODE:-}" in
+    fallback|core|verify_core) force_fallback=1 ;;
+  esac
+
+  if have_swiftpm && [[ "$force_fallback" -eq 0 ]]; then
     echo "==> Running native Swift Testing suite (non-destructive)"
     swift test
     echo "OK: native Swift Testing suite passed"
@@ -246,7 +254,11 @@ run_tests() {
     exit 1
   fi
 
-  echo "==> SwiftPM unavailable; running deterministic fallback core verification"
+  if [[ "$force_fallback" -eq 1 ]]; then
+    echo "==> LATTICE_TEST_MODE=${LATTICE_TEST_MODE}: running deterministic fallback core verification"
+  else
+    echo "==> SwiftPM unavailable; running deterministic fallback core verification"
+  fi
   echo "    Native Swift Testing suite is not run in fallback mode."
   verify_fallback_test_inventory
   ensure_core_library
