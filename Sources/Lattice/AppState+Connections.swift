@@ -23,6 +23,8 @@ extension AppState {
             hermes: hermesCatalogStatus,
             ollama: ollamaCatalogStatus
         )
+        // Capture map state before markLoading so cancel can restore exact prior snapshots.
+        let previousSnapshots = providerConnections.snapshots
         isRefreshingConnections = true
         providerConnections.markLoading(.codex)
         providerConnections.markLoading(.grok)
@@ -44,16 +46,8 @@ extension AppState {
                        localModelRefreshGeneration.isCurrent(localGeneration) {
                         ollamaCatalogStatus = previousCatalogStatuses.ollama
                     }
-                    // Restore snapshot map catalog statuses from the dual-written legacy fields path
-                    // by re-upserting last known non-loading status via ready=false presence.
-                    for key in ProviderConnectionKey.allCases {
-                        var snap = providerConnections.snapshot(for: key)
-                        if snap.catalogStatus == .loading {
-                            snap.catalogStatus = .unknown
-                            snap.ready = false
-                            providerConnections.setSnapshot(snap, for: key)
-                        }
-                    }
+                    // Restore the pre-refresh map (not .unknown) so dual-write stays aligned.
+                    providerConnections.replaceAll(previousSnapshots)
                 }
                 isRefreshingConnections = false
             }

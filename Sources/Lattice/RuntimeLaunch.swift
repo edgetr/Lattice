@@ -129,10 +129,11 @@ enum RuntimeLaunch: Equatable {
                 guard let provider else {
                     return .failed("The selected Hermes route is incomplete: provider is missing.")
                 }
-                // Always supply a systemIdentity string so the structured Hermes stream path is used.
-                let systemIdentity = launch.hermesSystemIdentity
-                    ?? launch.developerInstructions
-                    ?? "Lattice Hermes work route"
+                // Fail closed without a real identity — never invent a silent placeholder.
+                guard let systemIdentity = launch.hermesSystemIdentity ?? launch.developerInstructions,
+                      !systemIdentity.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return .failed("The selected Hermes route is incomplete: system identity is missing.")
+                }
                 return .acp(ACPRuntimeLaunch(
                     provider: .hermes,
                     sessionID: launch.sessionID,
@@ -194,10 +195,10 @@ enum RuntimeLaunch: Equatable {
                     model: route.model,
                     reasoningEffort: launch.reasoningEffort,
                     allowFileModification: launch.allowFileModification,
-                    mode: .code,
-                    workspaceInstructionsTrusted: false,
-                    instructionEnvelope: nil,
-                    openCodeAPIKey: nil
+                    mode: launch.route.mode == .local ? .code : launch.route.mode,
+                    workspaceInstructionsTrusted: launch.instructionEnvelope?.workspaceInstructionsTrusted ?? false,
+                    instructionEnvelope: launch.instructionEnvelope,
+                    openCodeAPIKey: launch.openCodeAPIKey
                 ))
             }
         }

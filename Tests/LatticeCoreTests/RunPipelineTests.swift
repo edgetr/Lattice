@@ -103,3 +103,78 @@ struct RunPipelineTests {
         }
     }
 }
+
+    @Test func plannerRecoveryKeepsOrResetsThreadConsistently() {
+        let session = LatticeSession(
+            title: "t",
+            messages: [
+                .init(role: .user, text: "first"),
+                .init(role: .assistant, text: "reply with enough text for context")
+            ],
+            backend: .grok(model: "grok-4"),
+            executionRoute: ExecutionRoute(mode: .code, providerID: "grok", modelID: "grok-4", runtimeID: "grok"),
+            harnessThreadID: "thread-abc"
+        )
+        let plan = RunLaunchPlanner.plan(
+            .init(
+                session: session,
+                submittedText: "follow-up",
+                additionalContext: "",
+                tokenLimit: 8_000,
+                effectiveRuntimeID: "grok"
+            )
+        )
+        #expect(plan.usesPromptDrivenBackend)
+        #expect(plan.recoveryPrompt != nil)
+        // Either keep the provider thread or explicitly reset; never invent a third state.
+        if plan.resetsHarnessSession {
+            #expect(plan.routeThreadID == nil)
+        } else {
+            #expect(plan.routeThreadID == "thread-abc")
+        }
+    }
+
+    @Test func reducerNoOpsWhenNotStreamingOrNoAssistant() {
+        let idle = SessionRunState(
+            isStreaming: false,
+            lastAssistantText: "x",
+            hasAssistantMessage: true,
+            isSuppressingInlineImagePayload: false
+        )
+        let idleResult = SessionRunReducer.reduce(state: idle, event: .assistantDelta("y"))
+        #expect(idleResult.assistantText == nil)
+        #expect(idleResult.effects.isEmpty)
+
+        let noAssistant = SessionRunState(
+            isStreaming: true,
+            lastAssistantText: "",
+            hasAssistantMessage: false,
+            isSuppressingInlineImagePayload: false
+        )
+        let noAssistResult = SessionRunReducer.reduce(state: noAssistant, event: .assistantDelta("y"))
+        #expect(noAssistResult.assistantText == nil)
+    }
+
+    @Test func snapshotReadyAlwaysMatchesReadinessFormula() {
+        let lying = ProviderRuntimeSnapshot(
+            installed: true,
+            authenticated: true,
+            catalogStatus: .loaded,
+            models: [],
+            harnessModels: [],
+            runnableModelCount: 0,
+            ready: true // ignored — single formula wins
+        )
+        #expect(!lying.ready)
+        #expect(!lying.readiness.isRunnable)
+        #expect(lying.ready == lying.readiness.isRunnable)
+        let consistent = ProviderRuntimeSnapshot(
+            installed: true,
+            authenticated: true,
+            catalogStatus: .loaded,
+            harnessModels: [HarnessModel(id: "a", name: "a")],
+            runnableModelCount: 1
+        )
+        #expect(consistent.ready)
+        #expect(consistent.ready == consistent.readiness.isRunnable)
+    }

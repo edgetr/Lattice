@@ -1189,6 +1189,28 @@ public enum SessionPortableArchiveImporter {
             guard route.modelID == backendModel else {
                 throw SessionPortableArchive.ArchiveError.invalidField("chat.executionRoute.modelID")
             }
+            // Reject inconsistent privacy/backend/route triples at ingest, not only at launch.
+            let privacy = SessionPrivacyMode(rawValue: privacyMode) ?? .cloudAllowed
+            let backend: ChatBackend = {
+                switch backendRoute {
+                case "codex": return .codex(model: backendModel ?? "")
+                case "grok": return .grok(model: backendModel ?? "")
+                case "opencode": return .openCode(model: backendModel ?? "")
+                case "antigravity": return .antigravity(model: backendModel ?? "")
+                case "appleIntelligence": return .appleIntelligence
+                case "ollama": return .ollama(model: backendModel ?? "")
+                default: return .codex(model: backendModel ?? "")
+                }
+            }()
+            if let rejection = SessionLaunchIntegrity.importRejection(
+                backend: backend,
+                privacyMode: privacy,
+                route: route
+            ) {
+                throw SessionPortableArchive.ArchiveError.invalidField(
+                    "chat.privacyMode/backend/executionRoute (\(SessionLaunchIntegrity.userMessage(for: rejection)))"
+                )
+            }
             mode = decodedMode
             executionRoute = route
         } else {

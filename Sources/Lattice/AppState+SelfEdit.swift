@@ -1476,13 +1476,13 @@ extension AppState {
             piInstalled = cached.providers["pi"]?.installed ?? false
             hermesInstalled = cached.providers["hermes"]?.installed ?? false
             ollamaInstalled = cached.providers["ollama"]?.installed ?? false
-            ollamaReady = cached.providers["ollama"]?.authenticated ?? false
-            // Cached state never makes a route runnable. Live model/runtime probes
-            // repopulate catalogs and readiness immediately after initialization.
+            // Hydrate map + legacy fields with the same fail-closed ready formula (never runnable from cache).
+            let hydrated = ProviderRuntimeSnapshotStore.hydratePresence(from: cached.providers)
+            providerConnections.replaceAll(hydrated)
+            ollamaReady = false
             codexReady = false
             grokReady = false
             openCodeReady = false
-            providerConnections.replaceAll(ProviderRuntimeSnapshotStore.hydratePresence(from: cached.providers))
         }
     }
 

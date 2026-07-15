@@ -362,7 +362,24 @@ extension AppState {
             in: &outbox,
             ledger: &receipts
         )
-        guard result == .dequeued || result == .alreadyDequeued else { return false }
+        switch result {
+        case .dequeued, .alreadyDequeued:
+            break
+        case .rejected(let rejection):
+            // Provider finished but local dequeue was rejected — leave a durable failure, not a stuck claim.
+            _ = SessionInputOutboxPolicy.recordFailure(
+                entryID: attempt.entryID,
+                attemptID: attempt.attemptID,
+                reason: .init(
+                    code: .dispatchRejected,
+                    detail: "Local dequeue was rejected (\(String(describing: rejection))). Review the queued input before retrying."
+                ),
+                in: &sessions[index].queuedFollowUps
+            )
+            sessions[index].lastUpdated = .now
+            threadActivityLanes.apply(.queued(sessions[index].queuedFollowUps.count), to: id)
+            return false
+        }
         sessions[index].queuedFollowUps = outbox
         sessions[index].inputOutboxReceipts = receipts
         sessions[index].lastUpdated = .now
@@ -900,22 +917,12 @@ extension AppState {
 
     /// Integrity check before stream launch: privacy + route/backend consistency.
     func sessionMayLaunchProviderRun(_ session: LatticeSession) -> String? {
-        guard SessionPrivacyPolicy.allows(session.backend, in: session.privacyMode) else {
-            return SessionPrivacyPolicy.blockedMessage(for: session.backend, in: session.privacyMode)
-                ?? SessionPrivacyPolicy.cloudBlockedMessage
-        }
-        if session.privacyMode == .localOnly {
-            if session.executionRoute.mode != .local || !session.backend.isLocal {
-                return SessionPrivacyPolicy.cloudBlockedMessage
-            }
-        }
-        if let projected = RouteRuntimeMap.backendProjection(for: session.executionRoute),
-           projected.id != session.backend.id,
-           ExecutionRouteResolver.isDeclared(session.executionRoute) {
-            // Declared route and durable backend disagree — refuse rather than launch the wrong provider.
-            return "This chat's route and backend disagree. Start a new chat or pick a model again."
-        }
-        return nil
+        guard let rejection = SessionLaunchIntegrity.launchRejection(
+            backend: session.backend,
+            privacyMode: session.privacyMode,
+            route: session.executionRoute
+        ) else { return nil }
+        return SessionLaunchIntegrity.userMessage(for: rejection)
     }
 
     func canRunDeclaredRoute(_ route: ExecutionRoute) -> Bool {
@@ -1339,7 +1346,13 @@ extension AppState {
                 schedulerCompletion: .cancel
             )
         } else {
-            // No active run ID — still clear streaming UI and scheduler claim.
+            // Queued / pre-launch stop: no active runID, but a dispatching outbox claim can still stick.
+            if dispatchingOutboxAttempt(for: id) != nil {
+                failDispatchingOutbox(
+                    for: id,
+                    reason: .init(code: .cancelled, detail: "The run was stopped before the provider stream started.")
+                )
+            }
             if let request = submittedRequests[id] { retryableRequests[id] = request }
             submittedRequests[id] = nil
             inlineImagePayloadSuppression.remove(id)

@@ -1198,7 +1198,7 @@ struct CoreVerification {
         let normalizedRoute = ExecutionRoutePolicy.normalize(staleRoute, fallbackEngineID: "codex", fallbackHarnessID: "codex")
         expect(normalizedRoute == EngineHarnessSelection(engineID: "codex", harnessID: "codex"), "Unqualified execution route normalized")
         expect(ExecutionRoutePolicy.normalize(route, fallbackEngineID: "codex", fallbackHarnessID: "codex") == route, "Qualified execution route preserved")
-        expect(ExecutionRoutePolicy.normalize(EngineHarnessSelection(engineID: "codex", harnessID: "grok"), fallbackEngineID: "opencode", fallbackHarnessID: "opencode") == EngineHarnessSelection(engineID: "codex", harnessID: "codex"), "Incompatible execution route normalized")
+        expect(ExecutionRoutePolicy.normalize(EngineHarnessSelection(engineID: "codex", harnessID: "grok"), fallbackEngineID: "opencode", fallbackHarnessID: "opencode") == EngineHarnessSelection(engineID: "codex", harnessID: "pi"), "Incompatible execution route normalized to declared default runtime")
         let modeCatalog = ExecutionRouteResolver.catalog(readiness: .validating)
         expect(modeCatalog.entries(for: .code).count == 4, "Code route catalog filters by mode")
         expect(modeCatalog.entries(for: .work).count == 3, "Work route catalog filters by mode")
@@ -3641,7 +3641,8 @@ struct CoreVerification {
             workspacePath: "/Users/secret/workspace",
             attachments: [ContextAttachment(path: "/Users/secret/file.txt")],
             policy: .ask,
-            privacyMode: .localOnly,
+            // cloudAllowed: this fixture tests path/thread privacy of export, not local-only mode.
+            privacyMode: .cloudAllowed,
             actions: [
                 SessionAction(messageID: archiveMessageID, kind: .tool, toolKind: .read, title: "Read secret-token", detail: "provider-secret-value", status: .completed, createdAt: archiveDate, updatedAt: archiveDate),
                 SessionAction(messageID: archiveMessageID, kind: .tool, title: "Running", detail: "live", status: .running, createdAt: archiveDate, updatedAt: archiveDate),
@@ -4547,6 +4548,53 @@ struct CoreVerification {
         expect(reducedDone.effects == [.finalize(.completed)] && !reducedDone.state.isStreaming, "Reducer finalizes completed")
         expect(SessionRunReducer.terminal(for: .failed("x")) == .failed("x"), "Reducer classifies failed terminal")
         expect(SessionRunReducer.terminal(for: .sessionStarted(UUID())) == nil, "Non-terminal events have no terminal")
+
+
+        // SessionLaunchIntegrity pure privacy/route matrix (fallback gate).
+        expect(
+            SessionLaunchIntegrity.launchRejection(
+                backend: .codex(model: "gpt-5.5"),
+                privacyMode: .localOnly,
+                route: ExecutionRoute(mode: .local, providerID: "apple", runtimeID: "lattice")
+            ) == .privacyBlocksCloudBackend,
+            "localOnly rejects cloud backend even with local route"
+        )
+        expect(
+            SessionLaunchIntegrity.launchRejection(
+                backend: .appleIntelligence,
+                privacyMode: .localOnly,
+                route: ExecutionRoute(mode: .code, providerID: "apple", modelID: nil, runtimeID: "lattice")
+            ) == .localOnlyNonLocalRoute,
+            "localOnly rejects non-local declared route mode"
+        )
+        expect(
+            SessionLaunchIntegrity.launchRejection(
+                backend: .codex(model: "gpt-5.5"),
+                privacyMode: .cloudAllowed,
+                route: ExecutionRoute(mode: .local, providerID: "apple", runtimeID: "lattice")
+            ) == .latticeRouteCloudBackend,
+            "local route never launches cloud backend"
+        )
+        expect(
+            SessionLaunchIntegrity.launchRejection(
+                backend: .appleIntelligence,
+                privacyMode: .localOnly,
+                route: ExecutionRoute(mode: .local, providerID: "apple", runtimeID: "lattice")
+            ) == nil,
+            "matching localOnly + apple + lattice allows launch"
+        )
+        expect(
+            SessionLaunchIntegrity.importRejection(
+                backend: .codex(model: "gpt-5.5"),
+                privacyMode: .localOnly,
+                route: ExecutionRoute(mode: .code, providerID: "codex", modelID: "gpt-5.5", runtimeID: "pi")
+            ) == .privacyBlocksCloudBackend,
+            "import rejects localOnly + cloud backend"
+        )
+        expect(
+            ExecutionRoutePolicy.defaultHarnessID(for: "codex") == "pi",
+            "defaultHarnessID for codex aligns with RouteRuntimeMap pi"
+        )
 
         print("Core verification passed: \(checks) checks")
     }

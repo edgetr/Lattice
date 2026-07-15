@@ -56,7 +56,8 @@ public struct ProviderRuntimeSnapshot: Equatable, Sendable {
         let count = runnableModelCount
             ?? max(models.count, harnessModels.count)
         self.runnableModelCount = max(0, count)
-        self.ready = ready ?? ProviderRuntimeSnapshotStore.computeReady(
+        // Single formula: stored ready always matches readiness.isRunnable.
+        self.ready = ProviderRuntimeSnapshotStore.computeReady(
             installed: installed,
             authenticated: authenticated,
             catalogStatus: catalogStatus,

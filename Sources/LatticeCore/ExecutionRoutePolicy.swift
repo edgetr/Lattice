@@ -20,13 +20,16 @@ public enum ExecutionRoutePolicy {
         Set(qualifiedEngineIDs.filter { compatibleHarnessIDs(for: $0).contains(harnessID) })
     }
 
+    /// Declared Wave-1 default runtimes (aligned with `RouteRuntimeMap` / catalog templates).
+    /// Prefer `RouteRuntimeMap.defaultRuntimeID(mode:providerID:)` for mode-aware selection.
     public static func defaultHarnessID(for engineID: String) -> String? {
+        // Code-mode declared defaults: codex/opencode → pi; others keep direct harness IDs.
         switch engineID {
-        case "codex": "codex"
-        case "opencode": "opencode"
-        case "grok": "grok"
-        case "antigravity": "antigravity"
-        case "ollama", "apple": "lattice"
+        case "codex": RouteRuntimeMap.defaultRuntimeID(mode: .code, providerID: "codex") ?? "pi"
+        case "opencode": RouteRuntimeMap.defaultRuntimeID(mode: .code, providerID: "opencode") ?? "pi"
+        case "grok": RouteRuntimeMap.defaultRuntimeID(mode: .code, providerID: "grok") ?? "grok"
+        case "antigravity": RouteRuntimeMap.defaultRuntimeID(mode: .code, providerID: "antigravity") ?? "antigravity"
+        case "ollama", "apple": RouteRuntimeMap.defaultRuntimeID(mode: .local, providerID: engineID == "apple" ? "apple" : "ollama") ?? "lattice"
         default: nil
         }
     }

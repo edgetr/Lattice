@@ -22,18 +22,16 @@ extension AppState {
             setActivity([.init(icon: "arrow.triangle.2.circlepath", title: "Provider session recovery", detail: detail)], sessionID: id)
             persist()
         case .assistantDelta(let delta):
+            guard let messageIndex = sessions[index].messages.indices.last,
+                  sessions[index].messages[messageIndex].role == .assistant else { return }
             let reduceState = SessionRunState(
                 isStreaming: sessions[index].isStreaming,
-                lastAssistantText: sessions[index].messages.last?.role == .assistant
-                    ? sessions[index].messages.last!.text
-                    : "",
-                hasAssistantMessage: sessions[index].messages.last?.role == .assistant,
+                lastAssistantText: sessions[index].messages[messageIndex].text,
+                hasAssistantMessage: true,
                 isSuppressingInlineImagePayload: inlineImagePayloadSuppression.contains(id)
             )
             let reduced = SessionRunReducer.reduce(state: reduceState, event: .assistantDelta(delta))
-            guard let assistantText = reduced.assistantText,
-                  sessions[index].messages.last?.role == .assistant else { return }
-            let messageIndex = sessions[index].messages.count - 1
+            guard let assistantText = reduced.assistantText else { return }
             sessions[index].messages[messageIndex].text = assistantText
             if reduced.isSuppressingInlineImagePayload == true {
                 inlineImagePayloadSuppression.insert(id)
@@ -331,8 +329,8 @@ extension AppState {
         backend: ChatBackend,
         schedulerCompletion: FinalizeSchedulerCompletion = .finish
     ) {
-        // Ignore stale terminals after stop already finalized this runID.
-        if activeRunIDs[id] != nil && activeRunIDs[id] != runID { return }
+        // Only the currently active run may finalize once. Nil or mismatched runIDs are stale.
+        guard activeRunIDs[id] == runID else { return }
 
         switch terminal {
         case .completed:
