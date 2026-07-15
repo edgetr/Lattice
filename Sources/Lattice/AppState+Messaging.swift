@@ -8,6 +8,28 @@ import LatticeCore
 
 @MainActor
 extension AppState {
+    // MARK: - Derived route identity (no stored selectedRoute* authority)
+
+    /// Derived route engine for composer/default when no session is selected.
+    var selectedRouteEngineID: String {
+        if let backend = composerSelectionBackend ?? Optional(defaultBackend) {
+            return Self.engineID(for: backend)
+        }
+        return Self.engineID(for: defaultBackend)
+    }
+
+    /// Derived route harness/runtime for composer/default when no session is selected.
+    var selectedRouteHarnessID: String {
+        if let session = selectedSession {
+            return effectiveHarnessID(for: session)
+        }
+        if let mode = composerSelectionMode, let backend = composerSelectionBackend,
+           let route = ExecutionRouteResolver.resolve(mode: mode, backend: backend) {
+            return route.runtimeID
+        }
+        return Self.defaultHarnessID(for: composerSelectionBackend ?? defaultBackend)
+    }
+
     func send(_ text: String) {
         if handleSelfEditReviewDecision(text) { return }
         guard let submission = prepareSubmission(text) else { return }
@@ -210,10 +232,7 @@ extension AppState {
 
     @discardableResult
     func runNextQueuedFollowUpIfPossible(for id: UUID) -> Bool {
-        guard let index = sessions.firstIndex(where: { $0.id == id }),
-              !sessions[index].isStreaming,
-              let followUp = sessions[index].queuedFollowUps.first else { return false }
-        return dispatchQueuedFollowUp(followUp.id, sessionID: id, afterExplicitReview: false)
+        runOrchestrator.runNextQueuedFollowUpIfPossible(for: id)
     }
 
     /// Claims the FIFO head durably before it can reach a provider. Local dequeue is committed
@@ -224,99 +243,7 @@ extension AppState {
         sessionID id: UUID,
         afterExplicitReview: Bool
     ) -> Bool {
-        guard let index = sessions.firstIndex(where: { $0.id == id }),
-              !sessions[index].isStreaming,
-              let entryIndex = sessions[index].queuedFollowUps.firstIndex(where: { $0.id == queuedID }),
-              entryIndex == sessions[index].queuedFollowUps.startIndex else { return false }
-
-        // Resolve legacy/runtime route normalization before comparing the captured authority.
-        // A normalization that changes execution context must block auto-send like any user change.
-        normalizeSessionBackendBeforeRun(at: index)
-        let context = inputOutboxContext(for: sessions[index])
-        if afterExplicitReview {
-            switch SessionInputOutboxPolicy.automaticDispatchEligibility(
-                of: queuedID,
-                currentContext: context,
-                in: sessions[index].queuedFollowUps
-            ) {
-            case .eligible:
-                break
-            case .ineligible(.contextMismatch):
-                sessions[index].queuedFollowUps[entryIndex].lifecycle = .blocked(.contextMismatch)
-                fallthrough
-            case .ineligible:
-                guard SessionInputOutboxPolicy.acceptExplicitReview(
-                    entryID: queuedID,
-                    currentContext: context,
-                    in: &sessions[index].queuedFollowUps
-                ) == .applied else { return false }
-            }
-        } else {
-            guard SessionInputOutboxPolicy.automaticDispatchEligibility(
-                of: queuedID,
-                currentContext: context,
-                in: sessions[index].queuedFollowUps
-            ) == .eligible else {
-                if sessions[index].queuedFollowUps[entryIndex].context != context,
-                   sessions[index].queuedFollowUps[entryIndex].context != nil {
-                    sessions[index].queuedFollowUps[entryIndex].lifecycle = .blocked(.contextMismatch)
-                    sessions[index].lastUpdated = .now
-                    persist()
-                }
-                return false
-            }
-        }
-
-        let beforeClaim = sessions[index]
-        let attemptID = UUID()
-        guard SessionInputOutboxPolicy.claimDispatch(
-            entryID: queuedID,
-            currentContext: context,
-            in: &sessions[index].queuedFollowUps,
-            attemptID: attemptID
-        ) == .claimed(attemptID: attemptID) else { return false }
-        sessions[index].lastUpdated = .now
-        guard persist() == .saved else {
-            sessions[index] = beforeClaim
-            return false
-        }
-
-        guard let followUp = sessions[index].queuedFollowUps.first(where: { $0.id == queuedID }),
-              let submission = prepareSubmission(followUp.text) else {
-            _ = SessionInputOutboxPolicy.recordFailure(
-                entryID: queuedID,
-                attemptID: attemptID,
-                reason: .init(code: .localValidationFailed, detail: "The queued input is no longer valid."),
-                in: &sessions[index].queuedFollowUps
-            )
-            sessions[index].lastUpdated = .now
-            persist()
-            return false
-        }
-
-        let accepted: Bool
-        if sessions[index].messages.contains(where: { $0.id == queuedID && $0.role == .user }) {
-            accepted = restartAcceptedOutboxSubmission(submission, for: id, at: index)
-        } else {
-            accepted = startPreparedSubmission(submission, for: id, at: index, sourceOutboxID: queuedID)
-        }
-        guard accepted else {
-            if let refreshedIndex = sessions.firstIndex(where: { $0.id == id }) {
-                _ = SessionInputOutboxPolicy.recordFailure(
-                    entryID: queuedID,
-                    attemptID: attemptID,
-                    reason: .init(code: .providerUnavailable, detail: "The selected route is unavailable."),
-                    in: &sessions[refreshedIndex].queuedFollowUps
-                )
-                sessions[refreshedIndex].lastUpdated = .now
-                persist()
-            }
-            return false
-        }
-
-        // Keep the durable claim until the provider reaches a terminal outcome. The queued
-        // input ID is also the local user-message ID, so a reviewed retry never duplicates it.
-        return true
+        runOrchestrator.dispatchQueuedFollowUp(queuedID, sessionID: id, afterExplicitReview: afterExplicitReview)
     }
 
     func restartAcceptedOutboxSubmission(
@@ -324,94 +251,20 @@ extension AppState {
         for id: UUID,
         at index: Int
     ) -> Bool {
-        guard canRunSession(sessions[index]) else {
-            setError(routeUnavailableMessage(for: sessions[index]) ?? "Choose a connected model.", sessionID: id)
-            return false
-        }
-        guard ensureUnsafeProviderRouteAcknowledged(for: sessions[index]) else { return false }
-        let beforeSubmission = sessions[index]
-        markConversationOutgoingAction(for: id)
-        sessions[index].messages.append(.init(role: .assistant, text: ""))
-        submittedRequests[id] = submission.runText
-        retryableRequests[id] = nil
-        guard startRun(for: id, at: index, submittedText: submission.runText) else {
-            sessions[index] = beforeSubmission
-            submittedRequests[id] = nil
-            return false
-        }
-        return true
+        runOrchestrator.restartAcceptedOutboxSubmission(submission, for: id, at: index)
     }
 
     func dispatchingOutboxAttempt(for id: UUID) -> (entryID: UUID, attemptID: UUID)? {
-        guard let session = sessions.first(where: { $0.id == id }),
-              let entry = session.queuedFollowUps.first else { return nil }
-        guard case .dispatching(let attemptID) = entry.lifecycle else { return nil }
-        return (entry.id, attemptID)
+        runOrchestrator.dispatchingOutboxAttempt(for: id)
     }
 
     @discardableResult
     func completeDispatchingOutbox(for id: UUID) -> Bool {
-        guard let index = sessions.firstIndex(where: { $0.id == id }),
-              let attempt = dispatchingOutboxAttempt(for: id) else { return true }
-        let beforeDequeue = sessions[index]
-        var outbox = sessions[index].queuedFollowUps
-        var receipts = sessions[index].inputOutboxReceipts
-        let result = SessionInputOutboxPolicy.completeLocalDequeue(
-            entryID: attempt.entryID,
-            attemptID: attempt.attemptID,
-            in: &outbox,
-            ledger: &receipts
-        )
-        switch result {
-        case .dequeued, .alreadyDequeued:
-            break
-        case .rejected(let rejection):
-            // Provider finished but local dequeue was rejected — leave a durable failure, not a stuck claim.
-            _ = SessionInputOutboxPolicy.recordFailure(
-                entryID: attempt.entryID,
-                attemptID: attempt.attemptID,
-                reason: .init(
-                    code: .dispatchRejected,
-                    detail: "Local dequeue was rejected (\(String(describing: rejection))). Review the queued input before retrying."
-                ),
-                in: &sessions[index].queuedFollowUps
-            )
-            sessions[index].lastUpdated = .now
-            threadActivityLanes.apply(.queued(sessions[index].queuedFollowUps.count), to: id)
-            return false
-        }
-        sessions[index].queuedFollowUps = outbox
-        sessions[index].inputOutboxReceipts = receipts
-        sessions[index].lastUpdated = .now
-        threadActivityLanes.apply(.queued(sessions[index].queuedFollowUps.count), to: id)
-        guard persist() == .saved else {
-            sessions[index] = beforeDequeue
-            _ = SessionInputOutboxPolicy.recordFailure(
-                entryID: attempt.entryID,
-                attemptID: attempt.attemptID,
-                reason: .init(
-                    code: .dispatchRejected,
-                    detail: "The provider completed, but local dequeue could not be saved. Remove it after confirming the response, or review before retrying."
-                ),
-                in: &sessions[index].queuedFollowUps
-            )
-            threadActivityLanes.apply(.queued(sessions[index].queuedFollowUps.count), to: id)
-            return false
-        }
-        return true
+        runOrchestrator.completeDispatchingOutbox(for: id)
     }
 
     func failDispatchingOutbox(for id: UUID, reason: QueuedFollowUpFailureReason) {
-        guard let index = sessions.firstIndex(where: { $0.id == id }),
-              let attempt = dispatchingOutboxAttempt(for: id) else { return }
-        _ = SessionInputOutboxPolicy.recordFailure(
-            entryID: attempt.entryID,
-            attemptID: attempt.attemptID,
-            reason: reason,
-            in: &sessions[index].queuedFollowUps
-        )
-        sessions[index].lastUpdated = .now
-        threadActivityLanes.apply(.queued(sessions[index].queuedFollowUps.count), to: id)
+        runOrchestrator.failDispatchingOutbox(for: id, reason: reason)
     }
 
     func inputOutboxContext(for session: LatticeSession) -> SessionInputOutboxContext {
@@ -501,253 +354,15 @@ extension AppState {
 
     @discardableResult
     func startRun(for id: UUID, at index: Int, submittedText: String) -> Bool {
-        // Defense in depth: every provider stream launch stays behind the same
-        // acknowledgement check, even if a future caller skips send validation.
-        guard ensureUnsafeProviderRouteAcknowledged(for: sessions[index]) else {
-            sessions[index].isStreaming = false
-            setError("Provider route blocked until its unsafe-route acknowledgement is accepted.", sessionID: id)
-            return false
-        }
-        sessions[index].isStreaming = true
-        inlineImagePayloadSuppression.remove(id)
-        sessions[index].lastUpdated = .now
-        computerFrameAccumulators[id] = ComputerFrameAccumulator(minimumInterval: 0.35, recentCapacity: 4)
-        globalErrorMessage = nil
-        let session = sessions[index]
-        let harnessID = effectiveHarnessID(for: session)
-        let providerID = RouteRuntimeMap.providerID(for: session)
-        let routeID = "\(harnessID)/\(providerID)"
-        let isExtensionSelfEdit = isExtensionSelfEditThread(session, submittedText: submittedText)
-        let sensitivity: AgentTaskRecoverySensitivity = isExtensionSelfEdit
-            ? .externallyConsequential
-            : (session.policy == .yolo ? .ordinary : .approvalSensitive)
-        let request = AgentTaskSchedulerRequest(
-            id: id,
-            sessionID: id,
-            resources: .init(
-                workspaceID: workspaceURL(for: session, isExtensionSelfEdit: isExtensionSelfEdit).standardizedFileURL.path,
-                providerID: providerID,
-                routeID: routeID
-            ),
-            priority: threadActivityLanes.lane(for: id).priority,
-            recoverySensitivity: sensitivity
-        )
-        if taskScheduler.snapshot(for: id)?.state == .recoveryHeld {
-            taskScheduler.discardRecovered(id)
-        }
-        let admitted = taskScheduler.submit(request)
-        threadActivityLanes.apply(.queued(1 + session.queuedFollowUps.count), to: id)
-        guard persist() == .saved else {
-            sessions[index].isStreaming = false
-            let newlyAdmitted = taskScheduler.cancel(id)
-            persistSchedulerMetadata()
-            handleSchedulerAdmissions(newlyAdmitted)
-            refreshSchedulerLanes()
-            return false
-        }
-        persistSchedulerMetadata()
-        handleSchedulerAdmissions(admitted)
-        refreshSchedulerLanes()
-        return true
+        runOrchestrator.startRun(for: id, at: index, submittedText: submittedText)
     }
 
     func launchScheduledRun(for id: UUID) {
-        guard let index = sessions.firstIndex(where: { $0.id == id }),
-              let submittedText = submittedRequests[id],
-              taskScheduler.snapshot(for: id)?.state == .running else { return }
-        let session = sessions[index]
-        let runID = UUID()
-        activeRunIDs[id] = runID
-        guard session.executionRoute.mode == .code else {
-            launchScheduledProviderRun(for: id, runID: runID)
-            return
-        }
-
-        let isExtensionSelfEdit = isExtensionSelfEditThread(session, submittedText: submittedText)
-        let workspace = workspaceURL(for: session, isExtensionSelfEdit: isExtensionSelfEdit)
-        checkpointReviewStates[id] = WorkspaceCheckpointReviewState(
-            sessionID: id,
-            runID: runID,
-            worktreePath: workspace.standardizedFileURL.path,
-            activity: .capturingBefore
-        )
-        let client = checkpointClient
-        Task { [weak self] in
-            do {
-                let checkpoint = try await client.capture(
-                    worktreeURL: workspace,
-                    sessionID: id,
-                    runID: runID,
-                    boundary: .beforeRun
-                )
-                guard self?.activeRunIDs[id] == runID,
-                      self?.taskScheduler.snapshot(for: id)?.state == .running else { return }
-                self?.checkpointReviewStates[id]?.beforeCheckpoint = checkpoint
-                self?.checkpointReviewStates[id]?.activity = .running
-                self?.checkpointReviewStates[id]?.issue = nil
-            } catch {
-                guard self?.activeRunIDs[id] == runID,
-                      self?.taskScheduler.snapshot(for: id)?.state == .running else { return }
-                self?.checkpointReviewStates[id]?.activity = .running
-                self?.checkpointReviewStates[id]?.issue = self?.checkpointMessage(for: error)
-            }
-            self?.launchScheduledProviderRun(for: id, runID: runID)
-        }
+        runOrchestrator.launchScheduledRun(for: id)
     }
 
     func launchScheduledProviderRun(for id: UUID, runID: UUID) {
-        guard activeRunIDs[id] == runID,
-              let index = sessions.firstIndex(where: { $0.id == id }),
-              let submittedText = submittedRequests[id],
-              taskScheduler.snapshot(for: id)?.state == .running else { return }
-        threadActivityLanes.apply(.started, to: id)
-        reduceRunUI(.started, for: id)
-
-        let session = sessions[index]
-        if let integrityIssue = sessionMayLaunchProviderRun(session) {
-            let failedStream = AsyncStream<AgentEvent> { continuation in
-                continuation.yield(.failed(integrityIssue))
-                continuation.finish()
-            }
-            Task { for await event in failedStream { apply(event, to: id, runID: runID) } }
-            return
-        }
-        // Full readiness recheck immediately before Keychain read / stream (not only at send).
-        guard canRunSession(session) else {
-            let detail = routeUnavailableMessage(for: session) ?? "Choose a connected model."
-            let failedStream = AsyncStream<AgentEvent> { continuation in
-                continuation.yield(.failed(detail))
-                continuation.finish()
-            }
-            Task { for await event in failedStream { apply(event, to: id, runID: runID) } }
-            return
-        }
-        let isExtensionSelfEdit = isExtensionSelfEditThread(session, submittedText: submittedText)
-        if isExtensionSelfEdit { selfEditRunIDs.insert(id) }
-        else { selfEditRunIDs.remove(id) }
-        let workspace = workspaceURL(for: session, isExtensionSelfEdit: isExtensionSelfEdit)
-        let reasoningEffort = validReasoningEffort(for: session)
-        let additionalContext = backendAdditionalContext(for: session, submittedText: submittedText)
-        let tokenLimit = contextTokenLimit(for: session)
-        let stream: AsyncStream<AgentEvent>
-        let harnessID = effectiveHarnessID(for: session)
-        let launchPlan = RunLaunchPlanner.plan(
-            .init(
-                session: session,
-                submittedText: submittedText,
-                additionalContext: additionalContext,
-                tokenLimit: tokenLimit,
-                effectiveRuntimeID: harnessID
-            )
-        )
-        let recoveryPrompt = launchPlan.recoveryPrompt
-        let recoveryUsesVisibleTranscriptHandoff = launchPlan.recoveryUsesVisibleTranscriptHandoff
-        let recoveryDeliveryIssue = launchPlan.recoveryDeliveryIssue
-        let prompt = launchPlan.prompt
-        let routeThreadID = launchPlan.routeThreadID
-        if launchPlan.resetsHarnessSession {
-            sessions[index].harnessThreadID = nil
-            persist()
-        }
-        if let statusDetail = launchPlan.statusDetail {
-            setActivity([.init(icon: launchPlan.didCompact ? "arrow.triangle.2.circlepath" : "doc.text.magnifyingglass", title: launchPlan.didCompact ? "Context compacted" : "Context handoff", detail: statusDetail)], sessionID: id)
-        }
-        if let deliveryIssue = launchPlan.deliveryIssue {
-            let failedStream = AsyncStream<AgentEvent> { continuation in
-                continuation.yield(.failed(deliveryIssue))
-                continuation.finish()
-            }
-            Task { for await event in failedStream { apply(event, to: id, runID: runID) } }
-            return
-        }
-        let envelope: LatticeInstructionEnvelope?
-        let envelopeError: String?
-        do {
-            envelope = try instructionEnvelope(for: session, workspace: workspace, allowFileModification: !isExtensionSelfEdit)
-            envelopeError = nil
-        } catch {
-            envelope = nil
-            envelopeError = error.localizedDescription
-        }
-        // Declared Pi routes require a real envelope; surface construction errors honestly.
-        if harnessID == "pi" || (ExecutionRouteResolver.isDeclared(session.executionRoute) && session.executionRoute.runtimeID == "pi") {
-            if envelope == nil {
-                let detail = envelopeError.map { "Could not build Pi instruction envelope: \($0)" }
-                    ?? "Could not build Pi instruction envelope for this route."
-                let failedStream = AsyncStream<AgentEvent> { continuation in
-                    continuation.yield(.failed(detail))
-                    continuation.finish()
-                }
-                Task { for await event in failedStream { apply(event, to: id, runID: runID) } }
-                return
-            }
-        }
-        let trustedInstructions = envelope.map {
-            trustedWorkspaceInstructionText(for: workspace, names: $0.trustedWorkspaceInstructionNames)
-        } ?? ""
-        let developerInstructions = envelope.map {
-            [$0.renderedSystemInstructions, trustedInstructions].filter { !$0.isEmpty }.joined(separator: "\n\n")
-        }
-        let openCodeAPIKey = OpenCodeCredentialPolicy.allowsKeychainCredential(
-            for: session.executionRoute,
-            enabledModes: openCodeCredentialEnabledModes
-        )
-            ? KeychainStore.read(account: OpenCodeCredentialPolicy.keychainAccount)
-            : nil
-        let localContextPlan: LatticeContextHandoffPlan? = {
-            switch session.backend {
-            case .appleIntelligence, .ollama:
-                return LatticeContextHandoffPlanner.plan(
-                    session: session,
-                    submittedText: submittedText,
-                    additionalContext: additionalContext,
-                    tokenLimit: tokenLimit,
-                    existingHarnessThreadID: "structured-message-list",
-                    managementMode: .latticeManagedVisibleTranscript
-                )
-            default:
-                return nil
-            }
-        }()
-        let appleTranscript: String? = session.backend == .appleIntelligence
-            ? LatticeBackendMessageBuilder.transcript(session: session, submittedText: submittedText, additionalContext: additionalContext, contextPlan: localContextPlan)
-            : nil
-        let ollamaMessages: [ChatMessage]? = {
-            guard case .ollama(let model) = session.backend else { return nil }
-            cancelLocalModelIdleUnload()
-            localModelStatus = "Loaded \(model)"
-            return LatticeBackendMessageBuilder.structuredMessages(session: session, submittedText: submittedText, additionalContext: additionalContext, contextPlan: localContextPlan)
-        }()
-        stream = executionCoordinator.stream(
-            LatticeExecutionLaunch(
-                sessionID: id,
-                route: session.executionRoute,
-                legacyHarnessID: harnessID,
-                backend: session.backend,
-                prompt: prompt,
-                attachments: session.attachments,
-                imageInputCapability: imageInputCapability(for: session),
-                threadID: routeThreadID,
-                workspace: workspace,
-                reasoningEffort: reasoningEffort,
-                policy: isExtensionSelfEdit ? .ask : session.policy,
-                allowFileModification: !isExtensionSelfEdit,
-                workspaceWrite: isExtensionSelfEdit ? SelfEditProviderLaunchPolicy.codexWorkspaceWrite : false,
-                recoveryPrompt: recoveryPrompt,
-                recoveryUsesVisibleTranscriptHandoff: recoveryUsesVisibleTranscriptHandoff,
-                recoveryDeliveryIssue: recoveryDeliveryIssue,
-                instructionEnvelope: envelope,
-                developerInstructions: developerInstructions,
-                hermesProvider: hermesProvider(for: session.executionRoute),
-                hermesSystemIdentity: developerInstructions,
-                openCodeAPIKey: openCodeAPIKey,
-                appleTranscript: appleTranscript,
-                ollamaMessages: ollamaMessages,
-                localModelKeepAliveSeconds: localModelIdleUnloadMinutes * 60
-            ),
-            runtimes: executionRuntimes
-        )
-        Task { for await event in stream { apply(event, to: id, runID: runID) } }
+        runOrchestrator.launchScheduledProviderRun(for: id, runID: runID)
     }
 
     func finishSchedulerRunAfterCheckpoint(
@@ -755,102 +370,15 @@ extension AppState {
         runID: UUID,
         completion: @escaping @MainActor () -> Void
     ) {
-        guard let review = checkpointReviewStates[id],
-              review.runID == runID,
-              sessions.first(where: { $0.id == id })?.executionRoute.mode == .code else {
-            completion()
-            return
-        }
-        checkpointReviewStates[id]?.activity = .capturingAfter
-        let workspace = URL(fileURLWithPath: review.worktreePath, isDirectory: true)
-        let client = checkpointClient
-        Task { [weak self] in
-            defer { completion() }
-            do {
-                let after = try await client.capture(
-                    worktreeURL: workspace,
-                    sessionID: id,
-                    runID: runID,
-                    boundary: .afterRun
-                )
-                guard self?.checkpointReviewStates[id]?.runID == runID else { return }
-                self?.checkpointReviewStates[id]?.afterCheckpoint = after
-                // A stop can clear the active run while the before capture is still
-                // finishing. Recover the durable before record instead of reporting a
-                // false incomplete pair when the actor already persisted it.
-                var before = self?.checkpointReviewStates[id]?.beforeCheckpoint
-                if before == nil {
-                    if let checkpoints = try? await client.checkpoints(sessionID: id) {
-                        before = checkpoints.first(where: { $0.ownership.runID == runID && $0.boundary == .beforeRun })
-                    }
-                    self?.checkpointReviewStates[id]?.beforeCheckpoint = before
-                }
-                if let before, before.status == .captured, after.status == .captured {
-                    do {
-                        let changes = try await client.changes(
-                            beforeCheckpointID: before.id,
-                            afterCheckpointID: after.id
-                        )
-                        self?.checkpointReviewStates[id]?.changes = changes
-                        self?.checkpointReviewStates[id]?.notes = (try? await client.reviewNotes(checkpointID: after.id)) ?? []
-                        self?.checkpointReviewStates[id]?.activity = .ready
-                        self?.checkpointReviewStates[id]?.issue = nil
-                    } catch {
-                        self?.checkpointReviewStates[id]?.activity = .failed
-                        self?.checkpointReviewStates[id]?.issue = self?.checkpointMessage(for: error)
-                    }
-                } else {
-                    self?.checkpointReviewStates[id]?.activity = .failed
-                    if self?.checkpointReviewStates[id]?.issue == nil {
-                        self?.checkpointReviewStates[id]?.issue = "The before-run checkpoint was not captured, so this run cannot be reviewed or reverted."
-                    }
-                }
-            } catch {
-                guard self?.checkpointReviewStates[id]?.runID == runID else { return }
-                self?.checkpointReviewStates[id]?.activity = .failed
-                self?.checkpointReviewStates[id]?.issue = self?.checkpointMessage(for: error)
-            }
-        }
+        runOrchestrator.finishSchedulerRunAfterCheckpoint(sessionID: id, runID: runID, completion: completion)
     }
 
     func handleSchedulerAdmissions(_ admitted: [UUID]) {
-        for id in admitted {
-            if taskScheduler.snapshot(for: id)?.isApprovalResume == true,
-               let pending = pendingApprovalResponses.removeValue(forKey: id) {
-                forwardAdmittedHarnessPermission(pending.notice, option: pending.option)
-            } else {
-                launchScheduledRun(for: id)
-            }
-        }
-        refreshSchedulerLanes()
-        persistSchedulerMetadata()
+        runOrchestrator.handleSchedulerAdmissions(admitted)
     }
 
     func refreshSchedulerLanes() {
-        for snapshot in taskScheduler.snapshots {
-            let id = snapshot.request.sessionID
-            threadActivityLanes.apply(.priorityChanged(snapshot.request.priority), to: id)
-            threadActivityLanes.apply(.queuePositionChanged(snapshot.queuePosition), to: id)
-            switch snapshot.state {
-            case .queued:
-                let followUps = sessions.first(where: { $0.id == id })?.queuedFollowUps.count ?? 0
-                if snapshot.isApprovalResume {
-                    threadActivityLanes.apply(.approvalQueued(1 + followUps), to: id)
-                } else {
-                    threadActivityLanes.apply(.queued(1 + followUps), to: id)
-                }
-            case .running:
-                let followUps = sessions.first(where: { $0.id == id })?.queuedFollowUps.count ?? 0
-                threadActivityLanes.apply(.queued(followUps), to: id)
-                threadActivityLanes.apply(.started, to: id)
-            case .waitingForApproval:
-                let followUps = sessions.first(where: { $0.id == id })?.queuedFollowUps.count ?? 0
-                threadActivityLanes.apply(.queued(followUps), to: id)
-                threadActivityLanes.apply(.approvalRequested, to: id)
-            case .recoveryHeld:
-                threadActivityLanes.apply(.failed("Interrupted work was not replayed. Review the chat and submit it again."), to: id)
-            }
-        }
+        runOrchestrator.refreshSchedulerLanes()
     }
 
     func persistSchedulerMetadata() {
@@ -1530,7 +1058,9 @@ extension AppState {
                 mode: sessions[index].executionRoute.mode == .local && backend.isLocal
                     ? .local
                     : (composerSelectionMode ?? sessions[index].executionRoute.mode),
-                preferredRuntimeID: shouldSyncExecutionRoute ? nil : selectedRouteHarnessID
+                preferredRuntimeID: shouldSyncExecutionRoute
+                    ? nil
+                    : (selectedSession.map { effectiveHarnessID(for: $0) })
             )
             sessions[index].executionRoute = route
             sessions[index].harnessID = route.runtimeID
@@ -1559,9 +1089,8 @@ extension AppState {
             setError(SessionPrivacyPolicy.cloudBlockedMessage, sessionID: selectedSessionID)
             return
         }
-        selectedRouteEngineID = route.engineID
-        selectedRouteHarnessID = route.harnessID
-        setBackend(backend, shouldSyncExecutionRoute: false)
+        // Authority is backend + session.executionRoute (via setBackend / RouteRuntimeMap).
+        setBackend(backend, shouldSyncExecutionRoute: true)
     }
 
     func setLocalModelIdleUnloadMinutes(_ minutes: Int) {
@@ -1886,19 +1415,30 @@ extension AppState {
 
     func refreshLocalModels(normalizeAfterRefresh: Bool = true) async {
         let generation = localModelRefreshGeneration.begin()
-        let previousCatalogStatus = ollamaCatalogStatus
-        ollamaCatalogStatus = .loading
+        let previous = providerConnections.snapshot(for: .ollama)
+        let previousModels = providerConnections.ollamaModels
+        providerConnections.markLoading(.ollama)
         defer {
             if Task.isCancelled,
                localModelRefreshGeneration.isCurrent(generation),
                ollamaCatalogStatus == .loading {
-                ollamaCatalogStatus = previousCatalogStatus
+                providerConnections.setSnapshot(previous, for: .ollama)
+                providerConnections.ollamaModels = previousModels
             }
         }
         let catalog = await ollama.modelsResult()
         guard !Task.isCancelled, localModelRefreshGeneration.isCurrent(generation) else { return }
-        ollamaCatalogStatus = catalog.status
         if catalog.status != .failed { ollamaModels = catalog.models }
+        setProviderSnapshot(
+            ProviderRuntimeSnapshot(
+                installed: ollamaInstalled,
+                authenticated: ollamaReady || catalog.status == .loaded,
+                catalogStatus: catalog.status,
+                models: ollamaModels.map { ProviderModel(id: $0.name, name: $0.name) },
+                runnableModelCount: ollamaModels.count
+            ),
+            for: .ollama
+        )
         if normalizeAfterRefresh {
             normalizeBackendsAfterCatalogRefresh()
             normalizeExecutionRouteAfterCatalogRefresh()

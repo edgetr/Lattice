@@ -115,9 +115,11 @@ final class AppState: ObservableObject {
             rebindWorkLoopSurfacesAfterSelectionChange()
         }
     }
-    @Published var sessions: [LatticeSession]
+    var sessions: [LatticeSession] {
+        get { sessionCatalog.sessions }
+        set { sessionCatalog.sessions = newValue }
+    }
     @Published var transcriptLoadingSessionID: UUID?
-    /// Shared composer text bound by workspace and overlay. Ordinary text syncs to the selected session's durable `draft`; edit text does not.
     @Published var draft = "" {
         didSet {
             syncOrdinaryDraftToSelectedSessionIfNeeded()
@@ -125,9 +127,7 @@ final class AppState: ObservableObject {
     }
     @Published var searchText = ""
     @Published var showInspector = false
-    /// Preferred inspector surface for Code chats (Details vs Review). Bound by InspectorView.
     @Published var preferredInspectorSurface: InspectorSurface = .details
-    /// Last runID that auto-promoted Review; avoids fighting a deliberate Details choice.
     var lastAutoPromotedReviewRunID: UUID?
     @Published var checkpointReviewStates: [UUID: WorkspaceCheckpointReviewState] = [:]
     @Published var showCommandPalette = false
@@ -135,14 +135,9 @@ final class AppState: ObservableObject {
     @Published var onboardingStep: LatticeOnboardingStep = .welcome
     @Published var commandPaletteSearch = ""
     @Published var commandPaletteSelectedID: String?
-    /// Per-session measured conversation scroll anchors. Not published — geometry samples must not re-render the workspace.
     var conversationScrollStates: [UUID: ConversationScrollSessionState] = [:]
-    /// Monotonic UI signal for successful sends, edits, continues, and queued follow-ups.
     @Published var conversationOutgoingActionSequence: [UUID: Int] = [:]
-    /// Published only when pending new-content count / jump visibility changes — never per geometry sample.
     @Published var conversationJumpAffordances: [UUID: ConversationJumpAffordance] = [:]
-    /// Shared UI command channel. User-driven binding updates stay quiet; explicit corrections
-    /// notify once from ConversationView so normal scrolling does not re-render the workspace.
     var conversationScrollPosition = ScrollPosition(idType: String.self)
     @Published var workOriginJumpTarget: UUID?
     @Published var workQuestionAnswers: [UUID: String] = [:]
@@ -170,30 +165,22 @@ final class AppState: ObservableObject {
     @Published var providerSessionHealth: [UUID: ProviderSessionLifecycleEvent] = [:]
     @Published var pendingUnsafeProviderRouteAcknowledgement: UnsafeProviderRouteAcknowledgement?
     @Published var editingMessageContext: MessageEditContext?
-    /// Composer draft present before the current edit began; restored when edit mode exits without a successful send.
     var preservedComposerDraftBeforeEdit: String = ""
     @Published var copiedMessageID: UUID?
     @Published var defaultBackend: ChatBackend
-    @Published var ollamaModels: [OllamaModel] = []
-    @Published var ollamaCatalogStatus: ProviderCatalogStatus = .unknown
     @Published var columnVisibility: NavigationSplitViewVisibility = .all
-    /// Last measured conversations workspace width; used only for split-column adaptation.
     var lastMeasuredWorkspaceWidth: CGFloat = 0
     let connectionRefreshGeneration = RefreshGenerationController()
     let localModelRefreshGeneration = RefreshGenerationController()
-    /// Visibility last written by adaptive layout; used to distinguish user-driven toggles.
     var lastAutoAppliedColumnVisibility: NavigationSplitViewVisibility?
-    /// When true, do not auto-change columns until the window is comfortably wide again.
     var respectsUserColumnChoice = false
     @Published var selectedWorkspacePath: String
     @Published var workspaceActionMessage: String?
-    // MARK: Work-loop surfaces (owned by WorkspaceToolsController)
     let workspaceTools = WorkspaceToolsController()
     let providerConnections = ProviderConnectionStore()
     let composer = ComposerController()
     let sessionCatalog = SessionCatalogStore()
     let runOrchestrator = RunOrchestrator()
-    /// New Chat setup stays transient until a message or attachment needs a durable session.
     var isTransientNewChat: Bool {
         get { composer.isTransientNewChat }
         set { composer.setTransientNewChat(newValue) }
@@ -216,7 +203,6 @@ final class AppState: ObservableObject {
     }
     @Published var includeScreenshotContext = false
     @Published var captureLifecycle = CaptureLifecycleState()
-    @Published var computerFrameAccumulators: [UUID: ComputerFrameAccumulator] = [:]
     @Published var codeInstructionAddOn: String
     @Published var workInstructionAddOn: String
     @Published var trustedWorkspacePaths: Set<String>
@@ -227,28 +213,6 @@ final class AppState: ObservableObject {
     @Published var deletingLocalModelName: String?
     @Published var localModelIdleUnloadMinutes: Int
     @Published var localModelStatus: String?
-    @Published var codexReady = false
-    @Published var codexAuthenticated = false
-    @Published var codexCatalogStatus: ProviderCatalogStatus = .unknown
-    @Published var codexProtocolUnavailableReason: String?
-    @Published var codexImageInputProtocolSupport: InputCapabilitySupport = .unknown
-    @Published var codexModels: [ProviderModel] = []
-    @Published var codexUsage: ProviderUsage?
-    @Published var codexCLIVersion: String?
-    @Published var codexLatestCLIVersion: String?
-    @Published var grokReady = false
-    @Published var grokAuthenticated = false
-    @Published var grokCatalogStatus: ProviderCatalogStatus = .unknown
-    @Published var grokModels: [ProviderModel] = []
-    var grokACPModels: [HarnessModel] = []
-    @Published var grokCLIInfo = CLIUpdateInfo()
-    @Published var openCodeReady = false
-    @Published var openCodeAuthenticated = false
-    @Published var openCodeCatalogStatus: ProviderCatalogStatus = .unknown
-    @Published var openCodeModels: [ProviderModel] = []
-    var openCodeACPModels: [HarnessModel] = []
-    @Published var openCodeCLIVersion: String?
-    @Published var openCodeLatestCLIVersion: String?
     @Published var openCodeAPIKeyDraft = ""
     @Published var openCodeAPIKeySaved = false
     @Published var openCodeCredentialAvailability: CredentialStoreAvailability = .unavailable
@@ -272,46 +236,17 @@ final class AppState: ObservableObject {
     @Published var cliActionStartedAt: [String: Date] = [:]
     @Published var cliActionEstimatedSeconds: [String: TimeInterval] = [:]
     @Published var pendingCLIInstallProvider: String?
-    @Published var antigravityInstalled = false
-    @Published var antigravityAuthenticated = false
-    @Published var antigravityCatalogStatus: ProviderCatalogStatus = .unknown
-    @Published var antigravityProtocolSupport: AntigravityCLIProtocol = .transcript(reason: "Not checked.")
-    @Published var antigravityModels: [ProviderModel] = []
-    @Published var antigravityCLIVersion: String?
-    @Published var antigravityLatestCLIVersion: String?
-    @Published var piInstalled = false
-    @Published var piCLIVersion: String?
-    @Published var piLatestCLIVersion: String?
-    @Published var piModelIDs: Set<String> = []
-    @Published var hermesInstalled = false
-    @Published var hermesCatalogStatus: ProviderCatalogStatus = .unknown
-    @Published var hermesCLIInfo = CLIUpdateInfo()
-    @Published var hermesModels: [HarnessModel] = []
-    @Published var appleIntelligenceReady = false
-    @Published var appleIntelligenceStatus = "Checking…"
-    @Published var ollamaInstalled = false
-    @Published var ollamaReady = false
-    /// Map-driven connection observations (owned by ProviderConnectionStore).
-    var providerSnapshots: [String: ProviderRuntimeSnapshot] {
-        get { providerConnections.snapshots }
-        set { providerConnections.replaceAll(newValue) }
-    }
-
-    @Published var grokUpdateStatus = ""
     @Published var extensions: [LatticeExtensionRecord] = []
     @Published var skills: [LatticeSkillRecord] = []
     @Published var selfEditJobs: [LatticeExtensionJobRecord] = []
     @Published var folderActionMessage: String?
     @Published var selfEditPreviews: [LatticeExtensionPreviewRecord] = []
     let selfEditDrafts = SelfEditDraftStore()
-    /// Durable store load failures that require explicit, non-destructive recovery before saves resume.
     @Published var persistenceRecoveryIssues: [DurableStoreIssue] = []
     @Published var expandedPersistenceRecoveryDetailIDs: Set<String> = []
     @Published var persistenceRecoveryStatusMessage: String?
     @Published var showPersistenceResetConfirmation = false
     @Published var pendingPersistenceResetIssueID: String?
-    /// Runtime session *save* failure (disk full, permission, write failure). Separate from load recovery.
-    /// In-memory sessions/draft remain; Retry writes the latest snapshot. No reset/quarantine of readable data.
     @Published var sessionSaveFailure: SessionSaveFailure?
     @Published var expandedSessionSaveFailureDetails = false
     @Published var enabledExtensionIDs: Set<String>
@@ -321,11 +256,6 @@ final class AppState: ObservableObject {
     @Published var activeCopyPatches: [LatticeCopyPatch] = []
     @Published var activePromptTemplates: [LatticePromptTemplate] = []
     @Published var selfMap = LatticeSelfMap()
-    /// Legacy engine/harness pair for `setExecutionRoute` compatibility only.
-    /// New composer selection uses mode + `ExecutionRoute`; do not use these as write authority.
-    @Published var selectedRouteEngineID: String
-    /// Legacy harness id companion to `selectedRouteEngineID`. Prefer `session.executionRoute.runtimeID`.
-    @Published var selectedRouteHarnessID: String
     var showOverlayAction: (() -> Void)?
     var openWorkspaceAction: (() -> Void)?
 
@@ -363,29 +293,15 @@ final class AppState: ObservableObject {
     var extensionDirectorySource: DispatchSourceFileSystemObject?
     var extensionDirectoryFileDescriptor: CInt = -1
     var cancellables: Set<AnyCancellable> = []
-    var submittedRequests: [UUID: String] = [:]
-    var retryableRequests: [UUID: String] = [:]
-    var selfEditRunIDs: Set<UUID> = []
-    var activeRunIDs: [UUID: UUID] = [:]
-    var inlineImagePayloadSuppression: Set<UUID> = []
-    var taskScheduler = AgentTaskScheduler(limits: .init(
-        global: 4,
-        perWorkspace: 2,
-        providerCaps: ["codex": 2, "grok": 2, "opencode": 2, "antigravity": 1, "apple": 1, "ollama": 1],
-        routeCaps: ["lattice/ollama": 1, "lattice/apple": 1]
-    ))
     let captureStorage = CaptureStorage.applicationSupportStore()
     let screenshotCaptureService = ScreenshotCaptureService()
     var pendingApprovalResponses: [UUID: (notice: HarnessPermissionNotice, option: ApprovalOption)] = [:]
     var lastAutomaticConnectionRefreshRequest = Date.distantPast
-    @Published var runUIStates: [UUID: RunUIState] = [:]
     @Published var threadActivityLanes = ThreadActivityLaneStore()
     @Published var schedulerGlobalLimit = 4
     @Published var schedulerWorkspaceLimit = 2
     @Published var globalErrorMessage: String?
-    /// Deliberately in-memory: provider tool bypass consent expires when Lattice exits.
     var acknowledgedUnsafeProviderRouteKeys: Set<String> = []
-    /// Suppresses draft→session write-back while loading a session's draft into the composer.
     var isApplyingComposerDraft = false
     static let idleUnloadKey = "localModelIdleUnloadMinutes"
     static let defaultBackendKey = "defaultBackend"
@@ -506,7 +422,7 @@ final class AppState: ObservableObject {
                 }
             }
         }
-        sessions = loadedSessions
+        sessionCatalog.replaceAll(loadedSessions)
         showsOnboarding = UserDefaults.standard.integer(forKey: Self.onboardingCompletedVersionKey) < Self.onboardingVersion
         disabledModelIDs = Set(UserDefaults.standard.stringArray(forKey: "disabledModelIDs") ?? [])
         enabledExtensionIDs = Set(UserDefaults.standard.stringArray(forKey: Self.enabledExtensionIDsKey) ?? [])
@@ -529,8 +445,6 @@ final class AppState: ObservableObject {
             persisted: Self.loadDefaultBackend()
         )
         defaultBackend = initialDefaultBackend
-        selectedRouteEngineID = Self.engineID(for: initialDefaultBackend)
-        selectedRouteHarnessID = Self.defaultHarnessID(for: initialDefaultBackend)
         selectedSessionID = LatticeSessionListOrdering.sorted(sessions).first?.id
         schedulerGlobalLimit = Self.storedSchedulerLimit(forKey: Self.schedulerGlobalLimitKey, fallback: 4)
         schedulerWorkspaceLimit = Self.storedSchedulerLimit(forKey: Self.schedulerWorkspaceLimitKey, fallback: 2)
@@ -541,6 +455,7 @@ final class AppState: ObservableObject {
         recoverSchedulerMetadata()
         rebuildThreadActivityLanes()
         composerSelectionMode = selectedSession?.executionRoute.mode
+        runOrchestrator.app = self
         workspaceTools.workspacePathProvider = { [weak self] in
             guard let self else { return "" }
             return self.activeWorkspacePathForTools

@@ -8,6 +8,70 @@ import LatticeCore
 
 @MainActor
 extension AppState {
+    // MARK: - Map-driven provider accessors (sole source of truth: ProviderConnectionStore)
+
+    var codexReady: Bool { providerConnections.ready(.codex) }
+    var codexAuthenticated: Bool { providerConnections.authenticated(.codex) }
+    var codexCatalogStatus: ProviderCatalogStatus { providerConnections.catalogStatus(.codex) }
+    var codexProtocolUnavailableReason: String? { providerConnections.protocolDetail(.codex) }
+    var codexImageInputProtocolSupport: InputCapabilitySupport {
+        get { providerConnections.codexImageInputProtocolSupport }
+        set { providerConnections.codexImageInputProtocolSupport = newValue }
+    }
+    var codexModels: [ProviderModel] { providerConnections.models(.codex) }
+    var codexUsage: ProviderUsage? { providerConnections.usage(.codex) }
+    var codexCLIVersion: String? { providerConnections.cliVersion(.codex) }
+    var codexLatestCLIVersion: String? { providerConnections.latestCLIVersion(.codex) }
+    var grokReady: Bool { providerConnections.ready(.grok) }
+    var grokAuthenticated: Bool { providerConnections.authenticated(.grok) }
+    var grokCatalogStatus: ProviderCatalogStatus { providerConnections.catalogStatus(.grok) }
+    var grokModels: [ProviderModel] { providerConnections.models(.grok) }
+    var grokACPModels: [HarnessModel] { providerConnections.harnessModels(.grok) }
+    var grokCLIInfo: CLIUpdateInfo { providerConnections.updateInfo(.grok) ?? CLIUpdateInfo() }
+    var openCodeReady: Bool { providerConnections.ready(.opencode) }
+    var openCodeAuthenticated: Bool { providerConnections.authenticated(.opencode) }
+    var openCodeCatalogStatus: ProviderCatalogStatus { providerConnections.catalogStatus(.opencode) }
+    var openCodeModels: [ProviderModel] { providerConnections.models(.opencode) }
+    var openCodeACPModels: [HarnessModel] { providerConnections.harnessModels(.opencode) }
+    var openCodeCLIVersion: String? { providerConnections.cliVersion(.opencode) }
+    var openCodeLatestCLIVersion: String? { providerConnections.latestCLIVersion(.opencode) }
+    var antigravityInstalled: Bool { providerConnections.installed(.antigravity) }
+    var antigravityAuthenticated: Bool { providerConnections.authenticated(.antigravity) }
+    var antigravityCatalogStatus: ProviderCatalogStatus { providerConnections.catalogStatus(.antigravity) }
+    var antigravityProtocolSupport: AntigravityCLIProtocol {
+        get { providerConnections.antigravityProtocolSupport }
+        set { providerConnections.antigravityProtocolSupport = newValue }
+    }
+    var antigravityModels: [ProviderModel] { providerConnections.models(.antigravity) }
+    var antigravityCLIVersion: String? { providerConnections.cliVersion(.antigravity) }
+    var antigravityLatestCLIVersion: String? { providerConnections.latestCLIVersion(.antigravity) }
+    var piInstalled: Bool { providerConnections.installed(.pi) }
+    var piCLIVersion: String? { providerConnections.cliVersion(.pi) }
+    var piLatestCLIVersion: String? { providerConnections.latestCLIVersion(.pi) }
+    var piModelIDs: Set<String> { providerConnections.piModelIDs() }
+    var hermesInstalled: Bool { providerConnections.installed(.hermes) }
+    var hermesCatalogStatus: ProviderCatalogStatus { providerConnections.catalogStatus(.hermes) }
+    var hermesCLIInfo: CLIUpdateInfo { providerConnections.updateInfo(.hermes) ?? CLIUpdateInfo() }
+    var hermesModels: [HarnessModel] { providerConnections.harnessModels(.hermes) }
+    var appleIntelligenceReady: Bool { providerConnections.ready(.apple) }
+    var appleIntelligenceStatus: String { providerConnections.protocolDetail(.apple) ?? "Checking…" }
+    var ollamaInstalled: Bool { providerConnections.installed(.ollama) }
+    var ollamaReady: Bool {
+        let snap = providerConnections.snapshot(for: .ollama)
+        return snap.installed && snap.authenticated
+    }
+    var ollamaModels: [OllamaModel] {
+        get { providerConnections.ollamaModels }
+        set { providerConnections.ollamaModels = newValue }
+    }
+    var ollamaCatalogStatus: ProviderCatalogStatus { providerConnections.catalogStatus(.ollama) }
+    /// Map-driven connection observations (owned by ProviderConnectionStore).
+    var providerSnapshots: [String: ProviderRuntimeSnapshot] {
+        get { providerConnections.snapshots }
+        set { providerConnections.replaceAll(newValue) }
+    }
+    var grokUpdateStatus: String { grokCLIInfo.statusText }
+
     func refreshConnections(refreshProviderCatalogs: Bool = false) async {
         let generation = connectionRefreshGeneration.begin()
         let localGeneration = localModelRefreshGeneration.begin()
@@ -15,16 +79,11 @@ extension AppState {
         // state. Every refresh invalidates them so revoked or changed login state
         // cannot remain runnable from a stale in-memory success.
         invalidateRuntimeAuthenticationValidations()
-        let previousCatalogStatuses = (
-            codex: codexCatalogStatus,
-            grok: grokCatalogStatus,
-            openCode: openCodeCatalogStatus,
-            antigravity: antigravityCatalogStatus,
-            hermes: hermesCatalogStatus,
-            ollama: ollamaCatalogStatus
-        )
         // Capture map state before markLoading so cancel can restore exact prior snapshots.
         let previousSnapshots = providerConnections.snapshots
+        let previousOllamaModels = providerConnections.ollamaModels
+        let previousCodexImage = providerConnections.codexImageInputProtocolSupport
+        let previousAntigravityProtocol = providerConnections.antigravityProtocolSupport
         isRefreshingConnections = true
         providerConnections.markLoading(.codex)
         providerConnections.markLoading(.grok)
@@ -37,17 +96,11 @@ extension AppState {
         defer {
             if connectionRefreshGeneration.isCurrent(generation) {
                 if Task.isCancelled {
-                    if codexCatalogStatus == .loading { codexCatalogStatus = previousCatalogStatuses.codex }
-                    if grokCatalogStatus == .loading { grokCatalogStatus = previousCatalogStatuses.grok }
-                    if openCodeCatalogStatus == .loading { openCodeCatalogStatus = previousCatalogStatuses.openCode }
-                    if antigravityCatalogStatus == .loading { antigravityCatalogStatus = previousCatalogStatuses.antigravity }
-                    if hermesCatalogStatus == .loading { hermesCatalogStatus = previousCatalogStatuses.hermes }
-                    if ollamaCatalogStatus == .loading,
-                       localModelRefreshGeneration.isCurrent(localGeneration) {
-                        ollamaCatalogStatus = previousCatalogStatuses.ollama
-                    }
-                    // Restore the pre-refresh map (not .unknown) so dual-write stays aligned.
+                    // Restore the pre-refresh map (sole source of truth).
                     providerConnections.replaceAll(previousSnapshots)
+                    providerConnections.ollamaModels = previousOllamaModels
+                    providerConnections.codexImageInputProtocolSupport = previousCodexImage
+                    providerConnections.antigravityProtocolSupport = previousAntigravityProtocol
                 }
                 isRefreshingConnections = false
             }
@@ -83,7 +136,7 @@ extension AppState {
         let executable = ExecutableDiscovery.locate("codex")
         guard canApplyCatalogRefresh(generation) else { return }
         if codex.isInstalled != (executable != nil) { codex = CodexExecHarness(executableURL: executable) }
-        codexCatalogStatus = .loading
+        providerConnections.markLoading(.codex)
         async let codexAuth = codex.isAuthenticated()
         async let codexData = codex.providerSnapshot()
         async let codexVersion = codex.cliVersion()
@@ -93,24 +146,27 @@ extension AppState {
         let version = await codexVersion
         let latest = await codexLatest
         guard canApplyCatalogRefresh(generation) else { return }
-        codexAuthenticated = auth
-        codexCatalogStatus = snapshot.catalogStatus
-        codexProtocolUnavailableReason = snapshot.unavailableReason
         switch snapshot.capabilities.imageInput {
         case .supported: codexImageInputProtocolSupport = .supported
         case .unsupported: codexImageInputProtocolSupport = .unsupported
         case .unknown: codexImageInputProtocolSupport = .unknown
         }
-        codexModels = snapshot.models
-        codexReady = ProviderRuntimeSnapshotStore.computeReady(
-            installed: codex.isInstalled,
-            authenticated: auth,
-            catalogStatus: snapshot.catalogStatus,
-            runnableModelCount: visibleCodexModels.count
+        // Write models first so visibleCodexModels/runnable counts read the new catalog.
+        setProviderSnapshot(
+            ProviderRuntimeSnapshot(
+                installed: codex.isInstalled,
+                authenticated: auth,
+                catalogStatus: snapshot.catalogStatus,
+                models: snapshot.models,
+                cliVersion: version,
+                latestCLIVersion: latest,
+                protocolDetail: snapshot.unavailableReason,
+                runnableModelCount: snapshot.models.filter { isModelEnabled("codex:\($0.id)") }.count,
+                usage: snapshot.usage
+            ),
+            for: .codex
         )
-        codexUsage = snapshot.usage
-        codexCLIVersion = version
-        codexLatestCLIVersion = latest
+        // Recompute readiness with disabled-model filter after models are published.
         setProviderSnapshot(
             ProviderRuntimeSnapshot(
                 installed: codex.isInstalled,
@@ -132,7 +188,7 @@ extension AppState {
         guard canApplyCatalogRefresh(generation) else { return }
         if grok.isInstalled != (executable != nil) { grok = StructuredCLIHarness(kind: .grok, executableURL: executable) }
         if grokACP.isInstalled != (executable != nil) { grokACP = ACPHarness(profile: .grok, executableURL: executable) }
-        grokCatalogStatus = .loading
+        providerConnections.markLoading(.grok)
         async let grokAuth = grok.isAuthenticated()
         async let grokCatalog = grok.modelsResult()
         async let grokACPCatalog = grokACP.modelsResult(workspace: URL(fileURLWithPath: selectedWorkspacePath))
@@ -142,25 +198,30 @@ extension AppState {
         let acpCatalog = await grokACPCatalog
         let update = await grokUpdate
         guard canApplyCatalogRefresh(generation) else { return }
-        grokAuthenticated = auth
-        grokACPModels = acpCatalog.models
-        grokCatalogStatus = ProviderCatalogStatus.combined(cliCatalog.status, acpCatalog.status)
-        grokModels = cliCatalog.models.isEmpty ? acpCatalog.models.map { ProviderModel(id: $0.id, name: $0.name) } : cliCatalog.models
-        grokReady = ProviderRuntimeSnapshotStore.computeReady(
-            installed: grok.isInstalled,
-            authenticated: auth,
-            catalogStatus: grokCatalogStatus,
-            runnableModelCount: runnableGrokModels.count
-        )
-        grokCLIInfo = update
-        grokUpdateStatus = grokCLIInfo.statusText
+        let combinedStatus = ProviderCatalogStatus.combined(cliCatalog.status, acpCatalog.status)
+        let models = cliCatalog.models.isEmpty ? acpCatalog.models.map { ProviderModel(id: $0.id, name: $0.name) } : cliCatalog.models
         setProviderSnapshot(
             ProviderRuntimeSnapshot(
                 installed: grok.isInstalled,
                 authenticated: auth,
-                catalogStatus: grokCatalogStatus,
-                models: grokModels,
-                harnessModels: grokACPModels,
+                catalogStatus: combinedStatus,
+                models: models,
+                harnessModels: acpCatalog.models,
+                cliVersion: update.currentVersion,
+                latestCLIVersion: update.latestVersion,
+                protocolDetail: update.detail,
+                runnableModelCount: models.count,
+                updateInfo: update
+            ),
+            for: .grok
+        )
+        setProviderSnapshot(
+            ProviderRuntimeSnapshot(
+                installed: grok.isInstalled,
+                authenticated: auth,
+                catalogStatus: combinedStatus,
+                models: models,
+                harnessModels: acpCatalog.models,
                 cliVersion: update.currentVersion,
                 latestCLIVersion: update.latestVersion,
                 protocolDetail: update.detail,
@@ -176,7 +237,7 @@ extension AppState {
         guard canApplyCatalogRefresh(generation) else { return }
         if openCode.isInstalled != (executable != nil) { openCode = StructuredCLIHarness(kind: .openCode, executableURL: executable) }
         if openCodeACP.isInstalled != (executable != nil) { openCodeACP = ACPHarness(profile: .openCode, executableURL: executable) }
-        openCodeCatalogStatus = .loading
+        providerConnections.markLoading(.opencode)
         async let openCodeAuth = openCode.isAuthenticated()
         async let openCodeCatalog = openCode.modelsResult(refreshCache: refreshCatalog)
         async let openCodeACPCatalog = openCodeACP.modelsResult(workspace: URL(fileURLWithPath: selectedWorkspacePath))
@@ -205,26 +266,29 @@ extension AppState {
         }
         // Direct OpenCode authentication remains a compatibility route. A
         // Lattice Keychain credential is separately consented for Pi/Hermes.
-        openCodeAuthenticated = auth
-        openCodeACPModels = acpCatalog.models
-        openCodeCatalogStatus = ProviderCatalogStatus.combined(catalog.status, acpCatalog.status)
-        openCodeModels = catalog.models
-        openCodeReady = ProviderRuntimeSnapshotStore.computeReady(
-            installed: openCode.isInstalled,
-            authenticated: openCodeAuthenticated,
-            catalogStatus: openCodeCatalogStatus,
-            runnableModelCount: runnableOpenCodeModels.count
-        )
-        openCodeCLIVersion = detectedVersion ?? installedVersion
-        openCodeLatestCLIVersion = latest
+        let combinedStatus = ProviderCatalogStatus.combined(catalog.status, acpCatalog.status)
+        let cliVersion = detectedVersion ?? installedVersion
         setProviderSnapshot(
             ProviderRuntimeSnapshot(
                 installed: openCode.isInstalled,
-                authenticated: openCodeAuthenticated,
-                catalogStatus: openCodeCatalogStatus,
-                models: openCodeModels,
-                harnessModels: openCodeACPModels,
-                cliVersion: openCodeCLIVersion,
+                authenticated: auth,
+                catalogStatus: combinedStatus,
+                models: catalog.models,
+                harnessModels: acpCatalog.models,
+                cliVersion: cliVersion,
+                latestCLIVersion: latest,
+                runnableModelCount: catalog.models.count,
+            ),
+            for: .opencode
+        )
+        setProviderSnapshot(
+            ProviderRuntimeSnapshot(
+                installed: openCode.isInstalled,
+                authenticated: auth,
+                catalogStatus: combinedStatus,
+                models: catalog.models,
+                harnessModels: acpCatalog.models,
+                cliVersion: cliVersion,
                 latestCLIVersion: latest,
                 runnableModelCount: runnableOpenCodeModels.count,
             ),
@@ -238,7 +302,7 @@ extension AppState {
         if antigravity.isInstalled != (executable != nil) {
             antigravity = AntigravityCLIHarness(executableURL: executable)
         }
-        antigravityCatalogStatus = .loading
+        providerConnections.markLoading(.antigravity)
         async let antigravityVersion = Self.commandOutput("agy", ["--version"])
         async let antigravityLatest = Self.latestCLIVersion(executableName: "agy", homebrewFormula: nil, homebrewCask: "antigravity-cli", npmPackage: nil, pnpmPackage: nil, directPackage: "@google/antigravity-cli")
         async let antigravityProtocol = antigravity.protocolSupport()
@@ -252,20 +316,15 @@ extension AppState {
         // probe. Never read Antigravity's OAuth token file in Lattice.
         let authenticated = executable != nil && !models.isEmpty
         guard canApplyCatalogRefresh(generation) else { return }
-        antigravityInstalled = executable != nil
-        antigravityAuthenticated = authenticated
-        antigravityCatalogStatus = catalog.status
         antigravityProtocolSupport = protocolSupport
-        antigravityModels = models
-        antigravityCLIVersion = CLIVersionDisplayPolicy.normalizedVersion(version)
-        antigravityLatestCLIVersion = latest
+        let cliVersion = CLIVersionDisplayPolicy.normalizedVersion(version)
         setProviderSnapshot(
             ProviderRuntimeSnapshot(
-                installed: antigravityInstalled,
+                installed: executable != nil,
                 authenticated: authenticated,
                 catalogStatus: catalog.status,
                 models: models,
-                cliVersion: antigravityCLIVersion,
+                cliVersion: cliVersion,
                 latestCLIVersion: latest,
                 protocolDetail: String(describing: protocolSupport),
                 runnableModelCount: models.count,
@@ -278,6 +337,7 @@ extension AppState {
         let executable = ExecutableDiscovery.locate("pi")
         guard canApplyCatalogRefresh(generation) else { return }
         if pi.isInstalled != (executable != nil) { pi = PiRPCHarness(executableURL: executable) }
+        providerConnections.markLoading(.pi)
         async let piVersion = Self.commandOutput("pi", ["--version"])
         async let piCatalog = pi.modelCatalog()
         async let piLatest = Self.latestCLIVersion(executableName: "pi", homebrewFormula: "pi", homebrewCask: nil, npmPackage: "@earendil-works/pi-coding-agent", pnpmPackage: "@earendil-works/pi-coding-agent", directPackage: "@earendil-works/pi-coding-agent")
@@ -285,14 +345,11 @@ extension AppState {
         let catalog = await piCatalog
         let latest = await piLatest
         guard canApplyCatalogRefresh(generation) else { return }
-        piInstalled = executable != nil
-        piCLIVersion = version
-        piModelIDs = catalog
-        piLatestCLIVersion = latest
+        let installed = executable != nil
         setProviderSnapshot(
             ProviderRuntimeSnapshot(
-                installed: piInstalled,
-                authenticated: piInstalled,
+                installed: installed,
+                authenticated: installed,
                 catalogStatus: catalog.isEmpty ? .empty : .loaded,
                 models: catalog.sorted().map { ProviderModel(id: $0, name: $0) },
                 cliVersion: version,
@@ -307,20 +364,17 @@ extension AppState {
         let executable = ExecutableDiscovery.locate("hermes")
         guard canApplyCatalogRefresh(generation) else { return }
         if hermes.isInstalled != (executable != nil) { hermes = ACPHarness(executableURL: executable) }
-        hermesCatalogStatus = .loading
+        providerConnections.markLoading(.hermes)
         async let hermesInfo = Self.hermesUpdateInfo()
         async let hermesCatalog = hermes.modelsResult(workspace: URL(fileURLWithPath: selectedWorkspacePath))
         let catalog = await hermesCatalog
         let info = await hermesInfo
         guard canApplyCatalogRefresh(generation) else { return }
-        hermesInstalled = executable != nil
-        hermesCatalogStatus = catalog.status
-        hermesModels = catalog.models
-        hermesCLIInfo = info
+        let installed = executable != nil
         setProviderSnapshot(
             ProviderRuntimeSnapshot(
-                installed: hermesInstalled,
-                authenticated: hermesInstalled,
+                installed: installed,
+                authenticated: installed,
                 catalogStatus: catalog.status,
                 harnessModels: catalog.models,
                 cliVersion: info.currentVersion,
@@ -336,7 +390,8 @@ extension AppState {
     func refreshLocalConnection(generation: UInt64, localGeneration: UInt64) async {
         guard canApplyCatalogRefresh(generation),
               localModelRefreshGeneration.isCurrent(localGeneration) else { return }
-        ollamaCatalogStatus = .loading
+        providerConnections.markLoading(.ollama)
+        providerConnections.markLoading(.apple)
         async let local = ollama.isAvailable()
         async let models = ollama.modelsResult()
         let localReady = await local
@@ -346,11 +401,6 @@ extension AppState {
         let intelligenceStatus = appleIntelligence.statusDescription
         guard canApplyCatalogRefresh(generation),
               localModelRefreshGeneration.isCurrent(localGeneration) else { return }
-        appleIntelligenceReady = intelligenceReady
-        appleIntelligenceStatus = intelligenceStatus
-        ollamaInstalled = localInstalled
-        ollamaReady = localReady
-        ollamaCatalogStatus = localCatalog.status
         if localCatalog.status != .failed { ollamaModels = localCatalog.models }
         setProviderSnapshot(
             ProviderRuntimeSnapshot(

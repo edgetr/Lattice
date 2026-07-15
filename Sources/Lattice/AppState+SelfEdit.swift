@@ -881,8 +881,7 @@ extension AppState {
         guard beginCLIAction(provider: "grok", progress: "Checking for update…", estimatedSeconds: 15) else { return }
         Task {
             let info = await grok.updateStatus()
-            grokCLIInfo = info
-            grokUpdateStatus = info.statusText
+            providerConnections.setUpdateInfo(info, for: .grok)
             cliActionMessages["grok"] = info.updateAvailable == true ? info.statusText : ""
             finishCLIAction("grok")
         }
@@ -929,7 +928,7 @@ extension AppState {
         guard beginCLIAction(provider: "hermes", progress: "Checking for update…", estimatedSeconds: 15) else { return }
         Task {
             let info = await Self.hermesUpdateCheck()
-            hermesCLIInfo = info
+            providerConnections.setUpdateInfo(info, for: .hermes)
             cliActionMessages["hermes"] = info.updateAvailable == true ? info.statusText : ""
             finishCLIAction("hermes")
         }
@@ -1468,21 +1467,9 @@ extension AppState {
             openCodeAPIKeySaved = cached.openCodeCredentialRecorded
         case .fresh(let cached):
             openCodeAPIKeySaved = cached.openCodeCredentialRecorded
-            codexAuthenticated = cached.providers["codex"]?.authenticated ?? false
-            grokAuthenticated = cached.providers["grok"]?.authenticated ?? false
-            openCodeAuthenticated = cached.providers["opencode"]?.authenticated ?? false
-            antigravityAuthenticated = cached.providers["antigravity"]?.authenticated ?? false
-            antigravityInstalled = cached.providers["antigravity"]?.installed ?? false
-            piInstalled = cached.providers["pi"]?.installed ?? false
-            hermesInstalled = cached.providers["hermes"]?.installed ?? false
-            ollamaInstalled = cached.providers["ollama"]?.installed ?? false
-            // Hydrate map + legacy fields with the same fail-closed ready formula (never runnable from cache).
+            // Snapshot map is sole presence authority; ready stays fail-closed (never runnable from cache).
             let hydrated = ProviderRuntimeSnapshotStore.hydratePresence(from: cached.providers)
             providerConnections.replaceAll(hydrated)
-            ollamaReady = false
-            codexReady = false
-            grokReady = false
-            openCodeReady = false
         }
     }
 
@@ -1682,17 +1669,24 @@ extension AppState {
     }
 
     func normalizeExecutionRouteAfterCatalogRefresh() {
-        let currentRoute = EngineHarnessSelection(engineID: selectedRouteEngineID, harnessID: selectedRouteHarnessID)
+        // Composer/session route identity is authoritative; selectedRoute* are derived only.
+        let engineID = selectedSession.map { Self.engineID(for: $0.backend) }
+            ?? (composerSelectionBackend.map { Self.engineID(for: $0) })
+            ?? Self.engineID(for: defaultBackend)
+        let harnessID = selectedSession.map { effectiveHarnessID(for: $0) }
+            ?? Self.defaultHarnessID(for: composerSelectionBackend ?? defaultBackend)
+        let currentRoute = EngineHarnessSelection(engineID: engineID, harnessID: harnessID)
         let normalizedRoute = ExecutionRoutePolicy.normalize(
             currentRoute,
             fallbackEngineID: Self.engineID(for: defaultBackend),
             fallbackHarnessID: Self.defaultHarnessID(for: defaultBackend)
         ) ?? currentRoute
 
-        if isRouteHarnessCompatible(engineID: normalizedRoute.engineID, harnessID: normalizedRoute.harnessID), backendForRouteEngine(normalizedRoute.engineID, harnessID: normalizedRoute.harnessID) != nil {
-            if normalizedRoute != currentRoute {
-                selectedRouteEngineID = normalizedRoute.engineID
-                selectedRouteHarnessID = normalizedRoute.harnessID
+        if isRouteHarnessCompatible(engineID: normalizedRoute.engineID, harnessID: normalizedRoute.harnessID),
+           let backend = backendForRouteEngine(normalizedRoute.engineID, harnessID: normalizedRoute.harnessID) {
+            if backend != defaultBackend {
+                defaultBackend = backend
+                saveDefaultBackend()
             }
             return
         }
@@ -1749,9 +1743,12 @@ extension AppState {
         UserDefaults.standard.set(data, forKey: Self.defaultBackendKey)
     }
 
+    /// Route identity is derived from mode + backend / session.executionRoute.
+    /// Kept as a no-op hook for call sites that previously mirrored engine/harness selection fields.
     func syncExecutionRoute(from backend: ChatBackend) {
-        selectedRouteEngineID = Self.engineID(for: backend)
-        selectedRouteHarnessID = Self.defaultHarnessID(for: backend)
+        // Intentionally empty: selectedRouteEngineID/HarnessID are computed from
+        // composer selection, session.executionRoute, or defaultBackend.
+        _ = backend
     }
 
     static func engineID(for backend: ChatBackend) -> String {

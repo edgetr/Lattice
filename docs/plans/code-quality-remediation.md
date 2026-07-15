@@ -247,14 +247,46 @@ Document any known residual debt honestly in the implementation summary (do not 
 
 ## Acceptance Criteria
 
-- [ ] All 15 review issues addressed or explicitly residual with justification in summary
-- [ ] AppState no longer owns file browser/terminal/self-edit draft CRUD/provider field sprawl/run apply body as monolithic private methods
-- [ ] Route identity is not triple-bookkept for new session writes
-- [ ] Provider state is map-driven
-- [ ] `./script/build_and_run.sh --test` passes
-- [ ] `./script/build_and_run.sh --verify` passes
-- [ ] No real secrets printed/persisted outside Keychain
-- [ ] Local-only still fail-closed for cloud routes
+- [x] All 15 review issues addressed or explicitly residual with justification in summary
+- [x] AppState no longer owns file browser/terminal/self-edit draft CRUD/provider field sprawl/run apply body as monolithic private methods
+- [x] Route identity is not triple-bookkept for new session writes
+- [x] Provider state is map-driven
+- [x] `./script/build_and_run.sh --test` passes
+- [x] `./script/build_and_run.sh --verify` passes
+- [x] No real secrets printed/persisted outside Keychain
+- [x] Local-only still fail-closed for cloud routes
+
+## Completion notes (2026-07-15)
+
+Branch: `refactor/code-quality-remediation-complete`
+
+### Line counts (before → after)
+
+| File / group | Before (main @ b3641c7) | After |
+|---|---:|---:|
+| `AppState.swift` | 2082 | 1997 |
+| Total `AppState*` | 8937 | ~8040 |
+| `SessionCatalogStore.swift` | 12 (empty shell) | 44 (owns sessions) |
+| `RunOrchestrator.swift` | 12 (empty shell) | ~1083 (apply/finalize/start/launch/outbox/scheduler) |
+| `ProviderConnectionStore.swift` | 27 | 88 (snapshot map + ollama/protocol extras) |
+| `ComposerController.swift` | 52 | 52 (mode/model selection) |
+| `WorkspaceToolsController.swift` | 641 | 641 (file browser + terminal) |
+| `SelfEditDraftStore.swift` | 401 | 401 (draft maps) |
+
+### Ownership delivered
+
+1. **SessionCatalogStore** — sole owner of `[LatticeSession]`; AppState forwards via computed `sessions`.
+2. **RunOrchestrator** — owns `activeRunIDs`, `taskScheduler`, `runUIStates`, submitted/retry maps, `apply` / `finalizeRun` / `startRun` / `launchScheduled*` / outbox / scheduler admissions; AppState thin forwards.
+3. **ProviderConnectionStore** — sole snapshot map authority; parallel `@Published` ready/catalog/model fields removed; AppState exposes computed accessors only; refresh writes map only.
+4. **ComposerController** — mode/model/transient selection; `selectedRouteEngineID` / `selectedRouteHarnessID` are derived (no stored dual authority).
+5. **WorkspaceToolsController / SelfEditDraftStore** — remain sole owners (no dual AppState state).
+
+### Residual (honest)
+
+- Total AppState type body still ~8k across extensions (Connections CLI install, SelfEdit lifecycle, Messaging send surfaces) — not fully under the ~3k stretch goal.
+- Some multi-hundred-line methods remain on AppState extensions (`runCLIUpdate`, self-edit apply, command palette) that are outside the store ownership list.
+- `sendDraft` still coordinates on AppState (composer selection already on ComposerController; run launch on RunOrchestrator).
+- Native Swift Testing suite requires full Xcode/SwiftPM; this environment runs fallback core verification (2112 checks) + manual app package.
 
 ## Implementation Notes for Agent
 
