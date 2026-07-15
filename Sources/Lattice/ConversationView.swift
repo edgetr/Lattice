@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import AppKit
 import LatticeCore
 
 struct ConversationView: View {
@@ -162,6 +163,11 @@ struct ConversationView: View {
                     }
                 }
                 if showsComposer {
+                    if let sessionID = state.selectedSessionID {
+                        ComputerFrameCard(presentation: state.computerFramePresentation(for: sessionID))
+                            .padding(.horizontal)
+                            .padding(.top, 8)
+                    }
                     ComposerView(state: state)
                 }
             } else if state.isTransientNewChat {
@@ -530,7 +536,7 @@ private struct NewChatShellView: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
             if state.activeComposerBackend == nil {
-                Text("Nothing is saved until you send your first message.")
+                Text("Nothing is saved until you send or attach context.")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
@@ -571,6 +577,11 @@ struct ComposerView: View {
                 onStop: state.stop,
                 onChooseFiles: state.chooseAttachments,
                 onDropFiles: state.addAttachments,
+                onDropImageData: state.addDroppedImageData,
+                onPasteImage: state.pasteImageFromClipboard,
+                onCaptureRegion: state.captureScreenRegion,
+                onCaptureWindow: state.captureAppWindow,
+                includeScreenshotContext: $state.includeScreenshotContext,
                 onDismissContext: {
                     // MorphingControl owns phase animation and honors Reduce Motion.
                     state.setVisibleComposerState(.expanded, for: state.selectedSession?.id)
@@ -759,7 +770,18 @@ struct AttachmentStrip: View {
                 HStack(spacing: 7) {
                     ForEach(state.attachments) { attachment in
                         HStack(spacing: 6) {
-                            Image(systemName: attachment.isImage ? "photo" : "doc")
+                            if attachment.isImage,
+                               !attachment.isMissing,
+                               let image = NSImage(contentsOfFile: attachment.path) {
+                                Image(nsImage: image)
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(width: 30, height: 24)
+                                    .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                                    .accessibilityHidden(true)
+                            } else {
+                                Image(systemName: attachment.isImage ? "photo" : "doc")
+                            }
                             Text(attachment.isMissing ? "Missing: \(attachment.name)" : attachment.name)
                                 .lineLimit(1)
                                 .foregroundStyle(attachment.isMissing ? .secondary : .primary)
@@ -779,6 +801,55 @@ struct AttachmentStrip: View {
                 }
             }
         }
+    }
+}
+
+struct ComputerFrameCard: View {
+    let presentation: ComputerFrameViewerPresentation
+
+    var body: some View {
+        if presentation.visibility == .visible {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Label("Provider computer view", systemImage: "display")
+                        .font(.caption.weight(.semibold))
+                    Spacer()
+                    if presentation.isCancelled { Text("Cancelled") }
+                    else if presentation.isStopped { Text("Stopped") }
+                    else { Text("Live activity") }
+                }
+                .foregroundStyle(.secondary)
+                switch presentation.content {
+                case .latestFrameOnly(let frame):
+                    if let url = frame.imageURL, let image = NSImage(contentsOf: url) {
+                        Image(nsImage: image)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxWidth: .infinity, maxHeight: 260)
+                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            .accessibilityLabel("Latest provider computer frame")
+                    } else {
+                        unavailable("The latest provider frame file is unavailable.")
+                    }
+                case .imageUnavailable(let reason): unavailable(reason)
+                case .none: EmptyView()
+                }
+                Text(presentation.controlBoundaryStatement)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(10)
+            .latticeGlass(cornerRadius: 12)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Observable provider computer activity")
+        }
+    }
+
+    private func unavailable(_ reason: String) -> some View {
+        Label(reason, systemImage: "photo.badge.exclamationmark")
+            .font(.caption)
+            .foregroundStyle(.orange)
     }
 }
 

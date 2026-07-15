@@ -390,9 +390,149 @@ public enum AgentEvent: Sendable, Equatable {
     case metric(name: String, value: Double, unit: String)
     case harnessActivity(HarnessActivityEvent)
     case providerDiagnostic(ProviderEventDiagnostic)
+    /// Observable provider computer-use frame. Lattice does not mediate mouse/keyboard tools.
+    case computerFrame(ComputerFrame)
     case completed
     case cancelled
     case failed(String)
+}
+
+/// How an attachment image entered Lattice context.
+public enum ContextAttachmentImageSource: String, Codable, Sendable, Hashable {
+    case existingFile
+    case clipboard
+    case regionCapture
+    case windowCapture
+}
+
+/// Explicit image-only fallback when authorized accessibility context is absent.
+public struct ContextAttachmentImageOnlyFallback: Hashable, Codable, Sendable, Equatable {
+    public var isImageOnly: Bool
+    public var reason: String?
+
+    public init(isImageOnly: Bool = false, reason: String? = nil) {
+        self.isImageOnly = isImageOnly
+        self.reason = isImageOnly ? reason : nil
+    }
+
+    public static let none = ContextAttachmentImageOnlyFallback(isImageOnly: false, reason: nil)
+
+    public static func imageOnly(reason: String) -> ContextAttachmentImageOnlyFallback {
+        ContextAttachmentImageOnlyFallback(isImageOnly: true, reason: reason)
+    }
+}
+
+/// Optional typed metadata for image attachments, including Lattice-managed captures.
+///
+/// Accessibility text is never retained unless `accessibilityTextAuthorized` is true.
+public struct ContextAttachmentImageMetadata: Hashable, Codable, Sendable, Equatable {
+    public static let maxAccessibilityTextLength = 4_000
+
+    /// When true, the file lives under Lattice-managed capture storage and cleanup may delete it.
+    public var isLatticeManaged: Bool
+    public var source: ContextAttachmentImageSource
+    public var capturedAt: Date?
+    /// User explicitly opted into attaching app/window identity for this image.
+    public var contextMetadataAuthorized: Bool
+    public var frontmostApplicationName: String?
+    public var frontmostApplicationBundleID: String?
+    public var frontmostWindowTitle: String?
+    /// User-authorized inclusion of accessibility text for this capture.
+    public var accessibilityTextAuthorized: Bool
+    /// Bounded accessibility text; always nil unless authorized.
+    public var accessibilityText: String?
+    public var imageOnlyFallback: ContextAttachmentImageOnlyFallback
+
+    public init(
+        isLatticeManaged: Bool = false,
+        source: ContextAttachmentImageSource = .existingFile,
+        capturedAt: Date? = nil,
+        contextMetadataAuthorized: Bool = false,
+        frontmostApplicationName: String? = nil,
+        frontmostApplicationBundleID: String? = nil,
+        frontmostWindowTitle: String? = nil,
+        accessibilityTextAuthorized: Bool = false,
+        accessibilityText: String? = nil,
+        imageOnlyFallback: ContextAttachmentImageOnlyFallback = .none
+    ) {
+        self.isLatticeManaged = isLatticeManaged
+        self.source = source
+        self.capturedAt = capturedAt
+        self.contextMetadataAuthorized = contextMetadataAuthorized
+        self.frontmostApplicationName = contextMetadataAuthorized ? Self.boundedOptional(frontmostApplicationName, max: 256) : nil
+        self.frontmostApplicationBundleID = contextMetadataAuthorized ? Self.boundedOptional(frontmostApplicationBundleID, max: 256) : nil
+        self.frontmostWindowTitle = contextMetadataAuthorized ? Self.boundedOptional(frontmostWindowTitle, max: 512) : nil
+        self.accessibilityTextAuthorized = contextMetadataAuthorized && accessibilityTextAuthorized
+        if self.accessibilityTextAuthorized {
+            self.accessibilityText = Self.boundedOptional(accessibilityText, max: Self.maxAccessibilityTextLength)
+        } else {
+            self.accessibilityText = nil
+        }
+        if self.accessibilityText != nil {
+            self.imageOnlyFallback = .none
+        } else {
+            self.imageOnlyFallback = imageOnlyFallback
+        }
+    }
+
+    public var isCapture: Bool {
+        switch source {
+        case .clipboard, .regionCapture, .windowCapture:
+            return true
+        case .existingFile:
+            return isLatticeManaged
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case isLatticeManaged, source, capturedAt, contextMetadataAuthorized
+        case frontmostApplicationName, frontmostApplicationBundleID, frontmostWindowTitle
+        case accessibilityTextAuthorized, accessibilityText, imageOnlyFallback
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let authorized = try container.decodeIfPresent(Bool.self, forKey: .accessibilityTextAuthorized) ?? false
+        let decodedText = try container.decodeIfPresent(String.self, forKey: .accessibilityText)
+        let fallback = try container.decodeIfPresent(ContextAttachmentImageOnlyFallback.self, forKey: .imageOnlyFallback) ?? .none
+        self.init(
+            isLatticeManaged: try container.decodeIfPresent(Bool.self, forKey: .isLatticeManaged) ?? false,
+            source: try container.decodeIfPresent(ContextAttachmentImageSource.self, forKey: .source) ?? .existingFile,
+            capturedAt: try container.decodeIfPresent(Date.self, forKey: .capturedAt),
+            contextMetadataAuthorized: try container.decodeIfPresent(Bool.self, forKey: .contextMetadataAuthorized) ?? false,
+            frontmostApplicationName: try container.decodeIfPresent(String.self, forKey: .frontmostApplicationName),
+            frontmostApplicationBundleID: try container.decodeIfPresent(String.self, forKey: .frontmostApplicationBundleID),
+            frontmostWindowTitle: try container.decodeIfPresent(String.self, forKey: .frontmostWindowTitle),
+            accessibilityTextAuthorized: authorized,
+            // Fail closed: ignore unauthorized text even if present in legacy/corrupt JSON.
+            accessibilityText: authorized ? decodedText : nil,
+            imageOnlyFallback: fallback
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(isLatticeManaged, forKey: .isLatticeManaged)
+        try container.encode(source, forKey: .source)
+        try container.encodeIfPresent(capturedAt, forKey: .capturedAt)
+        try container.encode(contextMetadataAuthorized, forKey: .contextMetadataAuthorized)
+        try container.encodeIfPresent(frontmostApplicationName, forKey: .frontmostApplicationName)
+        try container.encodeIfPresent(frontmostApplicationBundleID, forKey: .frontmostApplicationBundleID)
+        try container.encodeIfPresent(frontmostWindowTitle, forKey: .frontmostWindowTitle)
+        try container.encode(accessibilityTextAuthorized, forKey: .accessibilityTextAuthorized)
+        if accessibilityTextAuthorized {
+            try container.encodeIfPresent(accessibilityText, forKey: .accessibilityText)
+        }
+        try container.encode(imageOnlyFallback, forKey: .imageOnlyFallback)
+    }
+
+    private static func boundedOptional(_ value: String?, max: Int) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.count <= max { return trimmed }
+        return String(trimmed.prefix(max))
+    }
 }
 
 public struct ContextAttachment: Identifiable, Hashable, Codable, Sendable {
@@ -401,6 +541,9 @@ public struct ContextAttachment: Identifiable, Hashable, Codable, Sendable {
     public let path: String
     /// When true, the attachment is metadata-only and must not be opened, read, or resolved on disk.
     public var isMissing: Bool
+    /// Optional image capture metadata. Absent for ordinary non-image attachments and legacy records.
+    public var imageMetadata: ContextAttachmentImageMetadata?
+
     public var name: String {
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return "attachment" }
@@ -416,14 +559,20 @@ public struct ContextAttachment: Identifiable, Hashable, Codable, Sendable {
             (name as NSString).pathExtension.lowercased()
         )
     }
-    public init(id: UUID = UUID(), path: String, isMissing: Bool = false) {
+
+    public var isLatticeManagedCapture: Bool {
+        imageMetadata?.isLatticeManaged == true
+    }
+
+    public init(id: UUID = UUID(), path: String, isMissing: Bool = false, imageMetadata: ContextAttachmentImageMetadata? = nil) {
         self.id = id
         self.path = path
         self.isMissing = isMissing
+        self.imageMetadata = imageMetadata
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, path, isMissing
+        case id, path, isMissing, imageMetadata
     }
 
     public init(from decoder: Decoder) throws {
@@ -431,6 +580,7 @@ public struct ContextAttachment: Identifiable, Hashable, Codable, Sendable {
         id = try container.decode(UUID.self, forKey: .id)
         path = try container.decode(String.self, forKey: .path)
         isMissing = try container.decodeIfPresent(Bool.self, forKey: .isMissing) ?? false
+        imageMetadata = try container.decodeIfPresent(ContextAttachmentImageMetadata.self, forKey: .imageMetadata)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -438,6 +588,7 @@ public struct ContextAttachment: Identifiable, Hashable, Codable, Sendable {
         try container.encode(id, forKey: .id)
         try container.encode(path, forKey: .path)
         try container.encode(isMissing, forKey: .isMissing)
+        try container.encodeIfPresent(imageMetadata, forKey: .imageMetadata)
     }
 }
 
@@ -470,6 +621,12 @@ public struct ReasoningOption: Identifiable, Hashable, Codable, Sendable {
     }
 }
 
+/// Advertised model input modalities. Missing persisted values fail closed to text only.
+public enum ModelInputModality: String, Codable, Sendable, Hashable, CaseIterable {
+    case text
+    case image
+}
+
 public struct ProviderModel: Identifiable, Hashable, Codable, Sendable {
     public let id: String
     public let name: String
@@ -478,8 +635,19 @@ public struct ProviderModel: Identifiable, Hashable, Codable, Sendable {
     public let defaultReasoningEffort: ReasoningEffort?
     public let contextWindow: Int?
     public let isDefault: Bool
+    /// Modalities this model advertises accepting. Defaults to text-only when unknown.
+    public let inputModalities: Set<ModelInputModality>
 
-    public init(id: String, name: String, description: String = "", reasoningOptions: [ReasoningOption] = [], defaultReasoningEffort: ReasoningEffort? = nil, contextWindow: Int? = nil, isDefault: Bool = false) {
+    public init(
+        id: String,
+        name: String,
+        description: String = "",
+        reasoningOptions: [ReasoningOption] = [],
+        defaultReasoningEffort: ReasoningEffort? = nil,
+        contextWindow: Int? = nil,
+        isDefault: Bool = false,
+        inputModalities: Set<ModelInputModality> = [.text]
+    ) {
         self.id = id
         self.name = name
         self.description = description
@@ -487,6 +655,45 @@ public struct ProviderModel: Identifiable, Hashable, Codable, Sendable {
         self.defaultReasoningEffort = defaultReasoningEffort
         self.contextWindow = contextWindow.flatMap { $0 > 0 ? $0 : nil }
         self.isDefault = isDefault
+        self.inputModalities = inputModalities.isEmpty ? [.text] : inputModalities
+    }
+
+    public var acceptsImages: Bool {
+        inputModalities.contains(.image)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, description, reasoningOptions, defaultReasoningEffort, contextWindow, isDefault, inputModalities
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        description = try container.decodeIfPresent(String.self, forKey: .description) ?? ""
+        reasoningOptions = try container.decodeIfPresent([ReasoningOption].self, forKey: .reasoningOptions) ?? []
+        defaultReasoningEffort = try container.decodeIfPresent(ReasoningEffort.self, forKey: .defaultReasoningEffort)
+        let window = try container.decodeIfPresent(Int.self, forKey: .contextWindow)
+        contextWindow = window.flatMap { $0 > 0 ? $0 : nil }
+        isDefault = try container.decodeIfPresent(Bool.self, forKey: .isDefault) ?? false
+        // Fail closed: missing or empty modalities are text-only.
+        if let raw = try container.decodeIfPresent([ModelInputModality].self, forKey: .inputModalities), !raw.isEmpty {
+            inputModalities = Set(raw)
+        } else {
+            inputModalities = [.text]
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(description, forKey: .description)
+        try container.encode(reasoningOptions, forKey: .reasoningOptions)
+        try container.encodeIfPresent(defaultReasoningEffort, forKey: .defaultReasoningEffort)
+        try container.encodeIfPresent(contextWindow, forKey: .contextWindow)
+        try container.encode(isDefault, forKey: .isDefault)
+        try container.encode(inputModalities.sorted { $0.rawValue < $1.rawValue }, forKey: .inputModalities)
     }
 }
 
@@ -503,6 +710,58 @@ public enum ProviderModelMetadata {
             }
         }
         return nil
+    }
+
+    /// Parses advertised input modalities from a structured model/list object.
+    /// Missing or unrecognized values fail closed to text only.
+    public static func inputModalities(from object: [String: Any]) -> Set<ModelInputModality> {
+        let candidates: [Any?] = [
+            object["inputModalities"],
+            object["input_modalities"],
+            object["supportedInputModalities"],
+            object["supported_input_modalities"],
+            (object["capabilities"] as? [String: Any])?["inputModalities"],
+            (object["capabilities"] as? [String: Any])?["input_modalities"],
+            (object["metadata"] as? [String: Any])?["inputModalities"],
+            (object["metadata"] as? [String: Any])?["input_modalities"]
+        ]
+        for candidate in candidates {
+            if let modalities = parseModalityList(candidate), !modalities.isEmpty {
+                return modalities
+            }
+        }
+        return [.text]
+    }
+
+    private static func parseModalityList(_ value: Any?) -> Set<ModelInputModality>? {
+        switch value {
+        case let strings as [String]:
+            let parsed = Set(strings.compactMap(parseModalityToken(_:)))
+            return parsed.isEmpty ? nil : parsed
+        case let anyArray as [Any]:
+            let parsed = Set(anyArray.compactMap { item -> ModelInputModality? in
+                guard let string = item as? String else { return nil }
+                return parseModalityToken(string)
+            })
+            return parsed.isEmpty ? nil : parsed
+        case let string as String:
+            let parts = string.split { $0 == "," || $0 == " " || $0 == "|" }.map(String.init)
+            let parsed = Set(parts.compactMap(parseModalityToken(_:)))
+            return parsed.isEmpty ? nil : parsed
+        default:
+            return nil
+        }
+    }
+
+    private static func parseModalityToken(_ raw: String) -> ModelInputModality? {
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "text", "txt", "string":
+            return .text
+        case "image", "images", "vision", "img", "picture", "photo":
+            return .image
+        default:
+            return nil
+        }
     }
 
     private static func positiveInteger(_ value: Any?) -> Int? {
