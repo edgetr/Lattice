@@ -159,17 +159,14 @@ extension AppState {
                         providerAcknowledgement: .rejectedByHarness
                     )
                     updateSessionAction(id: request.id, status: allowed ? .cancelled : .denied, at: index)
-                    sessions[index].isStreaming = false
-                    activeRunIDs[id] = nil
-                    reduceRunUI(.failed("The provider rejected Lattice's automatic permission decision."), for: id)
-                    threadActivityLanes.apply(.failed("The provider rejected Lattice's automatic permission decision."), to: id)
                     cancelHarnessProcess(for: sessions[index], sessionID: id)
-                    persist()
-                    finishSchedulerRunAfterCheckpoint(sessionID: id, runID: runID) { [weak self] in
-                        guard let self else { return }
-                        self.handleSchedulerAdmissions(self.taskScheduler.finish(id))
-                        self.persist()
-                    }
+                    finalizeRun(
+                        .permissionDenied("The provider rejected Lattice's automatic permission decision."),
+                        sessionID: id,
+                        runID: runID,
+                        sessionIndex: index,
+                        backend: backend
+                    )
                     return
                 }
                 updateApprovalProvenance(
@@ -195,17 +192,14 @@ extension AppState {
                     providerAcknowledgement: cancellationForwarded ? .acceptedByHarness : .unavailable
                 )
                 updateSessionAction(id: request.id, status: .denied, at: index)
-                sessions[index].isStreaming = false
-                activeRunIDs[id] = nil
-                reduceRunUI(.failed("Blocked by Lattice policy: \(reason)"), for: id)
-                threadActivityLanes.apply(.failed("Blocked by Lattice policy: \(reason)"), to: id)
                 cancelHarnessProcess(for: sessions[index], sessionID: id)
-                persist()
-                finishSchedulerRunAfterCheckpoint(sessionID: id, runID: runID) { [weak self] in
-                    guard let self else { return }
-                    self.handleSchedulerAdmissions(self.taskScheduler.finish(id))
-                    self.persist()
-                }
+                finalizeRun(
+                    .permissionDenied("Blocked by Lattice policy: \(reason)"),
+                    sessionID: id,
+                    runID: runID,
+                    sessionIndex: index,
+                    backend: backend
+                )
             case .requestUser:
                 harnessPermissionNotices[id] = notice
                 setActivity([.init(icon: "hand.raised.fill", title: request.title, detail: "Waiting for your decision")], sessionID: id)
@@ -316,13 +310,16 @@ extension AppState {
             _ = accumulator.offer(frame)
             computerFrameAccumulators[id] = accumulator
             updateSessionAction(id: frame.id, status: .completed, at: index)
-        case .completed:
-            finalizeRun(.completed, sessionID: id, runID: runID, sessionIndex: index, backend: backend)
-        case .cancelled:
-            finalizeRun(.cancelled, sessionID: id, runID: runID, sessionIndex: index, backend: backend)
-        case .failed(let message):
-            finalizeRun(.failed(message), sessionID: id, runID: runID, sessionIndex: index, backend: backend)
+        case .completed, .cancelled, .failed:
+            // Terminal classification is pure; side-effect ladder is finalizeRun only.
+            guard let terminal = SessionRunReducer.terminal(for: event) else { return }
+            finalizeRun(terminal, sessionID: id, runID: runID, sessionIndex: index, backend: backend)
         }
+    }
+
+    enum FinalizeSchedulerCompletion {
+        case finish
+        case cancel
     }
 
     /// Single terminal ladder for completed / cancelled / failed / permission-denied runs.
@@ -331,8 +328,12 @@ extension AppState {
         sessionID id: UUID,
         runID: UUID,
         sessionIndex index: Int,
-        backend: ChatBackend
+        backend: ChatBackend,
+        schedulerCompletion: FinalizeSchedulerCompletion = .finish
     ) {
+        // Ignore stale terminals after stop already finalized this runID.
+        if activeRunIDs[id] != nil && activeRunIDs[id] != runID { return }
+
         switch terminal {
         case .completed:
             computerFrameAccumulators[id]?.stop()
@@ -346,6 +347,16 @@ extension AppState {
         activeRunIDs[id] = nil
         inlineImagePayloadSuppression.remove(id)
         harnessPermissionNotices[id] = nil
+
+        let admit: @MainActor () -> Void = { [weak self] in
+            guard let self else { return }
+            switch schedulerCompletion {
+            case .finish:
+                self.handleSchedulerAdmissions(self.taskScheduler.finish(id))
+            case .cancel:
+                self.handleSchedulerAdmissions(self.taskScheduler.cancel(id))
+            }
+        }
 
         switch terminal {
         case .completed:
@@ -364,7 +375,7 @@ extension AppState {
                 persist()
                 finishSchedulerRunAfterCheckpoint(sessionID: id, runID: runID) { [weak self] in
                     guard let self else { return }
-                    self.handleSchedulerAdmissions(self.taskScheduler.finish(id))
+                    admit()
                     self.persist()
                     self.scheduleIdleUnloadIfNeeded(for: backend)
                 }
@@ -373,7 +384,7 @@ extension AppState {
             persist()
             finishSchedulerRunAfterCheckpoint(sessionID: id, runID: runID) { [weak self] in
                 guard let self else { return }
-                self.handleSchedulerAdmissions(self.taskScheduler.finish(id))
+                admit()
                 if self.runNextQueuedFollowUpIfPossible(for: id) { return }
                 self.persist()
                 self.scheduleIdleUnloadIfNeeded(for: backend)
@@ -402,7 +413,7 @@ extension AppState {
             persist()
             finishSchedulerRunAfterCheckpoint(sessionID: id, runID: runID) { [weak self] in
                 guard let self else { return }
-                self.handleSchedulerAdmissions(self.taskScheduler.finish(id))
+                admit()
                 self.persist()
                 self.scheduleIdleUnloadIfNeeded(for: backend)
             }
@@ -420,11 +431,15 @@ extension AppState {
             }
             submittedRequests[id] = nil
             let timedOut = message == "Permission request timed out."
+            let isPermissionDenied: Bool = {
+                if case .permissionDenied = terminal { return true }
+                return false
+            }()
             finishPendingActions(
                 status: .failed,
                 at: index,
                 approvalOutcome: timedOut ? .timedOut : .failed,
-                providerAcknowledgement: timedOut ? .timedOut : .unavailable
+                providerAcknowledgement: timedOut ? .timedOut : (isPermissionDenied ? .rejectedByHarness : .unavailable)
             )
             sessions[index].isStreaming = false
             reduceRunUI(.failed(message), for: id)
@@ -436,7 +451,7 @@ extension AppState {
             persist()
             finishSchedulerRunAfterCheckpoint(sessionID: id, runID: runID) { [weak self] in
                 guard let self else { return }
-                self.handleSchedulerAdmissions(self.taskScheduler.finish(id))
+                admit()
                 self.persist()
                 self.scheduleIdleUnloadIfNeeded(for: backend)
             }

@@ -5,7 +5,7 @@ public extension WorkspaceCheckpointService {
     // MARK: Guarded revert
 
     /// Builds a revert preview from an after-run checkpoint back to its paired before-run checkpoint.
-    public func previewRevert(afterCheckpointID: UUID) async throws -> WorkspaceCheckpointRevertPreview {
+    func previewRevert(afterCheckpointID: UUID) async throws -> WorkspaceCheckpointRevertPreview {
         let after = try requireCaptured(id: afterCheckpointID)
         guard after.boundary == .afterRun else {
             throw WorkspaceCheckpointError.checkpointPairInvalid(
@@ -17,7 +17,7 @@ public extension WorkspaceCheckpointService {
     }
 
     /// Applies a previously previewed revert using the confirmation token from that preview.
-    public func confirmRevert(
+    func confirmRevert(
         afterCheckpointID: UUID,
         confirmationToken: String
     ) async throws -> WorkspaceCheckpointRevertResult {

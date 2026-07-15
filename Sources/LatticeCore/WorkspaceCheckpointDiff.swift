@@ -4,7 +4,7 @@ public extension WorkspaceCheckpointService {
     // MARK: Diff
 
     /// Computes per-file changes (with hunks) between a before/after checkpoint pair.
-    public func changes(
+    func changes(
         beforeCheckpointID: UUID,
         afterCheckpointID: UUID
     ) async throws -> WorkspaceCheckpointChangeSet {
@@ -48,7 +48,7 @@ public extension WorkspaceCheckpointService {
         )
     }
 
-    public static func parseNumstat(_ output: String) -> WorkspaceCheckpointChangeStats {
+    static func parseNumstat(_ output: String) -> WorkspaceCheckpointChangeStats {
         var files = 0
         var additions = 0
         var deletions = 0
@@ -229,7 +229,7 @@ public extension WorkspaceCheckpointService {
     }
 
     /// Parses `@@ -oldStart[,oldCount] +newStart[,newCount] @@` headers without regex force-unwraps.
-    public static func parseHunkHeader(_ header: String) -> (
+    static func parseHunkHeader(_ header: String) -> (
         oldStart: Int,
         oldCount: Int,
         newStart: Int,
@@ -267,7 +267,7 @@ public extension WorkspaceCheckpointService {
         return (old.0, old.1, new.0, new.1)
     }
 
-    public static func parseUnifiedDiffHunks(_ patch: String) -> [String: [WorkspaceCheckpointHunk]] {
+    static func parseUnifiedDiffHunks(_ patch: String) -> [String: [WorkspaceCheckpointHunk]] {
         var currentPath: String?
         var currentHunks: [WorkspaceCheckpointHunk] = []
         var result: [String: [WorkspaceCheckpointHunk]] = [:]

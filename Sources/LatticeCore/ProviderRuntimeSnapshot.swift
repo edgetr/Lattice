@@ -24,6 +24,9 @@ public struct ProviderRuntimeSnapshot: Equatable, Sendable {
     public var latestCLIVersion: String?
     /// Freeform protocol/detail note (unavailable reason, protocol support text, etc.).
     public var protocolDetail: String?
+    /// Explicit runnable-model count used for readiness. Prefer this over raw model array lengths
+    /// so filtered catalogs (visible/runnable) and harness-only catalogs stay consistent.
+    public var runnableModelCount: Int
     public var ready: Bool
     public var usage: ProviderUsage?
     public var updateInfo: CLIUpdateInfo?
@@ -37,7 +40,8 @@ public struct ProviderRuntimeSnapshot: Equatable, Sendable {
         cliVersion: String? = nil,
         latestCLIVersion: String? = nil,
         protocolDetail: String? = nil,
-        ready: Bool = false,
+        runnableModelCount: Int? = nil,
+        ready: Bool? = nil,
         usage: ProviderUsage? = nil,
         updateInfo: CLIUpdateInfo? = nil
     ) {
@@ -49,19 +53,28 @@ public struct ProviderRuntimeSnapshot: Equatable, Sendable {
         self.cliVersion = cliVersion
         self.latestCLIVersion = latestCLIVersion
         self.protocolDetail = protocolDetail
-        self.ready = ready
+        let count = runnableModelCount
+            ?? max(models.count, harnessModels.count)
+        self.runnableModelCount = max(0, count)
+        self.ready = ready ?? ProviderRuntimeSnapshotStore.computeReady(
+            installed: installed,
+            authenticated: authenticated,
+            catalogStatus: catalogStatus,
+            runnableModelCount: self.runnableModelCount
+        )
         self.usage = usage
         self.updateInfo = updateInfo
     }
 
     public static let empty = ProviderRuntimeSnapshot()
 
+    /// Single readiness formula — always agrees with `ready` when constructed via the designated init.
     public var readiness: ProviderReadinessSnapshot {
         ProviderReadinessSnapshot(
             installed: installed,
             authenticated: authenticated,
             catalogStatus: catalogStatus,
-            runnableModelCount: models.count
+            runnableModelCount: runnableModelCount
         )
     }
 
@@ -100,6 +113,15 @@ public enum ProviderRuntimeSnapshotStore {
         snapshots[key.rawValue] = current
     }
 
+    public static func markAllLoading(
+        _ snapshots: inout [String: ProviderRuntimeSnapshot],
+        keys: [ProviderConnectionKey] = ProviderConnectionKey.allCases
+    ) {
+        for key in keys {
+            markLoading(&snapshots, key: key)
+        }
+    }
+
     /// Fail-closed readiness: ready only when installed, authenticated, loaded, and runnable models exist.
     public static func computeReady(
         installed: Bool,
@@ -113,5 +135,23 @@ public enum ProviderRuntimeSnapshotStore {
             catalogStatus: catalogStatus,
             runnableModelCount: runnableModelCount
         ).isRunnable
+    }
+
+    /// Hydrate secret-free presence from durable cache without granting readiness.
+    public static func hydratePresence(
+        from cached: [String: PersistedConnectionState.Provider]
+    ) -> [String: ProviderRuntimeSnapshot] {
+        var result: [String: ProviderRuntimeSnapshot] = [:]
+        for key in ProviderConnectionKey.allCases {
+            guard let entry = cached[key.rawValue] else { continue }
+            result[key.rawValue] = ProviderRuntimeSnapshot(
+                installed: entry.installed,
+                authenticated: entry.authenticated,
+                catalogStatus: .unknown,
+                runnableModelCount: 0,
+                ready: false
+            )
+        }
+        return result
     }
 }

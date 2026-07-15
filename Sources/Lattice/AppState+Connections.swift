@@ -24,6 +24,14 @@ extension AppState {
             ollama: ollamaCatalogStatus
         )
         isRefreshingConnections = true
+        providerConnections.markLoading(.codex)
+        providerConnections.markLoading(.grok)
+        providerConnections.markLoading(.opencode)
+        providerConnections.markLoading(.antigravity)
+        providerConnections.markLoading(.pi)
+        providerConnections.markLoading(.hermes)
+        providerConnections.markLoading(.ollama)
+        providerConnections.markLoading(.apple)
         defer {
             if connectionRefreshGeneration.isCurrent(generation) {
                 if Task.isCancelled {
@@ -35,6 +43,16 @@ extension AppState {
                     if ollamaCatalogStatus == .loading,
                        localModelRefreshGeneration.isCurrent(localGeneration) {
                         ollamaCatalogStatus = previousCatalogStatuses.ollama
+                    }
+                    // Restore snapshot map catalog statuses from the dual-written legacy fields path
+                    // by re-upserting last known non-loading status via ready=false presence.
+                    for key in ProviderConnectionKey.allCases {
+                        var snap = providerConnections.snapshot(for: key)
+                        if snap.catalogStatus == .loading {
+                            snap.catalogStatus = .unknown
+                            snap.ready = false
+                            providerConnections.setSnapshot(snap, for: key)
+                        }
                     }
                 }
                 isRefreshingConnections = false
@@ -108,6 +126,7 @@ extension AppState {
                 cliVersion: version,
                 latestCLIVersion: latest,
                 protocolDetail: snapshot.unavailableReason,
+                runnableModelCount: visibleCodexModels.count,
                 ready: codexReady,
                 usage: snapshot.usage
             ),
@@ -152,6 +171,7 @@ extension AppState {
                 cliVersion: update.currentVersion,
                 latestCLIVersion: update.latestVersion,
                 protocolDetail: update.detail,
+                runnableModelCount: runnableGrokModels.count,
                 ready: grokReady,
                 updateInfo: update
             ),
@@ -214,6 +234,7 @@ extension AppState {
                 harnessModels: openCodeACPModels,
                 cliVersion: openCodeCLIVersion,
                 latestCLIVersion: latest,
+                runnableModelCount: runnableOpenCodeModels.count,
                 ready: openCodeReady
             ),
             for: .opencode
@@ -256,6 +277,7 @@ extension AppState {
                 cliVersion: antigravityCLIVersion,
                 latestCLIVersion: latest,
                 protocolDetail: String(describing: protocolSupport),
+                runnableModelCount: models.count,
                 ready: authenticated && catalog.status == .loaded && !models.isEmpty
             ),
             for: .antigravity
@@ -285,6 +307,7 @@ extension AppState {
                 models: catalog.sorted().map { ProviderModel(id: $0, name: $0) },
                 cliVersion: version,
                 latestCLIVersion: latest,
+                runnableModelCount: catalog.count,
                 ready: piInstalled && !catalog.isEmpty
             ),
             for: .pi
@@ -314,6 +337,7 @@ extension AppState {
                 cliVersion: info.currentVersion,
                 latestCLIVersion: info.latestVersion,
                 protocolDetail: info.detail,
+                runnableModelCount: catalog.models.count,
                 ready: hermesInstalled && catalog.status == .loaded && !catalog.models.isEmpty,
                 updateInfo: info
             ),
@@ -347,6 +371,7 @@ extension AppState {
                 catalogStatus: localCatalog.status,
                 models: ollamaModels.map { ProviderModel(id: $0.name, name: $0.name) },
                 protocolDetail: nil,
+                runnableModelCount: ollamaModels.count,
                 ready: localReady && localCatalog.status == .loaded && !ollamaModels.isEmpty
             ),
             for: .ollama
@@ -357,6 +382,7 @@ extension AppState {
                 authenticated: intelligenceReady,
                 catalogStatus: intelligenceReady ? .loaded : .empty,
                 protocolDetail: intelligenceStatus,
+                runnableModelCount: intelligenceReady ? 1 : 0,
                 ready: intelligenceReady
             ),
             for: .apple

@@ -25,6 +25,21 @@ struct ProviderRuntimeSnapshotTests {
         ))
     }
 
+    @Test func readyAndReadinessAgreeForHarnessOnlyCatalogs() {
+        let snap = ProviderRuntimeSnapshot(
+            installed: true,
+            authenticated: true,
+            catalogStatus: .loaded,
+            harnessModels: [HarnessModel(id: "p:m", name: "m")],
+            runnableModelCount: 1
+        )
+        #expect(snap.ready)
+        #expect(snap.readiness.isRunnable)
+        #expect(snap.ready == snap.readiness.isRunnable)
+        #expect(snap.models.isEmpty)
+        #expect(snap.runnableModelCount == 1)
+    }
+
     @Test func upsertAndSnapshotRoundTrip() {
         var map: [String: ProviderRuntimeSnapshot] = [:]
         let snapshot = ProviderRuntimeSnapshot(
@@ -58,5 +73,16 @@ struct ProviderRuntimeSnapshotTests {
         #expect(snap.catalogStatus == .loading)
         #expect(!snap.ready)
         #expect(snap.installed)
+    }
+
+    @Test func hydratePresenceNeverGrantsReadiness() {
+        let hydrated = ProviderRuntimeSnapshotStore.hydratePresence(from: [
+            "codex": .init(installed: true, authenticated: true, catalogStatus: .loaded, runnableModelCount: 4)
+        ])
+        #expect(hydrated["codex"]?.installed == true)
+        #expect(hydrated["codex"]?.authenticated == true)
+        #expect(hydrated["codex"]?.ready == false)
+        #expect(hydrated["codex"]?.catalogStatus == .unknown)
+        #expect(hydrated["codex"]?.runnableModelCount == 0)
     }
 }

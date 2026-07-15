@@ -854,20 +854,34 @@ struct ConnectionsView: View {
     @AppStorage("lattice.connections.runtimeComponentsExpanded") private var runtimeComponentsExpanded = false
     @FocusState private var openCodeKeyFocused: Bool
 
+    /// Prefer map-driven snapshot readiness; fall back to legacy dual-written fields during migration.
+    private var ollamaSnapshot: ProviderRuntimeSnapshot {
+        state.providerSnapshot(for: .ollama)
+    }
+
     private var ollamaConnectionReady: Bool {
-        state.ollamaReady && state.ollamaCatalogStatus == .loaded
+        if ollamaSnapshot.catalogStatus != .unknown {
+            return ollamaSnapshot.ready
+        }
+        return state.ollamaReady && state.ollamaCatalogStatus == .loaded
     }
 
     private var ollamaConnectionDetail: String {
-        guard state.ollamaInstalled else { return "Not installed" }
-        guard state.ollamaReady else { return "Installed · not running" }
-        switch state.ollamaCatalogStatus {
+        let installed = ollamaSnapshot.catalogStatus != .unknown ? ollamaSnapshot.installed : state.ollamaInstalled
+        let running = ollamaSnapshot.catalogStatus != .unknown ? ollamaSnapshot.authenticated : state.ollamaReady
+        let status = ollamaSnapshot.catalogStatus != .unknown ? ollamaSnapshot.catalogStatus : state.ollamaCatalogStatus
+        let modelCount = ollamaSnapshot.catalogStatus != .unknown
+            ? ollamaSnapshot.runnableModelCount
+            : state.ollamaModels.count
+        guard installed else { return "Not installed" }
+        guard running else { return "Installed · not running" }
+        switch status {
         case .unknown: return "Running · model catalog not checked"
         case .loading: return "Running · loading model catalog"
         case .failed: return "Running · model catalog unavailable"
         case .empty: return "Running · no chat models"
         case .loaded:
-            return "Running · \(state.ollamaModels.count) chat model\(state.ollamaModels.count == 1 ? "" : "s")"
+            return "Running · \(modelCount) chat model\(modelCount == 1 ? "" : "s")"
         }
     }
 

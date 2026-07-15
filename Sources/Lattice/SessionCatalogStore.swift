@@ -2,24 +2,11 @@ import Foundation
 import LatticeCore
 import Combine
 
-/// Owns the session catalog, selection, and lightweight list-level metadata.
-/// Run streaming and apply still coordinate through AppState/RunOrchestrator.
+/// Composition-root handle for session catalog work.
+/// Live sessions/selection remain on AppState until a full ownership move.
+/// This type intentionally holds no dual `@Published` session maps.
 @MainActor
 final class SessionCatalogStore: ObservableObject {
-    @Published var sessions: [LatticeSession] = []
-    @Published var selectedSessionID: UUID?
-    @Published private(set) var transcriptLoadingSessionID: UUID?
-
-    var selectedSession: LatticeSession? {
-        guard let selectedSessionID else { return nil }
-        return sessions.first { $0.id == selectedSessionID }
-    }
-
-    func index(for id: UUID) -> Int? {
-        sessions.firstIndex { $0.id == id }
-    }
-
-    func setTranscriptLoadingSessionID(_ id: UUID?) {
-        transcriptLoadingSessionID = id
-    }
+    /// Reserved for future ownership of persistence/hydration side channels.
+    /// Do not mirror AppState.sessions here.
 }

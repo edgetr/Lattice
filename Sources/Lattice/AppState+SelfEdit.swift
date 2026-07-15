@@ -1482,6 +1482,7 @@ extension AppState {
             codexReady = false
             grokReady = false
             openCodeReady = false
+            providerConnections.replaceAll(ProviderRuntimeSnapshotStore.hydratePresence(from: cached.providers))
         }
     }
 
@@ -1638,30 +1639,43 @@ extension AppState {
             }
         }
         for index in sessions.indices where !sessions[index].isStreaming && !sessions[index].messages.contains(where: { $0.role == .user }) {
+            let priorBackend = sessions[index].backend
+            let priorRoute = sessions[index].executionRoute
             if sessions[index].privacyMode == .localOnly {
                 let valid = validBackend(sessions[index].backend, privacyMode: .localOnly)
                 if valid != sessions[index].backend {
                     sessions[index].backend = valid
-                    sessions[index].harnessID = Self.defaultHarnessID(for: valid)
-                    sessions[index].reasoningEffort = defaultReasoning(for: valid, harnessID: sessions[index].harnessID)
+                    let route = RouteRuntimeMap.writeRoute(backend: valid, mode: .local)
+                    sessions[index].executionRoute = route
+                    sessions[index].harnessID = route.runtimeID
+                    sessions[index].reasoningEffort = defaultReasoning(for: valid, harnessID: route.runtimeID)
                     sessions[index].harnessThreadID = nil
                     didChangeSessions = true
                 }
             } else if let preferredCodex, case .codex(let model) = sessions[index].backend, shouldReplaceStaleCodexModel(model, preferred: preferredCodex.id) {
-                sessions[index].backend = .codex(model: preferredCodex.id)
-                sessions[index].harnessID = Self.defaultHarnessID(for: sessions[index].backend)
-                sessions[index].reasoningEffort = defaultReasoning(for: sessions[index].backend, harnessID: sessions[index].harnessID)
+                let backend = ChatBackend.codex(model: preferredCodex.id)
+                sessions[index].backend = backend
+                let route = RouteRuntimeMap.writeRoute(backend: backend, mode: priorRoute.mode)
+                sessions[index].executionRoute = route
+                sessions[index].harnessID = route.runtimeID
+                sessions[index].reasoningEffort = defaultReasoning(for: backend, harnessID: route.runtimeID)
                 sessions[index].harnessThreadID = nil
                 didChangeSessions = true
             } else {
                 let valid = validBackend(sessions[index].backend)
                 if valid != sessions[index].backend {
                     sessions[index].backend = valid
-                    sessions[index].harnessID = Self.defaultHarnessID(for: valid)
-                    sessions[index].reasoningEffort = defaultReasoning(for: valid, harnessID: sessions[index].harnessID)
+                    let route = RouteRuntimeMap.writeRoute(backend: valid, mode: priorRoute.mode)
+                    sessions[index].executionRoute = route
+                    sessions[index].harnessID = route.runtimeID
+                    sessions[index].reasoningEffort = defaultReasoning(for: valid, harnessID: route.runtimeID)
                     sessions[index].harnessThreadID = nil
                     didChangeSessions = true
                 }
+            }
+            // Keep declared routes in lockstep with backend when catalog rewrites model IDs.
+            if sessions[index].backend != priorBackend || sessions[index].executionRoute != priorRoute {
+                didChangeSessions = true
             }
         }
         if didChangeSessions { persist() }

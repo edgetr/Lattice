@@ -4465,6 +4465,89 @@ struct CoreVerification {
         expect(breakdown.tokens(for: .attachment) > 0, "Context breakdown includes attachment estimate")
         expect(breakdown.estimatedTotal == breakdown.slices.reduce(0) { $0 + $1.estimatedTokens }, "Context breakdown total equals slice sum")
 
+        // RouteRuntimeMap / ExecutionRoute authority (fallback machines never run native tests).
+        let codexPi = RouteRuntimeMap.writeRoute(backend: .codex(model: "gpt-5.5"), mode: .code)
+        expect(codexPi.runtimeID == "pi" && codexPi.providerID == "codex", "Declared codex code write route uses pi runtime")
+        expect(RouteRuntimeMap.defaultRuntimeID(mode: .code, providerID: "codex") == "pi", "Catalog default runtime for codex code is pi")
+        expect(RouteRuntimeMap.cancelTarget(for: codexPi) == "pi", "Cancel target prefers declared runtime")
+        let workHermes = RouteRuntimeMap.writeRoute(
+            backend: .openCode(model: "opencode-go:deepseek"),
+            mode: .work
+        )
+        expect(workHermes.runtimeID == "hermes", "Declared work openCode write route uses hermes")
+        expect(
+            RouteRuntimeMap.backendProjection(for: workHermes) == .openCode(model: "opencode-go:deepseek"),
+            "Backend projection round-trips declared work route"
+        )
+        expect(
+            !SessionPrivacyPolicy.allows(.codex(model: "gpt-5.5"), in: .localOnly),
+            "Local-only fails closed for cloud backends"
+        )
+        expect(
+            SessionPrivacyPolicy.allows(.appleIntelligence, in: .localOnly),
+            "Local-only allows Apple Intelligence"
+        )
+
+        // ProviderRuntimeSnapshot single readiness formula.
+        let hermesSnap = ProviderRuntimeSnapshot(
+            installed: true,
+            authenticated: true,
+            catalogStatus: .loaded,
+            harnessModels: [HarnessModel(id: "p:m", name: "m")],
+            runnableModelCount: 1
+        )
+        expect(hermesSnap.ready && hermesSnap.readiness.isRunnable, "Hermes harness-only catalog is ready via runnableModelCount")
+        expect(hermesSnap.ready == hermesSnap.readiness.isRunnable, "Snapshot ready and readiness always agree")
+        var snapMap: [String: ProviderRuntimeSnapshot] = [ProviderConnectionKey.hermes.rawValue: hermesSnap]
+        ProviderRuntimeSnapshotStore.markLoading(&snapMap, key: .hermes)
+        expect(
+            ProviderRuntimeSnapshotStore.snapshot(in: snapMap, key: .hermes).catalogStatus == .loading
+                && !ProviderRuntimeSnapshotStore.snapshot(in: snapMap, key: .hermes).ready,
+            "markLoading clears ready and sets loading"
+        )
+        let hydrated = ProviderRuntimeSnapshotStore.hydratePresence(from: [
+            "codex": .init(installed: true, authenticated: true, catalogStatus: .loaded, runnableModelCount: 3)
+        ])
+        expect(
+            hydrated["codex"]?.installed == true
+                && hydrated["codex"]?.ready == false
+                && hydrated["codex"]?.catalogStatus == .unknown,
+            "Hydrated presence never grants readiness"
+        )
+
+        // RunLaunchPlanner + SessionRunReducer pure pipeline.
+        let planSession = LatticeSession(
+            title: "Plan",
+            messages: [.init(role: .user, text: "hi")],
+            backend: .codex(model: "gpt-5.5"),
+            executionRoute: ExecutionRoute(mode: .code, providerID: "codex", modelID: "gpt-5.5", runtimeID: "pi")
+        )
+        let plan = RunLaunchPlanner.plan(
+            .init(
+                session: planSession,
+                submittedText: "hi",
+                additionalContext: "",
+                tokenLimit: 8_000,
+                effectiveRuntimeID: "pi"
+            )
+        )
+        expect(plan.usesPromptDrivenBackend && plan.deliveryIssue == nil && plan.prompt.contains("hi"), "Planner produces prompt for pi route")
+        expect(RunLaunchPlanner.usesPromptDrivenBackend(runtimeID: "hermes", backend: .openCode(model: "m")), "Hermes is prompt-driven")
+        expect(!RunLaunchPlanner.usesPromptDrivenBackend(runtimeID: "lattice", backend: .ollama(model: "q")), "Ollama lattice is not prompt-driven")
+
+        let reduceBase = SessionRunState(
+            isStreaming: true,
+            lastAssistantText: "Hello",
+            hasAssistantMessage: true,
+            isSuppressingInlineImagePayload: false
+        )
+        let reducedDelta = SessionRunReducer.reduce(state: reduceBase, event: .assistantDelta(" world"))
+        expect(reducedDelta.assistantText == "Hello world", "Reducer appends assistant delta")
+        let reducedDone = SessionRunReducer.reduce(state: reduceBase, event: .completed)
+        expect(reducedDone.effects == [.finalize(.completed)] && !reducedDone.state.isStreaming, "Reducer finalizes completed")
+        expect(SessionRunReducer.terminal(for: .failed("x")) == .failed("x"), "Reducer classifies failed terminal")
+        expect(SessionRunReducer.terminal(for: .sessionStarted(UUID())) == nil, "Non-terminal events have no terminal")
+
         print("Core verification passed: \(checks) checks")
     }
 }

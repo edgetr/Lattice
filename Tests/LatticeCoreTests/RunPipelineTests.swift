@@ -29,8 +29,35 @@ struct RunPipelineTests {
             )
         )
         #expect(plan.usesPromptDrivenBackend)
-        #expect(!plan.prompt.isEmpty)
+        #expect(plan.prompt.contains("hi"))
         #expect(plan.deliveryIssue == nil)
+        #expect(plan.recoveryPrompt == nil)
+        #expect(!plan.resetsHarnessSession)
+    }
+
+    @Test func plannerRecoveryWhenACPSessionExists() {
+        let session = LatticeSession(
+            title: "t",
+            messages: [
+                .init(role: .user, text: "first"),
+                .init(role: .assistant, text: "reply")
+            ],
+            backend: .grok(model: "grok-4"),
+            executionRoute: ExecutionRoute(mode: .code, providerID: "grok", modelID: "grok-4", runtimeID: "grok"),
+            harnessThreadID: "thread-1"
+        )
+        let plan = RunLaunchPlanner.plan(
+            .init(
+                session: session,
+                submittedText: "follow-up",
+                additionalContext: "",
+                tokenLimit: 8_000,
+                effectiveRuntimeID: "grok"
+            )
+        )
+        #expect(plan.usesPromptDrivenBackend)
+        #expect(plan.recoveryPrompt != nil)
+        #expect(plan.routeThreadID == "thread-1" || plan.resetsHarnessSession)
     }
 
     @Test func reducerFinalizesTerminalEvents() {
@@ -47,7 +74,11 @@ struct RunPipelineTests {
         let failed = SessionRunReducer.reduce(state: base, event: .failed("boom"))
         #expect(failed.effects == [.finalize(.failed("boom"))])
         #expect(SessionRunReducer.terminal(for: .cancelled) == .cancelled)
+        #expect(SessionRunReducer.terminal(for: .failed("x")) == .failed("x"))
         #expect(SessionRunReducer.terminal(for: .assistantDelta("x")) == nil)
+        let cancelled = SessionRunReducer.reduce(state: base, event: .cancelled)
+        #expect(cancelled.effects == [.finalize(.cancelled)])
+        #expect(!cancelled.state.isStreaming)
     }
 
     @Test func reducerAppliesAssistantDeltaThroughMediaPolicy() {
@@ -60,5 +91,15 @@ struct RunPipelineTests {
         let result = SessionRunReducer.reduce(state: base, event: .assistantDelta(" world"))
         #expect(result.assistantText == "Hello world")
         #expect(result.effects == [.scheduleStreamingPersist])
+    }
+
+    @Test func permissionDeniedTerminalIsDistinct() {
+        let terminal = SessionRunTerminal.permissionDenied("blocked")
+        #expect(!terminal.isSuccessful)
+        if case .permissionDenied(let message) = terminal {
+            #expect(message == "blocked")
+        } else {
+            Issue.record("Expected permissionDenied")
+        }
     }
 }

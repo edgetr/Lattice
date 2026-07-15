@@ -460,17 +460,26 @@ extension AppState {
     }
 
     func hermesProvider(for route: ExecutionRoute) -> String? {
-        guard route.mode == .work, route.runtimeID == "hermes", let model = route.modelID,
-              let separator = model.firstIndex(of: ":") else { return nil }
-        let provider = String(model[..<separator]).lowercased()
-        let allowed: Set<String>
+        guard route.mode == .work, route.runtimeID == "hermes" else { return nil }
+        // Prefer explicit provider:model IDs from Hermes catalogs.
+        if let model = route.modelID, let separator = model.firstIndex(of: ":") {
+            let provider = String(model[..<separator]).lowercased()
+            let allowed: Set<String>
+            switch route.providerID {
+            case "codex": allowed = [LatticeHermesProvider.openAICodex.rawValue]
+            case "grok": allowed = [LatticeHermesProvider.xAIOAuth.rawValue, LatticeHermesProvider.xAI.rawValue]
+            case "opencode": allowed = [LatticeHermesProvider.openCodeGo.rawValue, LatticeHermesProvider.openCodeZen.rawValue]
+            default: return nil
+            }
+            if allowed.contains(provider) { return provider }
+        }
+        // Declared work routes may use plain model IDs; map Lattice providerID → Hermes provider.
         switch route.providerID {
-        case "codex": allowed = [LatticeHermesProvider.openAICodex.rawValue]
-        case "grok": allowed = [LatticeHermesProvider.xAIOAuth.rawValue, LatticeHermesProvider.xAI.rawValue]
-        case "opencode": allowed = [LatticeHermesProvider.openCodeGo.rawValue, LatticeHermesProvider.openCodeZen.rawValue]
+        case "codex": return LatticeHermesProvider.openAICodex.rawValue
+        case "grok": return LatticeHermesProvider.xAIOAuth.rawValue
+        case "opencode": return LatticeHermesProvider.openCodeGo.rawValue
         default: return nil
         }
-        return allowed.contains(provider) ? provider : nil
     }
 
     @discardableResult
@@ -578,6 +587,14 @@ extension AppState {
         reduceRunUI(.started, for: id)
 
         let session = sessions[index]
+        if let integrityIssue = sessionMayLaunchProviderRun(session) {
+            let failedStream = AsyncStream<AgentEvent> { continuation in
+                continuation.yield(.failed(integrityIssue))
+                continuation.finish()
+            }
+            Task { for await event in failedStream { apply(event, to: id, runID: runID) } }
+            return
+        }
         let isExtensionSelfEdit = isExtensionSelfEditThread(session, submittedText: submittedText)
         if isExtensionSelfEdit { selfEditRunIDs.insert(id) }
         else { selfEditRunIDs.remove(id) }
@@ -616,7 +633,28 @@ extension AppState {
             Task { for await event in failedStream { apply(event, to: id, runID: runID) } }
             return
         }
-        let envelope = try? instructionEnvelope(for: session, workspace: workspace, allowFileModification: !isExtensionSelfEdit)
+        let envelope: LatticeInstructionEnvelope?
+        let envelopeError: String?
+        do {
+            envelope = try instructionEnvelope(for: session, workspace: workspace, allowFileModification: !isExtensionSelfEdit)
+            envelopeError = nil
+        } catch {
+            envelope = nil
+            envelopeError = error.localizedDescription
+        }
+        // Declared Pi routes require a real envelope; surface construction errors honestly.
+        if harnessID == "pi" || (ExecutionRouteResolver.isDeclared(session.executionRoute) && session.executionRoute.runtimeID == "pi") {
+            if envelope == nil {
+                let detail = envelopeError.map { "Could not build Pi instruction envelope: \($0)" }
+                    ?? "Could not build Pi instruction envelope for this route."
+                let failedStream = AsyncStream<AgentEvent> { continuation in
+                    continuation.yield(.failed(detail))
+                    continuation.finish()
+                }
+                Task { for await event in failedStream { apply(event, to: id, runID: runID) } }
+                return
+            }
+        }
         let trustedInstructions = envelope.map {
             trustedWorkspaceInstructionText(for: workspace, names: $0.trustedWorkspaceInstructionNames)
         } ?? ""
@@ -842,19 +880,42 @@ extension AppState {
     }
 
     func canRunSession(_ session: LatticeSession) -> Bool {
+        // Fail closed: local-only never runs a cloud backend, even if route mode was corrupted.
+        guard SessionPrivacyPolicy.allows(session.backend, in: session.privacyMode) else { return false }
+        if session.privacyMode == .localOnly {
+            // Declared non-local routes and cloud runtimes are never runnable under local-only.
+            if session.executionRoute.mode != .local { return false }
+            if !session.backend.isLocal { return false }
+        }
         if ExecutionRouteResolver.isDeclared(session.executionRoute) {
-            if session.privacyMode == .localOnly && session.executionRoute.mode != .local { return false }
             return canRunDeclaredRoute(session.executionRoute)
         }
         let harnessID = effectiveHarnessID(for: session)
         let routeLocked = session.messages.contains(where: { $0.role == .user }) || session.harnessThreadID != nil
-        if session.privacyMode == .localOnly && !session.backend.isLocal && routeLocked {
-            return false
-        }
         if routeLocked {
             return canContinueLockedRoute(session.backend, harnessID: harnessID)
         }
         return canRunBackend(validBackend(session.backend, privacyMode: session.privacyMode), harnessID: harnessID)
+    }
+
+    /// Integrity check before stream launch: privacy + route/backend consistency.
+    func sessionMayLaunchProviderRun(_ session: LatticeSession) -> String? {
+        guard SessionPrivacyPolicy.allows(session.backend, in: session.privacyMode) else {
+            return SessionPrivacyPolicy.blockedMessage(for: session.backend, in: session.privacyMode)
+                ?? SessionPrivacyPolicy.cloudBlockedMessage
+        }
+        if session.privacyMode == .localOnly {
+            if session.executionRoute.mode != .local || !session.backend.isLocal {
+                return SessionPrivacyPolicy.cloudBlockedMessage
+            }
+        }
+        if let projected = RouteRuntimeMap.backendProjection(for: session.executionRoute),
+           projected.id != session.backend.id,
+           ExecutionRouteResolver.isDeclared(session.executionRoute) {
+            // Declared route and durable backend disagree — refuse rather than launch the wrong provider.
+            return "This chat's route and backend disagree. Start a new chat or pick a model again."
+        }
+        return nil
     }
 
     func canRunDeclaredRoute(_ route: ExecutionRoute) -> Bool {
@@ -1260,32 +1321,38 @@ extension AppState {
         let session = sessions[index]
         let schedulerState = taskScheduler.snapshot(for: id)?.state
         let terminalRunID = activeRunIDs[id]
-        if let request = submittedRequests[id] { retryableRequests[id] = request }
-        activeRunIDs[id] = nil
-        inlineImagePayloadSuppression.remove(id)
-        finishPendingActions(status: .cancelled, at: index)
-        sessions[index].isStreaming = false
-        if shouldRemoveEmptyTrailingAssistant(from: sessions[index]) {
-            sessions[index].messages.removeLast()
-        }
-        recordWorkOutcome(.cancelled, title: "Work stopped", detail: "The run was cancelled before every item finished.", at: index)
-        reduceRunUI(.cancelled, for: id)
-        threadActivityLanes.apply(.cancelled, to: id)
-        harnessPermissionNotices[id] = nil
+        let backend = session.backend
         pendingApprovalResponses[id] = nil
         providerSessionHealth[id] = nil
+        // Cancel the harness first so late events cannot race a new run, then unify terminal cleanup
+        // (including dispatching-outbox fail) through finalizeRun.
         if schedulerState == .running || schedulerState == .waitingForApproval {
             cancelHarnessProcess(for: session, sessionID: id)
         }
-        persist()
-        if let terminalRunID,
-           (schedulerState == .running || schedulerState == .waitingForApproval) {
-            finishSchedulerRunAfterCheckpoint(sessionID: id, runID: terminalRunID) { [weak self] in
-                guard let self else { return }
-                self.handleSchedulerAdmissions(self.taskScheduler.cancel(id))
-                self.persist()
-            }
+        if let terminalRunID {
+            finalizeRun(
+                .cancelled,
+                sessionID: id,
+                runID: terminalRunID,
+                sessionIndex: index,
+                backend: backend,
+                schedulerCompletion: .cancel
+            )
         } else {
+            // No active run ID — still clear streaming UI and scheduler claim.
+            if let request = submittedRequests[id] { retryableRequests[id] = request }
+            submittedRequests[id] = nil
+            inlineImagePayloadSuppression.remove(id)
+            finishPendingActions(status: .cancelled, at: index)
+            sessions[index].isStreaming = false
+            if shouldRemoveEmptyTrailingAssistant(from: sessions[index]) {
+                sessions[index].messages.removeLast()
+            }
+            recordWorkOutcome(.cancelled, title: "Work stopped", detail: "The run was cancelled before every item finished.", at: index)
+            reduceRunUI(.cancelled, for: id)
+            threadActivityLanes.apply(.cancelled, to: id)
+            harnessPermissionNotices[id] = nil
+            persist()
             handleSchedulerAdmissions(taskScheduler.cancel(id))
         }
     }
@@ -1354,22 +1421,27 @@ extension AppState {
                     outcome: .stale,
                     providerAcknowledgement: .rejectedByHarness
                 )
-                activeRunIDs[notice.sessionID] = nil
-                sessions[sessionIndex].isStreaming = false
-                finishPendingActions(status: .cancelled, at: sessionIndex)
+                updateSessionAction(id: notice.request.id, status: .cancelled, sessionID: notice.sessionID)
                 cancelHarnessProcess(for: sessions[sessionIndex], sessionID: notice.sessionID)
-            }
-            updateSessionAction(id: notice.request.id, status: .cancelled, sessionID: notice.sessionID)
-            reduceRunUI(.failed("The provider could not resume this approval request."), for: notice.sessionID)
-            threadActivityLanes.apply(.failed("The provider could not resume this approval request."), to: notice.sessionID)
-            persist()
-            if let terminalRunID {
-                finishSchedulerRunAfterCheckpoint(sessionID: notice.sessionID, runID: terminalRunID) { [weak self] in
-                    guard let self else { return }
-                    self.handleSchedulerAdmissions(self.taskScheduler.finish(notice.sessionID))
-                    self.persist()
+                if let terminalRunID {
+                    finalizeRun(
+                        .permissionDenied("The provider could not resume this approval request."),
+                        sessionID: notice.sessionID,
+                        runID: terminalRunID,
+                        sessionIndex: sessionIndex,
+                        backend: sessions[sessionIndex].backend
+                    )
+                } else {
+                    sessions[sessionIndex].isStreaming = false
+                    finishPendingActions(status: .cancelled, at: sessionIndex)
+                    reduceRunUI(.failed("The provider could not resume this approval request."), for: notice.sessionID)
+                    threadActivityLanes.apply(.failed("The provider could not resume this approval request."), to: notice.sessionID)
+                    persist()
+                    handleSchedulerAdmissions(taskScheduler.finish(notice.sessionID))
                 }
             } else {
+                updateSessionAction(id: notice.request.id, status: .cancelled, sessionID: notice.sessionID)
+                persist()
                 handleSchedulerAdmissions(taskScheduler.finish(notice.sessionID))
             }
             return

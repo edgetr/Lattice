@@ -105,32 +105,6 @@ final class AppState: ObservableObject {
             if selectedSessionID != nil {
                 isTransientNewChat = false
                 composerSelectionMode = selectedSession?.executionRoute.mode
-        workspaceTools.workspacePathProvider = { [weak self] in
-            guard let self else { return "" }
-            return self.activeWorkspacePathForTools
-        }
-        workspaceTools.onWorkspaceActionMessage = { [weak self] message in
-            self?.workspaceActionMessage = message
-        }
-        // Forward nested tool updates into AppState for existing view bindings.
-        workspaceTools.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
-        }.store(in: &cancellables)
-        selfEditDrafts.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
-        }.store(in: &cancellables)
-        providerConnections.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
-        }.store(in: &cancellables)
-        composer.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
-        }.store(in: &cancellables)
-        sessionCatalog.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
-        }.store(in: &cancellables)
-        runOrchestrator.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
-        }.store(in: &cancellables)
                 composerSelectionBackend = selectedSession?.backend
             } else {
                 composerSelectionMode = nil
@@ -347,7 +321,10 @@ final class AppState: ObservableObject {
     @Published var activeCopyPatches: [LatticeCopyPatch] = []
     @Published var activePromptTemplates: [LatticePromptTemplate] = []
     @Published var selfMap = LatticeSelfMap()
+    /// Legacy engine/harness pair for `setExecutionRoute` compatibility only.
+    /// New composer selection uses mode + `ExecutionRoute`; do not use these as write authority.
     @Published var selectedRouteEngineID: String
+    /// Legacy harness id companion to `selectedRouteEngineID`. Prefer `session.executionRoute.runtimeID`.
     @Published var selectedRouteHarnessID: String
     var showOverlayAction: (() -> Void)?
     var openWorkspaceAction: (() -> Void)?
