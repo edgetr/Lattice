@@ -30,7 +30,10 @@ struct PolicyEngineTests {
     }
 
     @Test func smartRequiresApprovalForCodexFileChangeRequestWithoutProviderEvidence() throws {
-        let workspace = URL(fileURLWithPath: "/tmp/Lattice")
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lattice-policy-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
         let object: [String: Any] = [
             "method": "item/fileChange/requestApproval",
             "params": [
@@ -51,7 +54,10 @@ struct PolicyEngineTests {
     }
 
     @Test func smartRequiresApprovalForCodexFileChangeEventWithoutProviderEvidence() throws {
-        let workspace = URL(fileURLWithPath: "/tmp/Lattice")
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lattice-policy-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
         let object: [String: Any] = [
             "method": "item/started",
             "params": [
@@ -76,7 +82,10 @@ struct PolicyEngineTests {
     }
 
     @Test func smartKeepsOutOfWorkspaceCodexFileChangeApprovalGated() throws {
-        let workspace = URL(fileURLWithPath: "/tmp/Lattice")
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lattice-policy-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
         let object: [String: Any] = [
             "method": "item/started",
             "params": [

@@ -203,8 +203,8 @@ struct WorkProjectionTests {
         #expect(snapshot.actionable?.originMessageID == originMessageID)
         #expect(snapshot.actionable?.originActionID == originAction)
         #expect(snapshot.actionable?.artifactLocator == "out/result.pdf")
-        #expect(snapshot.log.first?.originMessageID == originMessageID)
-        #expect(snapshot.log.first?.artifactLocator == "out/result.pdf")
+        // Compact log excludes the current actionable entry to avoid double-rendering.
+        #expect(snapshot.log.allSatisfy { $0.id != artifactID })
 
         // Without explicit work artifact locator, detail is never treated as a path.
         let legacyTool = SessionAction(

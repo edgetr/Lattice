@@ -25,7 +25,8 @@ struct CodexWorkspaceScopeTests {
         let request = CodexExecHarness.appServerPermissionRequest(from: object, workspace: workspace)
         #expect(request?.toolRequest?.workspaceScoped == false)
         #expect(request?.toolRequest?.kind == .write)
-        #expect(request?.toolRequest?.reversible == true)
+        // File changes never claim undoability without provider evidence.
+        #expect(request?.toolRequest?.reversible == false)
     }
 
     @Test func emptyWhitespaceMalformedOutsideAndSymlinkOutsideGrantRootAreUnscoped() throws {
@@ -75,14 +76,14 @@ struct CodexWorkspaceScopeTests {
             return
         }
         #expect(toolRequest.workspaceScoped == false)
-        #expect(toolRequest.reversible == true)
+        #expect(toolRequest.reversible == false)
         guard case .requireApproval = policy.evaluate(toolRequest, under: .smart) else {
             Issue.record("Smart must require approval when scope is false")
             return
         }
     }
 
-    @Test func validInsideGrantRootIsScopedAndSmartMayAllow() throws {
+    @Test func validInsideGrantRootIsScopedAndSmartRequiresApprovalWithoutUndoEvidence() throws {
         let workspace = try uniqueWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
         let object: [String: Any] = [
@@ -98,9 +99,9 @@ struct CodexWorkspaceScopeTests {
             return
         }
         #expect(toolRequest.workspaceScoped == true)
-        #expect(toolRequest.reversible == true)
-        guard case .allow = policy.evaluate(toolRequest, under: .smart) else {
-            Issue.record("Smart may allow reversible scoped writes")
+        #expect(toolRequest.reversible == false)
+        guard case .requireApproval = policy.evaluate(toolRequest, under: .smart) else {
+            Issue.record("Smart must gate file changes without provider undo evidence")
             return
         }
     }
@@ -276,6 +277,6 @@ struct CodexWorkspaceScopeTests {
         }
         #expect(request.workspaceScoped == expected, "fileChange \(item["id"] as? String ?? "?") scope")
         #expect(request.kind == .write)
-        #expect(request.reversible == true)
+        #expect(request.reversible == false)
     }
 }

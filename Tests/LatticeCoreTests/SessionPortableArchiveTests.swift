@@ -30,7 +30,8 @@ struct SessionPortableArchiveTests {
                 ContextAttachment(id: attachmentID, path: "/Users/secret/docs/notes.txt")
             ],
             policy: .smart,
-            privacyMode: .localOnly,
+            // cloudAllowed + codex is a consistent triple; localOnly + cloud is rejected at import.
+            privacyMode: .cloudAllowed,
             actions: [
                 SessionAction(
                     id: actionID,
@@ -138,7 +139,7 @@ struct SessionPortableArchiveTests {
         #expect(imported.executionRoute == ExecutionRoute(mode: .code, providerID: "codex", modelID: "gpt-5.5", runtimeID: "codex"))
         #expect(imported.reasoningEffort == .medium)
         #expect(imported.policy == .smart)
-        #expect(imported.privacyMode == .localOnly)
+        #expect(imported.privacyMode == .cloudAllowed)
         #expect(imported.isPinned)
         #expect(imported.harnessThreadID == nil)
         #expect(imported.isStreaming == false)
@@ -488,7 +489,7 @@ struct SessionPortableArchiveTests {
         #expect(plan.preview.attachmentCount == 1)
         #expect(plan.preview.queuedFollowUpCount == 1)
         #expect(plan.preview.policy == "Smart")
-        #expect(plan.preview.privacyMode == "localOnly")
+        #expect(plan.preview.privacyMode == "cloudAllowed")
         #expect(plan.preview.summaryLines.contains(where: { $0.contains("new chat") || $0.contains("Import creates") }))
 
         let commit = SessionPortableArchiveImporter.commit(plan: plan, into: before, selectedSessionID: existingID)
