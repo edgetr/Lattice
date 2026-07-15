@@ -2096,7 +2096,13 @@ struct CoreVerification {
         let fitCodingCount = LocalModelCatalog.recommendations(for: hardware, category: "Coding", fitOnly: true).count
         expect(LocalModelCatalog.hiddenOversizedRecommendationCount(for: hardware, category: "Coding") == fullCodingCount - fitCodingCount, "Hidden oversized recommendation count matches filtered catalog")
         expect(ExecutableDiscovery.locate("../tool", path: "/bin:/usr/bin") == nil, "Executable validation")
-        expect(CodexExecHarness().isInstalled, "Codex discovery")
+        // Codex may be absent on CI runners; discovery must fail closed when missing and
+        // succeed when the binary is on PATH — never assume a developer machine install.
+        if ExecutableDiscovery.locate("codex") != nil {
+            expect(CodexExecHarness().isInstalled, "Codex discovery when binary is on PATH")
+        } else {
+            expect(!CodexExecHarness().isInstalled, "Codex discovery fails closed when binary is absent")
+        }
         let directCLI = CLIInstallSnapshot(executablePath: "/Users/test/.opencode/bin/opencode", homebrewPrefix: "/opt/homebrew", npmPrefix: "/Users/test/.local", homebrewFormulaInstalled: true, npmPackageInstalled: true)
         expect(CLIInstallResolver.source(for: directCLI, directPathMarkers: ["/.opencode/bin/"]) == .direct, "Direct CLI source wins")
         let directPlan = CLIInstallResolver.updatePlan(executableName: "opencode", source: .direct, homebrewFormula: "opencode", npmPackage: "opencode-ai", selfUpdateArguments: ["upgrade"], directArguments: ["upgrade", "--method", "curl"])
