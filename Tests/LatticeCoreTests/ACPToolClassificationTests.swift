@@ -4,10 +4,17 @@ import Testing
 
 @Suite("ACP tool classification")
 struct ACPToolClassificationTests {
-    private let workspace = URL(fileURLWithPath: "/Users/test/Lattice")
+    private func uniqueWorkspace() throws -> URL {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lattice-acp-tool-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root
+    }
 
-    @Test func explicitReadRemainsSafeInsideWorkspace() {
-        let request = makePermission(toolKind: "read", title: "Read file", rawInput: ["path": "Sources/App.swift"])
+    @Test func explicitReadRemainsSafeInsideWorkspace() throws {
+        let workspace = try uniqueWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let request = makePermission(toolKind: "read", title: "Read file", rawInput: ["path": "Sources/App.swift"], workspace: workspace)
         let toolRequest = request?.toolRequest
 
         #expect(toolRequest?.kind == .read)
@@ -15,8 +22,10 @@ struct ACPToolClassificationTests {
         #expect(toolRequest.map { DeterministicPolicyEngine().evaluate($0, under: .smart) } == .allow(reason: "Workspace-scoped reads are allowed."))
     }
 
-    @Test func unknownInWorkspaceDoesNotBorrowSafeReadFromTitle() {
-        let request = makePermission(toolKind: "mystery_action", title: "Read project metadata", rawInput: ["path": "Sources/App.swift"])
+    @Test func unknownInWorkspaceDoesNotBorrowSafeReadFromTitle() throws {
+        let workspace = try uniqueWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let request = makePermission(toolKind: "mystery_action", title: "Read project metadata", rawInput: ["path": "Sources/App.swift"], workspace: workspace)
         let toolRequest = request?.toolRequest
 
         #expect(toolRequest?.kind == .unknown)
@@ -29,14 +38,16 @@ struct ACPToolClassificationTests {
         #expect(reason == "Unknown tool capabilities require confirmation.")
     }
 
-    @Test func commandAndDestructiveNamesStayConservativeInsideWorkspace() {
+    @Test func commandAndDestructiveNamesStayConservativeInsideWorkspace() throws {
+        let workspace = try uniqueWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
         let cases: [(title: String, input: [String: Any], kind: ToolRequest.Kind)] = [
             ("Run command", ["path": "Sources/App.swift", "command": "git status"], .command),
             ("Delete file", ["path": "Sources/App.swift"], .destructive)
         ]
 
         for testCase in cases {
-            let request = makePermission(toolKind: "mystery_action", title: testCase.title, rawInput: testCase.input)
+            let request = makePermission(toolKind: "mystery_action", title: testCase.title, rawInput: testCase.input, workspace: workspace)
             let toolRequest = request?.toolRequest
             #expect(toolRequest?.kind == testCase.kind)
             #expect(toolRequest?.workspaceScoped == true)
@@ -48,7 +59,7 @@ struct ACPToolClassificationTests {
         }
     }
 
-    private func makePermission(toolKind: String, title: String, rawInput: [String: Any]) -> ApprovalRequest? {
+    private func makePermission(toolKind: String, title: String, rawInput: [String: Any], workspace: URL) -> ApprovalRequest? {
         let toolCall: [String: Any] = [
             "kind": toolKind,
             "title": title,
