@@ -357,6 +357,16 @@ public struct RouteCapability: Equatable, Sendable {
 
     private static func pi(policy: ExecutionPolicy) -> RouteCapability {
         let approval = piApproval(policy: policy)
+        var warnings = [
+            "\(LatticeAgentExecutable.productDisplayName) tools are provider-owned and are not mediated by LocalToolBroker.",
+            "Lattice write containment limits writes only; file reads and network remain allowed."
+        ]
+        if policy == .yolo {
+            warnings.append("YOLO may auto-allow reported \(LatticeAgentExecutable.productDisplayName) mutation requests; it does not prevent reads, network, prompt injection, or exfiltration.")
+        }
+        if policy == .acceptEdits {
+            warnings.append("Accept Edits auto-allows workspace file write/edit only after a reported permission request; bash, out-of-workspace, and unreported actions are not silently approved.")
+        }
         return RouteCapability(
             harnessID: "pi",
             policy: policy,
@@ -365,29 +375,26 @@ public struct RouteCapability: Equatable, Sendable {
             writeContainment: RouteCapabilityDetail(
                 assurance: .enforced,
                 summary: "Lattice macOS write containment",
-                detail: "Pi launches under Lattice sandbox-exec allowing the selected workspace, Pi session directory, scratch, and settings lock path. Reads and network remain allowed."
+                detail: "\(LatticeAgentExecutable.productDisplayName) launches under Lattice sandbox-exec allowing the selected workspace, session directory, scratch, and settings lock path. Reads and network remain allowed."
             ),
             writeContainmentKind: .latticeMacOSWriteContainment,
             approvalBehavior: approval.1,
             approvalBehaviorKind: approval.0,
-            fileReadRestriction: unrestrictedReads(owner: "Pi"),
-            networkRestriction: unrestrictedNetwork(owner: "Pi"),
-            credentialReadProtection: noCredentialProtection(owner: "Pi provider tools"),
-            structuredEvents: presentStructuredEvents(detail: "Pi RPC projects tool and permission-gate events when the agent emits them."),
+            fileReadRestriction: unrestrictedReads(owner: LatticeAgentExecutable.productDisplayName),
+            networkRestriction: unrestrictedNetwork(owner: LatticeAgentExecutable.productDisplayName),
+            credentialReadProtection: noCredentialProtection(owner: "\(LatticeAgentExecutable.productDisplayName) tools"),
+            structuredEvents: presentStructuredEvents(detail: "\(LatticeAgentExecutable.productDisplayName) RPC projects tool and permission-gate events when the agent emits them."),
             providerSessionResume: RouteCapabilityDetail(
                 assurance: .present,
                 summary: "Provider session resume",
-                detail: "Pi can resume a session ID when Lattice still holds it."
+                detail: "\(LatticeAgentExecutable.productDisplayName) can resume a session ID when Lattice still holds it."
             ),
             cancellation: RouteCapabilityDetail(
                 assurance: .present,
                 summary: "Cancellable",
-                detail: "Lattice can abort and terminate the active Pi process."
+                detail: "Lattice can abort and terminate the active \(LatticeAgentExecutable.productDisplayName) process."
             ),
-            warnings: [
-                "Pi tools are provider-owned and are not mediated by LocalToolBroker.",
-                "Lattice write containment limits writes only; file reads and network remain allowed."
-            ]
+            warnings: warnings
         )
     }
 
@@ -395,7 +402,7 @@ public struct RouteCapability: Equatable, Sendable {
 
     private static func antigravity(policy: ExecutionPolicy) -> RouteCapability {
         switch policy {
-        case .ask, .smart:
+        case .ask, .smart, .acceptEdits:
             return RouteCapability(
                 harnessID: "antigravity",
                 policy: policy,
@@ -410,7 +417,7 @@ public struct RouteCapability: Equatable, Sendable {
                 approvalBehavior: RouteCapabilityDetail(
                     assurance: .present,
                     summary: "Plan-only",
-                    detail: "Ask and Smart use provider plan mode because interactive permission requests cannot be forwarded from the non-interactive CLI."
+                    detail: "Ask, Smart, and Accept Edits use provider plan mode because interactive permission requests cannot be forwarded from the non-interactive CLI."
                 ),
                 approvalBehaviorKind: .planOnly,
                 fileReadRestriction: unrestrictedReads(owner: "Antigravity"),
@@ -618,13 +625,22 @@ public struct RouteCapability: Equatable, Sendable {
                     detail: "\(surfaceName) permission requests are forwarded. Smart may auto-allow a scoped read after a request arrives; current ACP write requests are conservatively non-reversible and still ask."
                 )
             )
+        case .acceptEdits:
+            (
+                .automaticPolicyDecisionsAfterRequest,
+                RouteCapabilityDetail(
+                    assurance: .present,
+                    summary: "Accept Edits after reported requests",
+                    detail: "\(surfaceName) permission requests are forwarded. Accept Edits may auto-allow workspace-scoped file writes/edits after a reported request (undo evidence not required); bash/command, out-of-workspace, credential, and unknown tools still ask. Tools remain provider-owned and unbrokered."
+                )
+            )
         case .yolo:
             (
                 .automaticPolicyDecisionsAfterRequest,
                 RouteCapabilityDetail(
                     assurance: .present,
                     summary: "Forwarded requests + YOLO auto-allow",
-                    detail: "\(surfaceName) permission requests are still received, but YOLO may auto-allow after a request arrives. Tools remain provider-owned and unbrokered."
+                    detail: "\(surfaceName) permission requests are still received, but YOLO may auto-allow after a request arrives. Tools remain provider-owned and unbrokered. YOLO does not prevent reads, network, prompt injection, or exfiltration."
                 )
             )
         }
@@ -638,7 +654,16 @@ public struct RouteCapability: Equatable, Sendable {
                 RouteCapabilityDetail(
                     assurance: .present,
                     summary: "Permission-gated mutations",
-                    detail: "Pi’s extension gates write/edit/bash. Ask and Smart surface these non-reversible requests in Lattice; automatic decisions apply only after a request arrives."
+                    detail: "\(LatticeAgentExecutable.productDisplayName)’s extension gates write/edit/bash. Ask and Smart surface these non-reversible requests in Lattice; automatic decisions apply only after a request arrives."
+                )
+            )
+        case .acceptEdits:
+            (
+                .automaticPolicyDecisionsAfterRequest,
+                RouteCapabilityDetail(
+                    assurance: .present,
+                    summary: "Accept Edits after reported requests",
+                    detail: "Workspace-scoped file write/edit requests auto-allow after \(LatticeAgentExecutable.productDisplayName) reports a permission request (undo evidence not required). Bash/command, out-of-workspace, credential, destructive, and unknown tools still require confirmation. Tools remain provider-owned and unbrokered."
                 )
             )
         case .yolo:
@@ -647,7 +672,7 @@ public struct RouteCapability: Equatable, Sendable {
                 RouteCapabilityDetail(
                     assurance: .present,
                     summary: "YOLO may auto-allow mutations",
-                    detail: "Pi still emits permission-gated mutation requests; YOLO may auto-allow after a request arrives. Reads and network remain allowed; tools stay provider-owned."
+                    detail: "\(LatticeAgentExecutable.productDisplayName) still emits permission-gated mutation requests; YOLO may auto-allow after a request arrives. Reads and network remain allowed; tools stay provider-owned. YOLO does not add read/network/credential containment."
                 )
             )
         }

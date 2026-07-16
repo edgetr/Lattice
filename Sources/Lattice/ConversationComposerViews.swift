@@ -17,6 +17,34 @@ struct ComposerView: View {
 
     var body: some View {
         VStack(spacing: state.composerSpacing()) {
+            if let session = state.selectedSession,
+               session.executionRoute.mode == .code,
+               session.executionRoute.runtimeID == "pi",
+               session.codePhase.restrictsMutatingTools {
+                HStack(spacing: 8) {
+                    Image(systemName: "list.bullet.clipboard")
+                    Text(session.codePhase == .planAwaitingApproval
+                         ? "Plan awaiting approval — write tools withheld on next send"
+                         : "Planning — write tools withheld on next send")
+                        .font(.caption.weight(.medium))
+                    Spacer(minLength: 4)
+                    if session.codePhase == .planAwaitingApproval {
+                        Button("Approve") { state.approveCodePlan() }
+                            .disabled(session.isStreaming)
+                        Button("Exit") { state.exitCodePlanPhase() }
+                            .disabled(session.isStreaming)
+                    } else {
+                        Button("Exit plan") { state.exitCodePlanPhase() }
+                            .disabled(session.isStreaming)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Code plan phase")
+                .accessibilityValue(session.codePhase.displayName)
+            }
             composerHeader
             if !commandSuggestions.isEmpty {
                 AppCommandSuggestionList(commands: commandSuggestions) { command in

@@ -572,7 +572,7 @@ struct SessionPersistenceTests {
         let workspace = URL(fileURLWithPath: "/tmp/Lattice")
         let unknownPi: [String: Any] = ["type": "future_provider_event", "secret": "must not be retained"]
         if case .providerDiagnostic(let diagnostic)? = HarnessToolEventDecoder.piEvent(from: unknownPi, workspace: workspace) {
-            #expect(diagnostic.provider == "Pi")
+            #expect(diagnostic.provider == "Lattice Agent")
             #expect(diagnostic.eventType == "future_provider_event")
             #expect(!diagnostic.detail.contains("must not be retained"))
         } else { Issue.record("Unknown Pi event must remain observable as a diagnostic") }
@@ -624,7 +624,7 @@ struct SessionPersistenceTests {
     }
 
     @Test func providerDiagnosticActivitySurvivesWithoutAssistantActionTarget() {
-        let diagnostic = ProviderEventDiagnostic(provider: "Pi", eventType: "future_event", reason: "Unsupported event.")
+        let diagnostic = ProviderEventDiagnostic(provider: "Lattice Agent", eventType: "future_event", reason: "Unsupported event.")
         #expect(ProviderDiagnosticRetentionPolicy.action(for: diagnostic, assistantMessageID: nil) == nil)
 
         let assistantID = UUID()

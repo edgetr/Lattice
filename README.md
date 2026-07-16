@@ -42,17 +42,17 @@ The model chooser shows only runtime-discovered models for the selected mode. La
 
 | Mode | Provider | Integration |
 | --- | --- | --- |
-| Code | Codex | Pi RPC with a Lattice system-instruction and permission extension |
-| Code | OpenCode Go/Zen | Pi RPC with an explicitly enabled Keychain credential |
+| Code | Codex | Lattice Agent (Pi-based) with a Lattice system-instruction and permission extension |
+| Code | OpenCode Go/Zen | Lattice Agent (Pi-based) with an explicitly enabled Keychain credential |
 | Code | Grok | Grok Build ACP |
 | Code | Antigravity | Transcript-driven `agy --print` |
 | Work | Codex / Grok / OpenCode | Unmodified Hermes ACP with an isolated Lattice profile and curated toolsets |
 | Local | Apple Intelligence | Foundation Models on supported macOS versions |
 | Local | Ollama | Local model catalog, pull/install, and streaming chat |
 
-Pi and Hermes are runtime components, not model providers. Their setup and diagnostics live in a collapsed Connections section. Direct Codex app-server and OpenCode ACP remain compatibility routes for existing chats and v1 archives, but are not offered for new chats.
+Lattice Agent (Code) and Hermes (Work) are runtime components, not model providers. Their setup and diagnostics live in a collapsed Connections section. Lattice Agent is Lattice-owned (pinned package under Application Support or a bundled binary) and does not use your personal Pi install or `~/.pi` profile. Direct Codex app-server and OpenCode ACP remain compatibility routes for existing chats and v1 archives, but are not offered for new chats.
 
-Authentication is runtime-owned and isolated: Pi owns the Code Codex login, while Hermes owns the Work Codex and Grok logins. One OpenCode key may be stored in macOS Keychain, but Code and Work access must be enabled and validated separately. Lattice never copies OAuth sessions between CLIs.
+Authentication is runtime-owned and isolated: Lattice Agent owns the Code Codex login, while Hermes owns the Work Codex and Grok logins. One OpenCode key may be stored in macOS Keychain, but Code and Work access must be enabled and validated separately. Lattice never copies OAuth sessions between CLIs.
 
 ### Safety and privacy
 

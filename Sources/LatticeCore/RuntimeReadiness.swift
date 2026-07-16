@@ -8,12 +8,19 @@ public enum LatticeRuntimeID: String, CaseIterable, Codable, Hashable, Sendable 
 
     public var displayName: String {
         switch self {
-        case .pi: "Pi"
+        case .pi: LatticeAgentExecutable.productDisplayName
         case .hermes: "Hermes"
         }
     }
 
-    public var executableName: String { rawValue }
+    /// On-disk / PATH basename for legacy discovery. Lattice Agent resolution
+    /// uses `LatticeAgentExecutable.resolve()` instead of this name alone.
+    public var executableName: String {
+        switch self {
+        case .pi: "pi"
+        case .hermes: "hermes"
+        }
+    }
 
     public var profileDirectoryName: String {
         switch self {
@@ -108,7 +115,7 @@ public struct RuntimeInstallDescriptor: Equatable, Hashable, Codable, Sendable, 
 
     public static let pi = RuntimeInstallDescriptor(
         runtime: .pi,
-        displayName: "Pi",
+        displayName: LatticeAgentExecutable.productDisplayName,
         source: "https://github.com/earendil-works/pi/releases/tag/v0.80.6",
         immutableVersion: "0.80.6",
         installReference: "@earendil-works/pi-coding-agent@0.80.6",
@@ -117,7 +124,7 @@ public struct RuntimeInstallDescriptor: Equatable, Hashable, Codable, Sendable, 
         permissions: [.network, .executeRuntime, .writeLatticeProfile, .writeUserToolDirectory, .readKeychainOpenCodeCredential],
         profileDirectory: "HarnessRuntime/Pi",
         rollback: "Rollback requires previously recorded exact package and integrity metadata; otherwise Lattice fails closed.",
-        uninstall: "Remove exact Pi package and delete only Lattice-owned Pi profile after confirmation."
+        uninstall: "Remove the Lattice-managed Lattice Agent install under Application Support. Profile data remains until you delete it manually. Personal Pi installs are never removed."
     )
 
     public static let hermes = RuntimeInstallDescriptor(

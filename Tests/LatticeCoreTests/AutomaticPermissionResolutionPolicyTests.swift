@@ -57,4 +57,31 @@ import Testing
             options: [allow]
         ) == .forward(optionID: "allow", allowed: true))
     }
+
+    @Test func acceptEditsNilDecisionRequestsUserNotAutoAllow() {
+        // Without a classified tool request, Accept Edits must not YOLO-auto-allow.
+        #expect(AutomaticPermissionResolutionPolicy.resolve(
+            decision: nil,
+            policy: .acceptEdits,
+            options: [allow, reject]
+        ) == .requestUser)
+        #expect(AutomaticPermissionResolutionPolicy.resolve(
+            decision: nil,
+            policy: .ask,
+            options: [allow]
+        ) == .requestUser)
+        #expect(AutomaticPermissionResolutionPolicy.resolve(
+            decision: nil,
+            policy: .smart,
+            options: [allow]
+        ) == .requestUser)
+    }
+
+    @Test func acceptEditsClassifiedAllowForwards() {
+        #expect(AutomaticPermissionResolutionPolicy.resolve(
+            decision: .allow(reason: "Workspace write."),
+            policy: .acceptEdits,
+            options: [allow, reject]
+        ) == .forward(optionID: "allow", allowed: true))
+    }
 }

@@ -82,9 +82,9 @@ struct ConversationMessagePresentationPolicyTests {
         )
         #expect(p.provider == "OpenCode")
         #expect(p.model == "anthropic/claude")
-        #expect(p.harnessLabel == "Pi")
-        #expect(p.displayLine == "OpenCode · anthropic/claude · Pi")
-        #expect(p.accessibilityLabel.contains("harness Pi"))
+        #expect(p.harnessLabel == "Lattice Agent")
+        #expect(p.displayLine == "OpenCode · anthropic/claude · Lattice Agent")
+        #expect(p.accessibilityLabel.contains("harness Lattice Agent"))
     }
 
     @Test func provenanceResolvesMissingHarnessIDToDefault() {

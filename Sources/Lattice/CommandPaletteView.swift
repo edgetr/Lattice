@@ -245,6 +245,7 @@ private struct CommandPaletteRow: View {
         case "open-skills-folder": return "wand.and.stars"
         case "policy-ask": return "hand.raised"
         case "policy-smart": return "sparkles"
+        case "policy-accept-edits": return "pencil.and.outline"
         case "policy-yolo": return "bolt.fill"
         case "privacy-cloud": return "cloud"
         case "privacy-local": return "lock.iphone"

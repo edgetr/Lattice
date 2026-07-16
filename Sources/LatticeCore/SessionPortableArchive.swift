@@ -201,6 +201,13 @@ public struct PortableChatPayload: Equatable, Sendable {
     public var mode: ConversationMode?
     /// Present in v2. Carries route authority without provider session identity.
     public var executionRoute: ExecutionRoute?
+    /// Optional Code plan phase (v2+). Absent → `.normal` on import.
+    public var codePhase: String?
+    /// Optional durable plan title (bounded, non-secret guidance text only).
+    public var codePlanTitle: String?
+    /// Optional durable plan body (bounded). Never includes credentials or private CoT.
+    public var codePlanBody: String?
+    // compactContextOnNextSend is intentionally never portable: one-shot runtime flag.
 
     public init(
         title: String,
@@ -218,7 +225,10 @@ public struct PortableChatPayload: Equatable, Sendable {
         actions: [PortableAction],
         queuedFollowUps: [PortableQueuedFollowUp],
         mode: ConversationMode? = nil,
-        executionRoute: ExecutionRoute? = nil
+        executionRoute: ExecutionRoute? = nil,
+        codePhase: String? = nil,
+        codePlanTitle: String? = nil,
+        codePlanBody: String? = nil
     ) {
         self.title = title
         self.isPinned = isPinned
@@ -236,6 +246,9 @@ public struct PortableChatPayload: Equatable, Sendable {
         self.queuedFollowUps = queuedFollowUps
         self.mode = mode
         self.executionRoute = executionRoute
+        self.codePhase = codePhase
+        self.codePlanTitle = codePlanTitle
+        self.codePlanBody = codePlanBody
     }
 }
 
@@ -447,6 +460,10 @@ public enum SessionPortableArchiveExporter {
 
         let (backendRoute, model) = backendParts(session.backend)
         let executionRoute = session.executionRoute
+        // Export plan phase + plan text when present. Never export compact one-shot flag.
+        let phaseRaw = session.codePhase == .normal ? nil : session.codePhase.rawValue
+        let planTitle = session.codePlan.map { String($0.title.prefix(200)) }
+        let planBody = session.codePlan.map { String($0.body.prefix(8_000)) }
         let chat = PortableChatPayload(
             title: session.title,
             isPinned: session.isPinned,
@@ -463,7 +480,10 @@ public enum SessionPortableArchiveExporter {
             actions: portableActions,
             queuedFollowUps: queued,
             mode: executionRoute.mode,
-            executionRoute: executionRoute
+            executionRoute: executionRoute,
+            codePhase: phaseRaw,
+            codePlanTitle: planTitle.flatMap { $0.isEmpty ? nil : $0 },
+            codePlanBody: planBody.flatMap { $0.isEmpty ? nil : $0 }
         )
         return PortableSessionDocument(
             exportedAt: options.exportedAt,
@@ -673,6 +693,16 @@ public enum SessionPortableArchiveExporter {
             }
             chat["executionRoute"] = routeObject
         }
+        if let codePhase = document.chat.codePhase {
+            chat["codePhase"] = codePhase
+        }
+        if let codePlanTitle = document.chat.codePlanTitle {
+            chat["codePlanTitle"] = codePlanTitle
+        }
+        if let codePlanBody = document.chat.codePlanBody {
+            chat["codePlanBody"] = codePlanBody
+        }
+        // compactContextOnNextSend is intentionally never encoded (one-shot runtime flag).
 
         return [
             "format": document.format,
@@ -1020,7 +1050,9 @@ public enum SessionPortableArchiveImporter {
     ]
 
     private static let disallowedChatKeys: Set<String> = disallowedRootKeys.union([
-        "id", "messageIDs", "actionIDs", "providerOwnedIDs"
+        "id", "messageIDs", "actionIDs", "providerOwnedIDs",
+        // One-shot runtime flags are never portable.
+        "compactContextOnNextSend"
     ])
 
     private static let allowedRootKeys: Set<String> = [
@@ -1031,7 +1063,11 @@ public enum SessionPortableArchiveImporter {
         "title", "isPinned", "lastUpdated", "backendRoute", "backendModel", "harnessID", "harnessLabel",
         "reasoningEffort", "policy", "privacyMode", "messages", "attachments", "actions", "queuedFollowUps"
     ]
-    private static let allowedV2ChatKeys: Set<String> = allowedV1ChatKeys.union(["mode", "executionRoute"])
+    private static let allowedV2ChatKeys: Set<String> = allowedV1ChatKeys.union([
+        "mode", "executionRoute",
+        // Code plan guidance (optional; absent → normal / no plan). Not secrets.
+        "codePhase", "codePlanTitle", "codePlanBody"
+    ])
 
     private static let allowedMessageKeys: Set<String> = ["role", "text", "date", "isPinned"]
     private static let allowedAttachmentKeys: Set<String> = ["name", "kind", "availability"]
@@ -1148,6 +1184,7 @@ public enum SessionPortableArchiveImporter {
             }
         }
         let policy = try requiredString(object["policy"], field: "chat.policy", limit: 32)
+        // Accept known policies including Accept Edits; unknown values fail closed at decode time.
         guard ExecutionPolicy(rawValue: policy) != nil else {
             throw SessionPortableArchive.ArchiveError.invalidEnum(field: "chat.policy", value: policy)
         }
@@ -1265,6 +1302,18 @@ public enum SessionPortableArchiveImporter {
             throw SessionPortableArchive.ArchiveError.invalidField("chat.queuedFollowUps")
         }
 
+        // Optional Code plan fields (absent → normal / no plan). compactContextOnNextSend never portable.
+        let codePhaseRaw = try optionalString(object["codePhase"], field: "chat.codePhase", limit: 64)
+        if let codePhaseRaw, CodeSessionPhase(rawValue: codePhaseRaw) == nil {
+            throw SessionPortableArchive.ArchiveError.invalidEnum(field: "chat.codePhase", value: codePhaseRaw)
+        }
+        let codePlanTitle = try optionalString(object["codePlanTitle"], field: "chat.codePlanTitle", limit: 200)
+        let codePlanBody = try optionalString(object["codePlanBody"], field: "chat.codePlanBody", limit: 8_000)
+        if object["compactContextOnNextSend"] != nil {
+            // Refuse smuggling a runtime one-shot into portable archives.
+            throw SessionPortableArchive.ArchiveError.unknownSensitiveField("chat.compactContextOnNextSend")
+        }
+
         return PortableChatPayload(
             title: title,
             isPinned: isPinned,
@@ -1281,7 +1330,10 @@ public enum SessionPortableArchiveImporter {
             actions: actions,
             queuedFollowUps: queued,
             mode: mode,
-            executionRoute: executionRoute
+            executionRoute: executionRoute,
+            codePhase: codePhaseRaw,
+            codePlanTitle: codePlanTitle,
+            codePlanBody: codePlanBody
         )
     }
 
@@ -1396,7 +1448,7 @@ public enum SessionPortableArchiveImporter {
         let chat = document.chat
         let backend = try backend(from: chat.backendRoute, model: chat.backendModel)
         let executionRoute = chat.executionRoute ?? ExecutionRoute.legacy(for: backend, harnessID: chat.harnessID)
-        let policy = ExecutionPolicy(rawValue: chat.policy) ?? .ask
+        let policy = ExecutionPolicy.decoding(chat.policy)
         let privacy = SessionPrivacyMode(rawValue: chat.privacyMode) ?? .cloudAllowed
         // v1 and v2: reject inconsistent privacy/backend/route triples at materialize (ingest).
         if let rejection = SessionLaunchIntegrity.importRejection(
@@ -1472,6 +1524,16 @@ public enum SessionPortableArchiveImporter {
             queued = []
         }
 
+        let codePhase = chat.codePhase.flatMap(CodeSessionPhase.init(rawValue:)) ?? .normal
+        let codePlan: CodePlanArtifact?
+        if let title = chat.codePlanTitle, !title.isEmpty {
+            codePlan = CodePlanArtifact(title: title, body: chat.codePlanBody ?? "")
+        } else if let body = chat.codePlanBody, !body.isEmpty {
+            codePlan = CodePlanArtifact(title: "Plan", body: body)
+        } else {
+            codePlan = nil
+        }
+
         return LatticeSession(
             id: freshID(),
             title: chat.title,
@@ -1486,6 +1548,9 @@ public enum SessionPortableArchiveImporter {
             policy: policy,
             privacyMode: privacy,
             intent: nil,
+            codePhase: codePhase,
+            codePlan: codePlan,
+            compactContextOnNextSend: false, // never import one-shot compact queue
             actions: actions,
             queuedFollowUps: queued,
             draft: "", // never import ordinary composer draft

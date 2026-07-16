@@ -555,7 +555,7 @@ public final class CodexExecHarness: @unchecked Sendable {
     private static func executionRoute(policy: ExecutionPolicy, workspaceWrite: Bool) -> (approvalPolicy: String, sandbox: String) {
         switch policy {
         case .ask: ("on-request", workspaceWrite ? "workspace-write" : "read-only")
-        case .smart: ("on-request", "workspace-write")
+        case .smart, .acceptEdits: ("on-request", "workspace-write")
         case .yolo: ("never", "danger-full-access")
         }
     }

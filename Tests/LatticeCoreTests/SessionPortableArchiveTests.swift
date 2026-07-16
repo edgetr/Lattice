@@ -201,6 +201,54 @@ struct SessionPortableArchiveTests {
         }
     }
 
+    @Test func exportsCodePhaseAndPlanButNeverCompactFlag() throws {
+        var source = sampleSession(includeQueued: false)
+        source.codePhase = .planAwaitingApproval
+        source.codePlan = CodePlanArtifact(title: "Ship feature", body: "1. Read\n2. Edit")
+        source.compactContextOnNextSend = true
+        let data = try SessionPortableArchiveExporter.exportData(
+            from: source,
+            options: .init(includeQueuedFollowUps: false, format: .jsonArchive, exportedAt: fixedDate)
+        )
+        let text = try #require(String(data: data, encoding: .utf8))
+        #expect(text.contains("planAwaitingApproval"))
+        #expect(text.contains("Ship feature"))
+        #expect(!text.contains("compactContextOnNextSend"))
+
+        let plan = try SessionPortableArchiveImporter.prepareImport(data: data, existingSessions: [])
+        #expect(plan.session.codePhase == .planAwaitingApproval)
+        #expect(plan.session.codePlan?.title == "Ship feature")
+        #expect(plan.session.codePlan?.body.contains("Read") == true)
+        #expect(!plan.session.compactContextOnNextSend)
+
+        let withCompact = """
+        {"format":"lattice.session.archive","version":2,"exportedAt":"2024-01-01T00:00:00Z","includeQueuedFollowUps":false,"chat":{"title":"x","backendRoute":"codex","backendModel":"gpt-5.5","policy":"Ask","privacyMode":"cloudAllowed","mode":"code","executionRoute":{"mode":"code","providerID":"codex","modelID":"gpt-5.5","runtimeID":"codex"},"messages":[],"attachments":[],"actions":[],"queuedFollowUps":[],"compactContextOnNextSend":true}}
+        """
+        #expect(throws: SessionPortableArchive.ArchiveError.self) {
+            _ = try SessionPortableArchiveImporter.prepareImport(data: Data(withCompact.utf8), existingSessions: [])
+        }
+    }
+
+    @Test func acceptsAcceptEditsPolicyAndRejectsUnknownPolicy() throws {
+        let acceptEdits = """
+        {"format":"lattice.session.archive","version":1,"exportedAt":"2024-01-01T00:00:00Z","includeQueuedFollowUps":false,"chat":{"title":"Accept","backendRoute":"codex","backendModel":"gpt-test","policy":"Accept Edits","privacyMode":"cloudAllowed","messages":[],"attachments":[],"actions":[],"queuedFollowUps":[]}}
+        """
+        let plan = try SessionPortableArchiveImporter.prepareImport(data: Data(acceptEdits.utf8), existingSessions: [])
+        #expect(plan.session.policy == .acceptEdits)
+
+        let unknown = """
+        {"format":"lattice.session.archive","version":1,"exportedAt":"2024-01-01T00:00:00Z","includeQueuedFollowUps":false,"chat":{"title":"x","backendRoute":"ollama","backendModel":"m","policy":"Mystery Mode","privacyMode":"cloudAllowed","messages":[],"attachments":[],"actions":[],"queuedFollowUps":[]}}
+        """
+        do {
+            _ = try SessionPortableArchiveImporter.prepareImport(data: Data(unknown.utf8), existingSessions: [])
+            Issue.record("Unknown policy must fail closed at import validate")
+        } catch let error as SessionPortableArchive.ArchiveError {
+            #expect(error == .invalidEnum(field: "chat.policy", value: "Mystery Mode") || String(describing: error).contains("chat.policy"))
+        }
+        #expect(ExecutionPolicy(rawValue: "Mystery Mode") == nil)
+        #expect(ExecutionPolicy.decoding("Mystery Mode") == .ask)
+    }
+
     // 3. Malicious archives
     @Test func rejectsMaliciousAndMalformedArchives() throws {
         // Future version

@@ -302,16 +302,34 @@ extension AppState {
         }
     }
 
-    func instructionEnvelope(for session: LatticeSession, workspace: URL, allowFileModification: Bool) throws -> LatticeInstructionEnvelope {
+    func instructionEnvelope(
+        for session: LatticeSession,
+        workspace: URL,
+        allowFileModification: Bool,
+        submittedText: String = "",
+        isExtensionSelfEdit: Bool = false,
+        skillID: String? = nil
+    ) throws -> LatticeInstructionEnvelope {
         let trusted = workspaceInstructionsAreTrusted(for: workspace)
+        let mode = session.executionRoute.mode
+        let includeProduct = LatticeProductInstructions.shouldIncludeProductContext(
+            mode: mode,
+            submittedText: submittedText,
+            isExtensionSelfEdit: isExtensionSelfEdit,
+            skillID: skillID
+        )
+        let effectiveAllowWrites = allowFileModification
+            && !(mode == .code && session.codePhase.restrictsMutatingTools)
         return try .default(
-            mode: session.executionRoute.mode,
+            mode: mode,
             workspace: workspace,
-            allowFileModification: allowFileModification,
+            allowFileModification: effectiveAllowWrites,
             workspaceInstructionsTrusted: trusted,
             trustedWorkspaceInstructionNames: appliedInstructionFileNames(for: workspace, trusted: trusted),
             codeUserAddOn: codeInstructionAddOn,
-            workUserAddOn: workInstructionAddOn
+            workUserAddOn: workInstructionAddOn,
+            includeProductContext: includeProduct,
+            codePhase: session.codePhase
         )
     }
 
@@ -610,13 +628,13 @@ extension AppState {
     func codeRouteReadinessDetail(providerID: String) -> String {
         switch providerID {
         case "codex":
-            if !piInstalled { return "Set up the Pi Code runtime in Connections" }
-            return piModelIDs.isEmpty ? "Pi did not report Codex models" : "No compatible Codex models reported"
+            if !piInstalled { return LatticeAgentExecutable.missingRuntimeMessage }
+            return piModelIDs.isEmpty ? "Lattice Agent did not report Codex models" : "No compatible Codex models reported"
         case "opencode":
-            if !piInstalled { return "Set up the Pi Code runtime in Connections" }
+            if !piInstalled { return LatticeAgentExecutable.missingRuntimeMessage }
             if !openCodeAPIKeySaved { return "Save an OpenCode key in Connections" }
             if !openCodeCredentialEnabledModes.contains(.code) { return "Enable the OpenCode key for Code" }
-            return piModelIDs.isEmpty ? "Pi did not report OpenCode models" : "No compatible OpenCode models reported"
+            return piModelIDs.isEmpty ? "Lattice Agent did not report OpenCode models" : "No compatible OpenCode models reported"
         case "grok": return grokReadinessCopy.detail
         case "antigravity": return antigravityReadinessDetail
         default: return "Route unavailable"
@@ -759,8 +777,8 @@ extension AppState {
         if ExecutionRouteResolver.isDeclared(session.executionRoute) {
             switch session.executionRoute.runtimeID {
             case "pi":
-                if !piInstalled { return "Set up the Pi Code runtime in Connections." }
-                return "Check Pi sign-in and exact model availability for this Code route."
+                if !piInstalled { return LatticeAgentExecutable.missingRuntimeMessage }
+                return "Check Lattice Agent sign-in and exact model availability for this Code route."
             case "hermes":
                 if !hermesInstalled { return "Set up the Hermes Work runtime in Connections." }
                 return "Check Hermes sign-in and exact model availability for this Work route."
@@ -771,7 +789,9 @@ extension AppState {
             }
         }
         if harnessID == "pi" {
-            return piInstalled ? "Pi cannot run this locked provider/model route." : "Pi is not installed."
+            return piInstalled
+                ? "Lattice Agent cannot run this locked provider/model route."
+                : LatticeAgentExecutable.notInstalledErrorMessage
         }
         if harnessID == "hermes" {
             return hermesInstalled ? "Hermes does not expose this locked model." : "Hermes is not installed."
@@ -830,7 +850,7 @@ extension AppState {
         guard !acknowledgedUnsafeProviderRouteKeys.contains(routeKey) else { return true }
         let providerName: String
         switch harnessID {
-        case "pi": providerName = "Pi"
+        case "pi": providerName = LatticeAgentExecutable.productDisplayName
         case "hermes": providerName = "Hermes"
         default: providerName = session.backend.harnessName
         }
@@ -1106,29 +1126,267 @@ extension AppState {
     }
 
     func setSessionPolicy(_ value: ExecutionPolicy) {
+        // Prefer session authority for the active chat. Do not dual-write the global
+        // default when the session cannot be updated (streaming / missing selection).
+        if let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }) {
+            if sessions[index].isStreaming {
+                setError("Stop the current response before changing execution policy.", sessionID: id)
+                return
+            }
+            sessions[index].policy = value
+            policy = value
+            persist()
+            return
+        }
+        // No active chat: update the default for the next new chat only.
         policy = value
+    }
+
+    // MARK: - Code plan phase (Lattice Agent)
+
+    /// Begin a guided plan phase for Code · Lattice Agent. Mutating tools stay withheld until approve.
+    func beginCodePlanPhase(title: String = "Plan", seed: String = "") {
+        guard let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        guard sessions[index].executionRoute.mode == .code,
+              sessions[index].executionRoute.runtimeID == "pi",
+              !sessions[index].isStreaming else {
+            setError("Plan phase is available for idle Code · Lattice Agent chats only.", sessionID: selectedSessionID)
+            return
+        }
+        sessions[index].codePhase = .planActive
+        if sessions[index].codePlan == nil {
+            sessions[index].codePlan = CodePlanArtifact(title: title, body: seed)
+        }
+        upsertSessionAction(.init(
+            messageID: sessions[index].messages.last?.id ?? UUID(),
+            kind: .plan,
+            title: "Plan phase started",
+            detail: "Mutating tools withheld on the next send until you approve the plan. Grok/Antigravity native plan modes are unchanged.",
+            status: .running,
+            work: .init(kind: .planStep, ownership: .userOwned, stepKey: "plan-active")
+        ), at: index)
+        setActivity([.init(
+            icon: "list.bullet.clipboard",
+            title: "Planning",
+            detail: "Write/edit/bash tools withheld on the next Lattice Agent send until you approve the plan."
+        )], sessionID: id)
+        persist()
+    }
+
+    func submitCodePlanForApproval(body: String? = nil) {
+        guard let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        guard sessions[index].executionRoute.runtimeID == "pi",
+              sessions[index].codePhase == .planActive,
+              !sessions[index].isStreaming else { return }
+        if let body {
+            let prior = sessions[index].codePlan
+            sessions[index].codePlan = CodePlanArtifact(
+                title: prior?.title ?? "Plan",
+                body: body,
+                revision: (prior?.revision ?? 0) + 1
+            )
+        }
+        sessions[index].codePhase = .planAwaitingApproval
+        setActivity([.init(
+            icon: "list.bullet.clipboard",
+            title: "Plan awaiting approval",
+            detail: "Write/edit/bash tools stay withheld until you approve. Takes effect on the next send."
+        )], sessionID: id)
+        persist()
+    }
+
+    func approveCodePlan() {
+        guard let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        guard sessions[index].executionRoute.runtimeID == "pi",
+              sessions[index].codePhase == .planAwaitingApproval,
+              !sessions[index].isStreaming else { return }
+        sessions[index].codePhase = .implement
+        upsertSessionAction(.init(
+            messageID: sessions[index].messages.last?.id ?? UUID(),
+            kind: .plan,
+            title: "Plan approved",
+            detail: sessions[index].codePlan.map { "Revision \($0.revision): \($0.title)" } ?? "Implement with normal tool policy.",
+            status: .allowed,
+            work: .init(kind: .planStep, ownership: .userOwned, stepKey: "plan-approved")
+        ), at: index)
+        setActivity([.init(
+            icon: "checkmark.circle",
+            title: "Plan approved",
+            detail: "Implementing with normal tool policy on the next send."
+        )], sessionID: id)
+        persist()
+    }
+
+    func requestCodePlanChanges(note: String = "") {
+        guard let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        guard sessions[index].executionRoute.runtimeID == "pi",
+              sessions[index].codePhase == .planAwaitingApproval,
+              !sessions[index].isStreaming else { return }
+        sessions[index].codePhase = .planActive
+        let detail = note.trimmingCharacters(in: .whitespacesAndNewlines)
+        upsertSessionAction(.init(
+            messageID: sessions[index].messages.last?.id ?? UUID(),
+            kind: .plan,
+            title: "Plan changes requested",
+            detail: detail.isEmpty ? "User requested plan revisions." : detail,
+            status: .waiting,
+            work: .init(kind: .planStep, ownership: .userOwned, stepKey: "plan-changes")
+        ), at: index)
+        persist()
+    }
+
+    func exitCodePlanPhase() {
+        guard let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        guard sessions[index].executionRoute.runtimeID == "pi", !sessions[index].isStreaming else { return }
+        sessions[index].codePhase = .normal
+        setActivity([.init(
+            icon: "list.bullet.clipboard",
+            title: "Plan phase ended",
+            detail: "Normal tool policy on the next send."
+        )], sessionID: id)
+        persist()
+    }
+
+    // MARK: - Mid-chat Lattice Agent model switch
+
+    /// True when the selected Code chat can switch between authenticated Codex↔OpenCode models on Lattice Agent.
+    var canSwitchLatticeAgentModelMidChat: Bool {
+        guard let session = selectedSession, !session.isStreaming else { return false }
+        guard session.executionRoute.mode == .code, session.executionRoute.runtimeID == "pi" else { return false }
+        guard session.messages.contains(where: { $0.role == .user }) else { return false }
+        return true
+    }
+
+    /// Composer model options eligible for mid-chat Lattice Agent switch (Codex + OpenCode on pi).
+    var latticeAgentMidChatModelOptions: [ComposerModelOption] {
+        guard canSwitchLatticeAgentModelMidChat else { return [] }
+        return composerModelOptions(for: .code).filter { option in
+            option.isAvailable
+                && option.route.runtimeID == "pi"
+                && (option.route.providerID == "codex" || option.route.providerID == "opencode")
+        }
+    }
+
+    /// Switch provider/model on an in-progress Code · Lattice Agent chat.
+    /// Process-per-turn launch already applies the new model on the next send (set_model semantics via relaunch).
+    func switchLatticeAgentModel(_ option: ComposerModelOption) {
+        guard canSwitchLatticeAgentModelMidChat,
+              let backend = option.backend,
+              option.route.runtimeID == "pi",
+              option.route.mode == .code,
+              option.route.providerID == "codex" || option.route.providerID == "opencode" else {
+            setError("Mid-chat model switch is only available for Code · Lattice Agent (Codex or OpenCode).", sessionID: selectedSessionID)
+            return
+        }
         guard let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }), !sessions[index].isStreaming else { return }
-        sessions[index].policy = value
+        if !SessionPrivacyPolicy.allows(backend, in: sessions[index].privacyMode) {
+            setError(SessionPrivacyPolicy.cloudBlockedMessage, sessionID: id)
+            return
+        }
+        guard option.isAvailable, canRunDeclaredRoute(option.route) || canRunBackend(backend, harnessID: "pi") else {
+            setError("Selected model is not available. Check Connections auth for Codex or OpenCode.", sessionID: id)
+            return
+        }
+        let previous = sessions[index].executionRoute
+        let previousLabel = "\(previous.providerID)/\(previous.modelID ?? "?")"
+        let nextLabel = "\(option.route.providerID)/\(option.route.modelID ?? "?")"
+        let providerChanged = previous.providerID.lowercased() != option.route.providerID.lowercased()
+        // Cross-provider switch requires explicit confirmation: prior transcript may be sent
+        // to the new provider and the Lattice Agent session id is not shared across providers.
+        if providerChanged {
+            let alert = NSAlert()
+            alert.messageText = "Switch provider mid-chat?"
+            alert.informativeText = """
+            Switching from \(previous.providerID) to \(option.route.providerID) starts a fresh Lattice Agent session for the new provider.
+
+            The prior visible transcript may be sent to \(option.route.providerID) on the next turn as a handoff. Provider-private state is not transferred.
+            """
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Switch provider")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        sessions[index].backend = backend
+        sessions[index].executionRoute = option.route
+        sessions[index].harnessID = "pi"
+        sessions[index].reasoningEffort = defaultReasoning(for: backend, harnessID: "pi")
+        if providerChanged {
+            // Never silently resume a Pi session created under another provider/auth.
+            sessions[index].harnessThreadID = nil
+            sessions[index].compactContextOnNextSend = true
+        }
+        // Same-provider model-id changes keep harnessThreadID when present.
+        let continuityDetail = providerChanged
+            ? "Provider changed: cleared Lattice Agent session id and queued a visible-transcript handoff. Prior transcript may be sent to \(option.route.providerID) on the next turn."
+            : "Same provider model change. Prior visible transcript may still be sent on the next turn."
+        upsertSessionAction(.init(
+            messageID: sessions[index].messages.last?.id ?? UUID(),
+            kind: .harness,
+            title: "Model switched",
+            detail: "Switched Lattice Agent model \(previousLabel) → \(nextLabel). \(continuityDetail)",
+            status: .completed
+        ), at: index)
+        setActivity([.init(
+            icon: "arrow.left.arrow.right",
+            title: "Model switched",
+            detail: providerChanged
+                ? "Next send uses \(nextLabel) with a fresh session + handoff."
+                : "Next send uses \(nextLabel)."
+        )], sessionID: id)
+        composerSelectionBackend = backend
+        composerSelectionMode = .code
+        persist()
+    }
+
+    // MARK: - Context compact
+
+    func requestContextCompactForNextSend() {
+        guard let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        guard !sessions[index].isStreaming else {
+            setError("Stop the current response before compacting context.", sessionID: id)
+            return
+        }
+        sessions[index].compactContextOnNextSend = true
+        setActivity([.init(
+            icon: "arrow.triangle.2.circlepath",
+            title: "Compact queued",
+            detail: "Next send clears provider session continuity and rebuilds a compacted visible-transcript handoff (local estimate; not a provider tokenizer claim)."
+        )], sessionID: id)
+        persist()
+    }
+
+    func clearContextCompactForNextSend() {
+        guard let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        sessions[index].compactContextOnNextSend = false
         persist()
     }
 
     func setSessionPrivacyMode(_ value: SessionPrivacyMode) {
-        privacyMode = value
-        guard let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }), !sessions[index].isStreaming else { return }
-        sessions[index].privacyMode = value
-        if value == .localOnly,
-           !sessions[index].messages.contains(where: { $0.role == .user }),
-           !sessions[index].backend.isLocal {
-            let local = localBackendFallback()
-            let route = RouteRuntimeMap.writeRoute(backend: local, mode: .local)
-            sessions[index].backend = local
-            sessions[index].executionRoute = route
-            sessions[index].harnessID = route.runtimeID
-            sessions[index].reasoningEffort = defaultReasoning(for: local, harnessID: route.runtimeID)
-            sessions[index].harnessThreadID = nil
-            syncExecutionRoute(from: local)
+        // Mirror setSessionPolicy: do not dual-write the global default when the active
+        // session cannot be updated (streaming).
+        if let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }) {
+            if sessions[index].isStreaming {
+                setError("Stop the current response before changing model privacy.", sessionID: id)
+                return
+            }
+            sessions[index].privacyMode = value
+            privacyMode = value
+            if value == .localOnly,
+               !sessions[index].messages.contains(where: { $0.role == .user }),
+               !sessions[index].backend.isLocal {
+                let local = localBackendFallback()
+                let route = RouteRuntimeMap.writeRoute(backend: local, mode: .local)
+                sessions[index].backend = local
+                sessions[index].executionRoute = route
+                sessions[index].harnessID = route.runtimeID
+                sessions[index].reasoningEffort = defaultReasoning(for: local, harnessID: route.runtimeID)
+                sessions[index].harnessThreadID = nil
+                syncExecutionRoute(from: local)
+            }
+            persist()
+            return
         }
-        persist()
+        privacyMode = value
     }
 
     func reasoningOptions(for backend: ChatBackend) -> [ReasoningOption] {
@@ -1517,13 +1775,13 @@ extension AppState {
             switch runtime {
             case .pi:
                 guard piInstalled else {
-                    connectionRefreshAction.fail("Pi is no longer available on PATH.")
+                    connectionRefreshAction.fail("Lattice Agent is not available. Install it from Connections.")
                     return
                 }
                 if piModelIDs.isEmpty {
-                    connectionRefreshAction.fail("Pi was detected, but it reported no compatible models.")
+                    connectionRefreshAction.fail("Lattice Agent was detected, but it reported no compatible models.")
                 } else {
-                    connectionRefreshAction.succeed("Pi diagnostics completed. \(piModelIDs.count) model route\(piModelIDs.count == 1 ? "" : "s") reported.")
+                    connectionRefreshAction.succeed("Lattice Agent diagnostics completed. \(piModelIDs.count) model route\(piModelIDs.count == 1 ? "" : "s") reported.")
                 }
             case .hermes:
                 guard hermesInstalled else {

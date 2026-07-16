@@ -77,13 +77,23 @@ public enum RunLaunchPlanner {
             runtimeID: request.effectiveRuntimeID,
             backend: request.session.backend
         )
+        let forceCompact = request.session.compactContextOnNextSend
+        // Force compact: rebuild a visible handoff and compact aggressively (threshold 0).
+        let existingThread: String? = {
+            if forceCompact { return nil }
+            return usesPromptDriven ? request.session.harnessThreadID : "structured-message-list"
+        }()
+        let management: LatticeContextManagementMode = forceCompact
+            ? .providerManagedSession
+            : (usesPromptDriven ? .providerManagedSession : .latticeManagedVisibleTranscript)
         let contextPlan = LatticeContextHandoffPlanner.plan(
             session: request.session,
             submittedText: request.submittedText,
             additionalContext: request.additionalContext,
             tokenLimit: request.tokenLimit,
-            existingHarnessThreadID: usesPromptDriven ? request.session.harnessThreadID : "structured-message-list",
-            managementMode: usesPromptDriven ? .providerManagedSession : .latticeManagedVisibleTranscript
+            existingHarnessThreadID: existingThread,
+            managementMode: management,
+            compactionThreshold: forceCompact ? 0 : LatticeContextHandoffPlanner.defaultCompactionThreshold
         )
         let supportsACPRecovery = ["grok", "opencode", "hermes"].contains(request.effectiveRuntimeID)
         let hasPersistedACPSession = supportsACPRecovery && request.session.harnessThreadID != nil
@@ -98,12 +108,20 @@ public enum RunLaunchPlanner {
             )
             : contextPlan
 
+        let statusDetail: String? = {
+            if forceCompact {
+                return contextPlan.statusDetail
+                    ?? "Compacted visible transcript for the next send as requested."
+            }
+            return contextPlan.statusDetail
+        }()
+
         return RunLaunchPlan(
             prompt: contextPlan.prompt,
             routeThreadID: contextPlan.resetsHarnessSession ? nil : request.session.harnessThreadID,
-            resetsHarnessSession: contextPlan.resetsHarnessSession,
-            statusDetail: contextPlan.statusDetail,
-            didCompact: contextPlan.didCompact,
+            resetsHarnessSession: contextPlan.resetsHarnessSession || forceCompact,
+            statusDetail: statusDetail,
+            didCompact: contextPlan.didCompact || forceCompact,
             deliveryIssue: contextPlan.deliveryIssue,
             recoveryPrompt: hasPersistedACPSession ? recoveryPlan.prompt : nil,
             recoveryUsesVisibleTranscriptHandoff: hasPersistedACPSession && recoveryPlan.usesVisibleTranscriptHandoff,

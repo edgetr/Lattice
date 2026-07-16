@@ -21,6 +21,46 @@ struct PolicyEngineTests {
         guard case .allow = engine.evaluate(request, under: .smart) else { Issue.record("Smart should allow reversible scoped edits"); return }
     }
 
+    @Test func acceptEditsAllowsWorkspaceWriteWithoutUndoEvidence() {
+        // Production Lattice Agent / Codex writes report reversible:false.
+        let request = ToolRequest(kind: .write, title: "Edit file", detail: "Sources/App.swift", workspaceScoped: true, reversible: false)
+        guard case .allow = engine.evaluate(request, under: .acceptEdits) else {
+            Issue.record("Accept Edits should auto-allow workspace-scoped writes after a reported request")
+            return
+        }
+    }
+
+    @Test func acceptEditsStillGatesBashAndOutOfWorkspace() {
+        let bash = ToolRequest(kind: .command, title: "Bash", detail: "rm -rf", workspaceScoped: true, reversible: false)
+        guard case .requireApproval = engine.evaluate(bash, under: .acceptEdits) else {
+            Issue.record("Accept Edits must gate bash/command")
+            return
+        }
+        let oow = ToolRequest(kind: .write, title: "Edit file", detail: "/tmp/other.swift", workspaceScoped: false, reversible: false)
+        guard case .requireApproval = engine.evaluate(oow, under: .acceptEdits) else {
+            Issue.record("Accept Edits must gate out-of-workspace writes")
+            return
+        }
+    }
+
+    @Test func smartStillGatesNonReversibleWorkspaceWrite() {
+        let request = ToolRequest(kind: .write, title: "Edit file", detail: "Sources/App.swift", workspaceScoped: true, reversible: false)
+        guard case .requireApproval = engine.evaluate(request, under: .smart) else {
+            Issue.record("Smart must stay stricter than Accept Edits without undo evidence")
+            return
+        }
+    }
+
+    @Test func acceptEditsVisibleOptionsMatchSmart() {
+        let options = [
+            ApprovalOption(id: "accept", name: "Allow once", kind: "allow_once"),
+            ApprovalOption(id: "acceptForSession", name: "Allow for session", kind: "allow_session"),
+            ApprovalOption(id: "acceptAlways", name: "Allow always", kind: "allow_always"),
+            ApprovalOption(id: "decline", name: "Deny", kind: "reject_once")
+        ]
+        #expect(ApprovalOptionPolicy.visibleOptions(options, under: .acceptEdits).map(\.id) == ["accept", "acceptForSession", "decline"])
+    }
+
     @Test func smartRequiresApprovalForMaterialFileChangeWithoutReversibleEvidence() {
         let request = ToolRequest(kind: .write, title: "Change files", detail: "Sources/App.swift", workspaceScoped: true, reversible: false)
         guard case .requireApproval = engine.evaluate(request, under: .smart) else {

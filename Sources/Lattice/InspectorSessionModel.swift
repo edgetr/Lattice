@@ -24,7 +24,10 @@ struct InspectorSessionModel: Equatable {
         self.modeDisplayName = session.executionRoute.mode.displayName
         self.providerDisplayName = session.backend.harnessName
         self.modelDisplayName = session.backend.displayName
-        self.runtimeID = session.executionRoute.runtimeID
+        // Display product name for Lattice Agent; persistence wire id remains "pi".
+        self.runtimeID = session.executionRoute.runtimeID == "pi"
+            ? LatticeAgentExecutable.productDisplayName
+            : session.executionRoute.runtimeID
         self.reasoningDisplayName = session.reasoningEffort?.displayName
         self.policy = session.policy
         self.privacyMode = session.privacyMode

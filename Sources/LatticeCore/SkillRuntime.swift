@@ -3,11 +3,15 @@ import Foundation
 public enum LatticeSkillSource: String, Codable, Hashable, Sendable {
     case generated
     case importedGlobal
+    case bundled
+    case userAuthored
 
     public var displayName: String {
         switch self {
         case .generated: "Lattice generated"
         case .importedGlobal: "Imported global"
+        case .bundled: "Bundled"
+        case .userAuthored: "Created in Settings"
         }
     }
 }
@@ -399,6 +403,120 @@ public struct LatticeSkillStore: Sendable {
         }
     }
 
+    /// User-created skill from Settings (lighter validation than self-edit generated skills).
+    public func writeUserAuthoredSkill(_ patch: LatticeSkillPatch, overwrite: Bool = false) throws -> URL {
+        let validation = Self.validate(patch)
+        guard validation.isEmpty else {
+            throw NSError(domain: "LatticeSkillStore", code: 1, userInfo: [NSLocalizedDescriptionKey: validation.joined(separator: " ")])
+        }
+        try prepareDirectory()
+        let canonicalRoot = try LatticeStorePathSecurity.canonicalDirectory(at: rootURL)
+        if !overwrite, try LatticeStorePathSecurity.existingChildDirectory(named: patch.id, under: canonicalRoot) != nil {
+            throw NSError(
+                domain: "LatticeSkillStore",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "A skill named “\(patch.id)” already exists. Choose another id or replace it."]
+            )
+        }
+        if overwrite, let existing = try LatticeStorePathSecurity.existingChildDirectory(named: patch.id, under: canonicalRoot) {
+            try LatticeStorePathSecurity.removeItem(at: existing, under: canonicalRoot)
+        }
+        let folder = try LatticeStorePathSecurity.createChildDirectory(named: patch.id, under: canonicalRoot)
+        let markdown = Self.normalizedUserAuthoredMarkdown(patch)
+        try LatticeStorePathSecurity.writeDataAtomically(
+            Data(markdown.utf8),
+            to: folder.appendingPathComponent("SKILL.md"),
+            under: canonicalRoot
+        )
+        try LatticeStorePathSecurity.writeDataAtomically(
+            Data(LatticeSkillSource.userAuthored.rawValue.utf8),
+            to: folder.appendingPathComponent(".lattice-skill-source"),
+            under: canonicalRoot
+        )
+        try LatticeStorePathSecurity.removeItem(at: folder.appendingPathComponent(".lattice-original-skill-path"), under: canonicalRoot)
+        try LatticeStorePathSecurity.removeItem(at: folder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillOriginalPathMarker), under: canonicalRoot)
+        try LatticeStorePathSecurity.removeItem(at: folder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillSourceMarker), under: canonicalRoot)
+        try LatticeStorePathSecurity.removeItem(at: importedGlobalBaselineURL(in: folder), under: canonicalRoot)
+        try LatticeStorePathSecurity.removeItem(at: folder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillImportedBaselineMarker), under: canonicalRoot)
+        try LatticeStorePathSecurity.removeItem(at: folder.appendingPathComponent(".lattice-skill-owner-extension-id"), under: canonicalRoot)
+        try LatticeStorePathSecurity.removeItem(at: folder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillOwnerMarker), under: canonicalRoot)
+        try removeDeletedGlobalSkillID(patch.id)
+        return folder.appendingPathComponent("SKILL.md")
+    }
+
+    /// Import a user-selected `SKILL.md` file or a skill directory containing one.
+    public func importSkill(from selectedURL: URL, overwrite: Bool = false) throws -> LatticeSkillRecord {
+        let skillFile = try resolveSkillMarkdownURL(from: selectedURL)
+        guard let data = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: skillFile),
+              let markdown = String(data: data, encoding: .utf8) else {
+            throw NSError(domain: "LatticeSkillStore", code: 4, userInfo: [NSLocalizedDescriptionKey: "Could not read SKILL.md as UTF-8 text."])
+        }
+        let folderHint = skillFile.deletingLastPathComponent().lastPathComponent
+        let id = Self.safeSkillID(from: folderHint.isEmpty ? skillFile.deletingPathExtension().lastPathComponent : folderHint)
+        guard !id.isEmpty else {
+            throw NSError(domain: "LatticeSkillStore", code: 5, userInfo: [NSLocalizedDescriptionKey: "Could not derive a safe skill id from the selected path."])
+        }
+        let issues = validateExistingSkill(id: id, markdown: markdown)
+        guard issues.isEmpty else {
+            throw NSError(domain: "LatticeSkillStore", code: 6, userInfo: [NSLocalizedDescriptionKey: issues.joined(separator: " ")])
+        }
+        try prepareDirectory()
+        let canonicalRoot = try LatticeStorePathSecurity.canonicalDirectory(at: rootURL)
+        if !overwrite, try LatticeStorePathSecurity.existingChildDirectory(named: id, under: canonicalRoot) != nil {
+            throw NSError(
+                domain: "LatticeSkillStore",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "A skill named “\(id)” already exists. Choose replace to overwrite Lattice’s copy."]
+            )
+        }
+        if overwrite, let existing = try LatticeStorePathSecurity.existingChildDirectory(named: id, under: canonicalRoot) {
+            try LatticeStorePathSecurity.removeItem(at: existing, under: canonicalRoot)
+        }
+        let targetFolder = try LatticeStorePathSecurity.createChildDirectory(named: id, under: canonicalRoot)
+        try writeImportedGlobalSkill(source: skillFile, sourceData: data, targetFolder: targetFolder)
+        try removeDeletedGlobalSkillID(id)
+        guard let record = loadRecord(targetFolder) else {
+            throw NSError(domain: "LatticeSkillStore", code: 7, userInfo: [NSLocalizedDescriptionKey: "Imported skill could not be reloaded."])
+        }
+        return record
+    }
+
+    private func resolveSkillMarkdownURL(from selectedURL: URL) throws -> URL {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: selectedURL.path, isDirectory: &isDirectory) else {
+            throw NSError(domain: "LatticeSkillStore", code: 8, userInfo: [NSLocalizedDescriptionKey: "Selected path does not exist."])
+        }
+        if isDirectory.boolValue {
+            let candidate = selectedURL.appendingPathComponent("SKILL.md")
+            guard FileManager.default.fileExists(atPath: candidate.path) else {
+                throw NSError(domain: "LatticeSkillStore", code: 9, userInfo: [NSLocalizedDescriptionKey: "Selected folder does not contain SKILL.md."])
+            }
+            return candidate
+        }
+        guard selectedURL.lastPathComponent == "SKILL.md" || selectedURL.pathExtension.lowercased() == "md" else {
+            throw NSError(domain: "LatticeSkillStore", code: 10, userInfo: [NSLocalizedDescriptionKey: "Select a SKILL.md file or a skill folder."])
+        }
+        return selectedURL
+    }
+
+    private static func normalizedUserAuthoredMarkdown(_ patch: LatticeSkillPatch) -> String {
+        let body = patch.markdown.trimmingCharacters(in: .whitespacesAndNewlines)
+        if body.hasPrefix("---") { return body + "\n" }
+        let description = patch.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        let descLine = description.isEmpty ? patch.title : description
+        return """
+        ---
+        name: \(patch.id)
+        description: \(descLine)
+        ---
+
+        # \(patch.title)
+
+        \(body)
+
+        """
+    }
+
     public func writeGeneratedSkill(_ patch: LatticeSkillPatch, ownerExtensionID: String? = nil) throws -> URL {
         let validation = Self.validate(patch)
         guard validation.isEmpty else {
@@ -515,10 +633,115 @@ public struct LatticeSkillStore: Sendable {
             primary: ".lattice-skill-source",
             legacy: LatticeLegacyBrandCompatibility.skillSourceMarker
         )
-        if LatticeSkillSource(rawValue: sourceRaw ?? "") == .importedGlobal {
+        let source = LatticeSkillSource(rawValue: sourceRaw ?? "")
+        // Tombstone imported and bundled skills so refresh/seed do not resurrect user deletes.
+        if source == .importedGlobal || source == .bundled {
             try addDeletedGlobalSkillID(id)
         }
         try LatticeStorePathSecurity.removeItem(at: folder, under: canonicalRoot)
+    }
+
+    /// Idempotent seed of the curated Code skill pack.
+    /// - Does not clobber user-edited or non-bundled skills with the same id.
+    /// - Respects delete tombstones (bundled + imported).
+    /// - When an existing bundled skill still matches the last seeded baseline, refresh content.
+    @discardableResult
+    public func seedBundledCodeSkills(
+        specs: [LatticeBundledCodeSkills.Spec] = LatticeBundledCodeSkills.all
+    ) throws -> LatticeBundledCodeSkills.SeedResult {
+        try prepareDirectory()
+        let canonicalRoot = try LatticeStorePathSecurity.canonicalDirectory(at: rootURL)
+        let tombstoned = deletedGlobalSkillIDs()
+        var seeded: [String] = []
+        var skippedExisting: [String] = []
+        var skippedTombstoned: [String] = []
+        var defaultDisabled: [String] = []
+
+        for spec in specs {
+            guard Self.isSafeSkillID(spec.id), "/\(spec.id)" != LatticeSelfEditCommand.name else { continue }
+            guard let markdown = LatticeBundledCodeSkills.markdown(for: spec.id), !markdown.isEmpty else { continue }
+            if !spec.defaultEnabled {
+                defaultDisabled.append(spec.id)
+            }
+            if tombstoned.contains(spec.id) {
+                skippedTombstoned.append(spec.id)
+                continue
+            }
+            if let existing = try LatticeStorePathSecurity.existingChildDirectory(named: spec.id, under: canonicalRoot) {
+                let sourceRaw = Self.readSidecarText(
+                    in: existing,
+                    primary: ".lattice-skill-source",
+                    legacy: LatticeLegacyBrandCompatibility.skillSourceMarker
+                )
+                let source = LatticeSkillSource(rawValue: sourceRaw ?? "")
+                guard source == .bundled else {
+                    skippedExisting.append(spec.id)
+                    continue
+                }
+                // Refresh only when the user has not locally edited past the bundled baseline.
+                let skillURL = existing.appendingPathComponent("SKILL.md")
+                let baselineURL = bundledBaselineURL(in: existing)
+                let localData = try? LatticeStorePathSecurity.readData(at: skillURL, under: canonicalRoot)
+                let baselineData = try? LatticeStorePathSecurity.readData(at: baselineURL, under: canonicalRoot)
+                let nextData = Data(markdown.utf8)
+                if let localData, let baselineData, localData == baselineData {
+                    if localData != nextData {
+                        try LatticeStorePathSecurity.writeDataAtomically(nextData, to: skillURL, under: canonicalRoot)
+                        try LatticeStorePathSecurity.writeDataAtomically(nextData, to: baselineURL, under: canonicalRoot)
+                    }
+                    seeded.append(spec.id)
+                } else if localData == nil {
+                    try writeBundledSkill(id: spec.id, markdown: markdown, under: canonicalRoot)
+                    seeded.append(spec.id)
+                } else if baselineData == nil, localData == nextData {
+                    try LatticeStorePathSecurity.writeDataAtomically(nextData, to: baselineURL, under: canonicalRoot)
+                    seeded.append(spec.id)
+                } else {
+                    skippedExisting.append(spec.id)
+                }
+                continue
+            }
+            try writeBundledSkill(id: spec.id, markdown: markdown, under: canonicalRoot)
+            seeded.append(spec.id)
+        }
+
+        return .init(
+            seededIDs: seeded,
+            skippedExistingIDs: skippedExisting,
+            skippedTombstonedIDs: skippedTombstoned,
+            defaultDisabledIDs: defaultDisabled
+        )
+    }
+
+    private func writeBundledSkill(id: String, markdown: String, under canonicalRoot: URL) throws {
+        let folder = try LatticeStorePathSecurity.createChildDirectory(named: id, under: canonicalRoot)
+        let data = Data(markdown.utf8)
+        try LatticeStorePathSecurity.writeDataAtomically(
+            data,
+            to: folder.appendingPathComponent("SKILL.md"),
+            under: canonicalRoot
+        )
+        try LatticeStorePathSecurity.writeDataAtomically(
+            Data(LatticeSkillSource.bundled.rawValue.utf8),
+            to: folder.appendingPathComponent(".lattice-skill-source"),
+            under: canonicalRoot
+        )
+        try LatticeStorePathSecurity.writeDataAtomically(
+            data,
+            to: bundledBaselineURL(in: folder),
+            under: canonicalRoot
+        )
+        try LatticeStorePathSecurity.removeItem(at: folder.appendingPathComponent(".lattice-original-skill-path"), under: canonicalRoot)
+        try LatticeStorePathSecurity.removeItem(at: folder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillOriginalPathMarker), under: canonicalRoot)
+        try LatticeStorePathSecurity.removeItem(at: folder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillSourceMarker), under: canonicalRoot)
+        try LatticeStorePathSecurity.removeItem(at: folder.appendingPathComponent(".lattice-skill-owner-extension-id"), under: canonicalRoot)
+        try LatticeStorePathSecurity.removeItem(at: folder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillOwnerMarker), under: canonicalRoot)
+        try LatticeStorePathSecurity.removeItem(at: importedGlobalBaselineURL(in: folder), under: canonicalRoot)
+        try LatticeStorePathSecurity.removeItem(at: folder.appendingPathComponent(LatticeLegacyBrandCompatibility.skillImportedBaselineMarker), under: canonicalRoot)
+    }
+
+    private func bundledBaselineURL(in folder: URL) -> URL {
+        folder.appendingPathComponent(".lattice-bundled-skill-baseline")
     }
 
     @discardableResult

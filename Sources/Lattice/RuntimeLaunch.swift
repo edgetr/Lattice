@@ -101,10 +101,10 @@ enum RuntimeLaunch: Equatable {
             switch launch.route.runtimeID {
             case "pi":
                 guard let model = launch.route.modelID else {
-                    return .failed("The selected Pi route is incomplete: model is missing.")
+                    return .failed("The selected Lattice Agent route is incomplete: model is missing.")
                 }
                 guard let envelope = launch.instructionEnvelope else {
-                    return .failed("The selected Pi route is incomplete: instruction envelope is missing.")
+                    return .failed("The selected Lattice Agent route is incomplete: instruction envelope is missing.")
                 }
                 return .pi(PiRuntimeLaunch(
                     sessionID: launch.sessionID,

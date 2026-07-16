@@ -164,8 +164,8 @@ public enum ExecutionRouteResolver {
     }
 
     private static let templates: [Template] = [
-        Template(mode: .code, providerID: "codex", runtimeID: "pi", title: "Codex · Pi", modelRequired: true),
-        Template(mode: .code, providerID: "opencode", runtimeID: "pi", title: "OpenCode · Pi", modelRequired: true),
+        Template(mode: .code, providerID: "codex", runtimeID: "pi", title: "Codex · Lattice Agent", modelRequired: true),
+        Template(mode: .code, providerID: "opencode", runtimeID: "pi", title: "OpenCode · Lattice Agent", modelRequired: true),
         Template(mode: .code, providerID: "grok", runtimeID: "grok", title: "Grok ACP", modelRequired: true),
         Template(mode: .code, providerID: "antigravity", runtimeID: "antigravity", title: "Antigravity", modelRequired: true),
         Template(mode: .work, providerID: "codex", runtimeID: "hermes", title: "Codex · Hermes", modelRequired: true),

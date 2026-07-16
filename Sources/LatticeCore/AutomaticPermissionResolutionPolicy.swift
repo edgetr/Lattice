@@ -26,6 +26,8 @@ public enum AutomaticPermissionResolutionPolicy {
         case .requireApproval:
             return .requestUser
         case nil:
+            // Without a tool-request classification, only YOLO may auto-allow.
+            // Accept Edits still requires a classified allow decision.
             guard policy == .yolo,
                   let option = options.first(where: { $0.kind == "allow_once" }) else {
                 return .requestUser

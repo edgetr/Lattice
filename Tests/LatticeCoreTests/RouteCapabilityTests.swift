@@ -132,7 +132,7 @@ struct RouteCapabilityTests {
         switch policy {
         case .ask:
             #expect(capability.approvalBehaviorKind == .providerRequestForwarding)
-        case .smart, .yolo:
+        case .smart, .acceptEdits, .yolo:
             #expect(capability.approvalBehaviorKind == .automaticPolicyDecisionsAfterRequest)
         }
     }
@@ -151,6 +151,10 @@ struct RouteCapabilityTests {
             #expect(capability.approvalBehaviorKind == .providerRequestForwarding)
             #expect(capability.approvalBehavior.summary.localizedCaseInsensitiveContains("permission") ||
                     capability.approvalBehavior.detail.localizedCaseInsensitiveContains("write/edit/bash"))
+        case .acceptEdits:
+            #expect(capability.approvalBehaviorKind == .automaticPolicyDecisionsAfterRequest)
+            #expect(capability.approvalBehavior.summary.localizedCaseInsensitiveContains("accept") ||
+                    capability.approvalBehavior.detail.localizedCaseInsensitiveContains("reversible"))
         case .yolo:
             #expect(capability.approvalBehaviorKind == .automaticPolicyDecisionsAfterRequest)
             #expect(capability.approvalBehavior.summary.localizedCaseInsensitiveContains("auto-allow") ||
@@ -160,7 +164,7 @@ struct RouteCapabilityTests {
 
     // MARK: - Antigravity
 
-    @Test(arguments: [ExecutionPolicy.ask, .smart])
+    @Test(arguments: [ExecutionPolicy.ask, .smart, .acceptEdits])
     func antigravityAskSmartArePlanOnlyProviderDeclared(policy: ExecutionPolicy) {
         let capability = RouteCapability.resolve(harnessID: "antigravity", policy: policy)
         #expect(capability.executionOwner == .providerOwned)

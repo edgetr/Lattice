@@ -2,22 +2,22 @@ import Foundation
 
 public enum HarnessToolEventDecoder {
     public static func piEvent(from object: [String: Any], workspace: URL) -> AgentEvent? {
-        guard let type = object["type"] as? String else { return diagnostic(provider: "Pi", object: object, reason: "Event is missing type.") }
+        guard let type = object["type"] as? String else { return diagnostic(provider: LatticeAgentExecutable.productDisplayName, object: object, reason: "Event is missing type.") }
         guard ["tool_execution_start", "tool_execution_update", "tool_execution_end"].contains(type) else {
             if ["message_update", "message_end", "agent_end", "extension_ui_request", "extension_error"].contains(type) { return nil }
-            return diagnostic(provider: "Pi", object: object, reason: "Unsupported event.")
+            return diagnostic(provider: LatticeAgentExecutable.productDisplayName, object: object, reason: "Unsupported event.")
         }
-        guard let externalID = object["toolCallId"] as? String, !externalID.isEmpty else { return diagnostic(provider: "Pi", object: object, reason: "Tool event is missing toolCallId.") }
+        guard let externalID = object["toolCallId"] as? String, !externalID.isEmpty else { return diagnostic(provider: LatticeAgentExecutable.productDisplayName, object: object, reason: "Tool event is missing toolCallId.") }
         let id = stableID(for: "pi:\(externalID)")
 
         switch type {
         case "tool_execution_start":
-            guard let toolName = object["toolName"] as? String, !toolName.isEmpty else { return diagnostic(provider: "Pi", object: object, reason: "Tool start is missing toolName.") }
+            guard let toolName = object["toolName"] as? String, !toolName.isEmpty else { return diagnostic(provider: LatticeAgentExecutable.productDisplayName, object: object, reason: "Tool start is missing toolName.") }
             let input = object["args"] as? [String: Any] ?? [:]
             return .toolRequested(.init(
                 id: id,
                 kind: kind(for: toolName),
-                title: "Pi is using \(displayName(toolName))",
+                title: "Lattice Agent is using \(displayName(toolName))",
                 detail: detail(input: input, fallback: toolName),
                 workspaceScoped: WorkspacePathScope.isWorkspaceScoped(input["path"] as? String, workspace: workspace),
                 reversible: false

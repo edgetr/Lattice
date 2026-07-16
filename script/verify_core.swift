@@ -341,6 +341,61 @@ struct CoreVerification {
         expect(codexAskWriteRoute.sandbox == "workspace-write", "Codex Ask with explicit workspaceWrite maps to workspace-write")
         let codexSmartRoute = CodexProviderExecutionRoute.resolve(policy: .smart)
         expect(codexSmartRoute.approvalPolicy == "on-request" && codexSmartRoute.sandbox == "workspace-write", "Codex Smart maps to on-request + workspace-write")
+        let codexAcceptEditsRoute = CodexProviderExecutionRoute.resolve(policy: .acceptEdits)
+        expect(codexAcceptEditsRoute.approvalPolicy == "on-request" && codexAcceptEditsRoute.sandbox == "workspace-write", "Codex Accept Edits maps to on-request + workspace-write")
+        let piAcceptEdits = RouteCapability.resolve(harnessID: "pi", policy: .acceptEdits)
+        expect(piAcceptEdits.approvalBehaviorKind == .automaticPolicyDecisionsAfterRequest, "Pi Accept Edits auto-decides after reported requests")
+        expect(piAcceptEdits.warnings.contains(where: { $0.localizedCaseInsensitiveContains("accept edits") }), "Pi Accept Edits discloses reported-request-only auto-allow")
+        // Accept Edits product utility: workspace write without undo evidence auto-allows; Smart does not; bash asks.
+        let acceptWrite = ToolRequest(kind: .write, title: "Edit", detail: "Sources/App.swift", workspaceScoped: true, reversible: false)
+        if case .allow = policy.evaluate(acceptWrite, under: .acceptEdits) {
+            expect(true, "Accept Edits auto-allows workspace write without undo evidence")
+        } else {
+            expect(false, "Accept Edits auto-allows workspace write without undo evidence")
+        }
+        if case .requireApproval = policy.evaluate(acceptWrite, under: .smart) {
+            expect(true, "Smart still gates non-reversible workspace write")
+        } else {
+            expect(false, "Smart still gates non-reversible workspace write")
+        }
+        let acceptBash = ToolRequest(kind: .command, title: "Bash", detail: "echo", workspaceScoped: true, reversible: false)
+        if case .requireApproval = policy.evaluate(acceptBash, under: .acceptEdits) {
+            expect(true, "Accept Edits gates bash/command")
+        } else {
+            expect(false, "Accept Edits gates bash/command")
+        }
+        let acceptOptions = [
+            ApprovalOption(id: "accept", name: "Allow once", kind: "allow_once"),
+            ApprovalOption(id: "acceptForSession", name: "Allow for session", kind: "allow_session"),
+            ApprovalOption(id: "acceptAlways", name: "Allow always", kind: "allow_always"),
+            ApprovalOption(id: "decline", name: "Deny", kind: "reject_once")
+        ]
+        expect(ApprovalOptionPolicy.visibleOptions(acceptOptions, under: .acceptEdits).map(\.id) == ["accept", "acceptForSession", "decline"], "Accept Edits exposes session approval options like Smart")
+        expect(CodeSessionPhase.planActive.restrictsMutatingTools && CodeSessionPhase.planAwaitingApproval.restrictsMutatingTools && !CodeSessionPhase.normal.restrictsMutatingTools && !CodeSessionPhase.implement.restrictsMutatingTools, "Plan phase mutating-tool matrix")
+        expect(!LatticeProductInstructions.refersToLatticeProduct("use Accept Edits and YOLO mode") && LatticeProductInstructions.refersToLatticeProduct("What is Lattice?"), "FAQ opt-in ignores policy labels alone")
+        expect(LatticeBundledCodeSkills.markdown(for: "resume-codex")?.contains("auth.json") == true, "Resume skills forbid auth.json reads")
+        // Unclassified permission requests: only YOLO auto-allows; Accept Edits asks.
+        let acceptNilResolution = AutomaticPermissionResolutionPolicy.resolve(
+            decision: nil,
+            policy: .acceptEdits,
+            options: [ApprovalOption(id: "allow_once", name: "Allow", kind: "allow_once")]
+        )
+        expect({
+            if case .requestUser = acceptNilResolution { return true }
+            return false
+        }(), "Accept Edits nil decision requests user (not YOLO auto-allow)")
+        let yoloNilResolution = AutomaticPermissionResolutionPolicy.resolve(
+            decision: nil,
+            policy: .yolo,
+            options: [ApprovalOption(id: "allow_once", name: "Allow", kind: "allow_once")]
+        )
+        expect({
+            if case .forward(_, true) = yoloNilResolution { return true }
+            return false
+        }(), "YOLO nil decision may auto-allow after reported request")
+        expect(ExecutionPolicy(rawValue: "Accept Edits") == .acceptEdits, "Accept Edits raw value is portable")
+        expect(ExecutionPolicy(rawValue: "Mystery Policy") == nil, "Unknown policy raw value fails closed at enum parse")
+        expect(ExecutionPolicy.decoding("Mystery Policy") == .ask, "Unknown policy decoding helper fails closed to Ask")
         let codexYoloRoute = CodexProviderExecutionRoute.resolve(policy: .yolo)
         expect(codexYoloRoute.approvalPolicy == "never" && codexYoloRoute.sandbox == "danger-full-access", "Codex YOLO maps to never + danger-full-access")
         let codexYoloCapability = RouteCapability.resolve(harnessID: "codex", policy: .yolo)
@@ -377,7 +432,7 @@ struct CoreVerification {
             isRunning: false,
             routeCredentialEnabled: false
         )
-        expect(unavailablePiCapabilities.protocolTransport.summary.contains("Pi RPC"), "Live capability surface identifies Pi protocol and transport")
+        expect(unavailablePiCapabilities.protocolTransport.summary.contains("Lattice Agent RPC"), "Live capability surface identifies Lattice Agent protocol and transport")
         expect(unavailablePiCapabilities.providerAvailability.assurance == .absent && unavailablePiCapabilities.modelAvailability.assurance == .unknown, "Live capability surface derives unavailable and unknown discovery states")
         let readyPiReadiness = RouteReadinessEvaluator.evaluate(
             route: livePiRoute,
@@ -863,8 +918,50 @@ struct CoreVerification {
             && productContext.contains("Antigravity")
             && productContext.contains("roadmap features")
             && productContext.localizedCaseInsensitiveContains("LocalToolBroker")
-            && productContext.localizedCaseInsensitiveContains("route-specific"),
+            && productContext.localizedCaseInsensitiveContains("route-specific")
+            && productContext.contains("Accept Edits")
+            && productContext.contains("Lattice Agent"),
             "Backend product instructions explain current Lattice surfaces, context handling, self-edit review behavior, generated skill standards, truthful route controls, and roadmap limits"
+        )
+        let slimCode = LatticeProductInstructions.codeMode
+        expect(
+            !slimCode.contains("Lattice product context:")
+            && slimCode.contains("Engineering contract")
+            && slimCode.utf8.count < productContext.utf8.count,
+            "Code baseline stays slim without product FAQ encyclopedia"
+        )
+        expect(
+            !LatticeProductInstructions.shouldIncludeProductContext(mode: .code, submittedText: "fix the flaky test")
+            && !LatticeProductInstructions.shouldIncludeProductContext(mode: .code, submittedText: "Accept Edits YOLO Lattice Agent")
+            && LatticeProductInstructions.shouldIncludeProductContext(mode: .code, submittedText: "What is Lattice?"),
+            "Code product FAQ is opt-in for Lattice questions"
+        )
+        // Session lock pure helper (seam; not wired into desktop run path).
+        do {
+            let lockRoot = FileManager.default.temporaryDirectory.appendingPathComponent("lattice-lock-verify-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: lockRoot, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: lockRoot) }
+            let sid = UUID()
+            let holder = try LatticeCodeSessionLock.acquire(sessionID: sid, owner: "verify", applicationSupport: lockRoot, isProcessAlive: { _ in true })
+            expect(holder.owner == "verify", "Code session lock acquires")
+            var held = false
+            do {
+                _ = try LatticeCodeSessionLock.acquire(sessionID: sid, owner: "other", applicationSupport: lockRoot, isProcessAlive: { _ in true })
+            } catch {
+                held = true
+            }
+            expect(held, "Code session lock is exclusive for live owners")
+            try LatticeCodeSessionLock.release(sessionID: sid, owner: "verify", applicationSupport: lockRoot)
+        } catch {
+            expect(false, "Code session lock pure helper works: \(error.localizedDescription)")
+        }
+        expect(
+            LatticeBundledCodeSkills.all.map(\.id).sorted() == [
+                "implement", "lattice-extension", "lattice-skill-author",
+                "resume-claude", "resume-codex", "resume-cursor", "review"
+            ].sorted()
+            && LatticeBundledCodeSkills.defaultEnabledIDs == ["lattice-extension"],
+            "Bundled Code skill pack ids and defaults are documented"
         )
         expect(LatticeContinuationPolicy.canContinue(session), "Continuation is available after a visible assistant response")
         expect(!LatticeContinuationPolicy.canContinue(LatticeSession(title: "Streaming", messages: session.messages, backend: .codex(model: "gpt-5.4"), isStreaming: true)), "Continuation is hidden while streaming")
@@ -1206,9 +1303,9 @@ struct CoreVerification {
         expect(ExecutionRouteResolver.resolve(mode: .local, providerID: "codex", modelID: "gpt-5.5") == nil, "Local route never falls back to cloud")
         expect(ExecutionRouteResolver.resolve(mode: .work, providerID: "ollama", modelID: "qwen3:8b") == nil, "Work route never falls back to local")
         expect(ExecutionRouteResolver.resolve(mode: .work, providerID: "opencode", modelID: "opencode-go:deepseek-v4") == ExecutionRoute(mode: .work, providerID: "opencode", modelID: "opencode-go:deepseek-v4", runtimeID: "hermes"), "Explicit Work route stays exact")
-        let setupReadinessAction = HarnessReadinessActionPolicy.resolve(readiness: .missingRuntime, modeName: "Code", runtimeName: "Pi")
+        let setupReadinessAction = HarnessReadinessActionPolicy.resolve(readiness: .missingRuntime, modeName: "Code", runtimeName: "Lattice Agent")
         expect(setupReadinessAction.kind == .setupRuntime && setupReadinessAction.title == "Set Up Code" && setupReadinessAction.isEnabled, "Missing runtime resolves to an enabled exact setup action")
-        let readyReadinessAction = HarnessReadinessActionPolicy.resolve(readiness: .runnable, modeName: "Code", runtimeName: "Pi")
+        let readyReadinessAction = HarnessReadinessActionPolicy.resolve(readiness: .runnable, modeName: "Code", runtimeName: "Lattice Agent")
         expect(readyReadinessAction.kind == .stateOnly && !readyReadinessAction.isInteractive, "Ready status remains non-interactive state")
         let busyFailureAction = HarnessReadinessActionPolicy.resolve(readiness: .failed("Offline"), modeName: "Work", runtimeName: "Hermes", actionAvailable: false)
         expect(busyFailureAction.kind == .diagnostics && !busyFailureAction.isEnabled, "Failed readiness resolves to diagnostics and rejects duplicate activation while busy")
@@ -1389,7 +1486,7 @@ struct CoreVerification {
         expect(BackendAvailabilityPolicy.normalize(.ollama(model: "qwen3:8b"), using: discoveredOllama) == .ollama(model: "qwen3:8b"), "Discovered Ollama model recovers exact route")
         expect(ExecutionRoutePolicy.defaultHarnessID(for: "ollama") == "lattice", "Ollama defaults to Lattice harness")
         expect(ExecutionRoutePolicy.compatibleHarnessIDs(for: "ollama") == ["lattice"], "Ollama only exposes its implemented Lattice route")
-        expect(ExecutionRoutePolicy.compatibleHarnessIDs(for: "codex").contains("pi"), "Codex can execute through Pi RPC")
+        expect(ExecutionRoutePolicy.compatibleHarnessIDs(for: "codex").contains("pi"), "Codex can execute through Lattice Agent (runtime id pi)")
         expect(ExecutionRoutePolicy.compatibleHarnessIDs(for: "opencode").contains("hermes"), "Compatible OpenCode models can execute through Hermes ACP")
         expect(!ExecutionRoutePolicy.compatibleHarnessIDs(for: "apple").contains("codex"), "Apple does not expose Codex harness")
         try? FileManager.default.removeItem(at: root)
@@ -1988,7 +2085,7 @@ struct CoreVerification {
             "message": "{\"toolName\":\"write\",\"input\":{\"path\":\"Sources/App.swift\",\"content\":\"ok\"}}"
         ]
         let parsedPiPermission = PiRPCHarness.permissionRequest(from: piRequestObject, workspace: piWorkspace)
-        expect(parsedPiPermission?.title == "Pi wants to use write", "Pi write permission title parsed")
+        expect(parsedPiPermission?.title == "Lattice Agent wants to use write", "Lattice Agent write permission title parsed")
         expect(parsedPiPermission?.detail == "Sources/App.swift", "Pi write path parsed")
         expect(parsedPiPermission?.toolRequest?.workspaceScoped == true, "Pi relative write is workspace scoped")
         let externalPiRequest: [String: Any] = [
@@ -2389,6 +2486,28 @@ struct CoreVerification {
             expect(false, "Enabled skill invocation injects SKILL.md into backend prompt")
         }
         expect(LatticeSkillPromptBuilder.invocation(in: "/subagents split this", records: importedSkills, disabledSkillIDs: ["subagents"]) == nil, "Disabled skills are not invoked")
+        let bundledSeedRoot = FileManager.default.temporaryDirectory.appendingPathComponent("lattice-bundled-skills-\(UUID().uuidString)", isDirectory: true)
+        try! FileManager.default.createDirectory(at: bundledSeedRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: bundledSeedRoot) }
+        let bundledStore = LatticeSkillStore(rootURL: bundledSeedRoot, globalRoots: [])
+        let bundledSeed = try! bundledStore.seedBundledCodeSkills()
+        expect(bundledSeed.seededIDs.count == LatticeBundledCodeSkills.all.count, "Bundled Code skills seed idempotently into managed store")
+        expect(bundledStore.load().filter { $0.source == .bundled }.count == LatticeBundledCodeSkills.all.count, "Bundled skills load with bundled source")
+        try! bundledStore.deleteSkill(id: "resume-codex")
+        let reseed = try! bundledStore.seedBundledCodeSkills()
+        expect(reseed.skippedTombstonedIDs.contains("resume-codex"), "Deleted bundled skills stay tombstoned on reseed")
+        expect(LatticeSkillPromptBuilder.invocation(in: "/resume-codex summarize", records: bundledStore.load(), disabledSkillIDs: []) == nil, "Tombstoned bundled resume skill is not invocable")
+        let codePhaseSession = LatticeSession(
+            title: "Code plan phase",
+            backend: .codex(model: "gpt-test"),
+            executionRoute: ExecutionRoute(mode: .code, providerID: "codex", modelID: "gpt-test", runtimeID: "pi"),
+            codePhase: .planActive,
+            compactContextOnNextSend: true
+        )
+        expect(codePhaseSession.codePhase.restrictsMutatingTools, "Plan-active phase withholds mutating tools")
+        let codePhaseData = try! JSONEncoder().encode(codePhaseSession)
+        let codePhaseDecoded = try! JSONDecoder().decode(LatticeSession.self, from: codePhaseData)
+        expect(codePhaseDecoded.codePhase == .planActive && codePhaseDecoded.compactContextOnNextSend, "Code phase and compact flag round-trip")
         let generatedReviewSkill = LatticeSkillPatch(id: "review-buddy", title: "Review Buddy", summary: "Review changes.", markdown: "# Review Buddy\n\nReview patches for risk.")
         let generatedReviewPreview = LatticeSkillPatchPreviewBuilder.preview(for: generatedReviewSkill)
         expect(generatedReviewPreview.command == "/review-buddy", "Skill preview shows generated slash command")

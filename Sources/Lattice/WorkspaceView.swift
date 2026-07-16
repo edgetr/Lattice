@@ -298,7 +298,7 @@ private struct WorkspaceDialogsModifier: ViewModifier {
         case "grok": "Grok CLI"
         case "opencode": "OpenCode CLI"
         case "antigravity": "Antigravity CLI"
-        case "pi": "Pi CLI"
+        case "pi": LatticeAgentExecutable.productDisplayName
         case "hermes": "Hermes CLI"
         default: "CLI"
         }

@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import LatticeCore
 
 @MainActor
@@ -169,6 +170,32 @@ struct InspectorView: View {
                     if let breakdown = state.selectedContextBudgetBreakdown {
                         ContextBudgetBreakdownView(breakdown: breakdown)
                     }
+                    HStack(spacing: 8) {
+                        Button(session.compactContextOnNextSend ? "Compact queued" : "Compact for next send") {
+                            if session.compactContextOnNextSend {
+                                state.clearContextCompactForNextSend()
+                            } else {
+                                state.requestContextCompactForNextSend()
+                            }
+                        }
+                        .disabled(session.isStreaming)
+                        .help(session.compactContextOnNextSend
+                              ? "Cancel the queued compact. While queued, the next send still starts a fresh provider session with a compacted handoff."
+                              : "Next send clears provider session continuity and rebuilds a compacted visible-transcript handoff (local estimate; not a provider tokenizer claim). Applies to any prompt-driven route with a harness thread.")
+                        .accessibilityLabel(session.compactContextOnNextSend ? "Cancel compact for next send" : "Compact for next send")
+                        .accessibilityHint("Resets provider session continuity on the next send and uses a compacted transcript handoff.")
+                        if session.compactContextOnNextSend {
+                            Text("Resets session")
+                                .font(LatticeTypography.caption)
+                                .foregroundStyle(LatticeStatusSemantic.warning.color)
+                        }
+                    }
+                    if session.compactContextOnNextSend {
+                        Text("Queued: next send starts a fresh provider session with a compacted visible-transcript handoff.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 if session.attachments.isEmpty {
                     Text("No attached paths. Drag files or use paperclip to add context.")
@@ -188,6 +215,81 @@ struct InspectorView: View {
                                 .buttonStyle(LatticeIconButtonStyle(size: .compact))
                                 .accessibilityLabel("Remove \(attachment.name)")
                         }
+                    }
+                }
+            }
+
+            if session.executionRoute.mode == .code && session.executionRoute.runtimeID == "pi" {
+                InspectorOpaqueDisclosure(title: "Plan phase", systemImage: "list.bullet.clipboard") {
+                    InspectorFactRow(title: "Phase", value: session.codePhase.displayName)
+                    if let plan = session.codePlan {
+                        InspectorFactRow(title: "Plan", value: "\(plan.title) · rev \(plan.revision)")
+                        Text(plan.body.isEmpty ? "No plan body yet." : String(plan.body.prefix(400)))
+                            .font(LatticeTypography.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text("Guided plan withholds mutating Lattice Agent tools until you approve. Not full multi-agent plan enforcement.")
+                            .font(LatticeTypography.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    HStack(spacing: 8) {
+                        if session.codePhase == .normal {
+                            Button("Start plan") { state.beginCodePlanPhase() }
+                                .disabled(session.isStreaming)
+                        }
+                        if session.codePhase == .planActive {
+                            Button("Submit for approval") { state.submitCodePlanForApproval() }
+                                .disabled(session.isStreaming)
+                            Button("Exit plan") { state.exitCodePlanPhase() }
+                                .disabled(session.isStreaming)
+                        }
+                        if session.codePhase == .planAwaitingApproval {
+                            Button("Approve") { state.approveCodePlan() }
+                                .disabled(session.isStreaming)
+                            Button("Request changes") { state.requestCodePlanChanges() }
+                                .disabled(session.isStreaming)
+                            Button("Exit plan") { state.exitCodePlanPhase() }
+                                .disabled(session.isStreaming)
+                        }
+                        if session.codePhase == .implement {
+                            Button("Back to normal") { state.exitCodePlanPhase() }
+                                .disabled(session.isStreaming)
+                        }
+                    }
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel("Plan phase controls")
+                    Text("Tool restriction takes effect on the next Lattice Agent send (launch-time allowlist), not mid-stream.")
+                        .font(LatticeTypography.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if state.canSwitchLatticeAgentModelMidChat {
+                InspectorOpaqueDisclosure(title: "Switch model", systemImage: "arrow.left.arrow.right") {
+                    Text("Lattice Agent only. Switching mid-chat may send prior transcript to the newly selected provider.")
+                        .font(LatticeTypography.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    ForEach(state.latticeAgentMidChatModelOptions, id: \.route.id) { option in
+                        Button {
+                            state.switchLatticeAgentModel(option)
+                        } label: {
+                            HStack {
+                                Text("\(option.providerTitle) · \(option.title)")
+                                    .lineLimit(1)
+                                Spacer(minLength: 4)
+                                if option.route == session.executionRoute {
+                                    Text("Current")
+                                        .font(LatticeTypography.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .disabled(!option.isAvailable || option.route == session.executionRoute || session.isStreaming)
+                        .accessibilityLabel("Switch to \(option.providerTitle) \(option.title)")
                     }
                 }
             }
@@ -917,9 +1019,9 @@ struct ConnectionsView: View {
                     .foregroundStyle(.secondary)
             }
             providerRow(
-                identity: .provider(.codex), name: "Codex", detail: "Code uses Pi · Work uses Hermes",
+                identity: .provider(.codex), name: "Codex", detail: "Code uses Lattice Agent · Work uses Hermes",
                 modes: [
-                    readinessMode(title: "Code", runtime: "Pi", readiness: state.modeReadiness(.code, providerID: "codex"), authenticationAction: state.runtimeAuthenticationAction(for: .pi)) { kind in
+                    readinessMode(title: "Code", runtime: LatticeAgentExecutable.productDisplayName, readiness: state.modeReadiness(.code, providerID: "codex"), authenticationAction: state.runtimeAuthenticationAction(for: .pi)) { kind in
                         switch kind {
                         case .setupRuntime: state.installPi()
                         case .signIn: state.openPiAuthentication()
@@ -941,7 +1043,7 @@ struct ConnectionsView: View {
             ) {
                 codexActions
             } content: {
-                Text("Sign in separately for Code through Pi and Work through Hermes. Signing in to the Codex CLI does not enable either route.")
+                Text("Sign in separately for Code through Lattice Agent and Work through Hermes. Signing in to the Codex CLI does not enable either route.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -978,7 +1080,7 @@ struct ConnectionsView: View {
             providerRow(
                 identity: .provider(.opencode), name: "OpenCode", detail: "One Keychain credential · separate mode consent",
                 modes: [
-                    openCodeReadinessMode(.code, title: "Code", runtime: "Pi"),
+                    openCodeReadinessMode(.code, title: "Code", runtime: LatticeAgentExecutable.productDisplayName),
                     openCodeReadinessMode(.work, title: "Work", runtime: "Hermes")
                 ]
             ) {
@@ -1051,8 +1153,8 @@ struct ConnectionsView: View {
                 ))
                     .toggleStyle(.checkbox)
                     .disabled(!state.openCodeAPIKeySaved)
-                    .accessibilityHint("Allow Pi Code routes to receive this key through their child environment.")
-                    .help(state.openCodeAPIKeySaved ? "Allow Pi Code routes to use the saved key" : "Save the key before enabling Code")
+                    .accessibilityHint("Allow Lattice Agent Code routes to receive this key through their child environment.")
+                    .help(state.openCodeAPIKeySaved ? "Allow Lattice Agent Code routes to use the saved key" : "Save the key before enabling Code")
                 Toggle("Work", isOn: Binding(
                     get: { state.isOpenCodeCredentialEnabled(for: .work) },
                     set: { state.setOpenCodeCredentialEnabled($0, for: .work) }
@@ -1069,7 +1171,7 @@ struct ConnectionsView: View {
                 HStack(spacing: 8) {
                     Button("Check Code") { state.validatePiAuthentication(providerID: "opencode") }
                         .disabled(!state.isOpenCodeCredentialEnabled(for: .code) || !state.piInstalled)
-                        .help(!state.piInstalled ? "Install Pi before checking Code" : (state.isOpenCodeCredentialEnabled(for: .code) ? "Check the saved key through Pi" : "Enable the saved key for Code first"))
+                        .help(!state.piInstalled ? "Install Lattice Agent before checking Code" : (state.isOpenCodeCredentialEnabled(for: .code) ? "Check the saved key through Lattice Agent" : "Enable the saved key for Code first"))
                     Button("Check Work") { state.validateHermesOpenCodeAuthentication() }
                         .disabled(!state.isOpenCodeCredentialEnabled(for: .work) || !state.hermesInstalled)
                         .help(!state.hermesInstalled ? "Install Hermes before checking Work" : (state.isOpenCodeCredentialEnabled(for: .work) ? "Check the saved key through Hermes" : "Enable the saved key for Work first"))
@@ -1118,7 +1220,7 @@ struct ConnectionsView: View {
     private var runtimeComponents: some View {
         DisclosureGroup(isExpanded: $runtimeComponentsExpanded) {
             VStack(alignment: .leading, spacing: 8) {
-                RuntimeComponentRow(name: "Pi", icon: "terminal", installed: state.piInstalled, version: state.piCLIVersion, latest: state.piLatestCLIVersion, provider: "pi", state: state)
+                RuntimeComponentRow(name: LatticeAgentExecutable.productDisplayName, icon: "terminal", installed: state.piInstalled, version: state.piCLIVersion, latest: state.piLatestCLIVersion, provider: "pi", state: state)
                 RuntimeComponentRow(name: "Hermes", icon: "shippingbox", installed: state.hermesInstalled, version: state.hermesCLIInfo.currentVersion, latest: state.hermesCLIInfo.latestVersion, provider: "hermes", state: state)
             }
             .padding(.top, 8)
@@ -1127,7 +1229,7 @@ struct ConnectionsView: View {
                 Label("Runtimes", systemImage: "shippingbox")
                     .font(.headline)
                 Spacer()
-                Text("Pi · Hermes")
+                Text("Lattice Agent · Hermes")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1543,12 +1645,13 @@ struct ExtensionsView: View {
                 Spacer(minLength: 8)
                 Button("Open Folder") { state.openSkillsFolder() }
                 Button("Refresh") { state.refreshSkills() }
+                Button("Import from Codex / Agents") { _ = state.importGlobalSkillsFromKnownRoots() }
             }
-            Text("Imported from ~/.codex/skills and ~/.agents/skills into Lattice’s shared skills folder. Generated /self-edit skills land here too.")
+            Text("Manage enable, import, and create in Settings → Skills. Only enabled skills appear as slash commands and inject when you run them.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             if state.skills.isEmpty {
-                Text("No skills imported.")
+                Text("No skills yet.")
                     .foregroundStyle(.secondary)
             } else {
                 LazyVStack(alignment: .leading, spacing: 0) {
@@ -2125,8 +2228,21 @@ private struct CatalogCardGrid<Content: View>: View {
     }
 }
 
+/// Local Settings UI state without SwiftUI property-wrapper macros (CLT-safe).
+@MainActor
+private final class SettingsSkillsModel: ObservableObject {
+    @Published var showCreateSkill = false
+    @Published var createSkillID = ""
+    @Published var createSkillTitle = ""
+    @Published var createSkillSummary = ""
+    @Published var createSkillMarkdown = "## Workflow\n\n1. …\n"
+    @Published var skillActionMessage: String?
+}
+
 struct SettingsView: View {
     @ObservedObject var state: AppState
+    @StateObject private var skillsModel = SettingsSkillsModel()
+
     var body: some View {
         Form {
             Section("Overlay") {
@@ -2153,12 +2269,47 @@ struct SettingsView: View {
                     .disabled(!state.canRequestLocalModelRefresh)
                     .help(state.localModelRefreshDisabledReason ?? "Refresh locally discovered Ollama models")
             }
-            Section("Extensions & Skills") {
-                Button("Open Extensions Folder") { state.openExtensionsFolder() }
-                Button("Open Skills Folder") { state.openSkillsFolder() }
-                if let message = state.folderActionMessage {
+            Section {
+                Text("Enabled skills appear as slash commands (/skill-id). They are injected only when you run them — not into every message.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if state.skills.isEmpty {
+                    Text("No skills yet. Import, create, or pull from Codex/Agents.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(state.skills) { record in
+                        SkillRecordRow(record: record, state: state)
+                    }
+                }
+                HStack {
+                    Button("Import…") { importSkillFromPanel() }
+                    Button("Import from Codex / Agents") {
+                        skillsModel.skillActionMessage = state.importGlobalSkillsFromKnownRoots()
+                    }
+                    Button("Create Skill…") {
+                        skillsModel.createSkillID = ""
+                        skillsModel.createSkillTitle = ""
+                        skillsModel.createSkillSummary = ""
+                        skillsModel.createSkillMarkdown = "## Workflow\n\n1. …\n"
+                        skillsModel.showCreateSkill = true
+                    }
+                }
+                HStack {
+                    Button("Open Skills Folder") { state.openSkillsFolder() }
+                    Button("Refresh") {
+                        state.refreshSkills()
+                        skillsModel.skillActionMessage = "Skills refreshed."
+                    }
+                    Button("Open Extensions Folder") { state.openExtensionsFolder() }
+                }
+                if let message = skillsModel.skillActionMessage ?? state.folderActionMessage {
                     Text(message).font(.caption).foregroundStyle(.secondary)
                 }
+            } header: {
+                Text("Skills")
+            } footer: {
+                Text("Disable a skill to hide it from the composer slash menu and block injection. Delete removes Lattice’s managed copy only.")
             }
             Section("Privacy & Security") {
                 Text(LatticeSettingsCopy.privacySecurityBody)
@@ -2172,5 +2323,70 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .frame(minWidth: 420, idealWidth: 560, maxWidth: .infinity, minHeight: 280, idealHeight: 400, maxHeight: .infinity, alignment: .topLeading)
+        .sheet(isPresented: Binding(
+            get: { skillsModel.showCreateSkill },
+            set: { skillsModel.showCreateSkill = $0 }
+        )) {
+            createSkillSheet
+        }
+    }
+
+    private var createSkillSheet: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Create skill").font(.title3.weight(.semibold))
+            Text("Enabled by default. Disable anytime in Settings.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextField("Skill id (slash name)", text: Binding(
+                get: { skillsModel.createSkillID },
+                set: { skillsModel.createSkillID = $0 }
+            ))
+            TextField("Title", text: Binding(
+                get: { skillsModel.createSkillTitle },
+                set: { skillsModel.createSkillTitle = $0 }
+            ))
+            TextField("Summary", text: Binding(
+                get: { skillsModel.createSkillSummary },
+                set: { skillsModel.createSkillSummary = $0 }
+            ))
+            TextEditor(text: Binding(
+                get: { skillsModel.createSkillMarkdown },
+                set: { skillsModel.createSkillMarkdown = $0 }
+            ))
+                .font(.system(.body, design: .monospaced))
+                .frame(minHeight: 180)
+                .border(Color.secondary.opacity(0.3))
+            HStack {
+                Spacer()
+                Button("Cancel") { skillsModel.showCreateSkill = false }
+                Button("Create") {
+                    let ok = state.createUserSkill(
+                        id: skillsModel.createSkillID,
+                        title: skillsModel.createSkillTitle.isEmpty ? skillsModel.createSkillID : skillsModel.createSkillTitle,
+                        summary: skillsModel.createSkillSummary,
+                        markdown: skillsModel.createSkillMarkdown
+                    )
+                    skillsModel.skillActionMessage = state.folderActionMessage
+                    // Keep sheet + draft on validation/IO failure.
+                    if ok { skillsModel.showCreateSkill = false }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(LatticeSkillStore.safeSkillID(from: skillsModel.createSkillID).isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 480, minHeight: 420)
+    }
+
+    private func importSkillFromPanel() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose a SKILL.md file or a skill folder."
+        panel.prompt = "Import"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        state.importSkill(from: url)
+        skillsModel.skillActionMessage = state.folderActionMessage
     }
 }

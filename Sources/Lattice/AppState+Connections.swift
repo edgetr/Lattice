@@ -334,14 +334,27 @@ extension AppState {
     }
 
     func refreshPiConnection(generation: UInt64) async {
-        let executable = ExecutableDiscovery.locate("pi")
+        let executable = LatticeAgentExecutable.resolve()
         guard canApplyCatalogRefresh(generation) else { return }
-        if pi.isInstalled != (executable != nil) { pi = PiRPCHarness(executableURL: executable) }
+        if pi.resolvedExecutableURL?.path != executable?.path {
+            pi = PiRPCHarness(executableURL: executable)
+        }
         providerConnections.markLoading(.pi)
-        async let piVersion = Self.commandOutput("pi", ["--version"])
+        let version: String?
+        if let executable {
+            version = await Self.commandOutput(executable.path, ["--version"])
+        } else {
+            version = nil
+        }
         async let piCatalog = pi.modelCatalog()
-        async let piLatest = Self.latestCLIVersion(executableName: "pi", homebrewFormula: "pi", homebrewCask: nil, npmPackage: "@earendil-works/pi-coding-agent", pnpmPackage: "@earendil-works/pi-coding-agent", directPackage: "@earendil-works/pi-coding-agent")
-        let version = await piVersion
+        async let piLatest = Self.latestCLIVersion(
+            executableName: "pi",
+            homebrewFormula: "pi",
+            homebrewCask: nil,
+            npmPackage: LatticeAgentExecutable.npmPackageName,
+            pnpmPackage: LatticeAgentExecutable.npmPackageName,
+            directPackage: LatticeAgentExecutable.npmPackageName
+        )
         let catalog = await piCatalog
         let latest = await piLatest
         guard canApplyCatalogRefresh(generation) else { return }
@@ -547,17 +560,32 @@ extension AppState {
         requestRuntimeAction(.firstUseInstall, runtime: .pi)
     }
     func performPiInstall() {
-        runCLIInstall(provider: "pi", progress: "Installing Pi 0.80.6…", executableName: "pi") {
+        let version = RuntimeInstallDescriptor.pi.immutableVersion
+        runCLIInstall(
+            provider: "pi",
+            progress: "Installing \(LatticeAgentExecutable.productDisplayName) \(version)…",
+            executableName: "pi"
+        ) {
             let reference = RuntimeInstallDescriptor.pi.installReference
+            let prefix = LatticeAgentExecutable.managedInstallRoot().path
+            try? FileManager.default.createDirectory(
+                at: LatticeAgentExecutable.managedInstallRoot(),
+                withIntermediateDirectories: true
+            )
             if ExecutableDiscovery.locate("npm") != nil {
                 let integrity = await Self.runCommand("npm", ["view", reference, "dist.integrity", "--json"], deadline: 30)
                 let reported = String(decoding: integrity.output, as: UTF8.self)
                 guard integrity.status == 0,
                       let expected = RuntimeInstallDescriptor.pi.registryIntegrity,
                       RuntimeArtifactVerification.registryIntegrityMatches(reported: reported, expected: expected) else {
-                    return (-1, Data("Pi registry integrity did not match Lattice's pinned release metadata.".utf8))
+                    return (-1, Data("Lattice Agent registry integrity did not match Lattice's pinned release metadata.".utf8))
                 }
-                return await Self.runCommand("npm", ["install", "-g", "--ignore-scripts", reference], deadline: 180)
+                // Prefix install keeps the engine out of the user's global npm/PATH Pi.
+                return await Self.runCommand(
+                    "npm",
+                    ["install", "--prefix", prefix, "--ignore-scripts", reference],
+                    deadline: 180
+                )
             }
             if ExecutableDiscovery.locate("pnpm") != nil {
                 let integrity = await Self.runCommand("pnpm", ["view", reference, "dist.integrity", "--json"], deadline: 30)
@@ -565,11 +593,15 @@ extension AppState {
                 guard integrity.status == 0,
                       let expected = RuntimeInstallDescriptor.pi.registryIntegrity,
                       RuntimeArtifactVerification.registryIntegrityMatches(reported: reported, expected: expected) else {
-                    return (-1, Data("Pi registry integrity did not match Lattice's pinned release metadata.".utf8))
+                    return (-1, Data("Lattice Agent registry integrity did not match Lattice's pinned release metadata.".utf8))
                 }
-                return await Self.runCommand("pnpm", ["add", "-g", "--ignore-scripts", reference], deadline: 180)
+                return await Self.runCommand(
+                    "pnpm",
+                    ["add", "--dir", prefix, "--ignore-scripts", reference],
+                    deadline: 180
+                )
             }
-            return (-1, Data("Node.js with npm or pnpm is required for the pinned Pi installation.".utf8))
+            return (-1, Data("Node.js with npm or pnpm is required to install the pinned Lattice Agent package into Lattice's private runtime folder.".utf8))
         }
     }
     func installHermes() {
@@ -659,12 +691,17 @@ extension AppState {
             let result: (status: Int32, output: Data)
             switch runtime {
             case .pi:
-                if ExecutableDiscovery.locate("npm") != nil {
-                    result = await Self.runCommand("npm", ["uninstall", "-g", "@earendil-works/pi-coding-agent"], deadline: 120)
-                } else if ExecutableDiscovery.locate("pnpm") != nil {
-                    result = await Self.runCommand("pnpm", ["remove", "-g", "@earendil-works/pi-coding-agent"], deadline: 120)
+                // Only remove Lattice-managed install; never touch a user global `pi`.
+                let managedRoot = LatticeAgentExecutable.managedInstallRoot()
+                if FileManager.default.fileExists(atPath: managedRoot.path) {
+                    do {
+                        try FileManager.default.removeItem(at: managedRoot)
+                        result = (0, Data())
+                    } catch {
+                        result = (-1, Data("Could not remove Lattice Agent: \(error.localizedDescription)".utf8))
+                    }
                 } else {
-                    result = (-1, Data("npm or pnpm is required to remove Pi.".utf8))
+                    result = (0, Data("No Lattice-managed Lattice Agent install was present.".utf8))
                 }
             case .hermes:
                 result = ExecutableDiscovery.locate("uv") == nil
@@ -672,7 +709,12 @@ extension AppState {
                     : await Self.runCommand("uv", ["tool", "uninstall", "hermes-agent"], deadline: 120)
             }
             await refreshConnections(refreshProviderCatalogs: true)
-            let removed = ExecutableDiscovery.locate(runtime.executableName) == nil
+            let removed: Bool = {
+                switch runtime {
+                case .pi: LatticeAgentExecutable.managedExecutableURL() == nil && LatticeAgentExecutable.bundledExecutableURL() == nil
+                case .hermes: ExecutableDiscovery.locate(runtime.executableName) == nil
+                }
+            }()
             let detail = removed
                 ? "Removed. Lattice-owned profile data remains available for rollback until you remove it manually."
                 : CLIActionStatusPolicy.failureMessage(prefix: "Removal incomplete", output: result.output)
@@ -729,25 +771,25 @@ extension AppState {
     }
 
     func openPiAuthentication() {
-        guard piInstalled, let executable = ExecutableDiscovery.locate("pi") else {
+        guard piInstalled, let executable = LatticeAgentExecutable.resolve() else {
             runtimeAuthenticationPhases[.pi] = .signInRequired
-            cliActionMessages["pi"] = "Install Pi before signing in."
+            cliActionMessages["pi"] = "Install Lattice Agent before signing in."
             return
         }
         validatedPiCodexModels.removeAll()
-        let profile = PiRPCHarness().sharedProfileDirectory
+        let profile = PiRPCHarness(executableURL: executable).sharedProfileDirectory
         guard openRuntimeTerminal(
-            name: "pi-login",
+            name: "lattice-agent-login",
             executable: executable,
             arguments: [],
             environment: ["PI_CODING_AGENT_DIR": profile.path]
         ) else {
             runtimeAuthenticationPhases[.pi] = .signInRequired
-            cliActionMessages["pi"] = "Lattice could not open the isolated Pi login terminal."
+            cliActionMessages["pi"] = "Lattice could not open the isolated Lattice Agent login terminal."
             return
         }
         runtimeAuthenticationPhases[.pi] = .validationPending
-        cliActionMessages["pi"] = "In Pi, run /login and choose ChatGPT. Return here, then choose Check Code."
+        cliActionMessages["pi"] = "In Lattice Agent, run /login and choose ChatGPT. Return here, then choose Check Code."
     }
 
     func runtimeAuthenticationAction(for runtime: LatticeRuntimeID) -> HarnessReadinessAuthenticationAction {
@@ -770,11 +812,11 @@ extension AppState {
         }
         guard let candidate = candidates.first else {
             runtimeAuthenticationPhases[.pi] = .signInRequired
-            cliActionMessages["pi"] = "Pi did not report a compatible \(providerID) model."
+            cliActionMessages["pi"] = "Lattice Agent did not report a compatible \(providerID) model."
             return
         }
         let actionID = "pi-\(providerID)"
-        guard beginCLIAction(provider: actionID, progress: "Checking Pi \(providerID)…", estimatedSeconds: 30) else { return }
+        guard beginCLIAction(provider: actionID, progress: "Checking Lattice Agent \(providerID)…", estimatedSeconds: 30) else { return }
         let refreshGeneration = connectionRefreshGeneration.current()
         Task {
             let key = providerID == "opencode" && openCodeCredentialEnabledModes.contains(.code)
@@ -795,11 +837,11 @@ extension AppState {
                 } else {
                     validatedPiOpenCodeModels = Set(candidates.map(\.model))
                 }
-                cliActionMessages["pi"] = "Pi \(providerID) sign-in and models are available."
+                cliActionMessages["pi"] = "Lattice Agent \(providerID) sign-in and models are available."
             } else {
                 if providerID == "codex" { validatedPiCodexModels.removeAll() }
                 else { validatedPiOpenCodeModels.removeAll() }
-                cliActionMessages["pi"] = "Pi could not verify \(providerID). Sign in again or check the enabled key, then validate once more."
+                cliActionMessages["pi"] = "Lattice Agent could not verify \(providerID). Sign in again or check the enabled key, then validate once more."
             }
             runtimeAuthenticationPhases[.pi] = .afterValidation()
             finishCLIAction(actionID)
@@ -980,8 +1022,13 @@ extension AppState {
 
     func refreshSkills() {
         do {
+            let previousSkillIDs = Set(skills.map(\.id))
             try skillStore.importGlobalSkills()
+            let seed = try skillStore.seedBundledCodeSkills()
+            applyBundledSkillDefaultDisablement(seed)
             skills = skillStore.load()
+            // Newly imported globals start disabled (safer defaults; match panel import behavior).
+            applyNewGlobalSkillDefaultDisablement(previousIDs: previousSkillIDs)
             disabledSkillIDs = disabledSkillIDs.intersection(Set(skills.map(\.id)))
             UserDefaults.standard.set(Array(disabledSkillIDs).sorted(), forKey: Self.disabledSkillIDsKey)
         } catch {
@@ -989,6 +1036,50 @@ extension AppState {
             setError(error.localizedDescription)
         }
     }
+
+    /// Lightweight reload without re-importing globals (toggle path).
+    func reloadSkillsFromDisk() {
+        skills = skillStore.load()
+        disabledSkillIDs = disabledSkillIDs.intersection(Set(skills.map(\.id)))
+        UserDefaults.standard.set(Array(disabledSkillIDs).sorted(), forKey: Self.disabledSkillIDsKey)
+    }
+
+    /// First-time seed only: mark default-off bundled skills disabled without re-disabling
+    /// skills the user later enabled. Tracked via UserDefaults seeded-id set.
+    private func applyBundledSkillDefaultDisablement(_ seed: LatticeBundledCodeSkills.SeedResult) {
+        let key = Self.bundledSkillDefaultsAppliedKey
+        var applied = Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+        let skillIDs = Set(skillStore.load().map(\.id))
+        for id in seed.defaultDisabledIDs where skillIDs.contains(id) && !applied.contains(id) {
+            disabledSkillIDs.insert(id)
+            applied.insert(id)
+        }
+        // Newly seeded default-off ids also get a one-shot disable even if already listed.
+        for id in seed.seededIDs where seed.defaultDisabledIDs.contains(id) && !applied.contains(id) {
+            disabledSkillIDs.insert(id)
+            applied.insert(id)
+        }
+        UserDefaults.standard.set(Array(applied).sorted(), forKey: key)
+    }
+
+    /// One-shot disable for skills that appear after a global import and were not previously known.
+    private func applyNewGlobalSkillDefaultDisablement(previousIDs: Set<String>) {
+        let key = Self.globalSkillDefaultsAppliedKey
+        var applied = Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+        let newlyImported = skills.filter { record in
+            record.source == .importedGlobal
+                && !previousIDs.contains(record.id)
+                && !applied.contains(record.id)
+        }
+        for record in newlyImported {
+            disabledSkillIDs.insert(record.id)
+            applied.insert(record.id)
+        }
+        UserDefaults.standard.set(Array(applied).sorted(), forKey: key)
+    }
+
+    private static let bundledSkillDefaultsAppliedKey = "latticeBundledSkillDefaultsApplied"
+    private static let globalSkillDefaultsAppliedKey = "latticeGlobalSkillDefaultsApplied"
 
     func startExtensionMonitoring() {
         try? extensionStore.prepareDirectory()
@@ -1172,11 +1263,25 @@ extension AppState {
             : "\n\nAttached paths:\n" + liveAttachmentPaths.joined(separator: "\n")
         let taskContext: String
         if session.executionRoute.runtimeID == "pi" || session.executionRoute.runtimeID == "hermes" || session.executionRoute.mode == .local {
+            // Lattice Agent / Hermes get system-level envelope instructions; avoid duplicating FAQ every turn.
             taskContext = ""
         } else {
-            let guidance = session.executionRoute.runtimeID == "codex"
-                ? LatticeProductInstructions.current
-                : LatticeProductInstructions.taskContext(for: session.executionRoute.mode)
+            let includeProduct = LatticeProductInstructions.shouldIncludeProductContext(
+                mode: session.executionRoute.mode,
+                submittedText: submittedText,
+                isExtensionSelfEdit: isExtensionSelfEdit
+            )
+            let guidance: String
+            if session.executionRoute.runtimeID == "codex" {
+                guidance = includeProduct
+                    ? LatticeProductInstructions.current
+                    : LatticeProductInstructions.codeMode
+            } else {
+                guidance = LatticeProductInstructions.taskContext(
+                    for: session.executionRoute.mode,
+                    includeProductContext: includeProduct
+                )
+            }
             taskContext = "\n\nLattice task context (visible task guidance; not a system prompt):\n" + guidance
         }
         return taskContext

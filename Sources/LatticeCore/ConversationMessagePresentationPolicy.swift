@@ -91,7 +91,7 @@ public enum ChatRouteProvenancePresentationPolicy: Sendable {
         case "grok": "Grok"
         case "opencode": "OpenCode"
         case "antigravity": "Antigravity"
-        case "pi": "Pi"
+        case "pi": LatticeAgentExecutable.productDisplayName
         case "hermes": "Hermes"
         case "lattice": "Lattice"
         case let other where !other.isEmpty:

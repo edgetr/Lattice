@@ -16,6 +16,9 @@ public struct CodexProviderExecutionRoute: Equatable, Sendable {
     /// Maps Lattice policy to Codex provider knobs.
     /// - Ask: `on-request` approvals with `read-only` sandbox unless explicit workspace write is requested.
     /// - Smart: `on-request` approvals with `workspace-write`.
+    /// - Accept Edits: `on-request` approvals with `workspace-write` (Lattice may auto-allow
+    ///   workspace-scoped file writes/edits after a reported request without undo evidence;
+    ///   bash/out-of-scope still surface).
     /// - YOLO: approvals `never` with `danger-full-access` (no provider sandbox containment).
     public static func resolve(policy: ExecutionPolicy, workspaceWrite: Bool = false) -> CodexProviderExecutionRoute {
         switch policy {
@@ -24,7 +27,7 @@ public struct CodexProviderExecutionRoute: Equatable, Sendable {
                 approvalPolicy: "on-request",
                 sandbox: workspaceWrite ? "workspace-write" : "read-only"
             )
-        case .smart:
+        case .smart, .acceptEdits:
             CodexProviderExecutionRoute(
                 approvalPolicy: "on-request",
                 sandbox: "workspace-write"

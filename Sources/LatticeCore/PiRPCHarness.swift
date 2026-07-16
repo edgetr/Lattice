@@ -47,19 +47,19 @@ public final class PiRPCHarness: @unchecked Sendable {
         public var errorDescription: String? {
             switch self {
             case .invalidProviderOrModel:
-                "Pi provider and model must be non-empty."
+                "Lattice Agent provider and model must be non-empty."
             case .invalidEnvironmentOverride(let name):
-                "Pi environment override is not allowed: \(name)."
+                "Lattice Agent environment override is not allowed: \(name)."
             case .instructionEnvelopeModeMismatch:
-                "Pi instruction envelope mode does not match launch mode."
+                "Lattice Agent instruction envelope mode does not match launch mode."
             case .instructionEnvelopeTrustMismatch:
-                "Pi instruction envelope trust does not match launch trust."
+                "Lattice Agent instruction envelope trust does not match launch trust."
             case .permissionTimedOut:
                 PermissionTimeout.message
             }
         }
 
-        var text: String { errorDescription ?? "Pi launch failed." }
+        var text: String { errorDescription ?? "Lattice Agent launch failed." }
     }
 
     private final class PendingPermission: @unchecked Sendable {
@@ -100,7 +100,7 @@ public final class PiRPCHarness: @unchecked Sendable {
     private var pendingPermissions: [UUID: PendingPermission] = [:]
 
     public init(
-        executableURL: URL? = ExecutableDiscovery.locate("pi"),
+        executableURL: URL? = LatticeAgentExecutable.resolve(),
         permissionExtensionURL: URL? = nil,
         sandboxExecutableURL: URL? = HarnessSandbox.systemExecutableURL,
         permissionTimeout: TimeInterval = 120,
@@ -114,6 +114,9 @@ public final class PiRPCHarness: @unchecked Sendable {
     }
 
     public var isInstalled: Bool { executableURL != nil }
+
+    /// Absolute path of the Lattice Agent binary used for this harness instance.
+    public var resolvedExecutableURL: URL? { executableURL }
 
     /// Shared private profile for Pi provider login/config state. Transcript
     /// and scratch directories remain per Lattice session.
@@ -259,7 +262,7 @@ public final class PiRPCHarness: @unchecked Sendable {
         environmentOverrides: [String: String] = [:]
     ) throws -> LaunchPlan {
         guard let executableURL else {
-            throw NSError(domain: "PiRPCHarness", code: 2, userInfo: [NSLocalizedDescriptionKey: "Pi is not installed."])
+            throw NSError(domain: "PiRPCHarness", code: 2, userInfo: [NSLocalizedDescriptionKey: LatticeAgentExecutable.notInstalledErrorMessage])
         }
         guard let providerModel = Self.mapProviderModel(provider: provider, model: model) else {
             throw Error.invalidProviderOrModel
@@ -385,7 +388,7 @@ public final class PiRPCHarness: @unchecked Sendable {
             let task = Task.detached(priority: .userInitiated) { [self] in
                 guard executableURL != nil else {
                     _ = processRegistry.abandonStart(start, sessionID: sessionID)
-                    continuation.yield(.failed("Pi is not installed.")); continuation.finish(); return
+                    continuation.yield(.failed(LatticeAgentExecutable.notInstalledErrorMessage)); continuation.finish(); return
                 }
                 let piThreadID = Self.piThreadID(from: threadID) ?? UUID().uuidString.lowercased()
                 var scratchDirectory: URL?
@@ -419,7 +422,7 @@ public final class PiRPCHarness: @unchecked Sendable {
                     transport = runningTransport
                     try runningTransport.start()
                     guard let registeredOwner = register(process: runningTransport, input: runningTransport.input, for: sessionID, start: start) else {
-                        throw NSError(domain: "PiRPCHarness", code: 1, userInfo: [NSLocalizedDescriptionKey: "Pi request cancelled before process registration."])
+                        throw NSError(domain: "PiRPCHarness", code: 1, userInfo: [NSLocalizedDescriptionKey: "Lattice Agent request cancelled before process registration."])
                     }
                     owner = registeredOwner
                     continuation.yield(.harnessSessionStarted("pi:\(piThreadID)"))
@@ -433,13 +436,13 @@ public final class PiRPCHarness: @unchecked Sendable {
                     runningTransport.finish()
                     let didCancel = unregister(registeredOwner, start: start, sessionID: sessionID)
                     if didCancel { continuation.yield(.cancelled) }
-                    else if !finished { continuation.yield(.failed("Pi ended before completing the response.")) }
+                    else if !finished { continuation.yield(.failed("Lattice Agent ended before completing the response.")) }
                 } catch {
                     let didCancel = unregister(owner, start: start, sessionID: sessionID)
                     transport?.cancel()
                     if didCancel || transport?.terminationReason == .cancelled { continuation.yield(.cancelled) }
-                    else if transport?.terminationReason == .timedOut { continuation.yield(.failed("Pi timed out.")) }
-                    else if transport?.terminationReason == .outputLimitExceeded { continuation.yield(.failed("Pi output exceeded its limit.")) }
+                    else if transport?.terminationReason == .timedOut { continuation.yield(.failed("Lattice Agent timed out.")) }
+                    else if transport?.terminationReason == .outputLimitExceeded { continuation.yield(.failed("Lattice Agent output exceeded its limit.")) }
                     else { continuation.yield(.failed((error as? PiRPCHarness.Error)?.text ?? error.localizedDescription)) }
                 }
                 if let scratchDirectory { try? FileManager.default.removeItem(at: scratchDirectory) }
@@ -481,17 +484,17 @@ public final class PiRPCHarness: @unchecked Sendable {
 
     private func parse(_ object: [String: Any], sessionID: UUID, owner: InteractiveProcessRegistry.Owner, workspace: URL, transport: BoundedProcessTransport, continuation: AsyncStream<AgentEvent>.Continuation) async throws -> Bool {
         guard let type = object["type"] as? String else {
-            continuation.yield(HarnessToolEventDecoder.diagnostic(provider: "Pi", object: object, reason: "Event is missing type."))
+            continuation.yield(HarnessToolEventDecoder.diagnostic(provider: LatticeAgentExecutable.productDisplayName, object: object, reason: "Event is missing type."))
             return false
         }
         if type == "extension_ui_request" {
-            guard object["id"] as? String != nil else { continuation.yield(HarnessToolEventDecoder.diagnostic(provider: "Pi", object: object, reason: "Extension UI request is missing id.")); return false }
+            guard object["id"] as? String != nil else { continuation.yield(HarnessToolEventDecoder.diagnostic(provider: LatticeAgentExecutable.productDisplayName, object: object, reason: "Extension UI request is missing id.")); return false }
             try await handleExtensionUIRequest(object, sessionID: sessionID, owner: owner, workspace: workspace, transport: transport, continuation: continuation)
             return false
         }
         if type == "extension_error" {
-            let message = object["error"] as? String ?? "Pi's permission gate failed."
-            continuation.yield(.failed("Pi permission gate failed: \(message)"))
+            let message = object["error"] as? String ?? "Lattice Agent permission gate failed."
+            continuation.yield(.failed("Lattice Agent permission gate failed: \(message)"))
             return true
         }
         if let event = HarnessToolEventDecoder.piEvent(from: object, workspace: workspace) {
@@ -503,7 +506,7 @@ public final class PiRPCHarness: @unchecked Sendable {
            let delta = update["delta"] as? String {
             continuation.yield(.assistantDelta(delta))
         } else if type == "message_update" {
-            continuation.yield(HarnessToolEventDecoder.diagnostic(provider: "Pi", object: object, reason: "Message update is malformed."))
+            continuation.yield(HarnessToolEventDecoder.diagnostic(provider: LatticeAgentExecutable.productDisplayName, object: object, reason: "Message update is malformed."))
         }
         if type == "message_end",
            let message = object["message"] as? [String: Any],
@@ -512,7 +515,7 @@ public final class PiRPCHarness: @unchecked Sendable {
             continuation.yield(.failed(error))
             return true
         } else if type == "message_end" {
-            continuation.yield(HarnessToolEventDecoder.diagnostic(provider: "Pi", object: object, reason: "Message end is malformed."))
+            continuation.yield(HarnessToolEventDecoder.diagnostic(provider: LatticeAgentExecutable.productDisplayName, object: object, reason: "Message end is malformed."))
         }
         if type == "agent_end" {
             if !processRegistry.isCancelled(owner, sessionID: sessionID) { continuation.yield(.completed) }
@@ -623,7 +626,16 @@ public final class PiRPCHarness: @unchecked Sendable {
         let path = rawInput["path"] as? String
         let workspaceScoped = path.map { WorkspacePathScope.isWorkspaceScoped($0, workspace: workspace) } ?? false
         let kind: ToolRequest.Kind = toolName == "bash" ? .command : .write
-        let toolRequest = ToolRequest(kind: kind, title: "Pi wants to use \(toolName)", detail: detail, workspaceScoped: workspaceScoped, reversible: false)
+        // Providers (and this gate) do not advertise undo evidence. Smart still requires
+        // reversible==true. Accept Edits auto-allows workspace-scoped .write after a reported
+        // request without requiring reversible (see DeterministicPolicyEngine). bash stays .command.
+        let toolRequest = ToolRequest(
+            kind: kind,
+            title: "Lattice Agent wants to use \(toolName)",
+            detail: detail,
+            workspaceScoped: workspaceScoped,
+            reversible: false
+        )
         return ApprovalRequest(
             title: toolRequest.title,
             detail: detail,

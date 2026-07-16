@@ -93,8 +93,8 @@ public struct HarnessCapabilitySnapshot: Equatable, Sendable {
             summary = "ACP JSON-RPC · stdio"
             detail = "Lattice exchanges Agent Client Protocol JSON-RPC messages with the provider runtime over child process standard streams."
         case "pi":
-            summary = "Pi RPC events · stdio"
-            detail = "Lattice exchanges newline-delimited Pi RPC commands and structured events over child process standard streams."
+            summary = "Lattice Agent RPC events · stdio"
+            detail = "Lattice exchanges newline-delimited Lattice Agent RPC commands and structured events over child process standard streams."
         case "antigravity":
             summary = "Provider CLI transcript · stdio"
             detail = "Lattice sends the prompt on standard input and receives transcript text from the non-interactive provider CLI; this is not a structured tool protocol."

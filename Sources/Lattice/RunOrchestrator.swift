@@ -81,6 +81,22 @@ final class RunOrchestrator: ObservableObject {
                 detail: explanation ?? "",
                 status: .running
             ), at: index)
+            // Durable plan artifact only for user-started Code · Lattice Agent guided plan.
+            // Never promote .normal → restricted tools from opportunistic provider plan events.
+            if host.sessions[index].executionRoute.mode == .code,
+               host.sessions[index].executionRoute.runtimeID == "pi",
+               host.sessions[index].codePhase == .planActive {
+                let body = ([explanation].compactMap { $0 } + steps.map(\.title))
+                    .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                    .joined(separator: "\n")
+                let prior = host.sessions[index].codePlan
+                host.sessions[index].codePlan = CodePlanArtifact(
+                    title: title,
+                    body: body.isEmpty ? (prior?.body ?? "") : body,
+                    revision: (prior?.revision ?? 0) + 1
+                )
+                host.sessions[index].codePhase = .planAwaitingApproval
+            }
             for step in steps {
                 let status: SessionAction.Status = switch step.status {
                 case .pending: .waiting
@@ -136,7 +152,7 @@ final class RunOrchestrator: ObservableObject {
             let notice = HarnessPermissionNotice(
                 sessionID: id,
                 harnessID: harnessID,
-                providerName: harnessID == "codex" ? "Codex" : (harnessID == "grok" ? "Grok" : (harnessID == "opencode" ? "OpenCode" : (harnessID == "pi" ? "Pi" : "Hermes"))),
+                providerName: harnessID == "codex" ? "Codex" : (harnessID == "grok" ? "Grok" : (harnessID == "opencode" ? "OpenCode" : (harnessID == "pi" ? LatticeAgentExecutable.productDisplayName : "Hermes"))),
                 request: request
             )
             let automaticDecision = request.toolRequest.map { host.policyEngine.evaluate($0, under: host.sessions[index].policy) }
@@ -871,14 +887,10 @@ final class RunOrchestrator: ObservableObject {
         let recoveryUsesVisibleTranscriptHandoff = launchPlan.recoveryUsesVisibleTranscriptHandoff
         let recoveryDeliveryIssue = launchPlan.recoveryDeliveryIssue
         let prompt = launchPlan.prompt
+        // Do not mutate harnessThreadID / compactContextOnNextSend until the run can actually
+        // start (after deliveryIssue + envelope success). On early failure keep both so the
+        // user can retry or cancel compact without losing provider continuity.
         let routeThreadID = launchPlan.routeThreadID
-        if launchPlan.resetsHarnessSession {
-            host.sessions[index].harnessThreadID = nil
-            host.persist()
-        }
-        if let statusDetail = launchPlan.statusDetail {
-            host.setActivity([.init(icon: launchPlan.didCompact ? "arrow.triangle.2.circlepath" : "doc.text.magnifyingglass", title: launchPlan.didCompact ? "Context compacted" : "Context handoff", detail: statusDetail)], sessionID: id)
-        }
         if let deliveryIssue = launchPlan.deliveryIssue {
             let failedStream = AsyncStream<AgentEvent> { continuation in
                 continuation.yield(.failed(deliveryIssue))
@@ -889,18 +901,39 @@ final class RunOrchestrator: ObservableObject {
         }
         let envelope: LatticeInstructionEnvelope?
         let envelopeError: String?
+        let skillID: String? = {
+            if let invocation = LatticeSkillPromptBuilder.invocation(
+                in: submittedText,
+                records: host.skills,
+                disabledSkillIDs: host.effectiveDisabledSkillIDs
+            ) {
+                return invocation.skillID
+            }
+            return nil
+        }()
+        let planRestrictsWrites = session.executionRoute.mode == .code
+            && session.executionRoute.runtimeID == "pi"
+            && session.codePhase.restrictsMutatingTools
+        let allowFileModification = !isExtensionSelfEdit && !planRestrictsWrites
         do {
-            envelope = try host.instructionEnvelope(for: session, workspace: workspace, allowFileModification: !isExtensionSelfEdit)
+            envelope = try host.instructionEnvelope(
+                for: session,
+                workspace: workspace,
+                allowFileModification: allowFileModification,
+                submittedText: submittedText,
+                isExtensionSelfEdit: isExtensionSelfEdit,
+                skillID: skillID
+            )
             envelopeError = nil
         } catch {
             envelope = nil
             envelopeError = error.localizedDescription
         }
-        // Declared Pi routes require a real envelope; surface construction errors honestly.
+        // Declared Lattice Agent routes require a real envelope; surface construction errors honestly.
         if harnessID == "pi" || (ExecutionRouteResolver.isDeclared(session.executionRoute) && session.executionRoute.runtimeID == "pi") {
             if envelope == nil {
-                let detail = envelopeError.map { "Could not build Pi instruction envelope: \($0)" }
-                    ?? "Could not build Pi instruction envelope for this route."
+                let detail = envelopeError.map { "Could not build Lattice Agent instruction envelope: \($0)" }
+                    ?? "Could not build Lattice Agent instruction envelope for this route."
                 let failedStream = AsyncStream<AgentEvent> { continuation in
                     continuation.yield(.failed(detail))
                     continuation.finish()
@@ -908,6 +941,19 @@ final class RunOrchestrator: ObservableObject {
                 Task { for await event in failedStream { apply(event, to: id, runID: runID) } }
                 return
             }
+        }
+        // Handoff accepted and envelope ready: apply one-shot compact / session reset side effects.
+        if launchPlan.resetsHarnessSession {
+            host.sessions[index].harnessThreadID = nil
+        }
+        if host.sessions[index].compactContextOnNextSend {
+            host.sessions[index].compactContextOnNextSend = false
+        }
+        if launchPlan.resetsHarnessSession || launchPlan.didCompact {
+            host.persist()
+        }
+        if let statusDetail = launchPlan.statusDetail {
+            host.setActivity([.init(icon: launchPlan.didCompact ? "arrow.triangle.2.circlepath" : "doc.text.magnifyingglass", title: launchPlan.didCompact ? "Context compacted" : "Context handoff", detail: statusDetail)], sessionID: id)
         }
         let trustedInstructions = envelope.map {
             host.trustedWorkspaceInstructionText(for: workspace, names: $0.trustedWorkspaceInstructionNames)
@@ -958,7 +1004,7 @@ final class RunOrchestrator: ObservableObject {
                 workspace: workspace,
                 reasoningEffort: reasoningEffort,
                 policy: isExtensionSelfEdit ? .ask : session.policy,
-                allowFileModification: !isExtensionSelfEdit,
+                allowFileModification: allowFileModification,
                 workspaceWrite: isExtensionSelfEdit ? SelfEditProviderLaunchPolicy.codexWorkspaceWrite : false,
                 recoveryPrompt: recoveryPrompt,
                 recoveryUsesVisibleTranscriptHandoff: recoveryUsesVisibleTranscriptHandoff,

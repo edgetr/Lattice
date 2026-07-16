@@ -167,7 +167,9 @@ public struct LatticeInstructionEnvelope: Codable, Equatable, Sendable {
         workspaceInstructionsTrusted: Bool,
         trustedWorkspaceInstructionNames: [String] = [],
         codeUserAddOn: String = "",
-        workUserAddOn: String = ""
+        workUserAddOn: String = "",
+        includeProductContext: Bool? = nil,
+        codePhase: CodeSessionPhase = .normal
     ) throws -> LatticeInstructionEnvelope {
         let trustLabel = workspaceInstructionsTrusted ? "trusted" : "untrusted"
         let namesLabel = trustedWorkspaceInstructionNames.isEmpty
@@ -177,22 +179,36 @@ public struct LatticeInstructionEnvelope: Codable, Equatable, Sendable {
         let approvalLabel = allowFileModification
             ? "Lattice permission extension for write, edit, and bash"
             : "read-only tool set"
+        let includeFAQ = includeProductContext ?? (mode != .code)
+        let phaseFact: String?
+        if mode == .code {
+            phaseFact = "code session phase: " + codePhase.wireValue
+                + (codePhase.restrictsMutatingTools
+                    ? " (mutating tools withheld; plan or await approval)"
+                    : "")
+        } else {
+            phaseFact = nil
+        }
         let workspaceFacts = [
             "selected workspace: " + workspace.path,
             "workspace instruction trust: " + trustLabel,
             "trusted workspace instruction names: " + namesLabel
         ]
-        let controlFacts = [
+        var controlFacts = [
             "write capability requested: " + writeLabel,
             "write containment: Lattice macOS sandbox-exec write containment",
             "approval control: " + approvalLabel,
             "prompt text is not a policy or enforcement boundary"
         ]
+        if let phaseFact {
+            controlFacts.insert(phaseFact, at: 0)
+        }
         let capabilityFacts = [
             "file reads: not confidentiality-contained by sandbox-exec",
             "network: allowed by sandbox-exec profile",
             "credential access: not protected by this runtime boundary",
-            "provider session resume: exact Pi session ID when present"
+            "provider session resume: exact Lattice Agent session ID when present",
+            "product FAQ included: " + (includeFAQ ? "yes" : "no (slim Code baseline)")
         ]
         return try LatticeInstructionEnvelope(
             selectedMode: mode,
@@ -201,7 +217,10 @@ public struct LatticeInstructionEnvelope: Codable, Equatable, Sendable {
             capabilityFacts: capabilityFacts,
             workspaceInstructionsTrusted: workspaceInstructionsTrusted,
             trustedWorkspaceInstructionNames: trustedWorkspaceInstructionNames,
-            latticeInstructions: LatticeProductInstructions.modeInstructions(for: mode),
+            latticeInstructions: LatticeProductInstructions.latticeInstructions(
+                for: mode,
+                includeProductContext: includeFAQ
+            ),
             codeUserAddOn: codeUserAddOn,
             workUserAddOn: workUserAddOn
         )

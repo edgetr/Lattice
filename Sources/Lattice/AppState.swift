@@ -919,7 +919,7 @@ final class AppState: ObservableObject {
                 case "opencode": title = "OpenCode"
                 case "grok": title = "Grok"
                 case "antigravity": title = "Antigravity"
-                case "pi": title = "Pi"
+                case "pi": title = LatticeAgentExecutable.productDisplayName
                 case "hermes": title = "Hermes"
                 default: title = "Lattice"
                 }
@@ -1716,6 +1716,7 @@ final class AppState: ObservableObject {
             .init(id: "open-skills-folder", title: "Open Skills Folder", detail: "Show Lattice’s shared SKILL.md folder for imported and generated skills", keywords: ["skills", "skill.md", "agents", "customization", "application support"]),
             .init(id: "policy-ask", title: "Set Policy: Ask", detail: "Ask before material changes and external control", keywords: ["permission", "safe", "approval"]),
             .init(id: "policy-smart", title: "Set Policy: Smart", detail: "Allow clearly safe scoped work and ask on risk", keywords: ["permission", "approval", "automatic"]),
+            .init(id: "policy-accept-edits", title: "Set Policy: Accept Edits", detail: "Auto-allow workspace file writes/edits after a reported permission request; bash and out-of-workspace still ask", keywords: ["permission", "approval", "accept", "edits"]),
             .init(id: "policy-yolo", title: "Set Policy: YOLO", detail: "Use the explicit high-trust policy for this session", keywords: ["permission", "approval", "danger"]),
             .init(id: "privacy-cloud", title: "Set Privacy: Cloud Allowed", detail: "Allow connected providers and local models for this session", keywords: ["privacy", "provider", "remote", "cloud"]),
             .init(id: "privacy-local", title: "Set Privacy: Local Only", detail: "Block cloud providers and keep routing on Apple Intelligence or Ollama", keywords: ["privacy", "local", "private", "offline", "no cloud"]),
@@ -1796,6 +1797,8 @@ final class AppState: ObservableObject {
             setSessionPolicy(.ask)
         case "policy-smart":
             setSessionPolicy(.smart)
+        case "policy-accept-edits":
+            setSessionPolicy(.acceptEdits)
         case "policy-yolo":
             setSessionPolicy(.yolo)
         case "privacy-cloud":

@@ -3,7 +3,61 @@ import Foundation
 public enum ExecutionPolicy: String, CaseIterable, Codable, Sendable {
     case ask = "Ask"
     case smart = "Smart"
+    /// Auto-allow workspace-scoped file writes/edits after a reported permission request
+    /// (undo evidence not required). Bash/command, out-of-workspace, credential, destructive,
+    /// and unknown tools still require approval. Not YOLO.
+    case acceptEdits = "Accept Edits"
     case yolo = "YOLO"
+
+    /// Portable-archive / legacy decode helper. Unknown raw values fail closed to Ask.
+    public static func decoding(_ raw: String) -> ExecutionPolicy {
+        ExecutionPolicy(rawValue: raw)
+            ?? ExecutionPolicy(rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines))
+            ?? .ask
+    }
+}
+
+/// Guided Code phase for Lattice Agent sessions. Grok native plan and Antigravity
+/// plan-only Ask/Smart remain separate provider behaviors.
+public enum CodeSessionPhase: String, CaseIterable, Codable, Sendable {
+    case normal
+    case planActive
+    case planAwaitingApproval
+    case implement
+
+    public var displayName: String {
+        switch self {
+        case .normal: "Normal"
+        case .planActive: "Planning"
+        case .planAwaitingApproval: "Awaiting plan approval"
+        case .implement: "Implementing"
+        }
+    }
+
+    public var wireValue: String { rawValue }
+
+    /// When true, Lattice Agent launch should withhold write/edit/bash tools.
+    public var restrictsMutatingTools: Bool {
+        switch self {
+        case .planActive, .planAwaitingApproval: true
+        case .normal, .implement: false
+        }
+    }
+}
+
+/// Durable plan artifact produced during a Code plan phase.
+public struct CodePlanArtifact: Hashable, Codable, Sendable {
+    public var title: String
+    public var body: String
+    public var updatedAt: Date
+    public var revision: Int
+
+    public init(title: String, body: String, updatedAt: Date = .now, revision: Int = 1) {
+        self.title = String(title.prefix(200))
+        self.body = String(body.prefix(32_000))
+        self.updatedAt = updatedAt
+        self.revision = max(1, revision)
+    }
 }
 
 public enum SessionPrivacyMode: String, CaseIterable, Codable, Sendable {
@@ -797,6 +851,12 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
     public var policy: ExecutionPolicy
     public var privacyMode: SessionPrivacyMode
     public var intent: LatticeSessionIntent?
+    /// Code · Lattice Agent guided plan phase. Absent/legacy decodes as `.normal`.
+    public var codePhase: CodeSessionPhase
+    /// Durable plan text for Code plan phase approve/request-changes flow.
+    public var codePlan: CodePlanArtifact?
+    /// When true, the next send forces a compact visible-transcript handoff.
+    public var compactContextOnNextSend: Bool
     public var actions: [SessionAction]
     public var queuedFollowUps: [QueuedFollowUp]
     /// Bounded, secret-free receipts for exactly-once local outbox dequeue callbacks.
@@ -830,6 +890,9 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         policy: ExecutionPolicy = .ask,
         privacyMode: SessionPrivacyMode = .cloudAllowed,
         intent: LatticeSessionIntent? = nil,
+        codePhase: CodeSessionPhase = .normal,
+        codePlan: CodePlanArtifact? = nil,
+        compactContextOnNextSend: Bool = false,
         actions: [SessionAction] = [],
         queuedFollowUps: [QueuedFollowUp] = [],
         inputOutboxReceipts: SessionInputOutboxReceiptLedger = .init(),
@@ -851,7 +914,11 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         self.harnessID = harnessID
         self.reasoningEffort = reasoningEffort
         self.harnessThreadID = harnessThreadID; self.workspacePath = workspacePath; self.attachments = attachments
-        self.policy = policy; self.privacyMode = privacyMode; self.intent = intent; self.actions = actions; self.queuedFollowUps = queuedFollowUps
+        self.policy = policy; self.privacyMode = privacyMode; self.intent = intent
+        self.codePhase = codePhase
+        self.codePlan = codePlan
+        self.compactContextOnNextSend = compactContextOnNextSend
+        self.actions = actions; self.queuedFollowUps = queuedFollowUps
         self.inputOutboxReceipts = inputOutboxReceipts
         self.draft = draft
         self.isPinned = isPinned; self.isStreaming = isStreaming; self.lastUpdated = lastUpdated
@@ -859,7 +926,7 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, messages, transcriptStorage, artifacts, artifactStorage, backend, executionRoute, harnessID, reasoningEffort, harnessThreadID, workspacePath, attachments, policy, privacyMode, intent, actions, queuedFollowUps, inputOutboxReceipts, draft, isPinned, isStreaming, lastUpdated, portableArchiveFingerprint
+        case id, title, messages, transcriptStorage, artifacts, artifactStorage, backend, executionRoute, harnessID, reasoningEffort, harnessThreadID, workspacePath, attachments, policy, privacyMode, intent, codePhase, codePlan, compactContextOnNextSend, actions, queuedFollowUps, inputOutboxReceipts, draft, isPinned, isStreaming, lastUpdated, portableArchiveFingerprint
     }
 
     public init(from decoder: Decoder) throws {
@@ -894,6 +961,9 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         policy = try container.decodeIfPresent(ExecutionPolicy.self, forKey: .policy) ?? .ask
         privacyMode = try container.decodeIfPresent(SessionPrivacyMode.self, forKey: .privacyMode) ?? .cloudAllowed
         intent = try container.decodeIfPresent(LatticeSessionIntent.self, forKey: .intent)
+        codePhase = try container.decodeIfPresent(CodeSessionPhase.self, forKey: .codePhase) ?? .normal
+        codePlan = try container.decodeIfPresent(CodePlanArtifact.self, forKey: .codePlan)
+        compactContextOnNextSend = try container.decodeIfPresent(Bool.self, forKey: .compactContextOnNextSend) ?? false
         actions = try container.decodeIfPresent([SessionAction].self, forKey: .actions) ?? []
         queuedFollowUps = try container.decodeIfPresent([QueuedFollowUp].self, forKey: .queuedFollowUps) ?? []
         inputOutboxReceipts = try container.decodeIfPresent(SessionInputOutboxReceiptLedger.self, forKey: .inputOutboxReceipts) ?? .init()
@@ -927,6 +997,13 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         try container.encode(policy, forKey: .policy)
         try container.encode(privacyMode, forKey: .privacyMode)
         try container.encodeIfPresent(intent, forKey: .intent)
+        if codePhase != .normal {
+            try container.encode(codePhase, forKey: .codePhase)
+        }
+        try container.encodeIfPresent(codePlan, forKey: .codePlan)
+        if compactContextOnNextSend {
+            try container.encode(compactContextOnNextSend, forKey: .compactContextOnNextSend)
+        }
         try container.encode(actions, forKey: .actions)
         try container.encode(queuedFollowUps, forKey: .queuedFollowUps)
         try container.encode(inputOutboxReceipts, forKey: .inputOutboxReceipts)

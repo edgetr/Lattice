@@ -727,7 +727,8 @@ extension AppState {
         guard canToggleSkill(record) else { return }
         if enabled { disabledSkillIDs.remove(record.id) } else { disabledSkillIDs.insert(record.id) }
         UserDefaults.standard.set(Array(disabledSkillIDs).sorted(), forKey: Self.disabledSkillIDsKey)
-        refreshSkills()
+        // Toggle must not re-import globals / re-seed pack.
+        reloadSkillsFromDisk()
     }
 
     func requestDeleteSkill(_ record: LatticeSkillRecord) {
@@ -757,6 +758,61 @@ extension AppState {
             clearError()
         } catch {
             setError(error.localizedDescription)
+        }
+    }
+
+    /// Import from Codex/Agents global roots into Lattice’s managed Skills folder.
+    @discardableResult
+    func importGlobalSkillsFromKnownRoots() -> String {
+        do {
+            try skillStore.importGlobalSkills()
+            refreshSkills()
+            clearError()
+            let message = "Imported available skills from ~/.codex/skills and ~/.agents/skills. Enable a skill to use it as a slash command."
+            folderActionMessage = message
+            return message
+        } catch {
+            setError(error.localizedDescription)
+            return error.localizedDescription
+        }
+    }
+
+    /// Import a user-selected SKILL.md or skill folder.
+    func importSkill(from url: URL, overwrite: Bool = false) {
+        do {
+            let record = try skillStore.importSkill(from: url, overwrite: overwrite)
+            // New imports start disabled so they do not appear in `/` until the user opts in.
+            disabledSkillIDs.insert(record.id)
+            UserDefaults.standard.set(Array(disabledSkillIDs).sorted(), forKey: Self.disabledSkillIDsKey)
+            refreshSkills()
+            clearError()
+            folderActionMessage = "Imported “\(record.title)”. Enable it in Settings to use /\(record.id)."
+        } catch {
+            setError(error.localizedDescription)
+        }
+    }
+
+    /// Create a user-authored skill from Settings (enabled by default for intentional creates).
+    @discardableResult
+    func createUserSkill(id: String, title: String, summary: String, markdown: String, overwrite: Bool = false) -> Bool {
+        let safeID = LatticeSkillStore.safeSkillID(from: id)
+        let patch = LatticeSkillPatch(
+            id: safeID,
+            title: title.trimmingCharacters(in: .whitespacesAndNewlines),
+            summary: summary.trimmingCharacters(in: .whitespacesAndNewlines),
+            markdown: markdown
+        )
+        do {
+            _ = try skillStore.writeUserAuthoredSkill(patch, overwrite: overwrite)
+            disabledSkillIDs.remove(patch.id)
+            UserDefaults.standard.set(Array(disabledSkillIDs).sorted(), forKey: Self.disabledSkillIDsKey)
+            reloadSkillsFromDisk()
+            clearError()
+            folderActionMessage = "Created skill /\(patch.id). It is enabled for slash use."
+            return true
+        } catch {
+            setError(error.localizedDescription)
+            return false
         }
     }
 
@@ -951,14 +1007,17 @@ extension AppState {
             let result = await action()
             let cancelled = Task.isCancelled
             await refreshConnections(refreshProviderCatalogs: provider == "opencode")
+            let available: Bool = {
+                if provider == "pi" { return LatticeAgentExecutable.resolve() != nil }
+                return ExecutableDiscovery.locate(executableName) != nil
+            }()
             cliActionMessages[provider] = CLIActionStatusPolicy.installMessage(
-                executableName: executableName,
+                executableName: provider == "pi" ? LatticeAgentExecutable.productDisplayName : executableName,
                 status: result.status,
                 output: result.output,
-                executableAvailableAfterRefresh: ExecutableDiscovery.locate(executableName) != nil
+                executableAvailableAfterRefresh: available
             )
             if let runtime {
-                let available = ExecutableDiscovery.locate(executableName) != nil
                 if !cancelled,
                    RuntimeOwnershipPolicy.shouldRecordOwnership(
                     after: lifecycleAction,

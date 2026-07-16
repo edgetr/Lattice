@@ -18,7 +18,7 @@ public enum ApprovalOptionPolicy {
         guard option.isAllow else { return false }
         switch policy {
         case .ask: return option.kind == "allow_once"
-        case .smart: return option.kind == "allow_once" || option.kind == "allow_session"
+        case .smart, .acceptEdits: return option.kind == "allow_once" || option.kind == "allow_session"
         case .yolo: return true
         }
     }
@@ -45,6 +45,13 @@ public struct DeterministicPolicyEngine: PolicyEngine {
         }
         if policy == .smart && request.reversible && request.kind == .write {
             return .allow(reason: "Smart mode allows reversible workspace-scoped edits.")
+        }
+        // Accept Edits: auto-allow workspace-scoped file writes/edits after a reported
+        // permission request, even when providers do not advertise undo evidence.
+        // Bash/command, destructive, credential, unknown, and out-of-workspace still ask.
+        // Smart remains stricter when reversible is false (no auto-allow without undo evidence).
+        if policy == .acceptEdits && request.kind == .write {
+            return .allow(reason: "Accept Edits auto-allows workspace-scoped file writes/edits after a reported permission request.")
         }
         return .requireApproval(reason: "Material changes require confirmation in \(policy.rawValue) mode.")
     }

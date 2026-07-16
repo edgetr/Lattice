@@ -193,7 +193,7 @@ struct RuntimeReadinessTests {
     }
 
     @Test func readinessActionsResolveToExactRecoveryFlows() {
-        let setup = HarnessReadinessActionPolicy.resolve(readiness: .missingRuntime, modeName: "Code", runtimeName: "Pi")
+        let setup = HarnessReadinessActionPolicy.resolve(readiness: .missingRuntime, modeName: "Code", runtimeName: "Lattice Agent")
         #expect(setup.kind == .setupRuntime)
         #expect(setup.title == "Set Up Code")
         #expect(setup.isInteractive && setup.isEnabled)
@@ -203,13 +203,13 @@ struct RuntimeReadinessTests {
         #expect(signIn.title == "Sign In to Work")
         #expect(signIn.accessibilityHint.contains("only after"))
 
-        let credential = HarnessReadinessActionPolicy.resolve(readiness: .authenticationRequired, modeName: "Code", runtimeName: "Pi", authenticationAction: .validate)
+        let credential = HarnessReadinessActionPolicy.resolve(readiness: .authenticationRequired, modeName: "Code", runtimeName: "Lattice Agent", authenticationAction: .validate)
         #expect(credential.kind == .validate)
         #expect(credential.title == "Check Code")
     }
 
     @Test func readyAndLoadingReadinessRemainNonInteractiveState() {
-        let ready = HarnessReadinessActionPolicy.resolve(readiness: .runnable, modeName: "Code", runtimeName: "Pi")
+        let ready = HarnessReadinessActionPolicy.resolve(readiness: .runnable, modeName: "Code", runtimeName: "Lattice Agent")
         #expect(ready.kind == .stateOnly)
         #expect(ready.title == "Code ready")
         #expect(!ready.isInteractive && !ready.isEnabled)

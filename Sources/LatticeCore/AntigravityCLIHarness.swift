@@ -144,7 +144,7 @@ public final class AntigravityCLIHarness: @unchecked Sendable {
                         title: "Antigravity permission events unsupported",
                         detail: policy == .yolo
                             ? "This run explicitly disables provider permission prompts."
-                            : "The declared stream-json surface does not advertise interactive permission events, so Ask and Smart remain in provider plan mode.",
+                            : "The declared stream-json surface does not advertise interactive permission events, so Ask, Smart, and Accept Edits remain in provider plan mode.",
                         status: .unsupported
                     )))
                 }
