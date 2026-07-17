@@ -12,6 +12,35 @@ struct RunPipelineTests {
         #expect(!RunLaunchPlanner.usesPromptDrivenBackend(runtimeID: "lattice", backend: .appleIntelligence))
     }
 
+    @Test func markedPiCodexFallbackGetsWorkspaceWriteOnlyWhenAllowed() {
+        let fallback = ExecutionRoute(
+            mode: .code,
+            providerID: "codex",
+            modelID: "gpt-5.6",
+            runtimeID: "codex",
+            fallbackFromRuntimeID: "pi"
+        )
+        #expect(CodeWorkspaceWritePolicy.codexWorkspaceWrite(
+            route: fallback,
+            allowFileModification: true,
+            isSelfEdit: false,
+            selfEditWorkspaceWrite: false
+        ))
+        #expect(!CodeWorkspaceWritePolicy.codexWorkspaceWrite(
+            route: fallback,
+            allowFileModification: false,
+            isSelfEdit: false,
+            selfEditWorkspaceWrite: false
+        ))
+        let legacy = ExecutionRoute(mode: .code, providerID: "codex", modelID: "gpt-5.6", runtimeID: "codex")
+        #expect(!CodeWorkspaceWritePolicy.codexWorkspaceWrite(
+            route: legacy,
+            allowFileModification: true,
+            isSelfEdit: false,
+            selfEditWorkspaceWrite: false
+        ))
+    }
+
     @Test func plannerProducesPromptWithoutDeliveryIssueForEmptySession() {
         let session = LatticeSession(
             title: "t",
@@ -62,6 +91,42 @@ struct RunPipelineTests {
         } else {
             #expect(plan.routeThreadID == "thread-abc")
         }
+    }
+
+    @Test func blockedLaunchPreservesOneShotThreadAndCompactState() {
+        let session = LatticeSession(
+            title: "t",
+            messages: [.init(role: .user, text: "hi")],
+            backend: .openCode(model: "opencode-go/model"),
+            executionRoute: ExecutionRoute(
+                mode: .code,
+                providerID: "opencode",
+                modelID: "opencode-go/model",
+                runtimeID: "pi"
+            ),
+            harnessThreadID: "thread-abc",
+            compactContextOnNextSend: true
+        )
+        let plan = RunLaunchPlanner.plan(
+            .init(
+                session: session,
+                submittedText: "hi",
+                additionalContext: "",
+                tokenLimit: 8_000,
+                effectiveRuntimeID: "pi"
+            )
+        )
+        let pending = RunLaunchOneShotState(
+            harnessThreadID: session.harnessThreadID,
+            compactContextOnNextSend: session.compactContextOnNextSend
+        )
+
+        #expect(plan.resetsHarnessSession)
+        #expect(RunLaunchCommitPolicy.applying(plan, admission: .blocked, to: pending) == pending)
+
+        let admitted = RunLaunchCommitPolicy.applying(plan, admission: .admitted, to: pending)
+        #expect(admitted.harnessThreadID == nil)
+        #expect(!admitted.compactContextOnNextSend)
     }
 
     @Test func reducerFinalizesTerminalEvents() {

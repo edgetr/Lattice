@@ -37,6 +37,39 @@ enum KeychainStoreSaveResult: Equatable, Sendable {
     }
 }
 
+enum KeychainStoreReadResult: Equatable, Sendable {
+    case value(String)
+    case missing
+    case locked
+    case denied
+    case unavailable
+    case invalidData
+
+    var state: CredentialReadState {
+        switch self {
+        case .value: .value
+        case .missing: .missing
+        case .locked: .locked
+        case .denied: .denied
+        case .unavailable: .unavailable
+        case .invalidData: .invalidData
+        }
+    }
+
+    var availability: CredentialStoreAvailability {
+        CredentialReadPolicy.availability(for: state)
+    }
+
+    var value: String? {
+        if case .value(let value) = self { return value }
+        return nil
+    }
+
+    func failureMessage(provider: String) -> String {
+        CredentialReadPolicy.failureMessage(for: state, provider: provider)
+    }
+}
+
 // MARK: - Store
 
 enum KeychainStore {
@@ -66,18 +99,20 @@ enum KeychainStore {
 
     static func hasValue(account: String) -> Bool { presence(account: account) == .present }
 
-    static func read(account: String) -> String? {
-        if let value = read(account: account, service: service) {
-            return value
+    static func read(account: String) -> KeychainStoreReadResult {
+        let current = read(account: account, service: service)
+        guard CredentialReadPolicy.shouldConsultLegacy(after: current.state) else {
+            return current
         }
-        guard let legacy = read(account: account, service: legacyService) else { return nil }
+        let legacy = read(account: account, service: legacyService)
+        guard case .value(let value) = legacy else { return legacy }
         // Promote legacy secrets into the Lattice service on first successful read.
         // Only remove the legacy entry after a confirmed successful write to the new service.
-        let promotion = saveResult(legacy, account: account, service: service)
+        let promotion = saveResult(value, account: account, service: service)
         if promotion.isSuccess {
             delete(account: account, service: legacyService)
         }
-        return legacy
+        return .value(value)
     }
 
     /// Compatibility boolean API used by existing call sites.
@@ -164,18 +199,36 @@ enum KeychainStore {
         return .failure(.unexpectedStatus(errSecDuplicateItem))
     }
 
-    private static func read(account: String, service: String) -> String? {
+    private static func read(account: String, service: String) -> KeychainStoreReadResult {
+        let authenticationContext = LAContext()
+        authenticationContext.interactionNotAllowed = true
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecUseAuthenticationContext as String: authenticationContext
         ]
         var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        switch status {
+        case errSecSuccess:
+            guard let data = result as? Data,
+                  let value = String(data: data, encoding: .utf8) else {
+                return .invalidData
+            }
+            guard !value.isEmpty else { return .invalidData }
+            return .value(value)
+        case errSecItemNotFound:
+            return .missing
+        case errSecInteractionNotAllowed:
+            return .locked
+        case errSecAuthFailed, errSecUserCanceled:
+            return .denied
+        default:
+            return .unavailable
+        }
     }
 
     private static func presence(account: String, service: String) -> CredentialStoreAvailability {

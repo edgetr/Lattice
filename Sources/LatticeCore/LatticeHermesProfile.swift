@@ -2,17 +2,21 @@ import Foundation
 
 public enum LatticeHermesProfileError: LocalizedError, Equatable, Sendable {
     case emptySystemIdentity
+    case systemIdentityTooLarge(Int)
     case invalidProvider(String)
     case emptyModel
     case invalidModel(String)
     case credentialInjectionNotAllowed
     case invalidHome(String)
+    case invalidTemporaryDirectory(String)
     case writeFailed(String)
 
     public var errorDescription: String? {
         switch self {
         case .emptySystemIdentity:
             "Lattice Hermes Work identity is empty."
+        case .systemIdentityTooLarge(let limit):
+            "Lattice Hermes Work identity exceeds the \(limit)-byte safety limit."
         case .invalidProvider(let provider):
             "Hermes Work provider is not allowed: \(provider)."
         case .emptyModel:
@@ -23,6 +27,8 @@ public enum LatticeHermesProfileError: LocalizedError, Equatable, Sendable {
             "Only the provider-specific OpenCode key may be injected, and only for an OpenCode Work route."
         case .invalidHome(let path):
             "Hermes profile home is not a directory: \(path)."
+        case .invalidTemporaryDirectory(let path):
+            "Hermes temporary directory is not a safe directory: \(path)."
         case .writeFailed(let detail):
             "Lattice could not create Hermes profile state: \(detail)"
         }
@@ -47,6 +53,7 @@ public enum LatticeHermesProvider: String, CaseIterable, Sendable {
 /// must use provider-qualified IDs supplied by the caller; no leaf-name rewrite
 /// or fuzzy lookup happens here.
 public struct LatticeHermesWorkRoute: Equatable, Hashable, Sendable {
+    public static let maximumModelByteCount = 1_024
     public let provider: String
     public let model: String
 
@@ -83,6 +90,9 @@ public struct LatticeHermesWorkRoute: Equatable, Hashable, Sendable {
     public func validate() throws {
         guard isAllowedProvider else { throw LatticeHermesProfileError.invalidProvider(provider) }
         guard !model.isEmpty else { throw LatticeHermesProfileError.emptyModel }
+        guard model.utf8.count <= Self.maximumModelByteCount else {
+            throw LatticeHermesProfileError.invalidModel(model)
+        }
         guard model.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else {
             throw LatticeHermesProfileError.invalidModel(model)
         }
@@ -174,6 +184,7 @@ public final class LatticeHermesProfile: @unchecked Sendable {
     public static let configFileName = "config.yaml"
     public static let soulFileName = "SOUL.md"
     public static let workToolPolicy = LatticeHermesWorkToolPolicy()
+    public static let maximumSystemIdentityByteCount = 256 * 1024
 
     /// Conservative parser for `hermes auth status` output. Only explicit
     /// logged-in/authenticated wording can pass; file contents are irrelevant.
@@ -223,6 +234,9 @@ public final class LatticeHermesProfile: @unchecked Sendable {
         guard !systemIdentity.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw LatticeHermesProfileError.emptySystemIdentity
         }
+        guard systemIdentity.utf8.count <= Self.maximumSystemIdentityByteCount else {
+            throw LatticeHermesProfileError.systemIdentityTooLarge(Self.maximumSystemIdentityByteCount)
+        }
         try route.validate()
         if let opencodeAPIKey, !opencodeAPIKey.isEmpty && !route.isOpenCodeRoute {
             throw LatticeHermesProfileError.credentialInjectionNotAllowed
@@ -243,7 +257,17 @@ public final class LatticeHermesProfile: @unchecked Sendable {
     }
 
     public func isConfigured() -> Bool {
-        fileManager.fileExists(atPath: configURL.path) && fileManager.fileExists(atPath: soulURL.path)
+        guard LatticeStorePathSecurity.isRegularFileWithoutFollowingSymlinks(at: configURL),
+              LatticeStorePathSecurity.isRegularFileWithoutFollowingSymlinks(at: soulURL),
+              let config = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(
+                  at: configURL,
+                  maximumByteCount: Self.maximumSystemIdentityByteCount
+              ),
+              let soul = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(
+                  at: soulURL,
+                  maximumByteCount: Self.maximumSystemIdentityByteCount
+              ) else { return false }
+        return !config.isEmpty && !soul.isEmpty
     }
 
     public func readiness(
@@ -274,6 +298,22 @@ public final class LatticeHermesProfile: @unchecked Sendable {
             throw LatticeHermesProfileError.credentialInjectionNotAllowed
         }
 
+        do { try ensureHome() } catch {
+            throw LatticeHermesProfileError.invalidHome(homeURL.path)
+        }
+        let canonicalHome: URL
+        do {
+            canonicalHome = try LatticeStorePathSecurity.canonicalDirectory(at: homeURL)
+        } catch {
+            throw LatticeHermesProfileError.invalidHome(homeURL.path)
+        }
+        let canonicalTemporaryDirectory: URL
+        do {
+            canonicalTemporaryDirectory = try LatticeStorePathSecurity.canonicalDirectory(at: temporaryDirectory)
+        } catch {
+            throw LatticeHermesProfileError.invalidTemporaryDirectory(temporaryDirectory.path)
+        }
+
         var environment: [String: String] = [:]
         let safeKeys = [
             "PATH", "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TERM",
@@ -282,11 +322,11 @@ public final class LatticeHermesProfile: @unchecked Sendable {
         for key in safeKeys where base[key] != nil {
             environment[key] = base[key]
         }
-        environment["HOME"] = homeURL.path
-        environment["HERMES_HOME"] = homeURL.path
-        environment["TMPDIR"] = temporaryDirectory.path.hasSuffix("/")
-            ? temporaryDirectory.path
-            : temporaryDirectory.path + "/"
+        environment["HOME"] = canonicalHome.path
+        environment["HERMES_HOME"] = canonicalHome.path
+        environment["TMPDIR"] = canonicalTemporaryDirectory.path.hasSuffix("/")
+            ? canonicalTemporaryDirectory.path
+            : canonicalTemporaryDirectory.path + "/"
         if let route,
            let environmentKey = route.openCodeCredentialEnvironmentKey,
            let opencodeAPIKey = opencodeAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -326,47 +366,27 @@ public final class LatticeHermesProfile: @unchecked Sendable {
     }
 
     private func ensureHomeLocked() throws {
-        var isDirectory: ObjCBool = false
-        if fileManager.fileExists(atPath: homeURL.path, isDirectory: &isDirectory) {
-            guard isDirectory.boolValue else { throw LatticeHermesProfileError.invalidHome(homeURL.path) }
-            try? fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: homeURL.path)
-            return
-        }
         do {
-            try fileManager.createDirectory(
-                at: homeURL,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
+            let canonical = try LatticeStorePathSecurity.canonicalDirectory(at: homeURL)
+            try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: canonical.path)
+        } catch let error as LatticeStorePathError {
+            switch error {
+            case .symlink, .notDirectory, .invalidPath, .outsideRoot, .notRegularFile:
+                throw LatticeHermesProfileError.invalidHome(homeURL.path)
+            default:
+                throw LatticeHermesProfileError.writeFailed(error.localizedDescription)
+            }
         } catch {
             throw LatticeHermesProfileError.writeFailed(error.localizedDescription)
         }
     }
 
     private func atomicallyWrite(_ data: Data, to url: URL, mode: Int) throws {
-        let parent = url.deletingLastPathComponent()
-        let temporary = parent.appendingPathComponent(".\(url.lastPathComponent).tmp-\(UUID().uuidString)")
-        guard fileManager.createFile(
-            atPath: temporary.path,
-            contents: nil,
-            attributes: [.posixPermissions: mode]
-        ) else {
-            throw LatticeHermesProfileError.writeFailed("temporary file creation failed")
-        }
         do {
-            let handle = try FileHandle(forWritingTo: temporary)
-            try handle.write(contentsOf: data)
-            try handle.synchronize()
-            try handle.close()
-            try fileManager.setAttributes([.posixPermissions: mode], ofItemAtPath: temporary.path)
-            if fileManager.fileExists(atPath: url.path) {
-                _ = try fileManager.replaceItemAt(url, withItemAt: temporary)
-            } else {
-                try fileManager.moveItem(at: temporary, to: url)
-            }
-            try? fileManager.setAttributes([.posixPermissions: mode], ofItemAtPath: url.path)
+            let canonicalHome = try LatticeStorePathSecurity.canonicalDirectory(at: homeURL)
+            try LatticeStorePathSecurity.writeDataAtomically(data, to: url, under: canonicalHome)
+            try fileManager.setAttributes([.posixPermissions: mode], ofItemAtPath: url.path)
         } catch {
-            try? fileManager.removeItem(at: temporary)
             if let profileError = error as? LatticeHermesProfileError { throw profileError }
             throw LatticeHermesProfileError.writeFailed(error.localizedDescription)
         }

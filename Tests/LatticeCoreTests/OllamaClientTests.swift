@@ -4,6 +4,44 @@ import Testing
 
 @Suite("Ollama client streaming")
 struct OllamaClientTests {
+    @Test(arguments: [
+        "http://localhost:11434",
+        "http://192.168.1.10:11434",
+        "https://127.0.0.1:11434",
+        "http://user:password@127.0.0.1:11434",
+        "http://127.0.0.1:11434/proxy",
+        "http://127.0.0.1.evil.test:11434"
+    ])
+    func nonNumericOrNonLocalBaseURLsAreRejected(_ value: String) {
+        #expect(!OllamaClient.isAllowedLoopbackBaseURL(URL(string: value)!))
+    }
+
+    @Test(arguments: [
+        "http://127.0.0.1:11434",
+        "http://127.0.0.2:11434/",
+        "http://[::1]:11434"
+    ])
+    func numericLoopbackBaseURLsAreAllowed(_ value: String) {
+        #expect(OllamaClient.isAllowedLoopbackBaseURL(URL(string: value)!))
+    }
+
+    @Test func remoteBaseNeverDispatchesLocalModeRequests() async {
+        let transport = RequestCountingTransport()
+        let client = OllamaClient(baseURL: URL(string: "http://example.test:11434")!, transport: transport)
+        #expect(await client.modelsResult().status == .failed)
+        var events: [AgentEvent] = []
+        for await event in client.stream(
+            messages: [.init(role: .user, text: "private prompt")],
+            model: "fixture",
+            sessionID: UUID()
+        ) {
+            events.append(event)
+        }
+        #expect(events == [.failed("The local model is unavailable. Start Ollama and try again.")])
+        #expect(await transport.requestCount == 0)
+        #expect(client.activeTaskCount == 0)
+    }
+
     @Test func completeModelDetailsProduceAuthoritativeCatalog() async {
         let transport = ModelCatalogFixtureTransport(
             tags: ["chat", "embed"],
@@ -112,6 +150,20 @@ struct OllamaClientTests {
             events.append(event)
         }
         return events
+    }
+}
+
+private actor RequestCountingTransport: OllamaTransport {
+    private(set) var requestCount = 0
+
+    func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+        requestCount += 1
+        throw URLError(.unsupportedURL)
+    }
+
+    func streamLines(for request: URLRequest) async throws -> (AsyncThrowingStream<String, Error>, URLResponse) {
+        requestCount += 1
+        throw URLError(.unsupportedURL)
     }
 }
 

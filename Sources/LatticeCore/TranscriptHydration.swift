@@ -1,12 +1,23 @@
 import Foundation
 
 public struct TranscriptHydrationRequest: Hashable, Sendable {
+    /// Unique identity for this exact hydration attempt. Storage references may repeat
+    /// across A→B→A selection cycles and therefore cannot identify a generation.
+    public let requestID: UUID
     public let sessionID: UUID
-    public let storage: SessionTranscriptStorage
+    public let storage: SessionTranscriptStorage?
+    public let artifactStorage: SessionArtifactStorage?
 
-    public init(sessionID: UUID, storage: SessionTranscriptStorage) {
+    public init(
+        requestID: UUID = UUID(),
+        sessionID: UUID,
+        storage: SessionTranscriptStorage?,
+        artifactStorage: SessionArtifactStorage? = nil
+    ) {
+        self.requestID = requestID
         self.sessionID = sessionID
         self.storage = storage
+        self.artifactStorage = artifactStorage
     }
 }
 
@@ -40,15 +51,22 @@ public enum TranscriptHydrationOutcome: Sendable {
 public enum TranscriptHydrationApplyPolicy: Sendable {
     public static func shouldApply(
         request: TranscriptHydrationRequest,
+        activeRequest: TranscriptHydrationRequest,
         selectedSessionID: UUID?,
         currentSession: LatticeSession
     ) -> Bool {
-        selectedSessionID == request.sessionID
-            && currentSession.id == request.sessionID
-            && currentSession.transcriptStorage == request.storage
-            && !currentSession.isTranscriptLoaded
+        guard activeRequest == request,
+              selectedSessionID == request.sessionID,
+              currentSession.id == request.sessionID,
+              currentSession.transcriptStorage == request.storage else { return false }
+        let canApplyTranscript = !currentSession.isTranscriptLoaded
             && !currentSession.isTranscriptDirty
             && currentSession.messages.isEmpty
+        let canApplyArtifacts = currentSession.artifactStorage == request.artifactStorage
+            && !currentSession.isArtifactsLoaded
+            && !currentSession.isArtifactsDirty
+            && currentSession.artifacts.isEmpty
+        return canApplyTranscript || canApplyArtifacts
     }
 }
 
@@ -143,5 +161,29 @@ public struct TranscriptHydrationLRU: Sendable {
 
     public mutating func removeAll() {
         accessOrder.removeAll(keepingCapacity: true)
+    }
+}
+
+/// Drops only clean, sidecar-backed content. State flags are flipped before
+/// clearing arrays so property observers cannot turn cache eviction into edits.
+public enum TranscriptHydrationEvictionPolicy {
+    @discardableResult
+    public static func evictCleanContent(in session: inout LatticeSession) -> Bool {
+        guard session.transcriptStorage != nil,
+              session.isTranscriptLoaded,
+              !session.isTranscriptDirty else { return false }
+
+        session.isTranscriptLoaded = false
+        session.messages = []
+        session.isTranscriptDirty = false
+
+        if session.artifactStorage != nil,
+           session.isArtifactsLoaded,
+           !session.isArtifactsDirty {
+            session.isArtifactsLoaded = false
+            session.artifacts = []
+            session.isArtifactsDirty = false
+        }
+        return true
     }
 }

@@ -12,9 +12,11 @@ public extension WorkspaceCheckpointService {
         let after = try requireCaptured(id: afterCheckpointID)
         try validatePair(before: before, after: after)
 
-        guard let beforeTree = before.treeOID, let afterTree = after.treeOID else {
+        guard let rawBeforeTree = before.treeOID, let rawAfterTree = after.treeOID else {
             throw WorkspaceCheckpointError.checkpointPairInvalid("Missing tree OIDs on checkpoint pair.")
         }
+        let beforeTree = try Self.validateGitOID(rawBeforeTree, label: "before tree")
+        let afterTree = try Self.validateGitOID(rawAfterTree, label: "after tree")
 
         let git = try resolveGit()
         let context = try await resolveWorktreeContext(
@@ -33,7 +35,7 @@ public extension WorkspaceCheckpointService {
             fromTree: beforeTree,
             toTree: afterTree
         )
-        let untrackedFiles = Self.untrackedChanges(before: before, after: after)
+        let untrackedFiles = try Self.untrackedChanges(before: before, after: after)
         let allFiles = (files + untrackedFiles).sorted { $0.path < $1.path }
         let stats = WorkspaceCheckpointChangeStats(
             filesChanged: allFiles.count,
@@ -76,24 +78,26 @@ public extension WorkspaceCheckpointService {
         fromTree: String,
         toTree: String
     ) async throws -> [WorkspaceCheckpointFileChange] {
-        if fromTree == toTree { return [] }
+        let validatedFrom = try Self.validateGitOID(fromTree, label: "from tree")
+        let validatedTo = try Self.validateGitOID(toTree, label: "to tree")
+        if validatedFrom == validatedTo { return [] }
 
         let nameStatus = try await runGitString(
             git: git,
             currentDirectory: URL(fileURLWithPath: context.toplevelPath, isDirectory: true),
-            arguments: ["diff", "--name-status", "-z", fromTree, toTree],
+            arguments: ["diff", "--no-ext-diff", "--no-textconv", "--name-status", "-z", validatedFrom, validatedTo, "--"],
             operation: "diff --name-status"
         )
         let numstat = try await runGitString(
             git: git,
             currentDirectory: URL(fileURLWithPath: context.toplevelPath, isDirectory: true),
-            arguments: ["diff", "--numstat", "-z", fromTree, toTree],
+            arguments: ["diff", "--no-ext-diff", "--no-textconv", "--numstat", "-z", validatedFrom, validatedTo, "--"],
             operation: "diff --numstat -z"
         )
         let patch = try await runGitString(
             git: git,
             currentDirectory: URL(fileURLWithPath: context.toplevelPath, isDirectory: true),
-            arguments: ["diff", "--unified=3", fromTree, toTree],
+            arguments: ["diff", "--no-ext-diff", "--no-textconv", "--unified=3", validatedFrom, validatedTo, "--"],
             operation: "diff unified"
         )
 
@@ -117,9 +121,9 @@ public extension WorkspaceCheckpointService {
     static func untrackedChanges(
         before: WorkspaceCheckpoint,
         after: WorkspaceCheckpoint
-    ) -> [WorkspaceCheckpointFileChange] {
-        let beforeByPath = Dictionary(uniqueKeysWithValues: before.untrackedFiles.map { ($0.path, $0) })
-        let afterByPath = Dictionary(uniqueKeysWithValues: after.untrackedFiles.map { ($0.path, $0) })
+    ) throws -> [WorkspaceCheckpointFileChange] {
+        let beforeByPath = try validatedUntrackedMap(before, label: "before-run checkpoint")
+        let afterByPath = try validatedUntrackedMap(after, label: "after-run checkpoint")
         return Set(beforeByPath.keys).union(afterByPath.keys).compactMap { path in
             let old = beforeByPath[path]
             let new = afterByPath[path]

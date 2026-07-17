@@ -60,6 +60,43 @@ public struct RunLaunchPlan: Equatable, Sendable {
     }
 }
 
+/// One-shot session state that may be consumed only after every launch gate
+/// (including credential admission) has succeeded.
+public struct RunLaunchOneShotState: Equatable, Sendable {
+    public var harnessThreadID: String?
+    public var compactContextOnNextSend: Bool
+
+    public init(harnessThreadID: String?, compactContextOnNextSend: Bool) {
+        self.harnessThreadID = harnessThreadID
+        self.compactContextOnNextSend = compactContextOnNextSend
+    }
+}
+
+public enum RunLaunchCommitAdmission: Equatable, Sendable {
+    case admitted
+    case blocked
+}
+
+public enum RunLaunchCommitPolicy {
+    /// A blocked launch is a no-op. This keeps retries on the existing provider
+    /// thread and preserves a requested compact until a provider can start.
+    public static func applying(
+        _ plan: RunLaunchPlan,
+        admission: RunLaunchCommitAdmission,
+        to state: RunLaunchOneShotState
+    ) -> RunLaunchOneShotState {
+        guard admission == .admitted else { return state }
+        var committed = state
+        if plan.resetsHarnessSession {
+            committed.harnessThreadID = nil
+        }
+        if committed.compactContextOnNextSend {
+            committed.compactContextOnNextSend = false
+        }
+        return committed
+    }
+}
+
 /// Pure plan → gateway prep. Secrets and process launch stay outside this type.
 public enum RunLaunchPlanner {
     public static func usesPromptDrivenBackend(runtimeID: String, backend: ChatBackend) -> Bool {
@@ -128,5 +165,25 @@ public enum RunLaunchPlanner {
             recoveryDeliveryIssue: hasPersistedACPSession ? recoveryPlan.deliveryIssue : nil,
             usesPromptDrivenBackend: usesPromptDriven
         )
+    }
+}
+
+/// Provider launch write authority. Pi/OpenCode use the typed
+/// `allowFileModification` field; Codex app-server additionally receives a
+/// workspace-write bit. Only an explicitly marked Pi fallback may enable that
+/// bit for a new route. Legacy direct routes stay read-only here.
+public enum CodeWorkspaceWritePolicy {
+    public static func codexWorkspaceWrite(
+        route: ExecutionRoute,
+        allowFileModification: Bool,
+        isSelfEdit: Bool,
+        selfEditWorkspaceWrite: Bool
+    ) -> Bool {
+        if isSelfEdit { return selfEditWorkspaceWrite }
+        return route.mode == .code
+            && route.providerID == "codex"
+            && route.runtimeID == "codex"
+            && route.fallbackFromRuntimeID == "pi"
+            && allowFileModification
     }
 }

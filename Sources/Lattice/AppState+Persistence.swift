@@ -59,7 +59,12 @@ extension AppState {
 
     func createPersistenceStoreBackup(_ issue: DurableStoreIssue) {
         do {
-            let result = try DurableStoreRecovery.preserveCopy(of: issue.fileURL, kind: .backup)
+            let result = try DurableStoreRecovery.preserveCopy(
+                of: issue.fileURL,
+                kind: .backup,
+                writeGate: persistenceWriteGate(for: issue.storeID),
+                storeName: issue.storeName
+            )
             var message = "Backup created at \(result.preservedURL.path)."
             if let note = result.note { message += " \(note)" }
             // Backup is non-destructive; the store remains in recovery until retry/reset succeeds.
@@ -140,7 +145,12 @@ extension AppState {
         }
         cancelPersistenceStoreReset()
         do {
-            let result = try DurableStoreRecovery.resetReplacingWithEmptyArray(at: issue.fileURL, expected: issue)
+            let result = try DurableStoreRecovery.resetReplacingWithEmptyArray(
+                at: issue.fileURL,
+                expected: issue,
+                writeGate: persistenceWriteGate(for: issue.storeID),
+                storeName: issue.storeName
+            )
             switch issue.storeID {
             case SessionPersistence.storeID:
                 resolvePersistenceRecovery(storeID: issue.storeID, gate: persistence.writeGate)
@@ -162,6 +172,15 @@ extension AppState {
             persistenceRecoveryStatusMessage = message
         } catch {
             persistenceRecoveryStatusMessage = error.localizedDescription
+        }
+    }
+
+    private func persistenceWriteGate(for storeID: String) -> DurableStoreWriteGate? {
+        switch storeID {
+        case SessionPersistence.storeID: persistence.writeGate
+        case LatticeExtensionJobStore.storeID: extensionJobStore.writeGate
+        case LatticeExtensionPreviewStore.storeID: extensionPreviewStore.writeGate
+        default: nil
         }
     }
 
@@ -192,9 +211,17 @@ extension AppState {
     }
 
     func resolvePersistenceRecovery(storeID: String, gate: DurableStoreWriteGate) {
-        gate.unblock()
+        if !gate.tryUnblock() {
+            Task.detached(priority: .userInitiated) { gate.unblock() }
+        }
         persistenceRecoveryIssues.removeAll { $0.storeID == storeID }
         expandedPersistenceRecoveryDetailIDs.remove(storeID)
+    }
+
+    /// Never waits on a stalled persistence transaction from MainActor.
+    func requestPersistenceGateBlock(_ gate: DurableStoreWriteGate) {
+        if gate.tryBlock() { return }
+        Task.detached(priority: .userInitiated) { gate.block() }
     }
 
     func rebuildThreadActivityLanes() {
@@ -243,15 +270,30 @@ extension AppState {
               let selectedIndex = sessions.firstIndex(where: { $0.id == selectedID }) else {
             return
         }
-        if sessions[selectedIndex].isTranscriptLoaded {
+        if sessions[selectedIndex].isTranscriptLoaded,
+           sessions[selectedIndex].isArtifactsLoaded {
             finishTranscriptAccess(sessionID: selectedID)
             return
         }
-        guard let storage = sessions[selectedIndex].transcriptStorage else { return }
+        let storage = sessions[selectedIndex].transcriptStorage
+        let artifactStorage = sessions[selectedIndex].artifactStorage
+        guard storage != nil || artifactStorage != nil else {
+            // A content-free session has no sidecars to hydrate.
+            sessions[selectedIndex].isTranscriptLoaded = true
+            sessions[selectedIndex].isTranscriptDirty = false
+            sessions[selectedIndex].isArtifactsLoaded = true
+            sessions[selectedIndex].isArtifactsDirty = false
+            finishTranscriptAccess(sessionID: selectedID)
+            return
+        }
 
         let snapshot = sessions[selectedIndex]
         let persistence = persistence
-        let request = TranscriptHydrationRequest(sessionID: selectedID, storage: storage)
+        let request = TranscriptHydrationRequest(
+            sessionID: selectedID,
+            storage: storage,
+            artifactStorage: artifactStorage
+        )
         activeTranscriptHydrationRequest = request
         transcriptLoadingSessionID = selectedID
         transcriptHydrationTask = Task { [weak self] in
@@ -266,36 +308,79 @@ extension AppState {
 
     func applyTranscriptHydrationOutcome(_ outcome: TranscriptHydrationOutcome) {
         switch outcome {
-        case .cancelled:
-            return
-        case .failed(let request, let issue):
-            guard selectedSessionID == request.sessionID,
-                  sessions.first(where: { $0.id == request.sessionID })?.transcriptStorage == request.storage else { return }
+        case .cancelled(let request):
+            guard activeTranscriptHydrationRequest == request,
+                  transcriptLoadingSessionID == request.sessionID else { return }
             transcriptLoadingSessionID = nil
             activeTranscriptHydrationRequest = nil
-            persistence.writeGate.block()
+        case .failed(let request, let issue):
+            guard activeTranscriptHydrationRequest == request,
+                  transcriptLoadingSessionID == request.sessionID,
+                  selectedSessionID == request.sessionID,
+                  let session = sessions.first(where: { $0.id == request.sessionID }),
+                  session.transcriptStorage == request.storage,
+                  session.artifactStorage == request.artifactStorage else { return }
+            transcriptLoadingSessionID = nil
+            activeTranscriptHydrationRequest = nil
+            requestPersistenceGateBlock(persistence.writeGate)
             replacePersistenceRecoveryIssue(issue)
             setError("This chat's stored conversation content could not be loaded. The original files were left untouched for recovery.", sessionID: request.sessionID)
         case .loaded(let request, let content):
-            guard let index = sessions.firstIndex(where: { $0.id == request.sessionID }) else { return }
+            guard let activeRequest = activeTranscriptHydrationRequest,
+                  activeRequest == request,
+                  transcriptLoadingSessionID == request.sessionID,
+                  let index = sessions.firstIndex(where: { $0.id == request.sessionID }) else { return }
+            let shouldApply = TranscriptHydrationApplyPolicy.shouldApply(
+                request: request,
+                activeRequest: activeRequest,
+                selectedSessionID: selectedSessionID,
+                currentSession: sessions[index]
+            )
             transcriptLoadingSessionID = nil
             activeTranscriptHydrationRequest = nil
             // A live or dirty in-memory transcript always wins over a late disk result.
-            guard TranscriptHydrationApplyPolicy.shouldApply(
-                request: request,
-                selectedSessionID: selectedSessionID,
-                currentSession: sessions[index]
-            ) else { return }
-            sessions[index].messages = content.messages
-            sessions[index].isTranscriptLoaded = true
-            sessions[index].isTranscriptDirty = false
-            if !sessions[index].isArtifactsDirty {
+            guard shouldApply else { return }
+            if !sessions[index].isTranscriptLoaded,
+               !sessions[index].isTranscriptDirty,
+               sessions[index].messages.isEmpty {
+                sessions[index].messages = content.messages
+                sessions[index].isTranscriptLoaded = true
+                sessions[index].isTranscriptDirty = false
+            }
+            if sessions[index].artifactStorage == request.artifactStorage,
+               !sessions[index].isArtifactsLoaded,
+               !sessions[index].isArtifactsDirty,
+               sessions[index].artifacts.isEmpty {
                 sessions[index].artifacts = content.artifacts
                 sessions[index].isArtifactsLoaded = true
                 sessions[index].isArtifactsDirty = false
             }
+            _ = ensureLegacySelfEditIntentPersisted(at: index)
             finishTranscriptAccess(sessionID: request.sessionID)
         }
+    }
+
+    /// Legacy message-based self-edit inference is impossible while a split transcript is
+    /// evicted. Resolve and durably persist it immediately after hydration. A failed save
+    /// restores the prior intent and blocks mutation/run admission until a later retry succeeds.
+    @discardableResult
+    func ensureLegacySelfEditIntentPersisted(at index: Int) -> Bool {
+        guard sessions.indices.contains(index),
+              sessions[index].isTranscriptLoaded,
+              sessions[index].isArtifactsLoaded else { return false }
+        guard sessions[index].intent == nil,
+              Self.isLegacySelfEditSession(sessions[index]) else { return true }
+        let sessionID = sessions[index].id
+        sessions[index].intent = .selfEdit
+        guard persist() == .saved else {
+            sessions[index].intent = nil
+            setError(
+                "This legacy self-edit chat could not be migrated safely. Resolve chat persistence before continuing.",
+                sessionID: sessionID
+            )
+            return false
+        }
+        return true
     }
 
     func finishTranscriptAccess(sessionID: UUID) {
@@ -311,12 +396,9 @@ extension AppState {
                 materializedTranscriptLRU.remove(id)
                 continue
             }
-            sessions[victimIndex].messages = []
-            sessions[victimIndex].isTranscriptLoaded = false
-            sessions[victimIndex].isTranscriptDirty = false
-            if !sessions[victimIndex].isArtifactsDirty {
-                sessions[victimIndex].artifacts = []
-                sessions[victimIndex].isArtifactsLoaded = false
+            guard TranscriptHydrationEvictionPolicy.evictCleanContent(in: &sessions[victimIndex]) else {
+                materializedTranscriptLRU.remove(id)
+                continue
             }
             transcriptRenderWindows.invalidate(sessionID: id)
             materializedTranscriptLRU.remove(id)

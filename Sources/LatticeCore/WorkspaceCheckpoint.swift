@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 // MARK: - Domain
@@ -516,6 +517,15 @@ public struct WorkspaceCheckpointStore: Sendable {
 
     public let fileURL: URL
 
+    /// A bounded, cross-process lock for the store's read/modify/write cycle.
+    ///
+    /// The JSON file itself is replaced atomically, but atomic replacement alone
+    /// does not serialize two callers that both read the same old document. The
+    /// adjacent lock file is intentionally separate so replacing the JSON target
+    /// never drops the lock held by another process.
+    private static let lockTimeoutNanoseconds: UInt64 = 500_000_000
+    private static let lockRetryMicroseconds: useconds_t = 5_000
+
     public init(fileURL: URL) {
         self.fileURL = fileURL
     }
@@ -523,20 +533,28 @@ public struct WorkspaceCheckpointStore: Sendable {
     /// Default location under Lattice Application Support (never inside a project repo).
     public static func defaultStore(fileName: String = defaultFileName) -> WorkspaceCheckpointStore {
         LatticeApplicationSupport.migrateLegacyProductDataIfNeeded()
-        let url = LatticeApplicationSupport.productRootURL().appendingPathComponent(fileName)
+        let safeFileName = normalizedDefaultStoreFileName(fileName)
+        let root = LatticeApplicationSupport.productRootURL().standardizedFileURL
+        let candidate = root.appendingPathComponent(safeFileName, isDirectory: false).standardizedFileURL
+        let url = candidate.deletingLastPathComponent() == root
+            ? candidate
+            : root.appendingPathComponent(defaultFileName, isDirectory: false)
         return WorkspaceCheckpointStore(fileURL: url)
     }
 
+    static func normalizedDefaultStoreFileName(_ fileName: String) -> String {
+        isSafeBasename(fileName) ? fileName : defaultFileName
+    }
+
     public func load() throws -> WorkspaceCheckpointStoreDocument {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: fileURL.path) else {
-            return WorkspaceCheckpointStoreDocument()
+        try withStoreLock { location in
+            try loadUnlocked(from: location)
         }
-        let data: Data
-        do {
-            data = try Data(contentsOf: fileURL)
-        } catch {
-            throw WorkspaceCheckpointError.storeUnreadable(error.localizedDescription)
+    }
+
+    private func loadUnlocked(from location: WorkspaceCheckpointStoreLocation) throws -> WorkspaceCheckpointStoreDocument {
+        guard let data = try readStoreData(from: location) else {
+            return WorkspaceCheckpointStoreDocument()
         }
         do {
             return try Self.decodeMigrating(data)
@@ -548,6 +566,20 @@ public struct WorkspaceCheckpointStore: Sendable {
     }
 
     public func save(_ document: WorkspaceCheckpointStoreDocument) throws {
+        try withStoreLock(isWrite: true) { location in
+            try saveUnlocked(document, to: location)
+        }
+    }
+
+    private func saveUnlocked(
+        _ document: WorkspaceCheckpointStoreDocument,
+        to location: WorkspaceCheckpointStoreLocation
+    ) throws {
+        guard document.version <= WorkspaceCheckpointStoreDocument.currentVersion else {
+            throw WorkspaceCheckpointError.storeWriteFailed(
+                "Checkpoint store schema version \(document.version) is newer than supported version \(WorkspaceCheckpointStoreDocument.currentVersion)."
+            )
+        }
         var normalized = document
         normalized.version = WorkspaceCheckpointStoreDocument.currentVersion
         let encoder = JSONEncoder()
@@ -559,56 +591,25 @@ public struct WorkspaceCheckpointStore: Sendable {
         } catch {
             throw WorkspaceCheckpointError.storeWriteFailed(error.localizedDescription)
         }
-
-        let parent = fileURL.deletingLastPathComponent()
-        do {
-            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-        } catch {
-            throw WorkspaceCheckpointError.storeWriteFailed(error.localizedDescription)
-        }
-
-        let temporary = parent.appendingPathComponent(".\(fileURL.lastPathComponent).tmp-\(UUID().uuidString)")
-        do {
-            let created = FileManager.default.createFile(
-                atPath: temporary.path,
-                contents: nil,
-                attributes: [.posixPermissions: 0o600]
+        let limit = DurableStoreRecovery.maximumStoreByteCount
+        guard data.count <= limit else {
+            throw WorkspaceCheckpointError.storeWriteFailed(
+                "Encoded checkpoint store exceeds the \(limit)-byte limit. Existing data was preserved."
             )
-            guard created else {
-                throw WorkspaceCheckpointError.storeWriteFailed("Failed to create temporary store file.")
-            }
-            let handle = try FileHandle(forWritingTo: temporary)
-            defer { try? handle.close() }
-            try handle.truncate(atOffset: 0)
-            try handle.write(contentsOf: data)
-            try handle.close()
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
-            if FileManager.default.fileExists(atPath: fileURL.path) {
-                _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: temporary)
-            } else {
-                try FileManager.default.moveItem(at: temporary, to: fileURL)
-            }
-            if FileManager.default.fileExists(atPath: temporary.path) {
-                try? FileManager.default.removeItem(at: temporary)
-            }
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
-        } catch let error as WorkspaceCheckpointError {
-            try? FileManager.default.removeItem(at: temporary)
-            throw error
-        } catch {
-            try? FileManager.default.removeItem(at: temporary)
-            throw WorkspaceCheckpointError.storeWriteFailed(error.localizedDescription)
         }
+        try publishStoreData(data, to: location)
     }
 
     public func upsert(_ checkpoint: WorkspaceCheckpoint) throws {
-        var document = try load()
-        if let index = document.checkpoints.firstIndex(where: { $0.id == checkpoint.id }) {
-            document.checkpoints[index] = checkpoint
-        } else {
-            document.checkpoints.append(checkpoint)
+        try withStoreLock(isWrite: true) { location in
+            var document = try loadUnlocked(from: location)
+            if let index = document.checkpoints.firstIndex(where: { $0.id == checkpoint.id }) {
+                document.checkpoints[index] = checkpoint
+            } else {
+                document.checkpoints.append(checkpoint)
+            }
+            try saveUnlocked(document, to: location)
         }
-        try save(document)
     }
 
     public func checkpoint(id: UUID) throws -> WorkspaceCheckpoint? {
@@ -629,9 +630,290 @@ public struct WorkspaceCheckpointStore: Sendable {
     }
 
     public func appendNote(_ note: WorkspaceReviewNote) throws {
-        var document = try load()
-        document.notes.append(note)
-        try save(document)
+        try withStoreLock(isWrite: true) { location in
+            var document = try loadUnlocked(from: location)
+            guard !document.notes.contains(where: { $0.id == note.id }) else { return }
+            document.notes.append(note)
+            try saveUnlocked(document, to: location)
+        }
+    }
+
+    private func withStoreLock<T>(
+        isWrite: Bool = false,
+        _ body: (WorkspaceCheckpointStoreLocation) throws -> T
+    ) throws -> T {
+        do {
+            let location = try openStoreLocation()
+            defer { _ = Darwin.close(location.parentDescriptor) }
+            let lockFD = try openStoreLockFile(at: location)
+            defer { _ = Darwin.close(lockFD) }
+
+            var lockStatus = stat()
+            guard fstat(lockFD, &lockStatus) == 0,
+                  (lockStatus.st_mode & S_IFMT) == S_IFREG,
+                  lockStatus.st_uid == geteuid() else {
+                throw WorkspaceCheckpointStoreLockError("Checkpoint store lock is not a regular file owned by the current user.")
+            }
+
+            let started = DispatchTime.now().uptimeNanoseconds
+            while true {
+                if flock(lockFD, LOCK_EX | LOCK_NB) == 0 { break }
+                let code = errno
+                if code != EWOULDBLOCK && code != EAGAIN && code != EINTR {
+                    throw WorkspaceCheckpointStoreLockError("Could not lock store (errno " + String(code) + ").")
+                }
+                let elapsed = DispatchTime.now().uptimeNanoseconds &- started
+                guard elapsed < Self.lockTimeoutNanoseconds else {
+                    throw WorkspaceCheckpointStoreLockError(
+                        "Timed out after 0.5 seconds waiting for the checkpoint store lock."
+                    )
+                }
+                usleep(Self.lockRetryMicroseconds)
+            }
+            defer { _ = flock(lockFD, LOCK_UN) }
+            return try body(location)
+        } catch let error as WorkspaceCheckpointError {
+            throw error
+        } catch let error as WorkspaceCheckpointStoreLockError {
+            if isWrite {
+                throw WorkspaceCheckpointError.storeWriteFailed(error.detail)
+            }
+            throw WorkspaceCheckpointError.storeUnreadable(error.detail)
+        } catch {
+            if isWrite {
+                throw WorkspaceCheckpointError.storeWriteFailed(error.localizedDescription)
+            }
+            throw WorkspaceCheckpointError.storeUnreadable(error.localizedDescription)
+        }
+    }
+
+    /// Opens the adjacent advisory lock without following symlinks.
+    ///
+    /// Creation is split from open so concurrent first writers never depend on a single
+    /// `O_CREAT|O_NOFOLLOW` openat succeeding under contention. Darwin can surface ENOENT
+    /// for that combined flag set when many callers race the first create.
+    private func openStoreLockFile(at location: WorkspaceCheckpointStoreLocation) throws -> Int32 {
+        let baseFlags = O_RDWR | O_CLOEXEC | O_NOFOLLOW
+        var lockFD = Darwin.openat(location.parentDescriptor, location.lockName, baseFlags)
+        if lockFD < 0, errno == ENOENT {
+            lockFD = Darwin.openat(
+                location.parentDescriptor,
+                location.lockName,
+                baseFlags | O_CREAT | O_EXCL,
+                mode_t(0o600)
+            )
+        }
+        if lockFD < 0, errno == EEXIST {
+            lockFD = Darwin.openat(location.parentDescriptor, location.lockName, baseFlags)
+        }
+        // Bounded retry for create races: another writer may create then rename/replace
+        // around the EXCL attempt, leaving a brief ENOENT/EEXIST window.
+        if lockFD < 0, errno == ENOENT || errno == EEXIST {
+            let started = DispatchTime.now().uptimeNanoseconds
+            while lockFD < 0 {
+                let elapsed = DispatchTime.now().uptimeNanoseconds &- started
+                guard elapsed < Self.lockTimeoutNanoseconds else { break }
+                usleep(Self.lockRetryMicroseconds)
+                lockFD = Darwin.openat(location.parentDescriptor, location.lockName, baseFlags)
+                if lockFD < 0, errno == ENOENT {
+                    lockFD = Darwin.openat(
+                        location.parentDescriptor,
+                        location.lockName,
+                        baseFlags | O_CREAT | O_EXCL,
+                        mode_t(0o600)
+                    )
+                }
+                if lockFD < 0, errno == EEXIST {
+                    lockFD = Darwin.openat(location.parentDescriptor, location.lockName, baseFlags)
+                }
+            }
+        }
+        guard lockFD >= 0 else {
+            throw WorkspaceCheckpointStoreLockError("Could not open lock file (errno " + String(errno) + ").")
+        }
+        return lockFD
+    }
+
+    private func openStoreLocation() throws -> WorkspaceCheckpointStoreLocation {
+        let storeName = fileURL.lastPathComponent
+        guard Self.isSafeBasename(storeName) else {
+            throw WorkspaceCheckpointStoreLockError("Checkpoint store name must be one safe file basename.")
+        }
+        let parent = fileURL.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        } catch {
+            throw WorkspaceCheckpointStoreLockError("Could not create checkpoint store directory: \(error.localizedDescription)")
+        }
+        guard let canonicalPointer = realpath(parent.path, nil) else {
+            throw WorkspaceCheckpointStoreLockError("Could not canonicalize checkpoint store directory (errno \(errno)).")
+        }
+        defer { free(canonicalPointer) }
+        let canonicalParent = String(cString: canonicalPointer)
+        let parentDescriptor = Darwin.open(
+            canonicalParent,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+        )
+        guard parentDescriptor >= 0 else {
+            throw WorkspaceCheckpointStoreLockError("Could not open checkpoint store directory (errno \(errno)).")
+        }
+        var parentStatus = stat()
+        guard fstat(parentDescriptor, &parentStatus) == 0,
+              (parentStatus.st_mode & S_IFMT) == S_IFDIR else {
+            _ = Darwin.close(parentDescriptor)
+            throw WorkspaceCheckpointStoreLockError("Checkpoint store parent must be a directory.")
+        }
+        return WorkspaceCheckpointStoreLocation(
+            parentDescriptor: parentDescriptor,
+            storeName: storeName,
+            lockName: "." + storeName + ".lock"
+        )
+    }
+
+    private func readStoreData(from location: WorkspaceCheckpointStoreLocation) throws -> Data? {
+        let descriptor = Darwin.openat(
+            location.parentDescriptor,
+            location.storeName,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+        )
+        guard descriptor >= 0 else {
+            if errno == ENOENT { return nil }
+            throw WorkspaceCheckpointError.storeUnreadable("Could not open checkpoint store (errno \(errno)).")
+        }
+        defer { _ = Darwin.close(descriptor) }
+
+        var status = stat()
+        guard fstat(descriptor, &status) == 0,
+              (status.st_mode & S_IFMT) == S_IFREG else {
+            throw WorkspaceCheckpointError.storeUnreadable("Checkpoint store must be a regular file.")
+        }
+        let limit = DurableStoreRecovery.maximumStoreByteCount
+        if status.st_size > off_t(limit) {
+            throw WorkspaceCheckpointError.storeUnreadable("Checkpoint store exceeds the \(limit)-byte limit.")
+        }
+
+        var data = Data()
+        data.reserveCapacity(min(Int(status.st_size), limit))
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.read(descriptor, bytes.baseAddress, bytes.count)
+            }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw WorkspaceCheckpointError.storeUnreadable("Could not read checkpoint store (errno \(errno)).")
+            }
+            if count == 0 { break }
+            data.append(contentsOf: buffer.prefix(count))
+            if data.count > limit {
+                throw WorkspaceCheckpointError.storeUnreadable("Checkpoint store exceeds the \(limit)-byte limit.")
+            }
+        }
+        return data
+    }
+
+    private func publishStoreData(
+        _ data: Data,
+        to location: WorkspaceCheckpointStoreLocation
+    ) throws {
+        let temporaryName = "." + location.storeName + ".tmp-" + UUID().uuidString
+        let temporaryDescriptor = Darwin.openat(
+            location.parentDescriptor,
+            temporaryName,
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            mode_t(0o600)
+        )
+        guard temporaryDescriptor >= 0 else {
+            throw WorkspaceCheckpointError.storeWriteFailed("Could not create checkpoint store temporary file (errno \(errno)).")
+        }
+        var published = false
+        defer {
+            _ = Darwin.close(temporaryDescriptor)
+            if !published {
+                _ = unlinkat(location.parentDescriptor, temporaryName, 0)
+            }
+        }
+
+        var temporaryStatus = stat()
+        guard fstat(temporaryDescriptor, &temporaryStatus) == 0,
+              (temporaryStatus.st_mode & S_IFMT) == S_IFREG,
+              temporaryStatus.st_uid == geteuid() else {
+            throw WorkspaceCheckpointError.storeWriteFailed("Checkpoint store temporary file is unsafe.")
+        }
+        try writeStoreData(data, to: temporaryDescriptor)
+        try synchronizeDescriptor(
+            temporaryDescriptor,
+            failure: "Could not synchronize checkpoint store temporary file"
+        )
+        try validatePublishTarget(location)
+        guard renameat(
+            location.parentDescriptor,
+            temporaryName,
+            location.parentDescriptor,
+            location.storeName
+        ) == 0 else {
+            throw WorkspaceCheckpointError.storeWriteFailed("Could not publish checkpoint store (errno \(errno)).")
+        }
+        published = true
+        try synchronizeDescriptor(
+            location.parentDescriptor,
+            failure: "Checkpoint store was published, but its directory could not be synchronized"
+        )
+    }
+
+    private func validatePublishTarget(_ location: WorkspaceCheckpointStoreLocation) throws {
+        var existingStatus = stat()
+        if fstatat(
+            location.parentDescriptor,
+            location.storeName,
+            &existingStatus,
+            AT_SYMLINK_NOFOLLOW
+        ) == 0 {
+            guard (existingStatus.st_mode & S_IFMT) == S_IFREG else {
+                throw WorkspaceCheckpointError.storeWriteFailed("Checkpoint store must be a regular file.")
+            }
+        } else if errno != ENOENT {
+            throw WorkspaceCheckpointError.storeWriteFailed("Could not inspect checkpoint store (errno \(errno)).")
+        }
+    }
+
+    private func writeStoreData(_ data: Data, to descriptor: Int32) throws {
+        try data.withUnsafeBytes { bytes in
+            var offset = 0
+            while offset < bytes.count {
+                let result = Darwin.write(
+                    descriptor,
+                    bytes.baseAddress?.advanced(by: offset),
+                    bytes.count - offset
+                )
+                if result < 0 {
+                    if errno == EINTR { continue }
+                    throw WorkspaceCheckpointError.storeWriteFailed("Could not write checkpoint store (errno \(errno)).")
+                }
+                guard result > 0 else {
+                    throw WorkspaceCheckpointError.storeWriteFailed("Checkpoint store write made no progress.")
+                }
+                offset += result
+            }
+        }
+    }
+
+    private func synchronizeDescriptor(_ descriptor: Int32, failure: String) throws {
+        while fsync(descriptor) != 0 {
+            if errno == EINTR { continue }
+            throw WorkspaceCheckpointError.storeWriteFailed(failure + " (errno " + String(errno) + ").")
+        }
+    }
+
+    private static func isSafeBasename(_ value: String) -> Bool {
+        !value.isEmpty
+            && value != "."
+            && value != ".."
+            && !value.contains("/")
+            && !value.contains("\\")
+            && !value.contains("\0")
+            // Leave room for adjacent lock and UUID-suffixed temporary names.
+            && value.utf8.count <= 200
     }
 
     public func notes(
@@ -652,6 +934,18 @@ public struct WorkspaceCheckpointStore: Sendable {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
 
+        let parsedObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        if let rawVersion = parsedObject?["version"] {
+            guard let version = rawVersion as? Int, version >= 1 else {
+                throw WorkspaceCheckpointError.storeUnreadable("Checkpoint store schema version is malformed.")
+            }
+            guard version <= WorkspaceCheckpointStoreDocument.currentVersion else {
+                throw WorkspaceCheckpointError.storeUnreadable(
+                    "Checkpoint store schema version \(version) is newer than supported version \(WorkspaceCheckpointStoreDocument.currentVersion)."
+                )
+            }
+        }
+
         if let modern = try? decoder.decode(WorkspaceCheckpointStoreDocument.self, from: data) {
             var document = modern
             if document.version < WorkspaceCheckpointStoreDocument.currentVersion {
@@ -661,7 +955,7 @@ public struct WorkspaceCheckpointStore: Sendable {
         }
 
         // Legacy v1: object with `checkpoints` only, or a bare checkpoint array.
-        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        if let object = parsedObject {
             let version = object["version"] as? Int ?? 1
             let checkpointData: Data
             if let checkpoints = object["checkpoints"] {
@@ -672,8 +966,12 @@ public struct WorkspaceCheckpointStore: Sendable {
             let checkpoints = try decoder.decode([WorkspaceCheckpoint].self, from: checkpointData)
             var notes: [WorkspaceReviewNote] = []
             if let rawNotes = object["notes"] {
-                let notesData = try JSONSerialization.data(withJSONObject: rawNotes)
-                notes = (try? decoder.decode([WorkspaceReviewNote].self, from: notesData)) ?? []
+                do {
+                    let notesData = try JSONSerialization.data(withJSONObject: rawNotes)
+                    notes = try decoder.decode([WorkspaceReviewNote].self, from: notesData)
+                } catch {
+                    throw WorkspaceCheckpointError.storeUnreadable("Legacy checkpoint review notes are malformed.")
+                }
             }
             return WorkspaceCheckpointStoreDocument(
                 version: max(version, WorkspaceCheckpointStoreDocument.currentVersion),
@@ -691,6 +989,20 @@ public struct WorkspaceCheckpointStore: Sendable {
         }
 
         throw WorkspaceCheckpointError.storeUnreadable("Unrecognized checkpoint store document.")
+    }
+}
+
+private struct WorkspaceCheckpointStoreLocation {
+    let parentDescriptor: Int32
+    let storeName: String
+    let lockName: String
+}
+
+private struct WorkspaceCheckpointStoreLockError: Error {
+    let detail: String
+
+    init(_ detail: String) {
+        self.detail = detail
     }
 }
 

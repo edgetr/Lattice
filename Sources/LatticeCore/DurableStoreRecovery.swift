@@ -79,6 +79,7 @@ public enum DurableStoreLoadResult<Value: Sendable>: Sendable {
 /// Blocks normal persistence writes for a store until recovery resolves the failure.
 public final class DurableStoreWriteGate: @unchecked Sendable {
     private let lock = NSLock()
+    private let writeLock = NSLock()
     private var blocked = false
 
     public init(blocked: Bool = false) {
@@ -90,12 +91,54 @@ public final class DurableStoreWriteGate: @unchecked Sendable {
         return blocked
     }
 
+    /// Marks the gate blocked after every already-running write finishes. The write lock is
+    /// intentionally acquired before the state lock so a recovery transition has a clear
+    /// linearization point and cannot race a save that already passed its writable check.
     public func block() {
-        lock.lock(); blocked = true; lock.unlock()
+        writeLock.lock()
+        lock.lock()
+        blocked = true
+        lock.unlock()
+        writeLock.unlock()
     }
 
     public func unblock() {
+        writeLock.lock()
         lock.lock(); blocked = false; lock.unlock()
+        writeLock.unlock()
+    }
+
+    /// Nonblocking transition for MainActor/UI callers. `false` means a persistence
+    /// transaction currently owns the gate; the caller should retry asynchronously.
+    @discardableResult
+    public func trySetBlocked(_ value: Bool) -> Bool {
+        guard writeLock.try() else { return false }
+        lock.lock(); blocked = value; lock.unlock()
+        writeLock.unlock()
+        return true
+    }
+
+    @discardableResult
+    public func tryBlock() -> Bool { trySetBlocked(true) }
+
+    @discardableResult
+    public func tryUnblock() -> Bool { trySetBlocked(false) }
+
+    /// Executes a recovery transition without exposing the write lock to callers.
+    /// This is useful when a transition must be retried on a background task.
+    public func withExclusiveTransition<T>(_ body: () throws -> T) rethrows -> T {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        return try body()
+    }
+
+    /// Serializes complete store transactions for every persistence value sharing this gate.
+    /// `SessionPersistence` is a value type, so this reference-backed gate is the safe place
+    /// to retain the lock across copied instances without introducing a process-wide registry.
+    public func withExclusiveWrite<T>(_ body: () throws -> T) rethrows -> T {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        return try body()
     }
 }
 
@@ -113,34 +156,22 @@ public struct DurableStoreFileIO: Sendable {
     public var moveItem: @Sendable (URL, URL) throws -> Void
     public var removeItem: @Sendable (URL) throws -> Void
     public var replaceItem: @Sendable (URL, URL) throws -> Void
+    public var contentsOfDirectory: @Sendable (URL) throws -> [URL]
 
     public init(
-        fileExists: @escaping @Sendable (String) -> Bool = { FileManager.default.fileExists(atPath: $0) },
-        attributesOfItem: @escaping @Sendable (String) throws -> [FileAttributeKey: Any] = { try FileManager.default.attributesOfItem(atPath: $0) },
-        readData: @escaping @Sendable (URL) throws -> Data = { try Data(contentsOf: $0) },
+        fileExists: @escaping @Sendable (String) -> Bool = { LatticeStorePathSecurity.entryExistsWithoutFollowingSymlinks(at: URL(fileURLWithPath: $0)) },
+        attributesOfItem: @escaping @Sendable (String) throws -> [FileAttributeKey: Any] = { try LatticeStorePathSecurity.attributesWithoutFollowingSymlinks(at: URL(fileURLWithPath: $0)) },
+        readData: @escaping @Sendable (URL) throws -> Data = { try LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: $0) },
         readDataUpTo: @escaping @Sendable (URL, Int) throws -> Data = { url, limit in
-            let handle = try FileHandle(forReadingFrom: url)
-            defer { try? handle.close() }
-
-            var data = Data()
-            while data.count <= limit {
-                let remaining = limit + 1 - data.count
-                guard remaining > 0 else { break }
-                guard let chunk = try handle.read(upToCount: remaining), !chunk.isEmpty else { break }
-                data.append(chunk)
-            }
-            return data
+            try LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: url, maximumByteCount: limit)
         },
-        writeDataAtomically: @escaping @Sendable (Data, URL) throws -> Void = { try $0.write(to: $1, options: .atomic) },
-        createDirectory: @escaping @Sendable (URL) throws -> Void = {
-            try FileManager.default.createDirectory(at: $0, withIntermediateDirectories: true)
-        },
-        copyItem: @escaping @Sendable (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
-        moveItem: @escaping @Sendable (URL, URL) throws -> Void = { try FileManager.default.moveItem(at: $0, to: $1) },
-        removeItem: @escaping @Sendable (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) },
-        replaceItem: @escaping @Sendable (URL, URL) throws -> Void = { original, replacement in
-            _ = try FileManager.default.replaceItemAt(original, withItemAt: replacement)
-        }
+        writeDataAtomically: @escaping @Sendable (Data, URL) throws -> Void = { try LatticeStorePathSecurity.writeDataAtomicallyWithoutFollowingSymlinks($0, to: $1) },
+        createDirectory: @escaping @Sendable (URL) throws -> Void = { try LatticeStorePathSecurity.prepareDirectory(at: $0) },
+        copyItem: @escaping @Sendable (URL, URL) throws -> Void = { try LatticeStorePathSecurity.copyItemWithoutFollowingSymlinks(at: $0, to: $1) },
+        moveItem: @escaping @Sendable (URL, URL) throws -> Void = { try LatticeStorePathSecurity.moveItemWithoutFollowingSymlinks(at: $0, to: $1) },
+        removeItem: @escaping @Sendable (URL) throws -> Void = { try LatticeStorePathSecurity.removeRegularFileWithoutFollowingSymlinks(at: $0) },
+        replaceItem: @escaping @Sendable (URL, URL) throws -> Void = { original, replacement in try LatticeStorePathSecurity.replaceItemWithoutFollowingSymlinks(at: original, with: replacement) },
+        contentsOfDirectory: @escaping @Sendable (URL) throws -> [URL] = { try LatticeStorePathSecurity.regularFilesWithoutFollowingSymlinks(in: $0) }
     ) {
         self.fileExists = fileExists
         self.attributesOfItem = attributesOfItem
@@ -152,6 +183,7 @@ public struct DurableStoreFileIO: Sendable {
         self.moveItem = moveItem
         self.removeItem = removeItem
         self.replaceItem = replaceItem
+        self.contentsOfDirectory = contentsOfDirectory
     }
 
     public static let `default` = DurableStoreFileIO()
@@ -218,6 +250,11 @@ public enum DurableStoreRecovery: Sendable {
 
     /// Classifies Foundation/POSIX/Cocoa read failures using direct error evidence (not localized strings alone).
     public static func isUnreadableError(_ error: Error) -> Bool {
+        // Secure store I/O throws LatticeStorePathError rather than Cocoa/POSIX NSErrors.
+        if case .fileSystem(_, let code) = error as? LatticeStorePathError {
+            let codes: Set<Int32> = [EACCES, EPERM, EIO, EBUSY, EAGAIN]
+            if codes.contains(code) { return true }
+        }
         let nsError = error as NSError
         if nsError.domain == NSCocoaErrorDomain {
             let codes: Set<Int> = [
@@ -240,6 +277,11 @@ public enum DurableStoreRecovery: Sendable {
     }
 
     public static func isNotFoundError(_ error: Error) -> Bool {
+        // Secure store I/O throws LatticeStorePathError.fileSystem(_, ENOENT) for absent files.
+        // Without this branch, missing stores would be misclassified as unreadable failures.
+        if case .fileSystem(_, let code) = error as? LatticeStorePathError, code == ENOENT {
+            return true
+        }
         let nsError = error as NSError
         if nsError.domain == NSCocoaErrorDomain,
            nsError.code == NSFileReadNoSuchFileError || nsError.code == NSFileNoSuchFileError {
@@ -384,8 +426,15 @@ public enum DurableStoreRecovery: Sendable {
         kind: DurableStorePreserveKind = .backup,
         io: DurableStoreFileIO = .default,
         now: Date = Date(),
-        uniqueToken: String = UUID().uuidString
+        uniqueToken: String = UUID().uuidString,
+        writeGate: DurableStoreWriteGate? = nil,
+        storeName: String = "this store"
     ) throws -> DurableStorePreserveResult {
+        if let writeGate {
+            return try writeGate.withExclusiveTransition {
+                return try preserveCopy(of: fileURL, kind: kind, io: io, now: now, uniqueToken: uniqueToken)
+            }
+        }
         guard io.fileExists(fileURL.path) else {
             throw DurableStoreRecoveryError.sourceMissing(path: fileURL.path)
         }
@@ -457,14 +506,21 @@ public enum DurableStoreRecovery: Sendable {
         expected: DurableStoreIssue? = nil,
         io: DurableStoreFileIO = .default,
         now: Date = Date(),
-        uniqueToken: String = UUID().uuidString
+        uniqueToken: String = UUID().uuidString,
+        writeGate: DurableStoreWriteGate? = nil,
+        storeName: String = "this store"
     ) throws -> DurableStorePreserveResult {
+        if let writeGate {
+            return try writeGate.withExclusiveTransition {
+                return try resetReplacingWithEmptyArray(at: fileURL, expected: expected, io: io, now: now, uniqueToken: uniqueToken)
+            }
+        }
         if !io.fileExists(fileURL.path) {
             if expected != nil {
                 throw DurableStoreRecoveryError.sourceMissing(path: fileURL.path)
             }
-            try writeEmptyArray(at: fileURL, io: io)
-            return .init(preservedURL: fileURL, note: "No original existed; wrote a new empty store.")
+            let durable = try writeEmptyArray(at: fileURL, io: io)
+            return .init(preservedURL: fileURL, note: durable ? "No original existed; wrote a new empty store." : "No original existed; empty store was published but durability could not be confirmed.")
         }
 
         if let expected {
@@ -472,6 +528,11 @@ public enum DurableStoreRecovery: Sendable {
         }
 
         let sourceBeforePreserve = observation(of: fileURL, io: io)
+        guard sourceBeforePreserve.fingerprint != nil else {
+            throw DurableStoreRecoveryError.resetFailed(
+                message: "Reset aborted because the original could not be bounded and fingerprinted safely. Original left unchanged."
+            )
+        }
 
         let preserved: DurableStorePreserveResult
         do {
@@ -489,18 +550,26 @@ public enum DurableStoreRecovery: Sendable {
             )
         }
 
+        // Close the final race window between backup verification and publish.
+        let sourceImmediatelyBeforeReplace = observation(of: fileURL, io: io)
+        guard observationsMatch(sourceAfterPreserve, sourceImmediatelyBeforeReplace) else {
+            throw DurableStoreRecoveryError.resetFailed(
+                message: "Reset aborted because the original changed immediately before replacement. Original left unchanged."
+            )
+        }
+
         do {
-            try writeEmptyArray(at: fileURL, io: io)
+            let durable = try writeEmptyArray(at: fileURL, io: io)
+            let durabilityNote = durable ? "" : " Durability could not be confirmed after publication."
+            return .init(
+                preservedURL: preserved.preservedURL,
+                note: "Original preserved; new empty JSON array installed.\(durabilityNote)"
+            )
         } catch {
             throw DurableStoreRecoveryError.resetFailed(
                 message: "Backup was saved to \(preserved.preservedURL.path), but replacing the original failed: \(error.localizedDescription)"
             )
         }
-
-        return .init(
-            preservedURL: preserved.preservedURL,
-            note: "Original preserved; new empty JSON array installed."
-        )
     }
 
     public static func uniquePreserveURL(
@@ -538,6 +607,11 @@ public enum DurableStoreRecovery: Sendable {
         expected: DurableStoreIssue,
         io: DurableStoreFileIO = .default
     ) throws {
+        // Without a bounded content fingerprint, same-size mutations cannot be
+        // distinguished safely. Refuse destructive recovery rather than guess.
+        guard expected.observedContentFingerprint != nil else {
+            throw DurableStoreRecoveryError.sourceChanged(path: fileURL.path)
+        }
         let current = observation(of: fileURL, io: io)
         if let expectedSize = expected.observedFileSize {
             guard current.fileSize == expectedSize else {
@@ -602,7 +676,7 @@ public enum DurableStoreRecovery: Sendable {
         )
     }
 
-    private static func writeEmptyArray(at fileURL: URL, io: DurableStoreFileIO) throws {
+    private static func writeEmptyArray(at fileURL: URL, io: DurableStoreFileIO) throws -> Bool {
         try io.createDirectory(fileURL.deletingLastPathComponent())
         let temporary = fileURL.appendingPathExtension("tmp-\(UUID().uuidString)")
         do {
@@ -613,12 +687,17 @@ public enum DurableStoreRecovery: Sendable {
                 try io.moveItem(temporary, fileURL)
             }
         } catch {
+            if (try? io.readDataUpTo(fileURL, maximumStoreByteCount)) == emptyJSONArray {
+                try? io.removeItem(temporary)
+                return false
+            }
             try? io.removeItem(temporary)
             throw error
         }
         if io.fileExists(temporary.path) {
             try? io.removeItem(temporary)
         }
+        return true
     }
 
     private static func sanitizeFileNameComponent(_ value: String) -> String {

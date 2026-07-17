@@ -2,17 +2,56 @@ import CryptoKit
 import Foundation
 
 public struct SessionSearchIndex: Codable, Equatable, Sendable {
-    public static let schemaVersion = 1
+    public static let schemaVersion = 2
 
     public struct Entry: Codable, Equatable, Sendable {
         public let transcriptFingerprint: String
         public let metadataFingerprint: String
         public let gramHashes: [String]
+        public let integrityChecksum: String
 
-        public init(transcriptFingerprint: String, metadataFingerprint: String, gramHashes: [String]) {
+        public init(
+            transcriptFingerprint: String,
+            metadataFingerprint: String,
+            gramHashes: [String],
+            integrityChecksum: String? = nil
+        ) {
             self.transcriptFingerprint = transcriptFingerprint
             self.metadataFingerprint = metadataFingerprint
             self.gramHashes = gramHashes
+            self.integrityChecksum = integrityChecksum ?? Self.checksum(
+                transcriptFingerprint: transcriptFingerprint,
+                metadataFingerprint: metadataFingerprint,
+                gramHashes: gramHashes
+            )
+        }
+
+        public var hasValidIntegrity: Bool {
+            Self.isLowercaseSHA256(transcriptFingerprint)
+                && Self.isLowercaseSHA256(metadataFingerprint)
+                && gramHashes == Array(Set(gramHashes)).sorted()
+                && gramHashes.allSatisfy(Self.isLowercaseSHA256)
+                && integrityChecksum == Self.checksum(
+                    transcriptFingerprint: transcriptFingerprint,
+                    metadataFingerprint: metadataFingerprint,
+                    gramHashes: gramHashes
+                )
+        }
+
+        private static func checksum(
+            transcriptFingerprint: String,
+            metadataFingerprint: String,
+            gramHashes: [String]
+        ) -> String {
+            let payload = ([transcriptFingerprint, metadataFingerprint] + gramHashes)
+                .joined(separator: "\n")
+            return SessionSearchIndex.digest(Data(payload.utf8))
+        }
+
+        private static func isLowercaseSHA256(_ value: String) -> Bool {
+            value.count == 64 && value.unicodeScalars.allSatisfy {
+                (48...57).contains($0.value) || (97...102).contains($0.value)
+            }
         }
     }
 
@@ -26,13 +65,20 @@ public struct SessionSearchIndex: Codable, Equatable, Sendable {
 
     public var indexedSessionIDs: Set<UUID> { Set(entries.keys) }
 
+    public var hasValidIntegrity: Bool {
+        version == Self.schemaVersion && entries.values.allSatisfy(\.hasValidIntegrity)
+    }
+
     /// Returns an indexed candidate set without decoding transcripts. Unindexed sessions are
     /// included so missing/corrupt derived index data can never hide a durable conversation.
     public func candidateSessionIDs(for query: String, allSessionIDs: Set<UUID>) -> Set<UUID> {
         let hashes = Self.queryGramHashes(query)
         guard !hashes.isEmpty else { return allSessionIDs }
-        var result = allSessionIDs.subtracting(entries.keys)
+        guard version == Self.schemaVersion else { return allSessionIDs }
+        let trustedEntryIDs = Set(entries.compactMap { $0.value.hasValidIntegrity ? $0.key : nil })
+        var result = allSessionIDs.subtracting(trustedEntryIDs)
         for (id, entry) in entries {
+            guard entry.hasValidIntegrity else { continue }
             let available = Set(entry.gramHashes)
             if hashes.isSubset(of: available) { result.insert(id) }
         }
@@ -49,9 +95,14 @@ public struct SessionSearchIndex: Codable, Equatable, Sendable {
     }
 
     public mutating func retainValidEntries(for sessions: [LatticeSession]) {
+        guard version == Self.schemaVersion else {
+            version = Self.schemaVersion
+            entries = [:]
+            return
+        }
         let byID = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
         entries = entries.filter { id, entry in
-            guard let session = byID[id] else { return false }
+            guard entry.hasValidIntegrity, let session = byID[id] else { return false }
             let transcriptMatches = session.isTranscriptLoaded
                 || session.transcriptStorage?.contentFingerprint == entry.transcriptFingerprint
             return transcriptMatches && Self.metadataFingerprint(session) == entry.metadataFingerprint
@@ -59,7 +110,9 @@ public struct SessionSearchIndex: Codable, Equatable, Sendable {
     }
 
     public func containsValidEntry(for session: LatticeSession) -> Bool {
-        guard let entry = entries[session.id] else { return false }
+        guard version == Self.schemaVersion,
+              let entry = entries[session.id],
+              entry.hasValidIntegrity else { return false }
         let transcriptMatches = session.isTranscriptLoaded
             ? entry.transcriptFingerprint == Self.fingerprint(messages: session.messages)
             : entry.transcriptFingerprint == session.transcriptStorage?.contentFingerprint
@@ -83,7 +136,9 @@ public struct SessionSearchIndex: Codable, Equatable, Sendable {
         metadata.artifacts = []
         metadata.artifactStorage = nil
         metadata.isArtifactsLoaded = true
-        return digest((try? JSONEncoder().encode(metadata)) ?? Data())
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return digest((try? encoder.encode(metadata)) ?? Data())
     }
 
     private static func searchableText(_ session: LatticeSession) -> String {

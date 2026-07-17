@@ -459,24 +459,30 @@ public struct ExecutionRoute: Hashable, Codable, Sendable, Identifiable {
     public let providerID: String
     public let modelID: String?
     public let runtimeID: String
+    /// Durable provenance for an explicit fallback. `runtimeID` remains the
+    /// sole authority for the runtime that actually executes this route.
+    public let fallbackFromRuntimeID: String?
 
     public init(
         mode: ConversationMode,
         providerID: String,
         modelID: String? = nil,
-        runtimeID: String
+        runtimeID: String,
+        fallbackFromRuntimeID: String? = nil
     ) {
         self.mode = mode
         self.providerID = providerID
         self.modelID = modelID
         self.runtimeID = runtimeID
+        self.fallbackFromRuntimeID = fallbackFromRuntimeID
     }
 
     /// Compatibility spelling for callers that still call runtimes harnesses.
     public var harnessID: String { runtimeID }
 
     public var id: String {
-        [mode.rawValue, providerID, modelID ?? "", runtimeID].joined(separator: "\u{1f}")
+        [mode.rawValue, providerID, modelID ?? "", runtimeID, fallbackFromRuntimeID ?? ""]
+            .joined(separator: "\u{1f}")
     }
 
     /// Reconstruct old persisted sessions without remapping direct provider routes.
@@ -724,7 +730,11 @@ public struct SessionAction: Identifiable, Hashable, Codable, Sendable {
     public let kind: Kind
     public let toolKind: ToolRequest.Kind?
     public let title: String
-    public var detail: String
+    public var detail: String {
+        didSet {
+            detail = SessionActionTextPolicy.detail(detail)
+        }
+    }
     public var status: Status
     public let workspaceScoped: Bool
     public let createdAt: Date
@@ -751,8 +761,8 @@ public struct SessionAction: Identifiable, Hashable, Codable, Sendable {
         self.messageID = messageID
         self.kind = kind
         self.toolKind = toolKind
-        self.title = title
-        self.detail = detail
+        self.title = SessionActionTextPolicy.title(title)
+        self.detail = SessionActionTextPolicy.detail(detail)
         self.status = status
         self.workspaceScoped = workspaceScoped
         self.createdAt = createdAt
@@ -771,8 +781,8 @@ public struct SessionAction: Identifiable, Hashable, Codable, Sendable {
         messageID = try container.decode(UUID.self, forKey: .messageID)
         kind = try container.decode(Kind.self, forKey: .kind)
         toolKind = try container.decodeIfPresent(ToolRequest.Kind.self, forKey: .toolKind)
-        title = try container.decode(String.self, forKey: .title)
-        detail = try container.decode(String.self, forKey: .detail)
+        title = SessionActionTextPolicy.title(try container.decode(String.self, forKey: .title))
+        detail = SessionActionTextPolicy.detail(try container.decode(String.self, forKey: .detail))
         status = try container.decode(Status.self, forKey: .status)
         workspaceScoped = try container.decodeIfPresent(Bool.self, forKey: .workspaceScoped) ?? false
         createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? .distantPast
@@ -787,8 +797,8 @@ public struct SessionAction: Identifiable, Hashable, Codable, Sendable {
         try container.encode(messageID, forKey: .messageID)
         try container.encode(kind, forKey: .kind)
         try container.encodeIfPresent(toolKind, forKey: .toolKind)
-        try container.encode(title, forKey: .title)
-        try container.encode(detail, forKey: .detail)
+        try container.encode(SessionActionTextPolicy.title(title), forKey: .title)
+        try container.encode(SessionActionTextPolicy.detail(detail), forKey: .detail)
         try container.encode(status, forKey: .status)
         try container.encode(workspaceScoped, forKey: .workspaceScoped)
         try container.encode(createdAt, forKey: .createdAt)
@@ -902,13 +912,32 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         lastUpdated: Date = .now,
         portableArchiveFingerprint: String? = nil
     ) {
+        // Normalize hand-built/legacy state so a nonempty sidecar can never be
+        // mistaken for an authoritative empty in-memory transcript. Conversely,
+        // nonempty in-memory content always wins and is marked dirty if a caller
+        // incorrectly labels it unloaded.
+        let normalizedTranscriptLoaded: Bool = {
+            guard let transcriptStorage else { return true }
+            if !messages.isEmpty { return true }
+            if transcriptStorage.messageCount > 0 { return false }
+            return isTranscriptLoaded
+        }()
+        let normalizedTranscriptDirty = isTranscriptDirty || (!isTranscriptLoaded && !messages.isEmpty)
+        let normalizedArtifactsLoaded: Bool = {
+            guard let artifactStorage else { return true }
+            if !artifacts.isEmpty { return true }
+            if artifactStorage.artifactCount > 0 { return false }
+            return isArtifactsLoaded
+        }()
+        let normalizedArtifactsDirty = isArtifactsDirty || (!isArtifactsLoaded && !artifacts.isEmpty)
+
         self.id = id; self.title = title; self.messages = messages
-        self.transcriptStorage = transcriptStorage; self.isTranscriptLoaded = isTranscriptLoaded
-        self.isTranscriptDirty = isTranscriptDirty
+        self.transcriptStorage = transcriptStorage; self.isTranscriptLoaded = normalizedTranscriptLoaded
+        self.isTranscriptDirty = normalizedTranscriptDirty
         self.artifacts = artifacts
         self.artifactStorage = artifactStorage
-        self.isArtifactsLoaded = isArtifactsLoaded
-        self.isArtifactsDirty = isArtifactsDirty
+        self.isArtifactsLoaded = normalizedArtifactsLoaded
+        self.isArtifactsDirty = normalizedArtifactsDirty
         self.backend = backend
         self.executionRoute = executionRoute ?? ExecutionRoute.legacy(for: backend, harnessID: harnessID)
         self.harnessID = harnessID
@@ -926,36 +955,53 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, messages, transcriptStorage, artifacts, artifactStorage, backend, executionRoute, harnessID, reasoningEffort, harnessThreadID, workspacePath, attachments, policy, privacyMode, intent, codePhase, codePlan, compactContextOnNextSend, actions, queuedFollowUps, inputOutboxReceipts, draft, isPinned, isStreaming, lastUpdated, portableArchiveFingerprint
+        case id, title, messages, transcriptStorage, artifacts, artifactStorage, backend, executionRoute, harnessID, reasoningEffort, workspacePath, attachments, policy, privacyMode, intent, codePhase, codePlan, compactContextOnNextSend, actions, queuedFollowUps, inputOutboxReceipts, draft, isPinned, isStreaming, lastUpdated, portableArchiveFingerprint
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
         title = try container.decode(String.self, forKey: .title)
-        messages = try container.decodeIfPresent([ChatMessage].self, forKey: .messages) ?? []
-        transcriptStorage = try container.decodeIfPresent(SessionTranscriptStorage.self, forKey: .transcriptStorage)
-        isTranscriptLoaded = transcriptStorage == nil
-        isTranscriptDirty = false
+        let inlineMessages = try container.decodeIfPresent([ChatMessage].self, forKey: .messages) ?? []
+        let decodedTranscriptStorage = try container.decodeIfPresent(SessionTranscriptStorage.self, forKey: .transcriptStorage)
+        messages = inlineMessages
+        transcriptStorage = decodedTranscriptStorage
+        if decodedTranscriptStorage != nil, !inlineMessages.isEmpty {
+            // Transitional/corrupt manifests may contain both representations.
+            // Preserve explicit inline user data as authoritative and rewrite it
+            // on the next save instead of silently preferring a sidecar.
+            isTranscriptLoaded = true
+            isTranscriptDirty = true
+        } else {
+            isTranscriptLoaded = decodedTranscriptStorage == nil
+            isTranscriptDirty = false
+        }
         // Prefer split artifact store. Inline `artifacts` is accepted only for transitional
         // payloads; legacy manifests without either field hydrate as empty/loaded.
         let decodedArtifactStorage = try container.decodeIfPresent(SessionArtifactStorage.self, forKey: .artifactStorage)
         let inlineArtifacts = try container.decodeIfPresent([AssistantArtifact].self, forKey: .artifacts) ?? []
         artifactStorage = decodedArtifactStorage
-        if decodedArtifactStorage != nil {
+        if decodedArtifactStorage != nil, !inlineArtifacts.isEmpty {
+            artifacts = inlineArtifacts
+            isArtifactsLoaded = true
+            isArtifactsDirty = true
+        } else if decodedArtifactStorage != nil {
             artifacts = []
             isArtifactsLoaded = false
+            isArtifactsDirty = false
         } else {
             artifacts = inlineArtifacts
             isArtifactsLoaded = true
+            isArtifactsDirty = false
         }
-        isArtifactsDirty = false
         backend = try container.decode(ChatBackend.self, forKey: .backend)
         harnessID = try container.decodeIfPresent(String.self, forKey: .harnessID)
         executionRoute = try container.decodeIfPresent(ExecutionRoute.self, forKey: .executionRoute)
             ?? ExecutionRoute.legacy(for: backend, harnessID: harnessID)
         reasoningEffort = try container.decodeIfPresent(ReasoningEffort.self, forKey: .reasoningEffort)
-        harnessThreadID = try container.decodeIfPresent(String.self, forKey: .harnessThreadID)
+        // Provider session handles are runtime-only. Legacy manifests may contain
+        // this key; deliberately ignore it instead of reviving a stale handle.
+        harnessThreadID = nil
         workspacePath = try container.decodeIfPresent(String.self, forKey: .workspacePath)
         attachments = try container.decodeIfPresent([ContextAttachment].self, forKey: .attachments) ?? []
         policy = try container.decodeIfPresent(ExecutionPolicy.self, forKey: .policy) ?? .ask
@@ -991,7 +1037,7 @@ public struct LatticeSession: Identifiable, Hashable, Codable, Sendable {
         try container.encode(executionRoute, forKey: .executionRoute)
         try container.encodeIfPresent(harnessID, forKey: .harnessID)
         try container.encodeIfPresent(reasoningEffort, forKey: .reasoningEffort)
-        try container.encodeIfPresent(harnessThreadID, forKey: .harnessThreadID)
+        // Never persist provider session handles. They belong to the live harness registry.
         try container.encodeIfPresent(workspacePath, forKey: .workspacePath)
         try container.encode(attachments, forKey: .attachments)
         try container.encode(policy, forKey: .policy)

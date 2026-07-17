@@ -168,6 +168,7 @@ public final class AntigravityCLIHarness: @unchecked Sendable {
                         executableURL: executableURL,
                         arguments: arguments,
                         currentDirectoryURL: workspace,
+                        environment: ChildProcessEnvironmentPolicy.providerOwnedRuntime(),
                         deadline: 30 * 60,
                         maximumOutputBytes: 8_000_000
                     ),
@@ -405,6 +406,7 @@ public final class AntigravityCLIHarness: @unchecked Sendable {
         await BoundedSubprocess.run(.init(
             executableURL: executableURL,
             arguments: arguments,
+            environment: ChildProcessEnvironmentPolicy.providerOwnedRuntime(),
             deadline: deadline,
             maximumOutputBytes: BoundedSubprocessRequest.defaultMaximumOutputBytes
         ))

@@ -9,7 +9,7 @@ enum PermissionWaitResult<Value: Sendable>: Sendable {
 final class PermissionWaiter<Value: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var result: PermissionWaitResult<Value>?
-    private var continuation: CheckedContinuation<PermissionWaitResult<Value>, Never>?
+    private var continuations: [CheckedContinuation<PermissionWaitResult<Value>, Never>] = []
     private var timeoutTask: Task<Void, Never>?
 
     @discardableResult
@@ -21,14 +21,14 @@ final class PermissionWaiter<Value: Sendable>: @unchecked Sendable {
         }
         let result: PermissionWaitResult<Value> = .resolved(value)
         self.result = result
-        let continuation = self.continuation
-        self.continuation = nil
+        let continuations = self.continuations
+        self.continuations.removeAll(keepingCapacity: false)
         let timeoutTask = self.timeoutTask
         self.timeoutTask = nil
         lock.unlock()
 
         timeoutTask?.cancel()
-        continuation?.resume(returning: result)
+        continuations.forEach { $0.resume(returning: result) }
         return true
     }
 
@@ -41,16 +41,18 @@ final class PermissionWaiter<Value: Sendable>: @unchecked Sendable {
                 return
             }
 
-            self.continuation = continuation
-            let timeoutTask = Task.detached { [weak self] in
-                do {
-                    try await Task.sleep(nanoseconds: timeoutNanoseconds)
-                } catch {
-                    return
+            self.continuations.append(continuation)
+            if self.timeoutTask == nil {
+                let timeoutTask = Task.detached { [weak self] in
+                    do {
+                        try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                    } catch {
+                        return
+                    }
+                    self?.expire()
                 }
-                self?.expire()
+                self.timeoutTask = timeoutTask
             }
-            self.timeoutTask = timeoutTask
             lock.unlock()
         }
     }
@@ -62,12 +64,12 @@ final class PermissionWaiter<Value: Sendable>: @unchecked Sendable {
             return
         }
         result = .timedOut
-        let continuation = self.continuation
-        self.continuation = nil
+        let continuations = self.continuations
+        self.continuations.removeAll(keepingCapacity: false)
         self.timeoutTask = nil
         lock.unlock()
 
-        continuation?.resume(returning: .timedOut)
+        continuations.forEach { $0.resume(returning: .timedOut) }
     }
 }
 

@@ -73,6 +73,7 @@ final class RunOrchestrator: ObservableObject {
             host.scheduleStreamingPersist()
         case .plan(let actionID, let title, let explanation, let steps):
             guard let messageID = host.sessions[index].messages.last(where: { $0.role == .assistant })?.id else { return }
+            var didMutateGuidedPlan = false
             host.upsertSessionAction(.init(
                 id: actionID,
                 messageID: messageID,
@@ -96,6 +97,7 @@ final class RunOrchestrator: ObservableObject {
                     revision: (prior?.revision ?? 0) + 1
                 )
                 host.sessions[index].codePhase = .planAwaitingApproval
+                didMutateGuidedPlan = true
             }
             for step in steps {
                 let status: SessionAction.Status = switch step.status {
@@ -117,6 +119,13 @@ final class RunOrchestrator: ObservableObject {
                         originActionID: actionID
                     )
                 ), at: index)
+            }
+            // The guided-plan artifact is mutated after the root action upsert. A provider can
+            // emit an empty-step plan, so no later action write is guaranteed to capture the
+            // codePlan/codePhase transition. Keep that transition crash-durable without adding
+            // another immediate write for plans whose step upserts already persisted/coalesced it.
+            if didMutateGuidedPlan && steps.isEmpty {
+                host.scheduleStreamingPersist()
             }
         case .reasoningSummary(let actionID, let delta):
             guard let messageID = host.sessions[index].messages.last(where: { $0.role == .assistant })?.id else { return }
@@ -354,7 +363,14 @@ final class RunOrchestrator: ObservableObject {
             var accumulator = computerFrameAccumulators[id] ?? ComputerFrameAccumulator(minimumInterval: 0.35, recentCapacity: 4)
             _ = accumulator.offer(frame)
             computerFrameAccumulators[id] = accumulator
-            host.updateSessionAction(id: frame.id, status: .completed, at: index)
+            // Computer frames can arrive rapidly for one provider tool call. The first frame
+            // closes the durable tool action; subsequent frames only update the bounded,
+            // in-memory accumulator and must not trigger an immediate full-store write each
+            // time.
+            if let action = host.sessions[index].actions.first(where: { $0.id == frame.id }),
+               action.status != .completed {
+                host.updateSessionAction(id: frame.id, status: .completed, at: index)
+            }
         case .completed, .cancelled, .failed:
             // Terminal classification is pure; side-effect ladder is finalizeRun only.
             guard let terminal = SessionRunReducer.terminal(for: event) else { return }
@@ -535,6 +551,10 @@ final class RunOrchestrator: ObservableObject {
         provenance.updatedAt = .now
         host.sessions[sessionIndex].actions[actionIndex].approvalProvenance = provenance
         host.sessions[sessionIndex].lastUpdated = .now
+        // Provenance may be updated independently of the status transition (for example when
+        // a stale approval response is observed). Coalesce a bounded save so the audit trail
+        // cannot be lost if no subsequent action-status write follows.
+        host.scheduleStreamingPersist()
     }
 
 
@@ -556,11 +576,15 @@ final class RunOrchestrator: ObservableObject {
               !host.sessions[index].isStreaming,
               let entryIndex = host.sessions[index].queuedFollowUps.firstIndex(where: { $0.id == queuedID }),
               entryIndex == host.sessions[index].queuedFollowUps.startIndex else { return false }
+        // An evicted transcript is an immutable placeholder. Hydrate before route
+        // normalization or durable claim so the queued lifecycle remains untouched.
+        guard host.requireLoadedSessionContent(for: id, at: index) else { return false }
 
         // Resolve legacy/runtime route normalization before comparing the captured authority.
         // A normalization that changes execution context must block auto-send like any user change.
         host.normalizeSessionBackendBeforeRun(at: index)
         let context = host.inputOutboxContext(for: host.sessions[index])
+        let beforeDispatchMutation = host.sessions[index]
         if afterExplicitReview {
             switch SessionInputOutboxPolicy.automaticDispatchEligibility(
                 of: queuedID,
@@ -589,13 +613,14 @@ final class RunOrchestrator: ObservableObject {
                    host.sessions[index].queuedFollowUps[entryIndex].context != nil {
                     host.sessions[index].queuedFollowUps[entryIndex].lifecycle = .blocked(.contextMismatch)
                     host.sessions[index].lastUpdated = .now
-                    host.persist()
+                    if host.persist() != .saved {
+                        host.sessions[index] = beforeDispatchMutation
+                    }
                 }
                 return false
             }
         }
 
-        let beforeClaim = host.sessions[index]
         let attemptID = UUID()
         guard SessionInputOutboxPolicy.claimDispatch(
             entryID: queuedID,
@@ -605,9 +630,10 @@ final class RunOrchestrator: ObservableObject {
         ) == .claimed(attemptID: attemptID) else { return false }
         host.sessions[index].lastUpdated = .now
         guard host.persist() == .saved else {
-            host.sessions[index] = beforeClaim
+            host.sessions[index] = beforeDispatchMutation
             return false
         }
+        let claimedSession = host.sessions[index]
 
         guard let followUp = host.sessions[index].queuedFollowUps.first(where: { $0.id == queuedID }),
               let submission = host.prepareSubmission(followUp.text) else {
@@ -618,7 +644,9 @@ final class RunOrchestrator: ObservableObject {
                 in: &host.sessions[index].queuedFollowUps
             )
             host.sessions[index].lastUpdated = .now
-            host.persist()
+            if host.persist() != .saved {
+                host.sessions[index] = claimedSession
+            }
             return false
         }
 
@@ -630,6 +658,7 @@ final class RunOrchestrator: ObservableObject {
         }
         guard accepted else {
             if let refreshedIndex = host.sessions.firstIndex(where: { $0.id == id }) {
+                let beforeFailure = host.sessions[refreshedIndex]
                 _ = SessionInputOutboxPolicy.recordFailure(
                     entryID: queuedID,
                     attemptID: attemptID,
@@ -637,7 +666,9 @@ final class RunOrchestrator: ObservableObject {
                     in: &host.sessions[refreshedIndex].queuedFollowUps
                 )
                 host.sessions[refreshedIndex].lastUpdated = .now
-                host.persist()
+                if host.persist() != .saved {
+                    host.sessions[refreshedIndex] = beforeFailure
+                }
             }
             return false
         }
@@ -658,13 +689,18 @@ final class RunOrchestrator: ObservableObject {
         }
         guard host.ensureUnsafeProviderRouteAcknowledged(for: host.sessions[index]) else { return false }
         let beforeSubmission = host.sessions[index]
+        let previousSubmittedRequest = submittedRequests[id]
+        let previousRetryableRequest = retryableRequests[id]
+        let previousOutgoingSequence = host.conversationOutgoingActionSequence[id]
         host.markConversationOutgoingAction(for: id)
         host.sessions[index].messages.append(.init(role: .assistant, text: ""))
         submittedRequests[id] = submission.runText
         retryableRequests[id] = nil
         guard startRun(for: id, at: index, submittedText: submission.runText) else {
             host.sessions[index] = beforeSubmission
-            submittedRequests[id] = nil
+            submittedRequests[id] = previousSubmittedRequest
+            retryableRequests[id] = previousRetryableRequest
+            host.conversationOutgoingActionSequence[id] = previousOutgoingSequence
             return false
         }
         return true
@@ -695,6 +731,7 @@ final class RunOrchestrator: ObservableObject {
             break
         case .rejected(let rejection):
             // Provider finished but local dequeue was rejected — leave a durable failure, not a stuck claim.
+            let beforeFailure = host.sessions[index]
             _ = SessionInputOutboxPolicy.recordFailure(
                 entryID: attempt.entryID,
                 attemptID: attempt.attemptID,
@@ -706,6 +743,10 @@ final class RunOrchestrator: ObservableObject {
             )
             host.sessions[index].lastUpdated = .now
             host.threadActivityLanes.apply(.queued(host.sessions[index].queuedFollowUps.count), to: id)
+            if host.persist() != .saved {
+                host.sessions[index] = beforeFailure
+                host.threadActivityLanes.apply(.queued(beforeFailure.queuedFollowUps.count), to: id)
+            }
             return false
         }
         host.sessions[index].queuedFollowUps = outbox
@@ -714,16 +755,7 @@ final class RunOrchestrator: ObservableObject {
         host.threadActivityLanes.apply(.queued(host.sessions[index].queuedFollowUps.count), to: id)
         guard host.persist() == .saved else {
             host.sessions[index] = beforeDequeue
-            _ = SessionInputOutboxPolicy.recordFailure(
-                entryID: attempt.entryID,
-                attemptID: attempt.attemptID,
-                reason: .init(
-                    code: .dispatchRejected,
-                    detail: "The provider completed, but local dequeue could not be saved. Remove it after confirming the response, or review before retrying."
-                ),
-                in: &host.sessions[index].queuedFollowUps
-            )
-            host.threadActivityLanes.apply(.queued(host.sessions[index].queuedFollowUps.count), to: id)
+            host.threadActivityLanes.apply(.queued(beforeDequeue.queuedFollowUps.count), to: id)
             return false
         }
         return true
@@ -732,6 +764,7 @@ final class RunOrchestrator: ObservableObject {
     func failDispatchingOutbox(for id: UUID, reason: QueuedFollowUpFailureReason) {
         guard let index = host.sessions.firstIndex(where: { $0.id == id }),
               let attempt = dispatchingOutboxAttempt(for: id) else { return }
+        let beforeFailure = host.sessions[index]
         _ = SessionInputOutboxPolicy.recordFailure(
             entryID: attempt.entryID,
             attemptID: attempt.attemptID,
@@ -740,10 +773,23 @@ final class RunOrchestrator: ObservableObject {
         )
         host.sessions[index].lastUpdated = .now
         host.threadActivityLanes.apply(.queued(host.sessions[index].queuedFollowUps.count), to: id)
+        if host.persist() != .saved {
+            host.sessions[index] = beforeFailure
+            host.threadActivityLanes.apply(.queued(beforeFailure.queuedFollowUps.count), to: id)
+        }
     }
 
     @discardableResult
     func startRun(for id: UUID, at index: Int, submittedText: String) -> Bool {
+        guard host.sessions.indices.contains(index),
+              host.sessions[index].id == id,
+              SessionTranscriptMutation.canMutateContent(in: host.sessions[index]) else {
+            host.setError(
+                "This chat's conversation content must finish loading before a run can start.",
+                sessionID: id
+            )
+            return false
+        }
         // Defense in depth: every provider stream launch stays behind the same
         // acknowledgement check, even if a future caller skips send validation.
         guard host.ensureUnsafeProviderRouteAcknowledged(for: host.sessions[index]) else {
@@ -912,7 +958,6 @@ final class RunOrchestrator: ObservableObject {
             return nil
         }()
         let planRestrictsWrites = session.executionRoute.mode == .code
-            && session.executionRoute.runtimeID == "pi"
             && session.codePhase.restrictsMutatingTools
         let allowFileModification = !isExtensionSelfEdit && !planRestrictsWrites
         do {
@@ -942,13 +987,38 @@ final class RunOrchestrator: ObservableObject {
                 return
             }
         }
-        // Handoff accepted and envelope ready: apply one-shot compact / session reset side effects.
-        if launchPlan.resetsHarnessSession {
-            host.sessions[index].harnessThreadID = nil
+        // Read every required credential before consuming one-shot handoff state. A
+        // locked, denied, missing, or unreadable Keychain item leaves retry state intact.
+        var openCodeAPIKey: String?
+        if OpenCodeCredentialPolicy.allowsKeychainCredential(
+            for: session.executionRoute,
+            enabledModes: host.openCodeCredentialEnabledModes
+        ) {
+            let readResult = KeychainStore.read(account: OpenCodeCredentialPolicy.keychainAccount)
+            host.applyOpenCodeCredentialReadResult(readResult)
+            guard case .value(let rawValue) = readResult,
+                  !rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                let detail = host.openCodeCredentialReadFailureMessage(readResult)
+                let failedStream = AsyncStream<AgentEvent> { continuation in
+                    continuation.yield(.failed(detail))
+                    continuation.finish()
+                }
+                Task { for await event in failedStream { apply(event, to: id, runID: runID) } }
+                return
+            }
+            openCodeAPIKey = rawValue
         }
-        if host.sessions[index].compactContextOnNextSend {
-            host.sessions[index].compactContextOnNextSend = false
-        }
+        // All launch gates are admitted: consume compact / session-reset state together.
+        let committedOneShotState = RunLaunchCommitPolicy.applying(
+            launchPlan,
+            admission: .admitted,
+            to: .init(
+                harnessThreadID: host.sessions[index].harnessThreadID,
+                compactContextOnNextSend: host.sessions[index].compactContextOnNextSend
+            )
+        )
+        host.sessions[index].harnessThreadID = committedOneShotState.harnessThreadID
+        host.sessions[index].compactContextOnNextSend = committedOneShotState.compactContextOnNextSend
         if launchPlan.resetsHarnessSession || launchPlan.didCompact {
             host.persist()
         }
@@ -961,12 +1031,6 @@ final class RunOrchestrator: ObservableObject {
         let developerInstructions = envelope.map {
             [$0.renderedSystemInstructions, trustedInstructions].filter { !$0.isEmpty }.joined(separator: "\n\n")
         }
-        let openCodeAPIKey = OpenCodeCredentialPolicy.allowsKeychainCredential(
-            for: session.executionRoute,
-            enabledModes: host.openCodeCredentialEnabledModes
-        )
-            ? KeychainStore.read(account: OpenCodeCredentialPolicy.keychainAccount)
-            : nil
         let localContextPlan: LatticeContextHandoffPlan? = {
             switch session.backend {
             case .appleIntelligence, .ollama:
@@ -1005,7 +1069,12 @@ final class RunOrchestrator: ObservableObject {
                 reasoningEffort: reasoningEffort,
                 policy: isExtensionSelfEdit ? .ask : session.policy,
                 allowFileModification: allowFileModification,
-                workspaceWrite: isExtensionSelfEdit ? SelfEditProviderLaunchPolicy.codexWorkspaceWrite : false,
+                workspaceWrite: CodeWorkspaceWritePolicy.codexWorkspaceWrite(
+                    route: session.executionRoute,
+                    allowFileModification: allowFileModification,
+                    isSelfEdit: isExtensionSelfEdit,
+                    selfEditWorkspaceWrite: SelfEditProviderLaunchPolicy.codexWorkspaceWrite
+                ),
                 recoveryPrompt: recoveryPrompt,
                 recoveryUsesVisibleTranscriptHandoff: recoveryUsesVisibleTranscriptHandoff,
                 recoveryDeliveryIssue: recoveryDeliveryIssue,

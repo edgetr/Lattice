@@ -1,12 +1,13 @@
 import Testing
 import Foundation
+import Darwin
 @testable import LatticeCore
 
 @Suite("Durable store recovery")
 struct DurableStoreRecoveryTests {
     // MARK: - Load classification
 
-    @Test func missingStoreIsNormalEmptyState() {
+    @Test func missingStoreIsNormalEmptyState() throws {
         let root = uniqueTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("sessions.json")
@@ -22,7 +23,7 @@ struct DurableStoreRecoveryTests {
             Issue.record("Absent file must be .missing, not a recovery failure")
         }
         let store = SessionPersistence(fileURL: url)
-        #expect(store.load().isEmpty)
+        #expect(try store.load().isEmpty)
     }
 
     @Test func corruptJSONIsFailedCorruptNotEmptySuccess() throws {
@@ -46,8 +47,13 @@ struct DurableStoreRecoveryTests {
         case .missing, .loaded:
             Issue.record("Corrupt JSON must surface as .failed(.corrupt)")
         }
-        // Compatibility load still returns empty without mutating the file.
-        #expect(store.load().isEmpty)
+        // Compatibility load is throwing: corruption can never masquerade as an empty store.
+        do {
+            _ = try store.load()
+            Issue.record("Corrupt compatibility load must throw")
+        } catch let error as SessionPersistenceLoadError {
+            #expect(error.issue.kind == .corrupt)
+        }
         #expect((try Data(contentsOf: url)) == corrupt)
     }
 
@@ -182,6 +188,15 @@ struct DurableStoreRecoveryTests {
         #expect(!DurableStoreRecovery.isNotFoundError(error))
     }
 
+    @Test func latticeStorePathENOENTIsNotFoundAndPermissionIsUnreadable() {
+        let missing = LatticeStorePathError.fileSystem(URL(fileURLWithPath: "/tmp/missing-sessions.json"), ENOENT)
+        let denied = LatticeStorePathError.fileSystem(URL(fileURLWithPath: "/tmp/denied-sessions.json"), EACCES)
+        #expect(DurableStoreRecovery.isNotFoundError(missing))
+        #expect(!DurableStoreRecovery.isUnreadableError(missing))
+        #expect(DurableStoreRecovery.isUnreadableError(denied))
+        #expect(!DurableStoreRecovery.isNotFoundError(denied))
+    }
+
     // MARK: - Self-edit stores
 
     @Test func selfEditJobsAndPreviewsReportCorruptIndependently() throws {
@@ -269,6 +284,52 @@ struct DurableStoreRecoveryTests {
         gate.unblock()
         try store.save([])
         #expect(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    @Test func writeGateBlockWaitsForInFlightWriteBeforeClosingGate() throws {
+        let gate = DurableStoreWriteGate()
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let blocked = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            gate.withExclusiveWrite {
+                entered.signal()
+                _ = release.wait(timeout: .now() + 2)
+            }
+        }
+        #expect(entered.wait(timeout: .now() + 1) == .success)
+        DispatchQueue.global(qos: .userInitiated).async {
+            gate.block()
+            blocked.signal()
+        }
+        // Recovery must not claim the gate while the transaction still owns the write lock.
+        #expect(blocked.wait(timeout: .now() + 0.1) == .timedOut)
+        release.signal()
+        #expect(blocked.wait(timeout: .now() + 1) == .success)
+        #expect(gate.isBlocked)
+        gate.unblock()
+    }
+
+    @Test func processLockContentionFailsWithinShortActionableBound() throws {
+        let root = uniqueTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let fileURL = root.appendingPathComponent(SessionPersistence.fileName)
+        let lockURL = root.appendingPathComponent(SessionPersistence.fileName + ".lock")
+        let descriptor = Darwin.open(lockURL.path, O_CREAT | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        #expect(descriptor >= 0)
+        guard descriptor >= 0 else { return }
+        defer {
+            _ = flock(descriptor, LOCK_UN)
+            Darwin.close(descriptor)
+        }
+        #expect(flock(descriptor, LOCK_EX) == 0)
+
+        let started = Date()
+        #expect(throws: Error.self) {
+            try SessionPersistence(fileURL: fileURL).save([])
+        }
+        #expect(Date().timeIntervalSince(started) < 2)
     }
 
     // MARK: - Retry / repair
@@ -629,7 +690,7 @@ struct DurableStoreRecoveryTests {
         let store = SessionPersistence(fileURL: root.appendingPathComponent("sessions.json"))
         let session = LatticeSession(title: "OK", backend: .codex(model: "gpt-5.4"), isPinned: true)
         try store.save([session])
-        #expect(store.load() == [session])
+        #expect(try store.load() == [session])
         if case .loaded(let sessions) = store.loadResult() {
             #expect(sessions == [session])
         } else {

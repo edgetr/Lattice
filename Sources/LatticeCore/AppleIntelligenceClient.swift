@@ -4,8 +4,13 @@ import FoundationModels
 #endif
 
 public final class AppleIntelligenceClient: @unchecked Sendable {
+    private struct Registration {
+        let token: UUID
+        var task: Task<Void, Never>?
+    }
+
     private let lock = NSLock()
-    private var tasks: [UUID: Task<Void, Never>] = [:]
+    private var tasks: [UUID: Registration] = [:]
 
     public init() {}
 
@@ -33,11 +38,18 @@ public final class AppleIntelligenceClient: @unchecked Sendable {
 
     public func stream(prompt: String, sessionID: UUID) -> AsyncStream<AgentEvent> {
         AsyncStream { continuation in
+            let token = UUID()
+            reserve(sessionID: sessionID, token: token)?.cancel()
             let task = Task { [self] in
+                defer {
+                    unregister(sessionID, token: token)
+                    continuation.finish()
+                }
                 #if canImport(FoundationModels)
                 if #available(macOS 26.0, *) {
                     guard SystemLanguageModel.default.isAvailable else {
-                        continuation.yield(.failed(statusDescription)); continuation.finish(); unregister(sessionID); return
+                        continuation.yield(.failed(statusDescription))
+                        return
                     }
                     do {
                         let session = LanguageModelSession(
@@ -55,20 +67,64 @@ public final class AppleIntelligenceClient: @unchecked Sendable {
                         continuation.yield(.completed)
                     } catch is CancellationError { continuation.yield(.cancelled) }
                     catch { continuation.yield(.failed(error.localizedDescription)) }
-                    continuation.finish(); unregister(sessionID); return
+                    return
                 }
                 #endif
-                continuation.yield(.failed("Apple Intelligence requires macOS 26 or later.")); continuation.finish(); unregister(sessionID)
+                continuation.yield(.failed("Apple Intelligence requires macOS 26 or later."))
             }
-            register(task, for: sessionID)
-            continuation.onTermination = { [weak self] _ in self?.cancel(sessionID: sessionID) }
+            attach(task, sessionID: sessionID, token: token)
+            continuation.onTermination = { [weak self] _ in
+                self?.cancel(sessionID: sessionID, token: token)
+            }
         }
     }
 
     public func cancel(sessionID: UUID) {
-        lock.lock(); let task = tasks.removeValue(forKey: sessionID); lock.unlock(); task?.cancel()
+        lock.lock()
+        let task = tasks.removeValue(forKey: sessionID)?.task
+        lock.unlock()
+        task?.cancel()
     }
 
-    private func register(_ task: Task<Void, Never>, for id: UUID) { lock.lock(); tasks[id] = task; lock.unlock() }
-    private func unregister(_ id: UUID) { lock.lock(); tasks[id] = nil; lock.unlock() }
+    var activeTaskCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return tasks.count
+    }
+
+    private func reserve(sessionID: UUID, token: UUID) -> Task<Void, Never>? {
+        lock.lock()
+        let previous = tasks.updateValue(Registration(token: token, task: nil), forKey: sessionID)?.task
+        lock.unlock()
+        return previous
+    }
+
+    private func attach(_ task: Task<Void, Never>, sessionID: UUID, token: UUID) {
+        lock.lock()
+        if tasks[sessionID]?.token == token {
+            tasks[sessionID]?.task = task
+            lock.unlock()
+        } else {
+            lock.unlock()
+            task.cancel()
+        }
+    }
+
+    private func unregister(_ id: UUID, token: UUID) {
+        lock.lock()
+        if tasks[id]?.token == token { tasks[id] = nil }
+        lock.unlock()
+    }
+
+    private func cancel(sessionID: UUID, token: UUID) {
+        lock.lock()
+        let task: Task<Void, Never>?
+        if tasks[sessionID]?.token == token {
+            task = tasks.removeValue(forKey: sessionID)?.task
+        } else {
+            task = nil
+        }
+        lock.unlock()
+        task?.cancel()
+    }
 }

@@ -6,8 +6,30 @@ import Darwin
 import UniformTypeIdentifiers
 import LatticeCore
 
+enum SelfEditReviewHandlingResult {
+    case notHandled
+    case committed
+    case failed
+}
+
 @MainActor
 extension AppState {
+    /// Mutating a lazy session while its sidecars are evicted would silently discard
+    /// transcript/artifact content. Start selection hydration and fail closed until both
+    /// authoritative content stores are materialized.
+    @discardableResult
+    func requireLoadedSessionContent(for id: UUID, at index: Int) -> Bool {
+        guard sessions.indices.contains(index), sessions[index].id == id else { return false }
+        guard SessionTranscriptMutation.canMutateContent(in: sessions[index]) else {
+            if selectedSessionID == id, transcriptLoadingSessionID != id {
+                prepareTranscriptSelection(selectedID: id)
+            }
+            setError("Loading this chat's conversation content. Try again when loading finishes.", sessionID: id)
+            return false
+        }
+        return ensureLegacySelfEditIntentPersisted(at: index)
+    }
+
     // MARK: - Derived route identity (no stored selectedRoute* authority)
 
     /// Derived route engine for composer/default when no session is selected.
@@ -30,17 +52,29 @@ extension AppState {
         return Self.defaultHarnessID(for: composerSelectionBackend ?? defaultBackend)
     }
 
-    func send(_ text: String) {
-        if handleSelfEditReviewDecision(text) { return }
-        guard let submission = prepareSubmission(text) else { return }
+    @discardableResult
+    func send(_ text: String) -> Bool {
+        switch handleSelfEditReviewDecision(text) {
+        case .committed:
+            return true
+        case .failed:
+            return false
+        case .notHandled:
+            break
+        }
+        guard let submission = prepareSubmission(text) else { return false }
         if selectedSessionID == nil {
             guard materializeTransientSession() else {
-                setError("Choose a mode and model before sending.", sessionID: nil)
-                return
+                if sessionSaveFailure == nil, !needsPersistenceRecovery {
+                    setError("Choose a mode and model before sending.", sessionID: nil)
+                }
+                return false
             }
         }
-        guard let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }), !sessions[index].isStreaming else { return }
-        startPreparedSubmission(submission, for: id, at: index)
+        guard let id = selectedSessionID,
+              let index = sessions.firstIndex(where: { $0.id == id }),
+              !sessions[index].isStreaming else { return false }
+        return startPreparedSubmission(submission, for: id, at: index)
     }
 
     @discardableResult
@@ -48,8 +82,19 @@ extension AppState {
         guard isTransientNewChat,
               let mode = composerSelectionMode,
               let backend = composerSelectionBackend,
-              let route = ExecutionRouteResolver.resolve(mode: mode, backend: backend),
-              composerUnavailableReason(for: backend, route: route) == nil else { return false }
+              let preferredRoute = ExecutionRouteResolver.resolve(mode: mode, backend: backend) else { return false }
+        let route: ExecutionRoute
+        if mode == .code,
+           let resolution = piFirstCodeResolution(for: preferredRoute, routeLocked: false) {
+            guard resolution.isRunnable else {
+                setError(resolution.blockingReason ?? resolution.disclosure, sessionID: nil)
+                return false
+            }
+            route = resolution.route
+        } else {
+            guard composerUnavailableReason(for: backend, route: preferredRoute) == nil else { return false }
+            route = preferredRoute
+        }
         let session = LatticeSession(
             title: "New chat",
             backend: backend,
@@ -62,36 +107,94 @@ extension AppState {
             draft: draft
         )
         sessions.insert(session, at: 0)
+        guard persist() == .saved else {
+            sessions.removeAll { $0.id == session.id }
+            refreshSearchIndexForLoadedSessions()
+            if needsPersistenceRecovery {
+                setError("Resolve chat store recovery before creating this conversation.", sessionID: nil)
+            }
+            return false
+        }
         isTransientNewChat = false
         selectedSessionID = session.id
         selectedSection = .conversations
         clearError()
-        persist()
+        return true
+    }
+
+    /// Admit a Pi-first route immediately before a prompt is appended. This is
+    /// the last safe point at which an unlocked, empty chat may switch runtime.
+    /// Persist the route before user content; rollback keeps the UI and durable
+    /// store truthful if the write fails.
+    @discardableResult
+    func materializePiFirstCodeRouteIfNeeded(at index: Int) -> Bool {
+        guard sessions.indices.contains(index),
+              sessions[index].isTranscriptLoaded,
+              sessions[index].totalMessageCount == 0 else { return true }
+        let current = sessions[index].executionRoute
+        guard let preferred = PiFirstCodeRoutingPolicy.preferredRoute(for: current)
+                ?? (current.mode == .code && current.runtimeID == "pi" ? current : nil) else {
+            return true
+        }
+        guard let resolution = piFirstCodeResolution(for: preferred, routeLocked: false) else { return true }
+        guard resolution.isRunnable else {
+            setError(resolution.blockingReason ?? resolution.disclosure, sessionID: sessions[index].id)
+            return false
+        }
+        guard resolution.route != current else { return true }
+        let previous = sessions[index]
+        sessions[index].executionRoute = resolution.route
+        sessions[index].harnessID = resolution.route.runtimeID
+        sessions[index].reasoningEffort = defaultReasoning(for: sessions[index].backend, harnessID: resolution.route.runtimeID)
+        sessions[index].harnessThreadID = nil
+        sessions[index].lastUpdated = .now
+        guard persist() == .saved else {
+            sessions[index] = previous
+            return false
+        }
+        setActivity(
+            [.init(
+                icon: resolution.usesProviderFallback ? "arrow.triangle.branch" : "cpu",
+                title: resolution.usesProviderFallback ? "Provider fallback" : "Lattice Agent restored",
+                detail: resolution.disclosure
+            )],
+            sessionID: sessions[index].id
+        )
         return true
     }
 
     @discardableResult
-    func handleSelfEditReviewDecision(_ text: String) -> Bool {
+    func handleSelfEditReviewDecision(_ text: String) -> SelfEditReviewHandlingResult {
         guard let decision = LatticeSelfEditReviewDecision.parse(text),
               let sessionID = selectedSessionID,
               let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }),
               !sessions[sessionIndex].isStreaming,
-              let preview = visibleSelfEditPreviews(for: sessionID).first else { return false }
+              requireLoadedSessionContent(for: sessionID, at: sessionIndex),
+              let preview = visibleSelfEditPreviews(for: sessionID).first else { return .notHandled }
+        let previousSession = sessions[sessionIndex]
+        let previousOutgoingSequence = conversationOutgoingActionSequence[sessionID]
         markConversationOutgoingAction(for: sessionID)
         sessions[sessionIndex].messages.append(.init(role: .user, text: text.trimmingCharacters(in: .whitespacesAndNewlines)))
         sessions[sessionIndex].lastUpdated = .now
-        persist()
+        guard persist() == .saved else {
+            sessions[sessionIndex] = previousSession
+            conversationOutgoingActionSequence[sessionID] = previousOutgoingSequence
+            return .failed
+        }
         switch decision {
         case .accept:
             acceptSelfEditPreview(preview)
         case .discard:
             discardSelfEditPreview(preview)
         }
-        return true
+        return .committed
     }
 
     func continueSelectedResponse() {
-        guard let session = selectedSession,
+        guard let sessionID = selectedSessionID,
+              let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }),
+              requireLoadedSessionContent(for: sessionID, at: sessionIndex),
+              let session = selectedSession,
               LatticeContinuationPolicy.canContinue(session) else { return }
         guard canRunSession(session) else {
             setError(routeUnavailableMessage(for: session) ?? "Choose a connected model.", sessionID: session.id)
@@ -109,7 +212,10 @@ extension AppState {
         at index: Int,
         sourceOutboxID: UUID? = nil
     ) -> Bool {
+        guard sessions.indices.contains(index), sessions[index].id == id,
+              requireLoadedSessionContent(for: id, at: index) else { return false }
         normalizeSessionBackendBeforeRun(at: index)
+        guard materializePiFirstCodeRouteIfNeeded(at: index) else { return false }
         guard canRunSession(sessions[index]) else {
             setError(routeUnavailableMessage(for: sessions[index]) ?? "Choose a connected model.", sessionID: id)
             composerState = .expanded
@@ -124,6 +230,9 @@ extension AppState {
         }
         guard ensureUnsafeProviderRouteAcknowledged(for: sessions[index]) else { return false }
         let beforeSubmission = sessions[index]
+        let previousSubmittedRequest = submittedRequests[id]
+        let previousRetryableRequest = retryableRequests[id]
+        let previousOutgoingSequence = conversationOutgoingActionSequence[id]
         markConversationOutgoingAction(for: id)
         if submission.startsSelfEdit {
             sessions[index].intent = .selfEdit
@@ -137,7 +246,9 @@ extension AppState {
         retryableRequests[id] = nil
         guard startRun(for: id, at: index, submittedText: submission.runText) else {
             sessions[index] = beforeSubmission
-            submittedRequests[id] = nil
+            submittedRequests[id] = previousSubmittedRequest
+            retryableRequests[id] = previousRetryableRequest
+            conversationOutgoingActionSequence[id] = previousOutgoingSequence
             return false
         }
         return true
@@ -149,6 +260,7 @@ extension AppState {
               edit.belongs(to: id),
               let index = sessions.firstIndex(where: { $0.id == id }),
               !sessions[index].isStreaming,
+              requireLoadedSessionContent(for: id, at: index),
               let messageIndex = sessions[index].messages.firstIndex(where: { $0.id == edit.messageID && $0.role == .user }) else { return }
         guard let submission = prepareSubmission(text) else { return }
         normalizeSessionBackendBeforeRun(at: index)
@@ -159,6 +271,10 @@ extension AppState {
             return
         }
         guard ensureUnsafeProviderRouteAcknowledged(for: sessions[index]) else { return }
+        let previousSession = sessions[index]
+        let previousSubmittedRequest = submittedRequests[id]
+        let previousRetryableRequest = retryableRequests[id]
+        let previousOutgoingSequence = conversationOutgoingActionSequence[id]
         markConversationOutgoingAction(for: id)
         sessions[index].messages[messageIndex].text = submission.userText
         sessions[index].messages.removeSubrange(sessions[index].messages.index(after: messageIndex)..<sessions[index].messages.endIndex)
@@ -176,14 +292,20 @@ extension AppState {
         if messageIndex == sessions[index].messages.startIndex {
             sessions[index].title = sessions[index].intent == .selfEdit ? Self.selfEditTitle(for: submission.userText) : String(submission.userText.prefix(48))
         }
+        submittedRequests[id] = submission.runText
+        retryableRequests[id] = nil
+        guard startRun(for: id, at: index, submittedText: submission.runText) else {
+            sessions[index] = previousSession
+            submittedRequests[id] = previousSubmittedRequest
+            retryableRequests[id] = previousRetryableRequest
+            conversationOutgoingActionSequence[id] = previousOutgoingSequence
+            return
+        }
         let existing = MessageEditDraftState(context: edit, preservedComposerDraft: preservedComposerDraftBeforeEdit)
-        // Clear edit mode first, then restore the pre-edit ordinary draft (still unsent).
+        // Clear edit mode only after the edited transcript is durably admitted.
         editingMessageContext = nil
         preservedComposerDraftBeforeEdit = ""
         draft = MessageEditDraftState.complete(existing)
-        submittedRequests[id] = submission.runText
-        retryableRequests[id] = nil
-        startRun(for: id, at: index, submittedText: submission.runText)
     }
 
     @discardableResult
@@ -217,10 +339,15 @@ extension AppState {
               let index = sessions.firstIndex(where: { $0.id == id }),
               let queuedIndex = sessions[index].queuedFollowUps.firstIndex(where: { $0.id == queuedID }) else { return }
         guard case .dispatching = sessions[index].queuedFollowUps[queuedIndex].lifecycle else {
+            let previousSession = sessions[index]
             sessions[index].queuedFollowUps.remove(at: queuedIndex)
             threadActivityLanes.apply(.queued(sessions[index].queuedFollowUps.count), to: id)
             sessions[index].lastUpdated = .now
-            persist()
+            guard persist() == .saved else {
+                sessions[index] = previousSession
+                threadActivityLanes.apply(.queued(previousSession.queuedFollowUps.count), to: id)
+                return
+            }
             return
         }
     }
@@ -434,7 +561,8 @@ extension AppState {
     }
 
     func normalizeSessionBackendBeforeRun(at index: Int) {
-        guard !sessions[index].messages.contains(where: { $0.role == .user }) else { return }
+        guard sessions[index].isTranscriptLoaded,
+              sessions[index].totalMessageCount == 0 else { return }
         // New mode routes are explicit user choices. Never normalize them back
         // through the legacy backend selector or switch their runtime implicitly.
         if ExecutionRouteResolver.isDeclared(sessions[index].executionRoute) { return }
@@ -464,7 +592,9 @@ extension AppState {
             return canRunDeclaredRoute(session.executionRoute)
         }
         let harnessID = effectiveHarnessID(for: session)
-        let routeLocked = session.messages.contains(where: { $0.role == .user }) || session.harnessThreadID != nil
+        let routeLocked = session.totalMessageCount > 0
+            || !session.isTranscriptLoaded
+            || session.harnessThreadID != nil
         if routeLocked {
             return canContinueLockedRoute(session.backend, harnessID: harnessID)
         }
@@ -496,6 +626,46 @@ extension AppState {
     func routeReadinessSnapshot(for route: ExecutionRoute) -> RouteReadinessSnapshot? {
         guard ExecutionRouteResolver.isDeclared(route) else {
             return nil
+        }
+
+        // A provider fallback is a declared, explicit route, but it must use
+        // the provider's own runtime readiness contract. Codex app-server owns
+        // its sandbox; OpenCode ACP still requires Lattice's system sandbox.
+        if PiFirstCodeRoutingPolicy.isDeclaredProviderFallback(route) {
+            let runtimePresent: Bool
+            let authenticationValidated: Bool
+            let modelValidated: Bool
+            let sandboxAvailable: Bool
+            switch route.providerID {
+            case "codex":
+                runtimePresent = codex.isInstalled
+                authenticationValidated = codexReady && codexAuthenticated && codexProtocolUnavailableReason == nil
+                modelValidated = route.modelID.map { model in
+                    visibleCodexModels.contains(where: { $0.id == model })
+                } ?? false
+                sandboxAvailable = true
+            case "opencode":
+                runtimePresent = openCodeACP.isInstalled
+                authenticationValidated = openCodeReady
+                modelValidated = route.modelID.map { model in
+                    visibleOpenCodeModels.contains(where: { $0.id == model })
+                        && ACPHarness.bestMatch(for: model, in: openCodeACPModels) != nil
+                } ?? false
+                sandboxAvailable = FileManager.default.isExecutableFile(atPath: HarnessSandbox.systemExecutableURL.path)
+            default:
+                return nil
+            }
+            return RouteReadinessEvaluator.evaluate(
+                route: route,
+                requirements: RouteReadinessRequirements(
+                    runtimePresent: runtimePresent,
+                    authenticationValidated: authenticationValidated,
+                    modelValidated: modelValidated,
+                    sandboxAvailable: sandboxAvailable
+                ),
+                validating: cliBusyProviders.contains(route.runtimeID)
+                    || cliBusyProviders.contains("\(route.runtimeID)-\(route.providerID)")
+            )
         }
 
         let runtimePresent: Bool
@@ -559,6 +729,26 @@ extension AppState {
                 sandboxAvailable: sandboxAvailable
             ),
             validating: cliBusyProviders.contains(route.runtimeID) || cliBusyProviders.contains("\(route.runtimeID)-\(route.providerID)")
+        )
+    }
+
+    /// Resolve the Pi-first policy against the live preferred and exact direct
+    /// provider readiness. Loading/validating preferred state never falls back.
+    func piFirstCodeResolution(
+        for route: ExecutionRoute,
+        routeLocked: Bool
+    ) -> PiFirstCodeRouteResolution? {
+        guard let preferred = PiFirstCodeRoutingPolicy.preferredRoute(for: route) else { return nil }
+        let preferredReadiness = routeReadinessSnapshot(for: preferred)?.readiness
+            ?? .failed("Lattice Agent did not report this exact model.")
+        let directReadiness = PiFirstCodeRoutingPolicy.fallbackRoute(for: preferred)
+            .flatMap { routeReadinessSnapshot(for: $0)?.readiness }
+            ?? .failed("The exact provider route is unavailable.")
+        return PiFirstCodeRoutingPolicy.resolve(
+            preferredRoute: preferred,
+            preferredReadiness: preferredReadiness,
+            directReadiness: directReadiness,
+            routeLocked: routeLocked
         )
     }
 
@@ -692,6 +882,10 @@ extension AppState {
         guard validBackend(backend, privacyMode: activePrivacyMode) == backend else {
             return backendUnavailableMessage(for: backend) ?? "Unavailable"
         }
+        if route.mode == .code,
+           let resolution = piFirstCodeResolution(for: route, routeLocked: false) {
+            return resolution.isRunnable ? nil : resolution.blockingReason
+        }
         let routeIsRunnable = ExecutionRouteResolver.isDeclared(route)
             ? canRunDeclaredRoute(route)
             : canRunBackend(backend, harnessID: route.runtimeID)
@@ -774,6 +968,9 @@ extension AppState {
             return message
         }
         if canRunSession(session) { return nil }
+        if PiFirstCodeRoutingPolicy.isDeclaredProviderFallback(session.executionRoute) {
+            return "Provider fallback is unavailable. Restore \(session.executionRoute.providerID.capitalized) or start a new chat to retry Lattice Agent."
+        }
         if ExecutionRouteResolver.isDeclared(session.executionRoute) {
             switch session.executionRoute.runtimeID {
             case "pi":
@@ -1053,25 +1250,35 @@ extension AppState {
         }
     }
 
-    func setBackend(_ backend: ChatBackend, shouldSyncExecutionRoute: Bool = true) {
+    func setBackend(
+        _ backend: ChatBackend,
+        shouldSyncExecutionRoute: Bool = true,
+        preferredHarnessID: String? = nil
+    ) {
         if !SessionPrivacyPolicy.allows(backend, in: activePrivacyMode) {
             let message = backendUnavailableMessage(for: backend) ?? SessionPrivacyPolicy.cloudBlockedMessage
             setError(message, sessionID: selectedSessionID)
             return
         }
-        if shouldSyncExecutionRoute, !canUseBackendInNewChat(backend) {
+        let requestedHarnessRunnable = preferredHarnessID.map { canRunBackend(backend, harnessID: $0) }
+        if shouldSyncExecutionRoute,
+           !(requestedHarnessRunnable ?? canUseBackendInNewChat(backend)) {
             let message = backendUnavailableMessage(for: backend) ?? "Choose a connected model."
             setError(message, sessionID: selectedSessionID)
             return
         }
         let previous = activeBackend
+        let previousDefaultBackend = defaultBackend
+        let selectedIndex = selectedSessionID.flatMap { id in sessions.firstIndex(where: { $0.id == id }) }
+        let previousSession = selectedIndex.map { sessions[$0] }
         defaultBackend = backend
         saveDefaultBackend()
         if shouldSyncExecutionRoute { syncExecutionRoute(from: backend) }
-        if let id = selectedSessionID,
-           let index = sessions.firstIndex(where: { $0.id == id }),
+        if selectedSessionID != nil,
+           let index = selectedIndex,
            !sessions[index].isStreaming,
-           !sessions[index].messages.contains(where: { $0.role == .user }) {
+           sessions[index].isTranscriptLoaded,
+           sessions[index].totalMessageCount == 0 {
             sessions[index].backend = backend
             let route = RouteRuntimeMap.writeRoute(
                 backend: backend,
@@ -1079,15 +1286,21 @@ extension AppState {
                     ? .local
                     : (composerSelectionMode ?? sessions[index].executionRoute.mode),
                 preferredRuntimeID: shouldSyncExecutionRoute
-                    ? nil
-                    : (selectedSession.map { effectiveHarnessID(for: $0) })
+                    ? preferredHarnessID
+                    : (preferredHarnessID ?? selectedSession.map { effectiveHarnessID(for: $0) })
             )
             sessions[index].executionRoute = route
             sessions[index].harnessID = route.runtimeID
             sessions[index].reasoningEffort = defaultReasoning(for: backend, harnessID: route.runtimeID)
             sessions[index].harnessThreadID = nil
-            persist()
+            guard persist() == .saved else {
+                if let previousSession, let index = selectedIndex { sessions[index] = previousSession }
+                defaultBackend = previousDefaultBackend
+                saveDefaultBackend()
+                return
+            }
         }
+        // Provider lifecycle side effects happen only after durable route admission.
         if case .ollama(let model) = previous, previous != backend {
             Task { await unloadLocalModel(model, reason: "Unloaded after model switch") }
         }
@@ -1110,7 +1323,7 @@ extension AppState {
             return
         }
         // Authority is backend + session.executionRoute (via setBackend / RouteRuntimeMap).
-        setBackend(backend, shouldSyncExecutionRoute: true)
+        setBackend(backend, shouldSyncExecutionRoute: true, preferredHarnessID: route.harnessID)
     }
 
     func setLocalModelIdleUnloadMinutes(_ minutes: Int) {
@@ -1120,9 +1333,16 @@ extension AppState {
     }
 
     func setReasoningEffort(_ effort: ReasoningEffort) {
-        guard let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }), !sessions[index].isStreaming else { return }
+        guard let id = selectedSessionID,
+              let index = sessions.firstIndex(where: { $0.id == id }),
+              !sessions[index].isStreaming,
+              requireLoadedSessionContent(for: id, at: index) else { return }
         guard reasoningOptions(for: sessions[index].backend, harnessID: effectiveHarnessID(for: sessions[index])).contains(where: { $0.effort == effort }) else { return }
-        sessions[index].reasoningEffort = effort; persist()
+        let previousSession = sessions[index]
+        sessions[index].reasoningEffort = effort
+        if persist() != .saved {
+            sessions[index] = previousSession
+        }
     }
 
     func setSessionPolicy(_ value: ExecutionPolicy) {
@@ -1133,9 +1353,14 @@ extension AppState {
                 setError("Stop the current response before changing execution policy.", sessionID: id)
                 return
             }
+            let previousSession = sessions[index]
+            let previousPolicy = policy
             sessions[index].policy = value
             policy = value
-            persist()
+            if persist() != .saved {
+                sessions[index] = previousSession
+                policy = previousPolicy
+            }
             return
         }
         // No active chat: update the default for the next new chat only.
@@ -1153,24 +1378,30 @@ extension AppState {
             setError("Plan phase is available for idle Code · Lattice Agent chats only.", sessionID: selectedSessionID)
             return
         }
+        guard requireLoadedSessionContent(for: id, at: index) else { return }
+        let previousSession = sessions[index]
         sessions[index].codePhase = .planActive
         if sessions[index].codePlan == nil {
             sessions[index].codePlan = CodePlanArtifact(title: title, body: seed)
         }
-        upsertSessionAction(.init(
+        SessionActionTrail.upsert(.init(
             messageID: sessions[index].messages.last?.id ?? UUID(),
             kind: .plan,
             title: "Plan phase started",
             detail: "Mutating tools withheld on the next send until you approve the plan. Grok/Antigravity native plan modes are unchanged.",
             status: .running,
             work: .init(kind: .planStep, ownership: .userOwned, stepKey: "plan-active")
-        ), at: index)
+        ), in: &sessions[index].actions)
+        sessions[index].lastUpdated = .now
+        guard persist() == .saved else {
+            sessions[index] = previousSession
+            return
+        }
         setActivity([.init(
             icon: "list.bullet.clipboard",
             title: "Planning",
             detail: "Write/edit/bash tools withheld on the next Lattice Agent send until you approve the plan."
         )], sessionID: id)
-        persist()
     }
 
     func submitCodePlanForApproval(body: String? = nil) {
@@ -1178,6 +1409,8 @@ extension AppState {
         guard sessions[index].executionRoute.runtimeID == "pi",
               sessions[index].codePhase == .planActive,
               !sessions[index].isStreaming else { return }
+        guard requireLoadedSessionContent(for: id, at: index) else { return }
+        let previousSession = sessions[index]
         if let body {
             let prior = sessions[index].codePlan
             sessions[index].codePlan = CodePlanArtifact(
@@ -1187,12 +1420,16 @@ extension AppState {
             )
         }
         sessions[index].codePhase = .planAwaitingApproval
+        sessions[index].lastUpdated = .now
+        guard persist() == .saved else {
+            sessions[index] = previousSession
+            return
+        }
         setActivity([.init(
             icon: "list.bullet.clipboard",
             title: "Plan awaiting approval",
             detail: "Write/edit/bash tools stay withheld until you approve. Takes effect on the next send."
         )], sessionID: id)
-        persist()
     }
 
     func approveCodePlan() {
@@ -1200,21 +1437,27 @@ extension AppState {
         guard sessions[index].executionRoute.runtimeID == "pi",
               sessions[index].codePhase == .planAwaitingApproval,
               !sessions[index].isStreaming else { return }
+        guard requireLoadedSessionContent(for: id, at: index) else { return }
+        let previousSession = sessions[index]
         sessions[index].codePhase = .implement
-        upsertSessionAction(.init(
+        SessionActionTrail.upsert(.init(
             messageID: sessions[index].messages.last?.id ?? UUID(),
             kind: .plan,
             title: "Plan approved",
             detail: sessions[index].codePlan.map { "Revision \($0.revision): \($0.title)" } ?? "Implement with normal tool policy.",
             status: .allowed,
             work: .init(kind: .planStep, ownership: .userOwned, stepKey: "plan-approved")
-        ), at: index)
+        ), in: &sessions[index].actions)
+        sessions[index].lastUpdated = .now
+        guard persist() == .saved else {
+            sessions[index] = previousSession
+            return
+        }
         setActivity([.init(
             icon: "checkmark.circle",
             title: "Plan approved",
             detail: "Implementing with normal tool policy on the next send."
         )], sessionID: id)
-        persist()
     }
 
     func requestCodePlanChanges(note: String = "") {
@@ -1222,29 +1465,40 @@ extension AppState {
         guard sessions[index].executionRoute.runtimeID == "pi",
               sessions[index].codePhase == .planAwaitingApproval,
               !sessions[index].isStreaming else { return }
+        guard requireLoadedSessionContent(for: id, at: index) else { return }
+        let previousSession = sessions[index]
         sessions[index].codePhase = .planActive
         let detail = note.trimmingCharacters(in: .whitespacesAndNewlines)
-        upsertSessionAction(.init(
+        SessionActionTrail.upsert(.init(
             messageID: sessions[index].messages.last?.id ?? UUID(),
             kind: .plan,
             title: "Plan changes requested",
             detail: detail.isEmpty ? "User requested plan revisions." : detail,
             status: .waiting,
             work: .init(kind: .planStep, ownership: .userOwned, stepKey: "plan-changes")
-        ), at: index)
-        persist()
+        ), in: &sessions[index].actions)
+        sessions[index].lastUpdated = .now
+        if persist() != .saved {
+            sessions[index] = previousSession
+        }
     }
 
     func exitCodePlanPhase() {
         guard let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }) else { return }
         guard sessions[index].executionRoute.runtimeID == "pi", !sessions[index].isStreaming else { return }
+        guard requireLoadedSessionContent(for: id, at: index) else { return }
+        let previousSession = sessions[index]
         sessions[index].codePhase = .normal
+        sessions[index].lastUpdated = .now
+        guard persist() == .saved else {
+            sessions[index] = previousSession
+            return
+        }
         setActivity([.init(
             icon: "list.bullet.clipboard",
             title: "Plan phase ended",
             detail: "Normal tool policy on the next send."
         )], sessionID: id)
-        persist()
     }
 
     // MARK: - Mid-chat Lattice Agent model switch
@@ -1287,6 +1541,9 @@ extension AppState {
             setError("Selected model is not available. Check Connections auth for Codex or OpenCode.", sessionID: id)
             return
         }
+        let previousSession = sessions[index]
+        let previousComposerMode = composerSelectionMode
+        let previousComposerBackend = composerSelectionBackend
         let previous = sessions[index].executionRoute
         let previousLabel = "\(previous.providerID)/\(previous.modelID ?? "?")"
         let nextLabel = "\(option.route.providerID)/\(option.route.modelID ?? "?")"
@@ -1326,6 +1583,14 @@ extension AppState {
             detail: "Switched Lattice Agent model \(previousLabel) → \(nextLabel). \(continuityDetail)",
             status: .completed
         ), at: index)
+        composerSelectionBackend = backend
+        composerSelectionMode = .code
+        guard persist() == .saved else {
+            sessions[index] = previousSession
+            composerSelectionMode = previousComposerMode
+            composerSelectionBackend = previousComposerBackend
+            return
+        }
         setActivity([.init(
             icon: "arrow.left.arrow.right",
             title: "Model switched",
@@ -1333,9 +1598,6 @@ extension AppState {
                 ? "Next send uses \(nextLabel) with a fresh session + handoff."
                 : "Next send uses \(nextLabel)."
         )], sessionID: id)
-        composerSelectionBackend = backend
-        composerSelectionMode = .code
-        persist()
     }
 
     // MARK: - Context compact
@@ -1346,19 +1608,29 @@ extension AppState {
             setError("Stop the current response before compacting context.", sessionID: id)
             return
         }
+        guard requireLoadedSessionContent(for: id, at: index) else { return }
+        let previousSession = sessions[index]
+        let previousActivity = activity
         sessions[index].compactContextOnNextSend = true
         setActivity([.init(
             icon: "arrow.triangle.2.circlepath",
             title: "Compact queued",
             detail: "Next send clears provider session continuity and rebuilds a compacted visible-transcript handoff (local estimate; not a provider tokenizer claim)."
         )], sessionID: id)
-        persist()
+        guard persist() == .saved else {
+            sessions[index] = previousSession
+            setActivity(previousActivity, sessionID: id)
+            return
+        }
     }
 
     func clearContextCompactForNextSend() {
         guard let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        guard !sessions[index].isStreaming,
+              requireLoadedSessionContent(for: id, at: index) else { return }
+        let previousSession = sessions[index]
         sessions[index].compactContextOnNextSend = false
-        persist()
+        guard persist() == .saved else { sessions[index] = previousSession; return }
     }
 
     func setSessionPrivacyMode(_ value: SessionPrivacyMode) {
@@ -1369,10 +1641,14 @@ extension AppState {
                 setError("Stop the current response before changing model privacy.", sessionID: id)
                 return
             }
+            guard requireLoadedSessionContent(for: id, at: index) else { return }
+            let previousSession = sessions[index]
+            let previousPrivacyMode = privacyMode
+            let previousActivity = activity
             sessions[index].privacyMode = value
             privacyMode = value
             if value == .localOnly,
-               !sessions[index].messages.contains(where: { $0.role == .user }),
+               sessions[index].totalMessageCount == 0,
                !sessions[index].backend.isLocal {
                 let local = localBackendFallback()
                 let route = RouteRuntimeMap.writeRoute(backend: local, mode: .local)
@@ -1383,7 +1659,12 @@ extension AppState {
                 sessions[index].harnessThreadID = nil
                 syncExecutionRoute(from: local)
             }
-            persist()
+            guard persist() == .saved else {
+                sessions[index] = previousSession
+                privacyMode = previousPrivacyMode
+                setActivity(previousActivity, sessionID: id)
+                return
+            }
             return
         }
         privacyMode = value
@@ -1435,10 +1716,17 @@ extension AppState {
     }
 
     func addAttachments(_ urls: [URL], source: ContextAttachmentSource) {
-        guard let id = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == id }) else {
+        guard let id = selectedSessionID,
+              let index = sessions.firstIndex(where: { $0.id == id }),
+              !sessions[index].isStreaming,
+              requireLoadedSessionContent(for: id, at: index) else {
             composerState = .expanded; overlayControlState = .expanded; overlayMode = .prompt
             return
         }
+        let previousSession = sessions[index]
+        let previousComposerState = composerState
+        let previousOverlayState = overlayControlState
+        let previousOverlayMode = overlayMode
         let existing = Set(sessions[index].attachments.map(\.path))
         let additions = urls
             .filter(\.isFileURL)
@@ -1446,16 +1734,36 @@ extension AppState {
             .filter { !existing.contains($0.path) }
             .map { ContextAttachment.inspecting(url: $0, source: source) }
         sessions[index].attachments.append(contentsOf: additions)
+        guard persist() == .saved else {
+            sessions[index] = previousSession
+            composerState = previousComposerState
+            overlayControlState = previousOverlayState
+            overlayMode = previousOverlayMode
+            setError("Could not save attachments for this chat.", sessionID: id)
+            return
+        }
         composerState = .expanded; overlayControlState = .expanded; overlayMode = .prompt
-        persist()
     }
 
     func removeAttachment(_ id: UUID) {
-        guard let sessionID = selectedSessionID, let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
-        if let attachment = sessions[index].attachments.first(where: { $0.id == id }), attachment.isLatticeManagedCapture {
-            try? captureStorage.removeCapture(attachment: attachment)
+        guard let sessionID = selectedSessionID,
+              let index = sessions.firstIndex(where: { $0.id == sessionID }),
+              !sessions[index].isStreaming,
+              requireLoadedSessionContent(for: sessionID, at: index),
+              let attachment = sessions[index].attachments.first(where: { $0.id == id }) else { return }
+        let previousSession = sessions[index]
+        sessions[index].attachments.removeAll { $0.id == id }
+        guard persist() == .saved else {
+            sessions[index] = previousSession
+            setError("Could not save the attachment removal.", sessionID: sessionID)
+            return
         }
-        sessions[index].attachments.removeAll { $0.id == id }; persist()
+        guard attachment.isLatticeManagedCapture else { return }
+        do {
+            try captureStorage.removeCapture(attachment: attachment)
+        } catch {
+            setError("Attachment removed from the chat, but its managed capture file could not be deleted: \(error.localizedDescription)", sessionID: sessionID)
+        }
     }
 
     func pasteImageFromClipboard() {
@@ -1561,7 +1869,10 @@ extension AppState {
         includeContext: Bool? = nil
     ) {
         let targetID = sessionID ?? selectedSessionID
-        guard let id = targetID, let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        guard let id = targetID,
+              let index = sessions.firstIndex(where: { $0.id == id }),
+              !sessions[index].isStreaming,
+              requireLoadedSessionContent(for: id, at: index) else { return }
         let contextAuthorized = (includeContext ?? includeScreenshotContext) && context != nil
         let accessibilityAuthorized = contextAuthorized && context?.accessibilityAuthorized == true
         let fallbackReason: String = {
@@ -1592,9 +1903,20 @@ extension AppState {
                 ),
                 protectedCaptureIDs: protectedCaptureIDs
             )
+            let previousSession = sessions[index]
             sessions[index].attachments.append(result.attachment)
+            guard persist() == .saved else {
+                sessions[index] = previousSession
+                do {
+                    try captureStorage.removeCapture(attachment: result.attachment)
+                } catch {
+                    setError("Could not save the screenshot attachment, and its temporary capture file could not be removed: \(error.localizedDescription)", sessionID: id)
+                    return
+                }
+                setError("Could not save the screenshot attachment.", sessionID: id)
+                return
+            }
             composerState = .expanded; overlayControlState = .expanded; overlayMode = .prompt
-            persist()
         } catch {
             setError("Could not store screenshot: \(error.localizedDescription)", sessionID: id)
         }
@@ -1610,12 +1932,20 @@ extension AppState {
         let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false; panel.prompt = "Choose"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         let previousRoot = activeWorkspacePathForTools
+        let previousSelectedWorkspacePath = selectedWorkspacePath
         selectedWorkspacePath = url.path
         if let id = selectedSessionID,
            let index = sessions.firstIndex(where: { $0.id == id }),
            sessions[index].totalMessageCount == 0,
            sessions[index].isTranscriptLoaded {
-            sessions[index].workspacePath = url.path; persist()
+            let previousSession = sessions[index]
+            sessions[index].workspacePath = url.path
+            guard persist() == .saved else {
+                sessions[index] = previousSession
+                selectedWorkspacePath = previousSelectedWorkspacePath
+                setError("Could not save the workspace change for this chat.", sessionID: id)
+                return
+            }
         }
         // Tools root can change without a session-ID change (global workspace, empty chat).
         if WorkspaceTerminalPolicy.sessionKey(forWorktreePath: previousRoot)

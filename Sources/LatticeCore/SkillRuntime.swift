@@ -101,7 +101,7 @@ public struct LatticeSkillRecord: Identifiable, Hashable, Sendable {
     public let validationMessages: [String]
 
     public var isValid: Bool { validationMessages.isEmpty }
-    public var canDelete: Bool { skillURL.path.hasPrefix(LatticeSkillStore.defaultRootURL().path) }
+    public var canDelete: Bool { LatticeSkillStore.isManagedSkillURL(skillURL) }
 
     public init(id: String, title: String, summary: String, source: LatticeSkillSource, skillURL: URL, originalURL: URL? = nil, ownerExtensionID: String? = nil, validationMessages: [String] = []) {
         self.id = id
@@ -172,12 +172,17 @@ public enum LatticeSkillPromptBuilder {
         let id = String(token).lowercased()
         guard LatticeSkillStore.isSafeSkillID(id), !disabledSkillIDs.contains(id) else { return nil }
         guard let record = records.first(where: { $0.id == id && $0.isValid }) else { return nil }
-        guard let data = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: record.skillURL),
+        guard let data = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(
+            at: record.skillURL,
+            maximumByteCount: LatticeSkillStore.maximumMarkdownByteCount
+        ),
               let markdown = String(data: data, encoding: .utf8),
               !markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         let request = tokenAndRest.count == 2
             ? String(tokenAndRest[1]).trimmingCharacters(in: .whitespacesAndNewlines)
             : ""
+        guard request.utf8.count <= LatticeSkillStore.maximumRequestByteCount,
+              record.title.utf8.count <= LatticeSkillStore.maximumTitleByteCount else { return nil }
         return .init(skillID: id, title: record.title, userRequest: request, markdown: markdown)
     }
 
@@ -303,6 +308,19 @@ public enum LatticeSkillEnablementRollbackPolicy {
 }
 
 public struct LatticeSkillStore: Sendable {
+    public static let maximumMarkdownByteCount = 128_000
+    public static let maximumRequestByteCount = 32_000
+    public static let maximumTitleByteCount = 512
+    private static let maximumSidecarByteCount = 8_192
+    private static let maximumGlobalSkillCount = 8_192
+    private static let maximumGlobalSkillDepth = 32
+
+    public static func isManagedSkillURL(_ url: URL) -> Bool {
+        guard let root = try? LatticeStorePathSecurity.canonicalDirectory(at: defaultRootURL()) else { return false }
+        let canonical = url.resolvingSymlinksInPath().standardizedFileURL
+        let rootPath = root.standardizedFileURL.path
+        return canonical.path == rootPath || canonical.path.hasPrefix(rootPath + "/")
+    }
     public let rootURL: URL
     public let globalRoots: [URL]
 
@@ -319,13 +337,13 @@ public struct LatticeSkillStore: Sendable {
     /// Prefer Lattice sidecar markers; fall back to pre-rename Nisa markers for existing skills.
     private static func readSidecarText(in folder: URL, primary: String, legacy: String) -> String? {
         let primaryURL = folder.appendingPathComponent(primary)
-        if let data = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: primaryURL),
+        if let data = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: primaryURL, maximumByteCount: maximumSidecarByteCount),
            let text = String(data: data, encoding: .utf8) {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty { return trimmed }
         }
         let legacyURL = folder.appendingPathComponent(legacy)
-        if let data = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: legacyURL),
+        if let data = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: legacyURL, maximumByteCount: maximumSidecarByteCount),
            let text = String(data: data, encoding: .utf8) {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty { return trimmed }
@@ -335,9 +353,9 @@ public struct LatticeSkillStore: Sendable {
 
     private static func readSidecarData(in folder: URL, primary: String, legacy: String) -> Data? {
         let primaryURL = folder.appendingPathComponent(primary)
-        if let data = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: primaryURL) { return data }
+        if let data = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: primaryURL, maximumByteCount: maximumMarkdownByteCount) { return data }
         let legacyURL = folder.appendingPathComponent(legacy)
-        return try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: legacyURL)
+        return try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: legacyURL, maximumByteCount: maximumMarkdownByteCount)
     }
 
     public static func defaultGlobalRoots() -> [URL] {
@@ -362,7 +380,11 @@ public struct LatticeSkillStore: Sendable {
             guard !id.isEmpty else { continue }
             guard "/\(id)" != LatticeSelfEditCommand.name else { continue }
             if deletedIDs.contains(id) { continue }
-            guard let sourceData = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: source) else {
+            guard let sourceData = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(
+                at: source,
+                maximumByteCount: Self.maximumMarkdownByteCount
+            ),
+                  String(data: sourceData, encoding: .utf8) != nil else {
                 continue
             }
             if let targetFolder = try LatticeStorePathSecurity.existingChildDirectory(named: id, under: canonicalRoot) {
@@ -447,7 +469,10 @@ public struct LatticeSkillStore: Sendable {
     /// Import a user-selected `SKILL.md` file or a skill directory containing one.
     public func importSkill(from selectedURL: URL, overwrite: Bool = false) throws -> LatticeSkillRecord {
         let skillFile = try resolveSkillMarkdownURL(from: selectedURL)
-        guard let data = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: skillFile),
+        guard let data = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(
+            at: skillFile,
+            maximumByteCount: Self.maximumMarkdownByteCount
+        ),
               let markdown = String(data: data, encoding: .utf8) else {
             throw NSError(domain: "LatticeSkillStore", code: 4, userInfo: [NSLocalizedDescriptionKey: "Could not read SKILL.md as UTF-8 text."])
         }
@@ -482,16 +507,18 @@ public struct LatticeSkillStore: Sendable {
     }
 
     private func resolveSkillMarkdownURL(from selectedURL: URL) throws -> URL {
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: selectedURL.path, isDirectory: &isDirectory) else {
+        guard LatticeStorePathSecurity.entryExistsWithoutFollowingSymlinks(at: selectedURL) else {
             throw NSError(domain: "LatticeSkillStore", code: 8, userInfo: [NSLocalizedDescriptionKey: "Selected path does not exist."])
         }
-        if isDirectory.boolValue {
+        if LatticeStorePathSecurity.isDirectoryWithoutFollowingSymlinks(at: selectedURL) {
             let candidate = selectedURL.appendingPathComponent("SKILL.md")
-            guard FileManager.default.fileExists(atPath: candidate.path) else {
+            guard LatticeStorePathSecurity.isRegularFileWithoutFollowingSymlinks(at: candidate) else {
                 throw NSError(domain: "LatticeSkillStore", code: 9, userInfo: [NSLocalizedDescriptionKey: "Selected folder does not contain SKILL.md."])
             }
             return candidate
+        }
+        guard LatticeStorePathSecurity.isRegularFileWithoutFollowingSymlinks(at: selectedURL) else {
+            throw NSError(domain: "LatticeSkillStore", code: 10, userInfo: [NSLocalizedDescriptionKey: "Select a regular SKILL.md file or a skill folder."])
         }
         guard selectedURL.lastPathComponent == "SKILL.md" || selectedURL.pathExtension.lowercased() == "md" else {
             throw NSError(domain: "LatticeSkillStore", code: 10, userInfo: [NSLocalizedDescriptionKey: "Select a SKILL.md file or a skill folder."])
@@ -570,7 +597,9 @@ public struct LatticeSkillStore: Sendable {
         }
         let folder = canonicalRoot.appendingPathComponent(id, isDirectory: true)
         let skillURL = folder.appendingPathComponent("SKILL.md")
-        let data = try? LatticeStorePathSecurity.readData(at: skillURL, under: canonicalRoot)
+        let data = (try? LatticeStorePathSecurity.readData(at: skillURL, under: canonicalRoot)).flatMap {
+            $0.count <= Self.maximumMarkdownByteCount ? $0 : nil
+        }
         let sourceRaw = Self.readSidecarText(in: folder, primary: ".lattice-skill-source", legacy: LatticeLegacyBrandCompatibility.skillSourceMarker)
         let originalPath = Self.readSidecarText(in: folder, primary: ".lattice-original-skill-path", legacy: LatticeLegacyBrandCompatibility.skillOriginalPathMarker)
         let importedBaselineData = Self.readSidecarData(in: folder, primary: ".lattice-imported-skill-baseline", legacy: LatticeLegacyBrandCompatibility.skillImportedBaselineMarker)
@@ -681,7 +710,9 @@ public struct LatticeSkillStore: Sendable {
                 // Refresh only when the user has not locally edited past the bundled baseline.
                 let skillURL = existing.appendingPathComponent("SKILL.md")
                 let baselineURL = bundledBaselineURL(in: existing)
-                let localData = try? LatticeStorePathSecurity.readData(at: skillURL, under: canonicalRoot)
+                let localData = (try? LatticeStorePathSecurity.readData(at: skillURL, under: canonicalRoot)).flatMap {
+                    $0.count <= Self.maximumMarkdownByteCount ? $0 : nil
+                }
                 let baselineData = try? LatticeStorePathSecurity.readData(at: baselineURL, under: canonicalRoot)
                 let nextData = Data(markdown.utf8)
                 if let localData, let baselineData, localData == baselineData {
@@ -926,15 +957,18 @@ public struct LatticeSkillStore: Sendable {
 
     public static func isSafeSkillID(_ id: String) -> Bool {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed == id, trimmed == trimmed.lowercased() else { return false }
+        guard !trimmed.isEmpty, trimmed == id, trimmed == trimmed.lowercased(), trimmed.utf8.count <= 64 else { return false }
         let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789-_")
         return trimmed.rangeOfCharacter(from: allowed.inverted) == nil
     }
 
     public static func safeSkillID(from value: String) -> String {
-        let lower = value.lowercased()
-        let mapped = lower.map { character -> Character in
-            if character.isLetter || character.isNumber || character == "-" || character == "_" { return character }
+        let lower = value.lowercased().prefix(256)
+        let mapped = lower.unicodeScalars.map { scalar -> Character in
+            if (scalar.value >= 97 && scalar.value <= 122) ||
+                (scalar.value >= 48 && scalar.value <= 57) || scalar.value == 45 || scalar.value == 95 {
+                return Character(String(scalar))
+            }
             return "-"
         }
         return String(mapped).trimmingCharacters(in: CharacterSet(charactersIn: "-_"))
@@ -980,17 +1014,31 @@ public struct LatticeSkillStore: Sendable {
     }
 
     private func globalSkillFiles() -> [URL] {
-        globalRoots.flatMap { root -> [URL] in
-            guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) else { return [] }
-            return enumerator.compactMap { item -> URL? in
-                guard let url = item as? URL, url.lastPathComponent == "SKILL.md" else { return nil }
-                if url.path.contains("/.system/") { return nil }
-                return url
-            }.sorted { $0.path < $1.path }
+        var files: [URL] = []
+        func walk(_ directory: URL, depth: Int) {
+            guard depth <= Self.maximumGlobalSkillDepth, files.count < Self.maximumGlobalSkillCount,
+                  LatticeStorePathSecurity.isDirectoryWithoutFollowingSymlinks(at: directory),
+                  let entries = try? LatticeStorePathSecurity.directoryEntriesWithoutFollowingSymlinks(in: directory) else { return }
+            for entry in entries.sorted(by: { $0.name < $1.name }) {
+                guard files.count < Self.maximumGlobalSkillCount,
+                      !entry.name.hasPrefix("."), entry.name != ".system" else { continue }
+                let child = directory.appendingPathComponent(entry.name)
+                if entry.isRegularFile {
+                    if entry.name == "SKILL.md" { files.append(child) }
+                } else if entry.isDirectory {
+                    walk(child, depth: depth + 1)
+                }
+            }
         }
+        for root in globalRoots { walk(root, depth: 0) }
+        return files.sorted { $0.path < $1.path }
     }
 
     private func writeImportedGlobalSkill(source: URL, sourceData: Data, targetFolder: URL) throws {
+        guard sourceData.count <= Self.maximumMarkdownByteCount,
+              String(data: sourceData, encoding: .utf8) != nil else {
+            throw NSError(domain: "LatticeSkillStore", code: 11, userInfo: [NSLocalizedDescriptionKey: "Imported skill exceeds safe UTF-8 size limit."])
+        }
         let canonicalRoot = try LatticeStorePathSecurity.canonicalDirectory(at: rootURL)
         let folder = try LatticeStorePathSecurity.createChildDirectory(named: targetFolder.lastPathComponent, under: canonicalRoot)
         let skillURL = folder.appendingPathComponent("SKILL.md")
@@ -1028,9 +1076,39 @@ public struct LatticeSkillStore: Sendable {
     private func loadRecord(_ folderURL: URL) -> LatticeSkillRecord? {
         guard LatticeStorePathSecurity.isDirectoryWithoutFollowingSymlinks(at: folderURL) else { return nil }
         let id = folderURL.lastPathComponent
+        guard Self.isSafeSkillID(id) else { return nil }
         let skillURL = folderURL.appendingPathComponent("SKILL.md")
-        guard let data = try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: skillURL),
-              let markdown = String(data: data, encoding: .utf8) else { return nil }
+        let data: Data
+        do {
+            data = try LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(
+                at: skillURL,
+                maximumByteCount: Self.maximumMarkdownByteCount
+            )
+        } catch let error as LatticeStorePathError {
+            if case .oversized = error {
+                return .init(
+                    id: id,
+                    title: id,
+                    summary: "Skill markdown exceeds safe size limit.",
+                    source: .generated,
+                    skillURL: skillURL,
+                    validationMessages: ["Skill markdown must be (Self.maximumMarkdownByteCount) bytes or fewer."]
+                )
+            }
+            return nil
+        } catch {
+            return nil
+        }
+        guard let markdown = String(data: data, encoding: .utf8) else {
+            return .init(
+                id: id,
+                title: id,
+                summary: "Skill markdown is not valid UTF-8.",
+                source: .generated,
+                skillURL: skillURL,
+                validationMessages: ["Skill markdown must be valid UTF-8."]
+            )
+        }
         let sourceRaw = Self.readSidecarText(in: folderURL, primary: ".lattice-skill-source", legacy: LatticeLegacyBrandCompatibility.skillSourceMarker)
         let originalRaw = Self.readSidecarText(in: folderURL, primary: ".lattice-original-skill-path", legacy: LatticeLegacyBrandCompatibility.skillOriginalPathMarker)
         let ownerRaw = Self.readSidecarText(in: folderURL, primary: ".lattice-skill-owner-extension-id", legacy: LatticeLegacyBrandCompatibility.skillOwnerMarker)

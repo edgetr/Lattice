@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import Darwin
 @testable import LatticeCore
 
 @Suite("Session persistence")
@@ -198,6 +199,42 @@ struct SessionPersistenceTests {
         try Data("newer".utf8).write(to: modern.appendingPathComponent("sessions.json"))
         #expect(!LatticeApplicationSupport.migrateLegacyProductDataIfNeeded(base: root))
         #expect((try String(contentsOf: modern.appendingPathComponent("sessions.json"), encoding: .utf8)) == "newer")
+    }
+
+    @Test func applicationSupportMigrationSkipsSecretsAndSymlinks() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let legacy = root.appendingPathComponent("Nisa", isDirectory: true)
+        try FileManager.default.createDirectory(at: legacy, withIntermediateDirectories: true)
+        try Data("safe".utf8).write(to: legacy.appendingPathComponent("sessions.json"))
+        try Data("provider-token".utf8).write(to: legacy.appendingPathComponent("auth.json"))
+        let outside = root.appendingPathComponent("outside.txt")
+        try Data("outside".utf8).write(to: outside)
+        try FileManager.default.createSymbolicLink(
+            at: legacy.appendingPathComponent("captures"),
+            withDestinationURL: outside
+        )
+
+        #expect(LatticeApplicationSupport.migrateLegacyProductDataIfNeeded(base: root))
+        let modern = root.appendingPathComponent("Lattice", isDirectory: true)
+        #expect(FileManager.default.fileExists(atPath: modern.appendingPathComponent("sessions.json").path))
+        #expect(!FileManager.default.fileExists(atPath: modern.appendingPathComponent("auth.json").path))
+        #expect(!FileManager.default.fileExists(atPath: modern.appendingPathComponent("captures").path))
+    }
+
+    @Test func skillDeleteAuthorityRejectsPrefixCollisionAndSymlink() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let managed = root.appendingPathComponent("managed", isDirectory: true)
+        let sibling = root.appendingPathComponent("managed-evil", isDirectory: true)
+        try FileManager.default.createDirectory(at: managed, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: sibling, withIntermediateDirectories: true)
+        let siblingSkill = sibling.appendingPathComponent("skill", isDirectory: true)
+        try FileManager.default.createDirectory(at: siblingSkill, withIntermediateDirectories: true)
+        let siblingURL = siblingSkill.appendingPathComponent("SKILL.md")
+        try Data("# outside".utf8).write(to: siblingURL)
+        let record = LatticeSkillRecord(id: "skill", title: "Skill", summary: "", source: .userAuthored, skillURL: siblingURL)
+        #expect(record.canDelete == false)
     }
 
     @Test func legacySkillSidecarsRetainDeleteAndOwnershipSemantics() throws {
@@ -421,12 +458,168 @@ struct SessionPersistenceTests {
             isPinned: true
         )
         try store.save([session])
-        let restored = store.load()
-        #expect(restored == [session])
+        let restored = try store.load()
+        var persistedSession = session
+        persistedSession.harnessThreadID = nil
+        #expect(restored == [persistedSession])
         #expect(restored.first?.privacyMode == .localOnly)
         #expect(restored.first?.isPinned == true)
         #expect(restored.first?.draft == "unsent ordinary draft\nwith newline")
         try? FileManager.default.removeItem(at: root)
+    }
+
+    @Test func failedSidecarCommitCleansOnlyFilesCreatedByThatAttempt() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent(SessionPersistence.fileName)
+        let store = SessionPersistence(fileURL: fileURL)
+        let original = LatticeSession(
+            title: "Sidecar cleanup",
+            messages: [.init(role: .user, text: "original")],
+            backend: .codex(model: "gpt-5.4")
+        )
+        try store.save([original])
+        let manifestBefore = try Data(contentsOf: fileURL)
+        let transcriptNamesBefore = try sidecarNames(in: store.transcriptDirectoryURL)
+
+        var changed = original
+        changed.messages = [.init(role: .user, text: "changed")]
+        let searchIndexProbe = SaveFailureProbe(target: .searchIndex, searchIndexURL: store.searchIndexURL, manifestURL: fileURL)
+        let failingIndexStore = SessionPersistence(fileURL: fileURL, io: searchIndexProbe.io)
+        _ = failingIndexStore.loadLazyResult()
+        #expect(throws: Error.self) {
+            try failingIndexStore.save([changed])
+        }
+        #expect(try Data(contentsOf: fileURL) == manifestBefore)
+        #expect(try sidecarNames(in: store.transcriptDirectoryURL) == transcriptNamesBefore)
+
+        let manifestProbe = SaveFailureProbe(target: .manifest, searchIndexURL: store.searchIndexURL, manifestURL: fileURL)
+        let failingManifestStore = SessionPersistence(fileURL: fileURL, io: manifestProbe.io)
+        _ = failingManifestStore.loadLazyResult()
+        #expect(throws: Error.self) {
+            try failingManifestStore.save([changed])
+        }
+        // The manifest is still the last known-good commit. A thrown manifest write with a
+        // mismatching payload is ambiguous, so the new sidecar must be retained in case the
+        // adapter published a manifest that could not be confirmed.
+        #expect(try Data(contentsOf: fileURL) == manifestBefore)
+        #expect(try sidecarNames(in: store.transcriptDirectoryURL).count == transcriptNamesBefore.count + 1)
+        // Reload uses the authoritative manifest and repairs any index that was committed
+        // before the manifest failure; it must never try to resolve the removed sidecar.
+        #expect(try store.load().first?.messages == original.messages)
+
+        try store.save([changed])
+        #expect(try sidecarNames(in: store.transcriptDirectoryURL).count == 1)
+        #expect(try store.load().first?.messages == changed.messages)
+    }
+
+    @Test func invalidExistingSidecarIsValidatedAndRepaired() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent(SessionPersistence.fileName)
+        let store = SessionPersistence(fileURL: fileURL)
+        let session = LatticeSession(
+            title: "Repair sidecar",
+            messages: [.init(role: .user, text: "durable")],
+            backend: .codex(model: "gpt-5.4")
+        )
+        try store.save([session])
+        let sidecar = try #require(try FileManager.default.contentsOfDirectory(
+            at: store.transcriptDirectoryURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ).first)
+        try Data("{corrupt".utf8).write(to: sidecar, options: .atomic)
+
+        // The deterministic filename is retained, but bytes are not trusted merely because
+        // the name contains a matching fingerprint prefix.
+        try store.save([session])
+        #expect(try store.load().first?.messages == session.messages)
+        let repaired = try Data(contentsOf: sidecar)
+        #expect(try JSONDecoder().decode([ChatMessage].self, from: repaired).count == 1)
+        let reference = try #require(store.loadLazyResult().value?.sessions.first?.transcriptStorage)
+        #expect(DurableStoreRecovery.contentFingerprint(for: repaired) == reference.contentFingerprint)
+    }
+
+    @Test func writeThenThrowAfterManifestPublishIsConfirmedAsSuccess() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent(SessionPersistence.fileName)
+        let store = SessionPersistence(fileURL: fileURL)
+        let original = LatticeSession(
+            title: "Publish confirmation",
+            messages: [.init(role: .user, text: "before")],
+            backend: .codex(model: "gpt-5.4")
+        )
+        try store.save([original])
+        var changed = original
+        changed.messages = [.init(role: .user, text: "after")]
+        let io = DurableStoreFileIO(writeDataAtomically: { data, url in
+            try data.write(to: url, options: .atomic)
+            if url.lastPathComponent == SessionPersistence.fileName {
+                throw NSError(domain: "SessionPersistenceTests", code: 99)
+            }
+        })
+
+        // The adapter reports an error after replacing the manifest. Exact-byte confirmation
+        // must treat this as a committed save, preserving the newly referenced sidecar.
+        let throwingStore = SessionPersistence(fileURL: fileURL, io: io)
+        _ = throwingStore.loadLazyResult()
+        try throwingStore.save([changed])
+        #expect(try store.load().first?.messages == changed.messages)
+        #expect(try sidecarNames(in: store.transcriptDirectoryURL).count == 1)
+    }
+
+    @Test func orphanCleanupDoesNotTrustInjectedDirectoryListing() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent(SessionPersistence.fileName)
+        let listingCalls = LockedCounter()
+        let io = DurableStoreFileIO(contentsOfDirectory: { _ in
+            listingCalls.increment()
+            return []
+        })
+        let store = SessionPersistence(fileURL: fileURL, io: io)
+        let session = LatticeSession(title: "Listing", backend: .codex(model: "gpt-5.4"))
+        try store.save([session])
+        let orphan = store.transcriptDirectoryURL.appendingPathComponent("orphan.json")
+        try Data("orphan".utf8).write(to: orphan)
+        try store.save([session])
+        #expect(!FileManager.default.fileExists(atPath: orphan.path))
+        #expect(listingCalls.value == 0)
+    }
+
+    @Test func lazyIndexRepairWaitsForAnInFlightSaveTransaction() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gate = DurableStoreWriteGate()
+        let fileURL = root.appendingPathComponent(SessionPersistence.fileName)
+        let store = SessionPersistence(fileURL: fileURL, writeGate: gate)
+        try store.save([LatticeSession(
+            title: "Index repair",
+            messages: [.init(role: .user, text: "hydrate")],
+            backend: .codex(model: "gpt-5.4")
+        )])
+        try FileManager.default.removeItem(at: store.searchIndexURL)
+
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            gate.withExclusiveWrite {
+                entered.signal()
+                _ = release.wait(timeout: .now() + 2)
+            }
+        }
+        #expect(entered.wait(timeout: .now() + 1) == .success)
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = store.loadLazyResult()
+            finished.signal()
+        }
+        #expect(finished.wait(timeout: .now() + 0.1) == .timedOut)
+        release.signal()
+        #expect(finished.wait(timeout: .now() + 1) == .success)
+        #expect(FileManager.default.fileExists(atPath: store.searchIndexURL.path))
     }
 
     @Test func perChatComposerDraftsRoundTripIndependently() throws {
@@ -435,10 +628,57 @@ struct SessionPersistenceTests {
         let chatA = LatticeSession(title: "A", backend: .codex(model: "gpt-5.4"), draft: "alpha\n  spaced  ")
         let chatB = LatticeSession(title: "B", backend: .codex(model: "gpt-5.4"), draft: "")
         try store.save([chatA, chatB])
-        let restored = store.load()
+        let restored = try store.load()
         #expect(restored.first(where: { $0.id == chatA.id })?.draft == "alpha\n  spaced  ")
         #expect(restored.first(where: { $0.id == chatB.id })?.draft == "")
         try? FileManager.default.removeItem(at: root)
+    }
+
+    private func sidecarNames(in directory: URL) throws -> Set<String> {
+        Set(try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ).map(\.lastPathComponent))
+    }
+
+    private final class SaveFailureProbe: @unchecked Sendable {
+        enum Target: Sendable, Equatable { case searchIndex, manifest }
+        let target: Target
+        let searchIndexURL: URL
+        let manifestURL: URL
+
+        init(target: Target, searchIndexURL: URL, manifestURL: URL) {
+            self.target = target
+            self.searchIndexURL = searchIndexURL
+            self.manifestURL = manifestURL
+        }
+
+        var io: DurableStoreFileIO {
+            DurableStoreFileIO(writeDataAtomically: { data, url in
+                if (self.target == .searchIndex && url == self.searchIndexURL)
+                    || (self.target == .manifest && url == self.manifestURL) {
+                    throw NSError(domain: "SessionPersistenceTests", code: 1, userInfo: [NSLocalizedDescriptionKey: "injected write failure"])
+                }
+                try data.write(to: url, options: .atomic)
+            })
+        }
+    }
+
+    private final class LockedCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+
+        var value: Int {
+            lock.lock(); defer { lock.unlock() }
+            return count
+        }
+
+        func increment() {
+            lock.lock()
+            count += 1
+            lock.unlock()
+        }
     }
 
     @Test func decodesLegacySessionWithoutActionsQueueOrPin() throws {
@@ -488,7 +728,7 @@ struct SessionPersistenceTests {
         let store = SessionPersistence(fileURL: root.appendingPathComponent("sessions.json"))
         let session = LatticeSession(title: "Interrupted", backend: .ollama(model: "qwen3:8b"), isStreaming: true)
         try store.save([session])
-        #expect(store.load().first?.isStreaming == false)
+        #expect(try store.load().first?.isStreaming == false)
         try? FileManager.default.removeItem(at: root)
     }
 
@@ -498,7 +738,7 @@ struct SessionPersistenceTests {
         let response = ChatMessage(role: .assistant, text: "Partial response")
         let action = SessionAction(messageID: response.id, kind: .tool, toolKind: .command, title: "Build", detail: "$ swift build", status: .running)
         try store.save([LatticeSession(title: "Interrupted", messages: [response], backend: .codex(model: "gpt-5.4"), actions: [action], isStreaming: true)])
-        let restored = try #require(store.load().first)
+        let restored = try #require(try store.load().first)
         #expect(restored.isStreaming == false)
         #expect(restored.actions.first?.status == .interrupted)
         try? FileManager.default.removeItem(at: root)
@@ -607,7 +847,7 @@ struct SessionPersistenceTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let store = SessionPersistence(fileURL: root.appendingPathComponent("sessions.json"))
         try store.save([session])
-        let restored = try #require(store.load().first)
+        let restored = try #require(try store.load().first)
         #expect(restored.actions.first?.kind == .diagnostic)
         #expect(restored.actions.first?.status == .failed)
         var actions = restored.actions
@@ -667,6 +907,12 @@ struct SessionPersistenceTests {
             title: "Source",
             messages: [firstUser, firstAssistant, secondUser, secondAssistant],
             backend: .codex(model: "gpt-5.4"),
+            executionRoute: ExecutionRoute(
+                mode: .code,
+                providerID: "codex",
+                modelID: "gpt-5.4",
+                runtimeID: "codex"
+            ),
             harnessID: "pi",
             harnessThreadID: "provider-thread",
             workspacePath: "/tmp/Lattice",
@@ -687,6 +933,7 @@ struct SessionPersistenceTests {
         #expect(branch.actions == [retainedAction])
         #expect(branch.harnessThreadID == nil)
         #expect(branch.backend == session.backend)
+        #expect(branch.executionRoute == session.executionRoute)
         #expect(branch.harnessID == session.harnessID)
         #expect(branch.workspacePath == session.workspacePath)
         #expect(branch.policy == session.policy)
@@ -699,6 +946,46 @@ struct SessionPersistenceTests {
         #expect(!branch.isStreaming)
         #expect(SessionTranscriptMutation.branchFromMessage(messageID: UUID(), in: session) == nil)
         #expect(SessionTranscriptMutation.branchFromMessage(messageID: firstUser.id, in: LatticeSession(title: "Running", messages: [firstUser], backend: .codex(model: "gpt-5.4"), isStreaming: true)) == nil)
+    }
+
+    @Test func branchAndDeleteRequireMaterializedTranscriptAndArtifacts() {
+        let user = ChatMessage(role: .user, text: "Keep me")
+        let transcriptReference = SessionTranscriptStorage(
+            fileName: "placeholder.json",
+            messageCount: 1,
+            contentFingerprint: "fingerprint"
+        )
+        let artifactReference = SessionArtifactStorage(
+            fileName: "placeholder.json",
+            artifactCount: 1,
+            contentFingerprint: "fingerprint"
+        )
+        var unloadedTranscript = LatticeSession(
+            title: "Lazy transcript",
+            messages: [],
+            transcriptStorage: transcriptReference,
+            isTranscriptLoaded: false,
+            backend: .codex(model: "gpt-5.4")
+        )
+        let transcriptSnapshot = unloadedTranscript
+        #expect(!SessionTranscriptMutation.canMutateContent(in: unloadedTranscript))
+        #expect(SessionTranscriptMutation.branchFromMessage(messageID: user.id, in: unloadedTranscript) == nil)
+        #expect(!SessionTranscriptMutation.deleteMessageAndFollowing(messageID: user.id, in: &unloadedTranscript))
+        #expect(unloadedTranscript == transcriptSnapshot)
+
+        var unloadedArtifacts = LatticeSession(
+            title: "Lazy artifacts",
+            messages: [user],
+            artifacts: [],
+            artifactStorage: artifactReference,
+            isArtifactsLoaded: false,
+            backend: .codex(model: "gpt-5.4")
+        )
+        let artifactSnapshot = unloadedArtifacts
+        #expect(!SessionTranscriptMutation.canMutateContent(in: unloadedArtifacts))
+        #expect(SessionTranscriptMutation.branchFromMessage(messageID: user.id, in: unloadedArtifacts) == nil)
+        #expect(!SessionTranscriptMutation.deleteMessageAndFollowing(messageID: user.id, in: &unloadedArtifacts))
+        #expect(unloadedArtifacts == artifactSnapshot)
     }
 
     @Test func deletingFirstUserTurnRestoresUnstartedChat() {
@@ -752,5 +1039,448 @@ struct SessionPersistenceTests {
         )
 
         #expect(session.matchesSearch("pinned answer"))
+    }
+
+    @Test func oversizedTranscriptIsRejectedBeforeAnyDurableWrite() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent(SessionPersistence.fileName)
+        let store = SessionPersistence(fileURL: fileURL)
+        let original = LatticeSession(
+            title: "Bounded",
+            messages: [.init(role: .user, text: "small")],
+            backend: .codex(model: "gpt-5.4")
+        )
+        try store.save([original])
+        let manifestBefore = try Data(contentsOf: fileURL)
+        let indexBefore = try Data(contentsOf: store.searchIndexURL)
+        let sidecarsBefore = try sidecarNames(in: store.transcriptDirectoryURL)
+
+        var oversized = original
+        oversized.messages = [.init(
+            role: .user,
+            text: String(
+                repeating: "x",
+                count: DurableStoreRecovery.maximumStoreByteCount + 1_024
+            )
+        )]
+        #expect(throws: SessionPersistenceStorageError.self) {
+            try store.save([oversized])
+        }
+
+        var oversizedManifest = original
+        oversizedManifest.draft = String(
+            repeating: "d",
+            count: DurableStoreRecovery.maximumStoreByteCount + 1_024
+        )
+        #expect(throws: SessionPersistenceStorageError.self) {
+            try store.save([oversizedManifest])
+        }
+
+        #expect(try Data(contentsOf: fileURL) == manifestBefore)
+        #expect(try Data(contentsOf: store.searchIndexURL) == indexBefore)
+        #expect(try sidecarNames(in: store.transcriptDirectoryURL) == sidecarsBefore)
+        #expect(try store.load().first?.messages == original.messages)
+    }
+
+    @Test func ambiguousWrongManifestPublicationPreservesPossiblyReferencedSidecar() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent(SessionPersistence.fileName)
+        let seed = SessionPersistence(fileURL: fileURL)
+        let original = LatticeSession(
+            title: "Ambiguous publication",
+            messages: [.init(role: .user, text: "before")],
+            backend: .codex(model: "gpt-5.4")
+        )
+        try seed.save([original])
+        let sidecarsBefore = try sidecarNames(in: seed.transcriptDirectoryURL)
+        let wrongManifest = Data("published bytes are not the requested manifest".utf8)
+        let ambiguousIO = DurableStoreFileIO(writeDataAtomically: { data, url in
+            if url == fileURL {
+                try wrongManifest.write(to: url, options: .atomic)
+                throw NSError(domain: "SessionPersistenceTests", code: 301)
+            }
+            try data.write(to: url, options: .atomic)
+        })
+        let writer = SessionPersistence(fileURL: fileURL, io: ambiguousIO)
+        _ = writer.loadLazyResult()
+        var changed = original
+        changed.messages = [.init(role: .user, text: "after")]
+
+        #expect(throws: Error.self) {
+            try writer.save([changed])
+        }
+        #expect(try Data(contentsOf: fileURL) == wrongManifest)
+        #expect(try sidecarNames(in: seed.transcriptDirectoryURL).count == sidecarsBefore.count + 1)
+    }
+
+    @Test func durabilityUnconfirmedManifestIsNotDowngradedToSuccess() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent(SessionPersistence.fileName)
+        let seed = SessionPersistence(fileURL: fileURL)
+        let original = LatticeSession(
+            title: "Durability",
+            messages: [.init(role: .user, text: "before")],
+            backend: .codex(model: "gpt-5.4")
+        )
+        try seed.save([original])
+        let uncertainIO = DurableStoreFileIO(writeDataAtomically: { data, url in
+            try data.write(to: url, options: .atomic)
+            if url == fileURL {
+                throw LatticeStorePathError.publishedButDurabilityUnconfirmed(url, EIO)
+            }
+        })
+        let writer = SessionPersistence(fileURL: fileURL, io: uncertainIO)
+        _ = writer.loadLazyResult()
+        var changed = original
+        changed.messages = [.init(role: .user, text: "published but sync failed")]
+
+        #expect(throws: Error.self) {
+            try writer.save([changed])
+        }
+        #expect(try sidecarNames(in: seed.transcriptDirectoryURL).count == 2)
+        #expect(try SessionPersistence(fileURL: fileURL).load().first?.messages == changed.messages)
+    }
+
+    @Test func everyLazySidecarIsValidatedBeforeManifestPublication() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent(SessionPersistence.fileName)
+        let store = SessionPersistence(fileURL: fileURL)
+        let response = ChatMessage(role: .assistant, text: "artifact response")
+        let artifact = AssistantArtifact(
+            messageID: response.id,
+            status: .available,
+            displayName: "proof.png",
+            mimeType: "image/png",
+            byteCount: 1,
+            canonicalPath: "/tmp/proof.png",
+            provenance: .init(provider: "test", origin: .structuredToolResult)
+        )
+        let session = LatticeSession(
+            title: "Lazy validation",
+            messages: [response],
+            artifacts: [artifact],
+            backend: .codex(model: "gpt-5.4")
+        )
+        try store.save([session])
+        let lazy = try #require(store.loadLazyResult().value?.sessions.first)
+        let transcriptReference = try #require(lazy.transcriptStorage)
+        let artifactReference = try #require(lazy.artifactStorage)
+        let transcriptURL = store.transcriptDirectoryURL.appendingPathComponent(transcriptReference.fileName)
+        let artifactURL = store.artifactDirectoryURL.appendingPathComponent(artifactReference.fileName)
+        let transcriptBytes = try Data(contentsOf: transcriptURL)
+        let artifactBytes = try Data(contentsOf: artifactURL)
+        let manifestBefore = try Data(contentsOf: fileURL)
+
+        try FileManager.default.removeItem(at: transcriptURL)
+        #expect(throws: Error.self) { try store.save([lazy]) }
+        #expect(try Data(contentsOf: fileURL) == manifestBefore)
+        try transcriptBytes.write(to: transcriptURL, options: .atomic)
+
+        try Data("corrupt transcript".utf8).write(to: transcriptURL, options: .atomic)
+        #expect(throws: Error.self) { try store.save([lazy]) }
+        #expect(try Data(contentsOf: fileURL) == manifestBefore)
+        try transcriptBytes.write(to: transcriptURL, options: .atomic)
+
+        try FileManager.default.removeItem(at: artifactURL)
+        #expect(throws: Error.self) { try store.save([lazy]) }
+        #expect(try Data(contentsOf: fileURL) == manifestBefore)
+        try artifactBytes.write(to: artifactURL, options: .atomic)
+
+        try Data("corrupt artifact metadata".utf8).write(to: artifactURL, options: .atomic)
+        #expect(throws: Error.self) { try store.save([lazy]) }
+        #expect(try Data(contentsOf: fileURL) == manifestBefore)
+    }
+
+    @Test func independentStaleWriterCannotReplaceNewerManifest() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent(SessionPersistence.fileName)
+        let seed = SessionPersistence(fileURL: fileURL)
+        let original = LatticeSession(
+            title: "Original",
+            messages: [.init(role: .user, text: "original")],
+            backend: .codex(model: "gpt-5.4")
+        )
+        try seed.save([original])
+
+        let firstWriter = SessionPersistence(fileURL: fileURL)
+        let staleWriter = SessionPersistence(fileURL: fileURL)
+        _ = firstWriter.loadLazyResult()
+        _ = staleWriter.loadLazyResult()
+        var firstChange = original
+        firstChange.title = "First writer won"
+        try firstWriter.save([firstChange])
+        var staleChange = original
+        staleChange.title = "Stale writer"
+
+        do {
+            try staleWriter.save([staleChange])
+            Issue.record("A stale writer replaced a newer session manifest")
+        } catch let error as SessionPersistenceConflictError {
+            #expect(error == .staleWriter(path: fileURL.path))
+        }
+        #expect(try SessionPersistence(fileURL: fileURL).load().first?.title == "First writer won")
+    }
+
+    @Test func copiedPersistenceValuesShareOptimisticRevisionState() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent(SessionPersistence.fileName)
+        let store = SessionPersistence(fileURL: fileURL)
+        let copiedStore = store
+        let first = LatticeSession(title: "First", backend: .codex(model: "gpt-5.4"))
+        try store.save([first])
+        var second = first
+        second.title = "Second"
+
+        try copiedStore.save([second])
+        #expect(try store.load().first?.title == "Second")
+    }
+
+    @Test func indexRepairFailureReturnsSessionsWithConservativeSearch() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent(SessionPersistence.fileName)
+        let seed = SessionPersistence(fileURL: fileURL)
+        let session = LatticeSession(
+            title: "Still visible",
+            messages: [.init(role: .user, text: "indexed needle")],
+            backend: .codex(model: "gpt-5.4")
+        )
+        try seed.save([session])
+        try FileManager.default.removeItem(at: seed.searchIndexURL)
+        let repairIO = DurableStoreFileIO(writeDataAtomically: { data, url in
+            if url.lastPathComponent == SessionPersistence.searchIndexFileName {
+                throw NSError(domain: "SessionPersistenceTests", code: 401)
+            }
+            try data.write(to: url, options: .atomic)
+        })
+
+        let result = SessionPersistence(fileURL: fileURL, io: repairIO).loadLazyResult()
+        let snapshot = try #require(result.value)
+        #expect(snapshot.sessions.map(\.id) == [session.id])
+        #expect(snapshot.indexWarning?.kind == .repairFailed)
+        let allIDs = Set(snapshot.sessions.map(\.id))
+        #expect(snapshot.searchIndex.candidateSessionIDs(for: "definitely absent", allSessionIDs: allIDs) == allIDs)
+    }
+
+    @Test func corruptedGramSetCannotHideAConversationAndIsRepaired() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent(SessionPersistence.fileName)
+        let store = SessionPersistence(fileURL: fileURL)
+        let session = LatticeSession(
+            title: "Search integrity",
+            messages: [.init(role: .user, text: "needle in transcript")],
+            backend: .codex(model: "gpt-5.4")
+        )
+        try store.save([session])
+        var corrupted = try JSONDecoder().decode(
+            SessionSearchIndex.self,
+            from: Data(contentsOf: store.searchIndexURL)
+        )
+        let entry = try #require(corrupted.entries[session.id])
+        corrupted.entries[session.id] = SessionSearchIndex.Entry(
+            transcriptFingerprint: entry.transcriptFingerprint,
+            metadataFingerprint: entry.metadataFingerprint,
+            gramHashes: [],
+            integrityChecksum: entry.integrityChecksum
+        )
+        try JSONEncoder().encode(corrupted).write(to: store.searchIndexURL, options: .atomic)
+        let allIDs: Set<UUID> = [session.id]
+        #expect(!corrupted.hasValidIntegrity)
+        #expect(corrupted.candidateSessionIDs(for: "absent", allSessionIDs: allIDs) == allIDs)
+
+        let repaired = try #require(store.loadLazyResult().value)
+        #expect(repaired.indexWarning == nil)
+        #expect(repaired.searchIndex.hasValidIntegrity)
+        #expect(repaired.searchIndex.candidateSessionIDs(for: "needle", allSessionIDs: allIDs) == allIDs)
+        let onDisk = try JSONDecoder().decode(
+            SessionSearchIndex.self,
+            from: Data(contentsOf: store.searchIndexURL)
+        )
+        #expect(onDisk.hasValidIntegrity)
+    }
+
+    @Test func lazyReferenceRequiresExactUUIDAndFingerprintPrefixFileName() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent(SessionPersistence.fileName)
+        let store = SessionPersistence(fileURL: fileURL)
+        let session = LatticeSession(
+            title: "Strict reference",
+            messages: [.init(role: .user, text: "durable")],
+            backend: .codex(model: "gpt-5.4")
+        )
+        try store.save([session])
+        var lazy = try #require(store.loadLazyResult().value?.sessions.first)
+        let reference = try #require(lazy.transcriptStorage)
+        lazy.transcriptStorage = SessionTranscriptStorage(
+            fileName: "\(session.id.uuidString.uppercased())-\(reference.contentFingerprint.prefix(16)).json",
+            messageCount: reference.messageCount,
+            contentFingerprint: reference.contentFingerprint,
+            lastMessagePreview: reference.lastMessagePreview
+        )
+        let manifestBefore = try Data(contentsOf: fileURL)
+
+        #expect(throws: SessionTranscriptStoreError.self) {
+            try store.save([lazy])
+        }
+        #expect(try Data(contentsOf: fileURL) == manifestBefore)
+    }
+
+    @Test func orphanCleanupRemovesOnlyRegularNoFollowJSONFiles() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SessionPersistence(fileURL: root.appendingPathComponent(SessionPersistence.fileName))
+        let session = LatticeSession(title: "Cleanup", backend: .codex(model: "gpt-5.4"))
+        try store.save([session])
+        let regular = store.transcriptDirectoryURL.appendingPathComponent("regular-orphan.json")
+        let directory = store.transcriptDirectoryURL.appendingPathComponent("directory-orphan.json", isDirectory: true)
+        let unrelated = store.transcriptDirectoryURL.appendingPathComponent("notes.txt")
+        let target = root.appendingPathComponent("symlink-target.txt")
+        let link = store.transcriptDirectoryURL.appendingPathComponent("symlink-orphan.json")
+        try Data("regular".utf8).write(to: regular)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        try Data("unrelated".utf8).write(to: unrelated)
+        try Data("target must survive".utf8).write(to: target)
+        #expect(symlink(target.path, link.path) == 0)
+
+        try store.save([session])
+        #expect(!FileManager.default.fileExists(atPath: regular.path))
+        #expect(FileManager.default.fileExists(atPath: directory.path))
+        #expect(try String(contentsOf: unrelated, encoding: .utf8) == "unrelated")
+        #expect(try FileManager.default.destinationOfSymbolicLink(atPath: link.path) == target.path)
+        #expect(try String(contentsOf: target, encoding: .utf8) == "target must survive")
+    }
+
+    @Test func manifestAndSidecarDirectorySymlinksFailClosed() throws {
+        let manifestRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: manifestRoot) }
+        try FileManager.default.createDirectory(at: manifestRoot, withIntermediateDirectories: true)
+        let target = manifestRoot.appendingPathComponent("target.json")
+        let manifest = manifestRoot.appendingPathComponent(SessionPersistence.fileName)
+        try Data("[]".utf8).write(to: target)
+        #expect(symlink(target.path, manifest.path) == 0)
+        #expect(throws: SessionPersistenceLoadError.self) {
+            _ = try SessionPersistence(fileURL: manifest).load()
+        }
+
+        let sidecarRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: sidecarRoot) }
+        let external = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: external) }
+        try FileManager.default.createDirectory(at: sidecarRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: external, withIntermediateDirectories: true)
+        let transcriptLink = sidecarRoot.appendingPathComponent(SessionPersistence.transcriptDirectoryName)
+        #expect(symlink(external.path, transcriptLink.path) == 0)
+        #expect(throws: SessionPersistenceLoadError.self) {
+            _ = try SessionPersistence(
+                fileURL: sidecarRoot.appendingPathComponent(SessionPersistence.fileName)
+            ).load()
+        }
+
+        let lockRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: lockRoot) }
+        try FileManager.default.createDirectory(at: lockRoot, withIntermediateDirectories: true)
+        let lockTarget = lockRoot.appendingPathComponent("lock-target.txt")
+        let lockURL = lockRoot.appendingPathComponent(SessionPersistence.fileName + ".lock")
+        try Data("must remain data".utf8).write(to: lockTarget)
+        #expect(symlink(lockTarget.path, lockURL.path) == 0)
+        #expect(throws: SessionPersistenceLoadError.self) {
+            _ = try SessionPersistence(
+                fileURL: lockRoot.appendingPathComponent(SessionPersistence.fileName)
+            ).load()
+        }
+        #expect(try String(contentsOf: lockTarget, encoding: .utf8) == "must remain data")
+    }
+
+    @Test func fifoSearchIndexReturnsSessionsWithoutBlockingOrReplacingEntry() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SessionPersistence(fileURL: root.appendingPathComponent(SessionPersistence.fileName))
+        let session = LatticeSession(
+            title: "FIFO safe",
+            messages: [.init(role: .user, text: "visible")],
+            backend: .codex(model: "gpt-5.4")
+        )
+        try store.save([session])
+        try FileManager.default.removeItem(at: store.searchIndexURL)
+        #expect(mkfifo(store.searchIndexURL.path, mode_t(0o600)) == 0)
+
+        let snapshot = try #require(SessionPersistence(fileURL: store.fileURL).loadLazyResult().value)
+        #expect(snapshot.sessions.map(\.id) == [session.id])
+        #expect(snapshot.indexWarning?.kind == .unreadable)
+        let allIDs = Set(snapshot.sessions.map(\.id))
+        #expect(snapshot.searchIndex.candidateSessionIDs(for: "absent", allSessionIDs: allIDs) == allIDs)
+        var status = stat()
+        #expect(lstat(store.searchIndexURL.path, &status) == 0)
+        #expect((status.st_mode & S_IFMT) == S_IFIFO)
+    }
+
+    @Test func indexRepairAndWriterAreOneSerializedManifestTransaction() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent(SessionPersistence.fileName)
+        let seed = SessionPersistence(fileURL: fileURL)
+        let original = LatticeSession(
+            title: "Before repair",
+            messages: [.init(role: .user, text: "repairable")],
+            backend: .codex(model: "gpt-5.4")
+        )
+        try seed.save([original])
+        let writer = SessionPersistence(fileURL: fileURL)
+        _ = writer.loadLazyResult()
+        try FileManager.default.removeItem(at: seed.searchIndexURL)
+
+        let repairEntered = DispatchSemaphore(value: 0)
+        let releaseRepair = DispatchSemaphore(value: 0)
+        let repairFinished = DispatchSemaphore(value: 0)
+        let writerFinished = DispatchSemaphore(value: 0)
+        let repairIO = DurableStoreFileIO(writeDataAtomically: { data, url in
+            if url.lastPathComponent == SessionPersistence.searchIndexFileName {
+                repairEntered.signal()
+                guard releaseRepair.wait(timeout: .now() + 3) == .success else {
+                    throw NSError(domain: "SessionPersistenceTests", code: 501)
+                }
+            }
+            try data.write(to: url, options: .atomic)
+        })
+        let repairStore = SessionPersistence(fileURL: fileURL, io: repairIO)
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = repairStore.loadLazyResult()
+            repairFinished.signal()
+        }
+        #expect(repairEntered.wait(timeout: .now() + 1) == .success)
+
+        var changed = original
+        changed.title = "Writer after repair"
+        DispatchQueue.global(qos: .userInitiated).async {
+            try? writer.save([changed])
+            writerFinished.signal()
+        }
+        #expect(writerFinished.wait(timeout: .now() + 0.15) == .timedOut)
+        releaseRepair.signal()
+        #expect(repairFinished.wait(timeout: .now() + 2) == .success)
+        #expect(writerFinished.wait(timeout: .now() + 2) == .success)
+
+        #expect(try SessionPersistence(fileURL: fileURL).load().first?.title == "Writer after repair")
+        let index = try JSONDecoder().decode(
+            SessionSearchIndex.self,
+            from: Data(contentsOf: seed.searchIndexURL)
+        )
+        #expect(index.hasValidIntegrity)
+        #expect(index.containsValidEntry(for: changed))
+    }
+}
+
+private extension DurableStoreLoadResult where Value == LazySessionLoad {
+    var value: LazySessionLoad? {
+        if case .loaded(let value) = self { return value }
+        return nil
     }
 }

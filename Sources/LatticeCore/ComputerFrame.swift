@@ -32,11 +32,19 @@ public struct ComputerFrameControlBoundary: Hashable, Codable, Sendable, Equatab
 
 /// A provider-supplied computer-use frame for observable UI only.
 public struct ComputerFrame: Identifiable, Hashable, Codable, Sendable, Equatable {
+    public static let maximumImageByteCount = 10 * 1024 * 1024
+    public static let allowedImageExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "heic", "heif"
+    ]
+
     public let id: UUID
     public let provider: String
     public let timestamp: Date
     /// Local file path/URL string supplied by a structured provider event.
     public let imagePath: String
+    /// Immutable bytes admitted at the provider-event boundary. The UI renders
+    /// these bytes instead of reopening a provider-controlled path later.
+    public let imageData: Data?
     /// Monotonic frame sequence when the provider supplies one.
     public let sequence: Int?
     /// Stable source identity (for example a computer-use tool call or stream id).
@@ -48,6 +56,7 @@ public struct ComputerFrame: Identifiable, Hashable, Codable, Sendable, Equatabl
         provider: String,
         timestamp: Date = Date(),
         imagePath: String,
+        imageData: Data? = nil,
         sequence: Int? = nil,
         sourceIdentity: String? = nil,
         controlBoundary: ComputerFrameControlBoundary = .observeOnly
@@ -56,13 +65,18 @@ public struct ComputerFrame: Identifiable, Hashable, Codable, Sendable, Equatabl
         self.provider = provider.trimmingCharacters(in: .whitespacesAndNewlines)
         self.timestamp = timestamp
         self.imagePath = imagePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.imageData = imageData.flatMap { data in
+            guard !data.isEmpty, data.count <= Self.maximumImageByteCount else { return nil }
+            return data
+        }
         self.sequence = sequence
         self.sourceIdentity = sourceIdentity?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.controlBoundary = controlBoundary
     }
 
     public var imageURL: URL? {
-        Self.validatedFileURL(from: imagePath)
+        guard imageData?.isEmpty == false else { return nil }
+        return Self.validatedFileURL(from: imagePath)
     }
 
     public static func validatedFileURL(from pathOrURL: String) -> URL? {
@@ -77,6 +91,31 @@ public struct ComputerFrame: Identifiable, Hashable, Codable, Sendable, Equatabl
 
         guard trimmed.hasPrefix("/") else { return nil }
         return URL(fileURLWithPath: trimmed)
+    }
+
+    /// Reads an immutable, bounded frame only when the provider path is a
+    /// regular image file contained by one of the explicitly authorized roots.
+    /// The descriptor-safe store reader rejects symlinks and unstable files.
+    public static func authorizedImage(
+        from pathOrURL: String,
+        under allowedRoots: [URL],
+        maximumByteCount: Int = maximumImageByteCount
+    ) -> (url: URL, data: Data)? {
+        guard maximumByteCount > 0,
+              let url = validatedFileURL(from: pathOrURL) else { return nil }
+        let ext = url.pathExtension.lowercased()
+        guard allowedImageExtensions.contains(ext) else { return nil }
+
+        for root in allowedRoots where root.isFileURL {
+            do {
+                let data = try LatticeStorePathSecurity.readData(at: url, under: root)
+                guard !data.isEmpty, data.count <= maximumByteCount else { continue }
+                return (url.standardizedFileURL, data)
+            } catch {
+                continue
+            }
+        }
+        return nil
     }
 }
 
@@ -135,7 +174,7 @@ public struct ComputerFrameAccumulator: Equatable, Sendable {
             droppedCount += 1
             return .rejectedStopped
         }
-        guard ComputerFrame.validatedFileURL(from: frame.imagePath) != nil else {
+        guard frame.imageData?.isEmpty == false else {
             droppedCount += 1
             return .rejectedInvalidPath
         }
@@ -258,7 +297,7 @@ public enum ComputerFramePresentationPolicy {
             )
         }
 
-        if ComputerFrame.validatedFileURL(from: latest.imagePath) == nil {
+        if latest.imageData?.isEmpty != false {
             return ComputerFrameViewerPresentation(
                 visibility: .visible,
                 content: .imageUnavailable(reason: "Computer frame image path is missing or not a local file."),

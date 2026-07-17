@@ -12,8 +12,8 @@ public enum ChildProcessEnvironmentPolicy {
     ]
 
     public static func providerOwnedRuntime(
-        from base: [String: String],
-        temporaryDirectory: URL
+        from base: [String: String] = ProcessInfo.processInfo.environment,
+        temporaryDirectory: URL = FileManager.default.temporaryDirectory
     ) -> [String: String] {
         var environment = allowedParentKeys.reduce(into: [String: String]()) { result, key in
             if let value = base[key], !value.isEmpty { result[key] = value }

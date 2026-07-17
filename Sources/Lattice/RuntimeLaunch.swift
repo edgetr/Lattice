@@ -97,6 +97,17 @@ enum RuntimeLaunch: Equatable {
             }
         }
 
+        // A persisted provider fallback must carry the explicit Pi provenance
+        // marker. Never let a malformed marked route silently fall through to
+        // a legacy provider launch.
+        if launch.route.mode == .code,
+           (launch.route.providerID == "codex" || launch.route.providerID == "opencode"),
+           launch.route.runtimeID == launch.route.providerID,
+           launch.route.fallbackFromRuntimeID != nil,
+           !PiFirstCodeRoutingPolicy.isDeclaredProviderFallback(launch.route) {
+            return .failed("The provider fallback route is invalid or missing its Pi provenance.")
+        }
+
         if ExecutionRouteResolver.isDeclared(launch.route) {
             switch launch.route.runtimeID {
             case "pi":

@@ -16,6 +16,7 @@ struct InspectorSessionModel: Equatable {
     let workspacePath: String?
     let isLocalBackend: Bool
     let hasUserMessages: Bool
+    let canChooseWorkspace: Bool
     let usesLegacyDirectOpenCode: Bool
 
     init(session: LatticeSession, usesLegacyDirectOpenCode: Bool) {
@@ -34,7 +35,10 @@ struct InspectorSessionModel: Equatable {
         self.isStreaming = session.isStreaming
         self.workspacePath = session.workspacePath
         self.isLocalBackend = session.backend.isLocal
-        self.hasUserMessages = session.messages.contains { $0.role == .user }
+        self.hasUserMessages = session.totalMessageCount > 0
+        self.canChooseWorkspace = !session.isStreaming
+            && session.isTranscriptLoaded
+            && session.totalMessageCount == 0
         self.usesLegacyDirectOpenCode = usesLegacyDirectOpenCode
     }
 }

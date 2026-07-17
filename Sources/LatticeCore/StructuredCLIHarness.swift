@@ -100,6 +100,7 @@ public final class StructuredCLIHarness: @unchecked Sendable {
         await BoundedSubprocess.run(.init(
             executableURL: executable,
             arguments: arguments,
+            environment: ChildProcessEnvironmentPolicy.providerOwnedRuntime(),
             deadline: 30,
             maximumOutputBytes: BoundedSubprocessRequest.defaultMaximumOutputBytes
         ))

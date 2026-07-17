@@ -298,11 +298,24 @@ public struct LatticeExtensionPreviewStore: Sendable {
     }
 
     public func save(_ records: [LatticeExtensionPreviewRecord]) throws {
-        try DurableStoreRecovery.enforceWritable(gate: writeGate, storeName: Self.storeName)
-        try io.createDirectory(fileURL.deletingLastPathComponent())
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try io.writeDataAtomically(encoder.encode(records.sorted { $0.createdAt > $1.createdAt }), fileURL)
+        try writeGate.withExclusiveWrite {
+            try DurableStoreRecovery.enforceWritable(gate: writeGate, storeName: Self.storeName)
+            try io.createDirectory(fileURL.deletingLastPathComponent())
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(records.sorted { $0.createdAt > $1.createdAt })
+            guard data.count <= DurableStoreRecovery.maximumStoreByteCount else {
+                throw NSError(domain: "LatticeExtensionPreviewStore", code: 7, userInfo: [NSLocalizedDescriptionKey: "Self-edit previews exceed the safe storage limit."])
+            }
+            do {
+                try io.writeDataAtomically(data, fileURL)
+            } catch {
+                if (try? io.readDataUpTo(fileURL, DurableStoreRecovery.maximumStoreByteCount)) == data {
+                    throw NSError(domain: "LatticeExtensionPreviewStore", code: 8, userInfo: [NSLocalizedDescriptionKey: "Self-edit previews were published, but write durability could not be confirmed. (error.localizedDescription)"])
+                }
+                throw error
+            }
+        }
     }
 
     public func record(_ record: LatticeExtensionPreviewRecord, in records: [LatticeExtensionPreviewRecord]) throws -> [LatticeExtensionPreviewRecord] {

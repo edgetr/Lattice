@@ -72,10 +72,15 @@ public final class OllamaClient: @unchecked Sendable {
     /// Chat streams can run for a long time; this bounds connection establishment / stall only.
     public static let chatTimeout: TimeInterval = 600
 
+    private struct TaskRegistration {
+        let token: UUID
+        var task: Task<Void, Never>?
+    }
+
     private let baseURL: URL
     private let transport: any OllamaTransport
     private let lock = NSLock()
-    private var tasks: [UUID: Task<Void, Never>] = [:]
+    private var tasks: [UUID: TaskRegistration] = [:]
     private var activeModel: String?
 
     public init(
@@ -244,9 +249,11 @@ public final class OllamaClient: @unchecked Sendable {
 
     public func stream(messages: [ChatMessage], model: String, sessionID: UUID, keepAliveSeconds: Int = 300) -> AsyncStream<AgentEvent> {
         AsyncStream { continuation in
+            let token = UUID()
+            reserve(sessionID: sessionID, token: token)?.cancel()
             let task = Task { [self] in
                 defer {
-                    finish(sessionID)
+                    finish(sessionID, token: token)
                     continuation.finish()
                 }
                 do {
@@ -299,14 +306,20 @@ public final class OllamaClient: @unchecked Sendable {
                     }
                 }
             }
-            register(task, sessionID: sessionID)
-            continuation.onTermination = { [weak self] _ in self?.cancel(sessionID: sessionID) }
+            attach(task, sessionID: sessionID, token: token)
+            continuation.onTermination = { [weak self] _ in
+                self?.cancel(sessionID: sessionID, token: token)
+            }
         }
     }
 
     public func cancel(sessionID: UUID) {
-        let task = lock.withLock { tasks.removeValue(forKey: sessionID) }
+        let task = lock.withLock { tasks.removeValue(forKey: sessionID)?.task }
         task?.cancel()
+    }
+
+    var activeTaskCount: Int {
+        lock.withLock { tasks.count }
     }
 
     public func unload(model: String) async {
@@ -361,16 +374,65 @@ public final class OllamaClient: @unchecked Sendable {
         if let previous, previous != model { await unload(model: previous) }
     }
 
-    private func register(_ task: Task<Void, Never>, sessionID: UUID) {
-        lock.withLock { tasks[sessionID] = task }
+    private func reserve(sessionID: UUID, token: UUID) -> Task<Void, Never>? {
+        lock.withLock {
+            tasks.updateValue(TaskRegistration(token: token, task: nil), forKey: sessionID)?.task
+        }
     }
 
-    private func finish(_ id: UUID) {
-        lock.withLock { tasks[id] = nil }
+    private func attach(_ task: Task<Void, Never>, sessionID: UUID, token: UUID) {
+        let shouldCancel = lock.withLock { () -> Bool in
+            guard tasks[sessionID]?.token == token else { return true }
+            tasks[sessionID]?.task = task
+            return false
+        }
+        if shouldCancel { task.cancel() }
+    }
+
+    private func finish(_ id: UUID, token: UUID) {
+        lock.withLock {
+            if tasks[id]?.token == token { tasks[id] = nil }
+        }
+    }
+
+    private func cancel(sessionID: UUID, token: UUID) {
+        let task = lock.withLock { () -> Task<Void, Never>? in
+            guard tasks[sessionID]?.token == token else { return nil }
+            return tasks.removeValue(forKey: sessionID)?.task
+        }
+        task?.cancel()
     }
 
     private func endpoint(_ path: String) -> URL? {
-        URL(string: path, relativeTo: baseURL)?.absoluteURL
+        guard Self.isAllowedLoopbackBaseURL(baseURL) else { return nil }
+        return URL(string: path, relativeTo: baseURL)?.absoluteURL
+    }
+
+    /// Local mode must never become a network routing toggle. Ollama endpoints
+    /// are restricted to numeric loopback hosts so DNS/hosts-file changes cannot
+    /// redirect prompts or model metadata to another machine.
+    public static func isAllowedLoopbackBaseURL(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "http",
+              url.user == nil,
+              url.password == nil,
+              url.query == nil,
+              url.fragment == nil,
+              url.path.isEmpty || url.path == "/",
+              let rawHost = url.host?.lowercased() else { return false }
+        if let port = url.port, !(1...65_535).contains(port) { return false }
+        let host = rawHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        if host == "::1" { return true }
+        let octets = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard octets.count == 4,
+              octets.first == "127",
+              octets.allSatisfy({ part in
+                  guard !part.isEmpty,
+                        part.allSatisfy(\.isNumber),
+                        let value = Int(part),
+                        (0...255).contains(value) else { return false }
+                  return String(value) == part || part == "0"
+              }) else { return false }
+        return true
     }
 
     private func validatedData(for request: URLRequest) async throws -> Data {

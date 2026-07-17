@@ -1,12 +1,16 @@
 import Foundation
 
 public enum SessionTranscriptMutation {
+    public static func canMutateContent(in session: LatticeSession) -> Bool {
+        !session.isStreaming && session.isTranscriptLoaded && session.isArtifactsLoaded
+    }
+
     public static func branchFromMessage(
         messageID: UUID,
         in session: LatticeSession,
         at date: Date = .now
     ) -> LatticeSession? {
-        guard !session.isStreaming,
+        guard canMutateContent(in: session),
               let messageIndex = session.messages.firstIndex(where: { $0.id == messageID }) else {
             return nil
         }
@@ -25,6 +29,7 @@ public enum SessionTranscriptMutation {
             isArtifactsLoaded: true,
             isArtifactsDirty: true,
             backend: session.backend,
+            executionRoute: session.executionRoute,
             harnessID: session.harnessID,
             reasoningEffort: session.reasoningEffort,
             harnessThreadID: nil,
@@ -48,7 +53,7 @@ public enum SessionTranscriptMutation {
         in session: inout LatticeSession,
         at date: Date = .now
     ) -> Bool {
-        guard !session.isStreaming,
+        guard canMutateContent(in: session),
               let messageIndex = session.messages.firstIndex(where: { $0.id == messageID }) else {
             return false
         }

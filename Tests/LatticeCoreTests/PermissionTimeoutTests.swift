@@ -4,6 +4,35 @@ import Testing
 
 @Suite("Permission deadlines")
 struct PermissionTimeoutTests {
+    @Test func multipleWaitersResolveTogetherWithoutContinuationOverwrite() async {
+        let waiter = PermissionWaiter<String>()
+        async let first = waiter.wait(timeoutNanoseconds: 1_000_000_000)
+        async let second = waiter.wait(timeoutNanoseconds: 1_000_000_000)
+        await Task.yield()
+        #expect(waiter.resolve("allow"))
+
+        guard case .resolved(let firstValue) = await first,
+              case .resolved(let secondValue) = await second else {
+            Issue.record("Every registered waiter must receive the one-shot result")
+            return
+        }
+        #expect(firstValue == "allow")
+        #expect(secondValue == "allow")
+        #expect(!waiter.resolve("deny"))
+    }
+
+    @Test func multipleWaitersTimeoutTogether() async {
+        let waiter = PermissionWaiter<Int>()
+        async let first = waiter.wait(timeoutNanoseconds: 1_000_000)
+        async let second = waiter.wait(timeoutNanoseconds: 1_000_000)
+        guard case .timedOut = await first,
+              case .timedOut = await second else {
+            Issue.record("Every registered waiter must receive the timeout")
+            return
+        }
+        #expect(!waiter.resolve(1))
+    }
+
     @Test func codexPermissionTimeoutFailsAndCleansUp() async throws {
         let root = try makeTestRoot()
         defer { try? FileManager.default.removeItem(at: root) }

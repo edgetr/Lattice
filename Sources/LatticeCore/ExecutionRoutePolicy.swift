@@ -228,9 +228,13 @@ public enum ExecutionRouteResolver {
     }
 
     public static func isDeclared(_ route: ExecutionRoute) -> Bool {
+        if PiFirstCodeRoutingPolicy.isDeclaredProviderFallback(route) {
+            return true
+        }
         guard let template = templates.first(where: {
             $0.mode == route.mode && $0.providerID == route.providerID && $0.runtimeID == route.runtimeID
         }) else { return false }
+        guard route.fallbackFromRuntimeID == nil else { return false }
         if template.modelRequired {
             return route.modelID?.isEmpty == false
         }
@@ -239,7 +243,9 @@ public enum ExecutionRouteResolver {
 
     /// Allows persisted routes that predate mode routing while keeping new resolution strict.
     public static func isLegacyCompatible(_ route: ExecutionRoute) -> Bool {
-        guard !route.providerID.isEmpty, !route.runtimeID.isEmpty else { return false }
+        guard !route.providerID.isEmpty,
+              !route.runtimeID.isEmpty,
+              route.fallbackFromRuntimeID == nil else { return false }
         switch route.providerID {
         case "codex":
             return route.mode == .code
@@ -287,8 +293,119 @@ public enum LegacyOpenCodeBridgePolicy {
         route.mode == .code
             && route.providerID == "opencode"
             && route.runtimeID == "opencode"
+            && route.fallbackFromRuntimeID == nil
             && route.modelID?.isEmpty == false
             && !ExecutionRouteResolver.isDeclared(route)
+    }
+}
+
+public struct PiFirstCodeRouteResolution: Equatable, Sendable {
+    public let route: ExecutionRoute
+    public let disclosure: String
+    public let blockingReason: String?
+
+    public init(route: ExecutionRoute, disclosure: String, blockingReason: String? = nil) {
+        self.route = route
+        self.disclosure = disclosure
+        self.blockingReason = blockingReason
+    }
+
+    public var isRunnable: Bool { blockingReason == nil }
+    public var usesProviderFallback: Bool { route.fallbackFromRuntimeID == "pi" }
+}
+
+/// Materializes Code routes before prompt admission. Lattice Agent (Pi) remains
+/// preferred. A direct provider harness is selected only for an unlocked chat,
+/// after Pi is conclusively unavailable, and when that exact route is runnable.
+public enum PiFirstCodeRoutingPolicy {
+    public static let preferredRuntimeID = "pi"
+
+    /// Returns the declared Pi route represented by either a preferred route or
+    /// a previously materialized provider fallback. This is intentionally
+    /// limited to Code Codex/OpenCode routes; legacy direct routes stay legacy.
+    public static func preferredRoute(for route: ExecutionRoute) -> ExecutionRoute? {
+        guard route.mode == .code,
+              route.providerID == "codex" || route.providerID == "opencode",
+              let modelID = route.modelID,
+              !modelID.isEmpty else { return nil }
+        guard route.runtimeID == preferredRuntimeID || isDeclaredProviderFallback(route) else { return nil }
+        return ExecutionRoute(
+            mode: .code,
+            providerID: route.providerID,
+            modelID: modelID,
+            runtimeID: preferredRuntimeID
+        )
+    }
+
+    public static func fallbackRoute(for preferredRoute: ExecutionRoute) -> ExecutionRoute? {
+        guard preferredRoute.mode == .code,
+              preferredRoute.runtimeID == preferredRuntimeID,
+              preferredRoute.fallbackFromRuntimeID == nil,
+              let modelID = preferredRoute.modelID,
+              !modelID.isEmpty,
+              preferredRoute.providerID == "codex" || preferredRoute.providerID == "opencode" else {
+            return nil
+        }
+        return ExecutionRoute(
+            mode: .code,
+            providerID: preferredRoute.providerID,
+            modelID: modelID,
+            runtimeID: preferredRoute.providerID,
+            fallbackFromRuntimeID: preferredRuntimeID
+        )
+    }
+
+    public static func isDeclaredProviderFallback(_ route: ExecutionRoute) -> Bool {
+        route.mode == .code
+            && route.fallbackFromRuntimeID == preferredRuntimeID
+            && route.runtimeID == route.providerID
+            && (route.providerID == "codex" || route.providerID == "opencode")
+            && route.modelID?.isEmpty == false
+    }
+
+    public static func resolve(
+        preferredRoute: ExecutionRoute,
+        preferredReadiness: ExecutionRouteReadiness,
+        directReadiness: ExecutionRouteReadiness,
+        routeLocked: Bool
+    ) -> PiFirstCodeRouteResolution {
+        if preferredReadiness.isRunnable {
+            return .init(route: preferredRoute, disclosure: "Lattice Agent · preferred Code runtime")
+        }
+        guard let fallback = fallbackRoute(for: preferredRoute) else {
+            return .init(
+                route: preferredRoute,
+                disclosure: "Selected Code runtime",
+                blockingReason: preferredReadiness.detail
+            )
+        }
+        if routeLocked {
+            return .init(
+                route: preferredRoute,
+                disclosure: "Lattice Agent · chat runtime locked",
+                blockingReason: "This chat is locked to Lattice Agent. Restore that runtime or start a new chat to use a provider fallback."
+            )
+        }
+        switch preferredReadiness {
+        case .loading, .validating:
+            return .init(
+                route: preferredRoute,
+                disclosure: "Lattice Agent · checking preferred runtime",
+                blockingReason: preferredReadiness.detail
+            )
+        case .missingRuntime, .authenticationRequired, .failed:
+            break
+        case .runnable:
+            return .init(route: preferredRoute, disclosure: "Lattice Agent · preferred Code runtime")
+        }
+        guard directReadiness.isRunnable else {
+            return .init(
+                route: preferredRoute,
+                disclosure: "Lattice Agent unavailable · provider fallback unavailable",
+                blockingReason: "Lattice Agent is unavailable, and the exact \(preferredRoute.providerID) provider route is not ready: \(directReadiness.detail)"
+            )
+        }
+        return .init(route: fallback, disclosure: "Provider fallback · Lattice Agent unavailable")
     }
 }
 

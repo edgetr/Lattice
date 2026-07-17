@@ -542,6 +542,10 @@ public enum SessionPortableArchiveExporter {
         if let harness = document.chat.harnessID, !harness.isEmpty {
             lines.append("- **Harness:** \(harness)")
         }
+        if let route = document.chat.executionRoute,
+           let preferred = route.fallbackFromRuntimeID {
+            lines.append("- **Runtime selection:** Provider fallback (preferred \(preferred) runtime was unavailable)")
+        }
         if let reasoning = document.chat.reasoningEffort {
             lines.append("- **Reasoning:** \(reasoning)")
         }
@@ -691,6 +695,9 @@ public enum SessionPortableArchiveExporter {
             if let modelID = route.modelID {
                 routeObject["modelID"] = modelID
             }
+            if let fallbackFromRuntimeID = route.fallbackFromRuntimeID {
+                routeObject["fallbackFromRuntimeID"] = fallbackFromRuntimeID
+            }
             chat["executionRoute"] = routeObject
         }
         if let codePhase = document.chat.codePhase {
@@ -808,8 +815,9 @@ public enum SessionPortableArchiveFingerprint {
                 lines.append(route.providerID)
                 lines.append(route.modelID ?? "")
                 lines.append(route.runtimeID)
+                lines.append(route.fallbackFromRuntimeID ?? "")
             } else {
-                lines.append(contentsOf: ["", "", "", ""])
+                lines.append(contentsOf: ["", "", "", "", ""])
             }
         }
         lines.append("messages:\(chat.messages.count)")
@@ -1075,7 +1083,9 @@ public enum SessionPortableArchiveImporter {
         "kind", "toolKind", "title", "detail", "status", "workspaceScoped", "createdAt", "updatedAt", "messageIndex"
     ]
     private static let allowedQueuedKeys: Set<String> = ["text", "date"]
-    private static let allowedExecutionRouteKeys: Set<String> = ["mode", "providerID", "modelID", "runtimeID"]
+    private static let allowedExecutionRouteKeys: Set<String> = [
+        "mode", "providerID", "modelID", "runtimeID", "fallbackFromRuntimeID"
+    ]
 
     private static func rejectSensitiveKeys(in root: [String: Any], path: String) throws {
         let version = strictInteger(root["version"]) ?? 0
@@ -1345,7 +1355,18 @@ public enum SessionPortableArchiveImporter {
         let providerID = try requiredString(object["providerID"], field: "chat.executionRoute.providerID", limit: SessionPortableArchive.maxHarnessIDLength)
         let modelID = try optionalString(object["modelID"], field: "chat.executionRoute.modelID", limit: SessionPortableArchive.maxModelLength)
         let runtimeID = try requiredString(object["runtimeID"], field: "chat.executionRoute.runtimeID", limit: SessionPortableArchive.maxHarnessIDLength)
-        return ExecutionRoute(mode: mode, providerID: providerID, modelID: modelID, runtimeID: runtimeID)
+        let fallbackFromRuntimeID = try optionalString(
+            object["fallbackFromRuntimeID"],
+            field: "chat.executionRoute.fallbackFromRuntimeID",
+            limit: SessionPortableArchive.maxHarnessIDLength
+        )
+        return ExecutionRoute(
+            mode: mode,
+            providerID: providerID,
+            modelID: modelID,
+            runtimeID: runtimeID,
+            fallbackFromRuntimeID: fallbackFromRuntimeID
+        )
     }
 
     private static func decodeMessage(_ object: [String: Any], index: Int) throws -> PortableMessage {

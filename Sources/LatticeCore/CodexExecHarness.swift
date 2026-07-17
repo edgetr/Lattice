@@ -155,6 +155,7 @@ public final class CodexExecHarness: @unchecked Sendable {
             let transport = BoundedProcessTransport(request: .init(
                 executableURL: executableURL,
                 arguments: ["app-server", "-c", "service_tier=\"flex\""],
+                environment: ChildProcessEnvironmentPolicy.providerOwnedRuntime(),
                 deadline: timeout,
                 maximumOutputBytes: 4_000_000
             ))
@@ -237,6 +238,7 @@ public final class CodexExecHarness: @unchecked Sendable {
                     executableURL: executableURL,
                     arguments: ["app-server", "-c", "service_tier=\"flex\""],
                     currentDirectoryURL: workspace,
+                    environment: ChildProcessEnvironmentPolicy.providerOwnedRuntime(),
                     deadline: 30 * 60,
                     maximumOutputBytes: 8_000_000
                 ))
@@ -821,18 +823,31 @@ public final class CodexExecHarness: @unchecked Sendable {
             let isComputerTool = tool.lowercased().contains("computer")
             if completed, isComputerTool,
                let content = item["contentItems"] as? [[String: Any]],
-               let imagePath = content.compactMap({ value -> String? in
+               let admittedImage = content.compactMap({ value -> (path: String, data: Data)? in
                    guard value["type"] as? String == "inputImage",
                          let raw = value["imageUrl"] as? String,
-                         ComputerFrame.validatedFileURL(from: raw) != nil else { return nil }
-                   return raw
+                         let admitted = ComputerFrame.authorizedImage(
+                             from: raw,
+                             under: [workspace, applicationSupportRoot]
+                         ) else { return nil }
+                   return (admitted.url.path, admitted.data)
                }).last {
                 return .computerFrame(.init(
                     id: id,
                     provider: "Codex",
-                    imagePath: imagePath,
+                    imagePath: admittedImage.path,
+                    imageData: admittedImage.data,
                     sourceIdentity: externalID
                 ))
+            }
+            if completed, isComputerTool,
+               let content = item["contentItems"] as? [[String: Any]],
+               content.contains(where: { $0["type"] as? String == "inputImage" }) {
+                return HarnessToolEventDecoder.diagnostic(
+                    provider: "Codex",
+                    object: ["type": type, "status": item["status"] as? String ?? "completed"],
+                    reason: "Computer frame was outside the workspace or Lattice storage, was not a regular image, or exceeded the frame limit."
+                )
             }
             if completed { return terminalToolProgress(id: id, status: item["status"]) }
             return .toolRequested(.init(
@@ -935,6 +950,7 @@ public final class CodexExecHarness: @unchecked Sendable {
         await BoundedSubprocess.run(.init(
             executableURL: executable,
             arguments: arguments,
+            environment: ChildProcessEnvironmentPolicy.providerOwnedRuntime(),
             deadline: 30,
             maximumOutputBytes: BoundedSubprocessRequest.defaultMaximumOutputBytes
         ))

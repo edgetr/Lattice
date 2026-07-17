@@ -126,7 +126,7 @@ struct InspectorView: View {
                     Label("Cloud routes blocked for this chat.", systemImage: "lock.fill")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    if !session.backend.isLocal && session.messages.contains(where: { $0.role == .user }) {
+                    if !session.backend.isLocal && model.hasUserMessages {
                         Text("This chat is locked to its cloud route. Start a separate local chat to continue without cloud requests.")
                             .font(.caption)
                             .foregroundStyle(.orange)
@@ -141,6 +141,7 @@ struct InspectorView: View {
             instructionEditor(for: session.executionRoute.mode)
 
             InspectorOpaqueDisclosure(title: "Workspace", systemImage: "folder") {
+                let canChooseWorkspace = inspectorSessionModel?.canChooseWorkspace == true
                 Text(session.workspacePath ?? "No workspace selected")
                     .font(.caption.monospaced())
                     .foregroundStyle(session.workspacePath == nil ? .secondary : .primary)
@@ -160,8 +161,8 @@ struct InspectorView: View {
                 let names = state.selectedAppliedInstructionFileNames
                 InspectorFactRow(title: "Applied files", value: names.isEmpty ? "None" : names.joined(separator: ", "))
                 Button("Choose Workspace…") { state.chooseWorkspace() }
-                    .disabled(!session.messages.isEmpty)
-                    .help(session.messages.isEmpty ? "Choose this chat’s workspace" : "A chat workspace cannot change after messages are sent")
+                    .disabled(!canChooseWorkspace)
+                    .help(canChooseWorkspace ? "Choose this chat’s workspace" : "A chat workspace cannot change while content is loading, running, or after messages are sent")
             }
 
             InspectorOpaqueDisclosure(title: "Context", systemImage: "paperclip") {
@@ -221,6 +222,14 @@ struct InspectorView: View {
 
             if session.executionRoute.mode == .code && session.executionRoute.runtimeID == "pi" {
                 InspectorOpaqueDisclosure(title: "Plan phase", systemImage: "list.bullet.clipboard") {
+                    let canMutatePlan = !session.isStreaming
+                        && session.isTranscriptLoaded
+                        && session.isArtifactsLoaded
+                    let planControlHelp = canMutatePlan
+                        ? "Update this chat’s guided plan phase"
+                        : (session.isStreaming
+                            ? "Stop the current response before changing plan phase"
+                            : "Wait for this chat’s transcript and artifacts to finish loading")
                     InspectorFactRow(title: "Phase", value: session.codePhase.displayName)
                     if let plan = session.codePlan {
                         InspectorFactRow(title: "Plan", value: "\(plan.title) · rev \(plan.revision)")
@@ -237,25 +246,32 @@ struct InspectorView: View {
                     HStack(spacing: 8) {
                         if session.codePhase == .normal {
                             Button("Start plan") { state.beginCodePlanPhase() }
-                                .disabled(session.isStreaming)
+                                .disabled(!canMutatePlan)
+                                .help(planControlHelp)
                         }
                         if session.codePhase == .planActive {
                             Button("Submit for approval") { state.submitCodePlanForApproval() }
-                                .disabled(session.isStreaming)
+                                .disabled(!canMutatePlan)
+                                .help(planControlHelp)
                             Button("Exit plan") { state.exitCodePlanPhase() }
-                                .disabled(session.isStreaming)
+                                .disabled(!canMutatePlan)
+                                .help(planControlHelp)
                         }
                         if session.codePhase == .planAwaitingApproval {
                             Button("Approve") { state.approveCodePlan() }
-                                .disabled(session.isStreaming)
+                                .disabled(!canMutatePlan)
+                                .help(planControlHelp)
                             Button("Request changes") { state.requestCodePlanChanges() }
-                                .disabled(session.isStreaming)
+                                .disabled(!canMutatePlan)
+                                .help(planControlHelp)
                             Button("Exit plan") { state.exitCodePlanPhase() }
-                                .disabled(session.isStreaming)
+                                .disabled(!canMutatePlan)
+                                .help(planControlHelp)
                         }
                         if session.codePhase == .implement {
                             Button("Back to normal") { state.exitCodePlanPhase() }
-                                .disabled(session.isStreaming)
+                                .disabled(!canMutatePlan)
+                                .help(planControlHelp)
                         }
                     }
                     .accessibilityElement(children: .contain)

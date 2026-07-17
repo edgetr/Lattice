@@ -1,6 +1,34 @@
 import Foundation
 import Darwin
-import LatticeCore
+@testable import LatticeCore
+
+actor TranscriptHydrationFallbackGate {
+    private var started: Set<String> = []
+    private var released: Set<String> = []
+    private var waiters: [String: CheckedContinuation<Void, Never>] = [:]
+
+    func suspend(_ key: String) async {
+        started.insert(key)
+        if released.remove(key) != nil { return }
+        await withCheckedContinuation { continuation in
+            waiters[key] = continuation
+        }
+    }
+
+    func waitUntilStarted(_ key: String) async {
+        while !started.contains(key) {
+            await Task.yield()
+        }
+    }
+
+    func release(_ key: String) {
+        released.insert(key)
+        if let continuation = waiters.removeValue(forKey: key) {
+            released.remove(key)
+            continuation.resume()
+        }
+    }
+}
 
 @main
 struct CoreVerification {
@@ -10,6 +38,104 @@ struct CoreVerification {
         func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
             guard condition() else { fputs("FAILED: \(message)\n", stderr); exit(1) }
             checks += 1
+        }
+
+        // Atomic JSON fallback coverage (native Swift Testing is unavailable on
+        // toolchain-only verification machines).
+        let atomicRoot = FileManager.default.temporaryDirectory.appendingPathComponent("lattice-atomic-json-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: atomicRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: atomicRoot) }
+        let atomicURL = atomicRoot.appendingPathComponent("auth.json")
+        if case .success(let missingAtomic) = AtomicJSONFileTransaction.readObject(at: atomicURL) {
+            expect(!missingAtomic.exists && missingAtomic.object?.isEmpty == true, "Atomic JSON missing file reads as an empty object")
+            expect(!FileManager.default.fileExists(atPath: atomicRoot.appendingPathComponent(".lattice-atomic-json.lock").path), "Atomic JSON reads do not create a lock sidecar")
+        } else {
+            expect(false, "Atomic JSON missing file reads as an empty object")
+        }
+        expect(AtomicJSONFileTransaction.mutateObject(at: atomicURL) { object in
+            object["first"] = true
+        }.isSuccess, "Atomic JSON mutation publishes a new object")
+        if case .success(let atomicSnapshot) = AtomicJSONFileTransaction.readObject(at: atomicURL),
+           let atomicObject = atomicSnapshot.object {
+            expect(atomicObject["first"] as? Bool == true, "Atomic JSON mutation is readable after publish")
+        } else {
+            expect(false, "Atomic JSON mutation is readable after publish")
+        }
+        let atomicLink = atomicRoot.appendingPathComponent("link.json")
+        try? FileManager.default.createSymbolicLink(at: atomicLink, withDestinationURL: atomicURL)
+        if case .failure(.unreadable) = AtomicJSONFileTransaction.readObject(at: atomicLink) {
+            expect(true, "Atomic JSON refuses symlinked paths")
+        } else {
+            expect(false, "Atomic JSON refuses symlinked paths")
+        }
+        let danglingParent = atomicRoot.appendingPathComponent("dangling")
+        let missingDestination = atomicRoot.appendingPathComponent("does-not-exist")
+        try? FileManager.default.createSymbolicLink(at: danglingParent, withDestinationURL: missingDestination)
+        if case .failure(.unreadable) = AtomicJSONFileTransaction.readObject(at: danglingParent.appendingPathComponent("auth.json")) {
+            expect(true, "Atomic JSON refuses dangling parent symlinks")
+        } else {
+            expect(false, "Atomic JSON refuses dangling parent symlinks")
+        }
+        let oversizedAtomic = atomicRoot.appendingPathComponent("oversized.json")
+        try? Data(repeating: 0x20, count: AtomicJSONFileTransaction.maximumFileBytes + 1).write(to: oversizedAtomic)
+        if case .failure(.unreadable) = AtomicJSONFileTransaction.readObject(at: oversizedAtomic) {
+            expect(true, "Atomic JSON bounds regular-file reads")
+        } else {
+            expect(false, "Atomic JSON bounds regular-file reads")
+        }
+        let incompleteBaseline = JSONFileSnapshot(exists: true, object: [:])
+        let incompleteResult = AtomicJSONFileTransaction.writeObject(["a": 1], to: oversizedAtomic, expected: incompleteBaseline)
+        if case .failure = incompleteResult {
+            expect(true, "Atomic JSON rejects incomplete existing baselines")
+        } else {
+            expect(false, "Atomic JSON rejects incomplete existing baselines")
+        }
+        expect(AtomicJSONFileTransaction.fingerprint(for: Data("verify".utf8)).count == 64, "Atomic JSON uses a cryptographic fingerprint")
+        expect(!AtomicJSONFileTransaction.mutateObject(at: atomicRoot.appendingPathComponent(".LATTICE-ATOMIC-JSON.LOCK")) { $0["blocked"] = true }.isSuccess, "Atomic JSON reserves its advisory lock leaf case-insensitively")
+        let aliasName = "lattice-atomic-alias-\(UUID().uuidString)"
+        let aliasCanonicalRoot = URL(fileURLWithPath: "/private/var/tmp/\(aliasName)", isDirectory: true)
+        let aliasRoot = URL(fileURLWithPath: "/var/tmp/\(aliasName)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: aliasCanonicalRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: aliasCanonicalRoot) }
+        let aliasWrite = AtomicJSONFileTransaction.mutateObject(at: aliasRoot.appendingPathComponent("auth.json"), maxAttempts: Int.max) { object in
+            object["alias"] = true
+        }
+        expect(aliasWrite.isSuccess, "Atomic JSON accepts /var alias for canonical /private/var path")
+        if case .success(let aliasSnapshot) = AtomicJSONFileTransaction.readObject(at: aliasCanonicalRoot.appendingPathComponent("auth.json")),
+           let aliasObject = aliasSnapshot.object {
+            expect(aliasObject["alias"] as? Bool == true, "Atomic JSON aliases share one canonical file")
+        } else {
+            expect(false, "Atomic JSON aliases share one canonical file")
+        }
+        let blockedRoot = atomicRoot.appendingPathComponent("blocked-root", isDirectory: true)
+        try? FileManager.default.createDirectory(at: blockedRoot, withIntermediateDirectories: false)
+        let blockedLockURL = blockedRoot.appendingPathComponent(".lattice-atomic-json.lock", isDirectory: true)
+        try? FileManager.default.createDirectory(at: blockedLockURL, withIntermediateDirectories: false)
+        let blockedLockResult = AtomicJSONFileTransaction.mutateObject(at: blockedRoot.appendingPathComponent("blocked.json")) { object in
+            object["blocked"] = true
+        }
+        if case .failure(let detail) = blockedLockResult {
+            expect(detail.localizedCaseInsensitiveContains("lock"), "Atomic JSON rejects non-regular interprocess lock paths")
+        } else {
+            expect(false, "Atomic JSON rejects non-regular interprocess lock paths")
+        }
+        try? FileManager.default.removeItem(at: blockedLockURL)
+        let reservedResult = AtomicJSONFileTransaction.mutateObject(at: atomicRoot.appendingPathComponent(".lattice-atomic-json.lock")) { object in
+            object["blocked"] = true
+        }
+        if case .failure(let detail) = reservedResult {
+            expect(detail.localizedCaseInsensitiveContains("reserved"), "Atomic JSON reserves its interprocess lock filename")
+        } else {
+            expect(false, "Atomic JSON reserves its interprocess lock filename")
+        }
+        let sharedReadRoot = atomicRoot.appendingPathComponent("shared-read", isDirectory: true)
+        try? FileManager.default.createDirectory(at: sharedReadRoot, withIntermediateDirectories: false)
+        try? Data("{\"safe\":true}".utf8).write(to: sharedReadRoot.appendingPathComponent("auth.json"))
+        try? Data().write(to: sharedReadRoot.appendingPathComponent(".lattice-atomic-json.lock"))
+        if case .success(let sharedReadSnapshot) = AtomicJSONFileTransaction.readObject(at: sharedReadRoot.appendingPathComponent("auth.json")) {
+            expect(sharedReadSnapshot.object?["safe"] as? Bool == true, "Atomic JSON takes shared locks for existing safe sidecars")
+        } else {
+            expect(false, "Atomic JSON takes shared locks for existing safe sidecars")
         }
 
         let connectionCacheNow = Date(timeIntervalSince1970: 1_750_000_000)
@@ -463,22 +589,257 @@ struct CoreVerification {
             }
         }
 
+        let durableSecretForms = """
+        OPENAI_API_KEY=env-secret AWS_SECRET_ACCESS_KEY='aws-secret' SLACK_BOT_TOKEN="slack-secret"
+        {"session_id":"antigravity-secret","sessionId":"session-secret","thread_id":"thread-secret","provider_session_id":"provider-secret","harnessThreadID":"harness-secret","client_secret":"json-client-value-sensitive"}
+        --session-id cli-session-secret --thread-id=cli-thread-secret --client-secret cli-client-secret https://example.test/?client_secret=query-client-secret TOKEN_COUNT=42
+        """
+        let durableRedacted = SessionActionTextPolicy.detail(durableSecretForms)
+        for secret in ["env-secret", "aws-secret", "slack-secret", "antigravity-secret", "session-secret", "thread-secret", "provider-secret", "harness-secret", "json-client-value-sensitive", "cli-session-secret", "cli-thread-secret", "cli-client-secret", "query-client-secret"] {
+            expect(!durableRedacted.contains(secret), "Durable action redaction removes \(secret)")
+        }
+        expect(durableRedacted.contains("TOKEN_COUNT=42"), "Durable action redaction preserves unrelated ordinary fields")
+        let authorizationSummary = SessionActionTextPolicy.detail("Authorization: Bearer authorization-secret")
+        expect(authorizationSummary == "Authorization: Bearer [REDACTED]", "Authorization redaction preserves scheme exactly once")
+        expect(SessionActionTextPolicy.detail(authorizationSummary) == authorizationSummary, "Durable action redaction is idempotent")
+        let quotedAuthorizationSummary = SessionActionTextPolicy.detail(#"{"authorization":"Basic authorization-secret"}"#)
+        expect(quotedAuthorizationSummary == #"{"authorization":"Basic [REDACTED]"}"#, "Quoted Authorization redaction preserves quote and scheme")
+        let escapedQuoteInput = #"{"client_secret":"two word secret","password":"correct horse battery staple","token":"prefix \"escaped\" suffix secret"}"#
+        let escapedQuoteExpected = #"{"client_secret":"[REDACTED]","password":"[REDACTED]","token":"[REDACTED]"}"#
+        let escapedQuoteSummary = SessionActionTextPolicy.detail(escapedQuoteInput)
+        expect(escapedQuoteSummary == escapedQuoteExpected, "Quoted sensitive fields consume escaped quotes without leaking a suffix")
+        expect(SessionActionTextPolicy.detail(escapedQuoteSummary) == escapedQuoteExpected, "Escaped-quote redaction is idempotent")
+
+        let cookieSummary = SessionActionTextPolicy.detail("Cookie: session=first-secret; csrf=second-secret")
+        expect(cookieSummary == "Cookie: [REDACTED]", "Cookie header redaction consumes the entire header value")
+        expect(SessionActionTextPolicy.detail(cookieSummary) == cookieSummary, "Cookie header redaction is idempotent")
+        let setCookieSummary = SessionActionTextPolicy.detail("Set-Cookie: session=first-secret; Path=/; HttpOnly")
+        expect(setCookieSummary == "Set-Cookie: [REDACTED]", "Set-Cookie header redaction consumes the entire header value")
+        let passwordSummary = SessionActionTextPolicy.detail("password: correct horse battery staple")
+        expect(passwordSummary == "password: [REDACTED]", "Colon-form password redaction consumes the entire line")
+        expect(SessionActionTextPolicy.detail(passwordSummary) == passwordSummary, "Colon-form credential redaction is idempotent")
+        expect(SessionActionTextPolicy.detail("password=single-secret keep=value") == "password=[REDACTED] keep=value", "Equals-form credential redaction retains token semantics")
+
+        let delimiterCases = [
+            (#"{"cmd":"OPENAI_API_KEY=secret"}"#, #"{"cmd":"OPENAI_API_KEY=[REDACTED]"}"#),
+            (#"{"cmd":"--token secret"}"#, #"{"cmd":"--token [REDACTED]"}"#),
+            (#"{"url":"https://example.test/?token=secret"}"#, #"{"url":"https://example.test/?token=[REDACTED]"}"#),
+            (#"{"cmd":"OPENAI_API_KEY=\"quoted env secret\""}"#, #"{"cmd":"OPENAI_API_KEY=[REDACTED]"}"#),
+            (#"{"cmd":"tool --token \"quoted cli secret\""}"#, #"{"cmd":"tool --token [REDACTED]"}"#)
+        ]
+        for (input, expected) in delimiterCases {
+            let sanitized = SessionActionTextPolicy.detail(input)
+            expect(sanitized == expected, "Sensitive unquoted/escaped value redaction preserves JSON delimiters")
+            expect(SessionActionTextPolicy.detail(sanitized) == expected, "JSON-delimiter redaction is idempotent")
+            expect((try? JSONSerialization.jsonObject(with: Data(sanitized.utf8))) != nil, "Redacted JSON remains parseable")
+        }
+        let prettyCredentialJSON = """
+        {
+          "password": "secret",
+          "keep": "yes"
+        }
+        """
+        let prettyCredentialSummary = SessionActionTextPolicy.detail(prettyCredentialJSON)
+        let prettyCredentialObject = try! JSONSerialization.jsonObject(with: Data(prettyCredentialSummary.utf8)) as! [String: String]
+        expect(prettyCredentialObject["password"] == "[REDACTED]" && prettyCredentialObject["keep"] == "yes", "Pretty JSON credential redaction preserves syntax and unrelated fields")
+        expect(SessionActionTextPolicy.detail(prettyCredentialSummary) == prettyCredentialSummary, "Pretty JSON credential redaction is idempotent")
+
+        let boundaryLimit = SessionActionTextPolicy.maximumInputCharacterCount
+        let boundarySentinel = "boundary-password-secret"
+        let boundaryAssignmentPrefix = "password=\""
+        let boundaryTokenUnit = "token=" + String(repeating: "e", count: 180) + " "
+        let boundaryVisibleTailCount = boundaryAssignmentPrefix.count + boundarySentinel.count + 8
+        let boundaryPreludeTarget = boundaryLimit - boundaryVisibleTailCount
+        let boundaryTokenCount = boundaryPreludeTarget / boundaryTokenUnit.count
+        let boundaryPadding = String(repeating: " ", count: boundaryPreludeTarget - (boundaryTokenCount * boundaryTokenUnit.count))
+        let boundaryInput = String(repeating: boundaryTokenUnit, count: boundaryTokenCount)
+            + boundaryPadding
+            + boundaryAssignmentPrefix
+            + boundarySentinel
+            + String(repeating: "z", count: 128)
+            + "\""
+        let boundaryExpected = SessionActionTextPolicy.oversizedInputMarker
+        let boundarySummary = SessionActionTextPolicy.detail(boundaryInput)
+        expect(boundaryInput.count > boundaryLimit && String(boundaryInput.prefix(boundaryLimit)).contains(boundarySentinel), "Boundary fixture crosses the bounded input after a visible sentinel")
+        expect(boundarySummary == boundaryExpected && !boundarySummary.contains(boundarySentinel), "Oversized quoted credential input fails closed before any substring is returned")
+        expect(boundarySummary.utf8.count <= SessionActionTextPolicy.maximumDetailUTF8ByteCount, "Boundary redaction remains within the durable byte cap")
+        expect(SessionActionTextPolicy.detail(boundarySummary) == boundarySummary, "Boundary redaction is idempotent")
+
+        for prefix in ["sk-", "ghp_", "github_pat_", "xoxb-", "AIza", "AKIA", "npm_", "hf_", "gsk_", "xai-", "cred_"] {
+            let sentinel = prefix + "boundary-secret-value"
+            let summary = SessionActionTextPolicy.detail(String(repeating: "ordinary-token ", count: 1_200) + sentinel)
+            expect(summary == SessionActionTextPolicy.oversizedInputMarker && !summary.contains(sentinel), "Oversized (prefix) input is replaced with a fixed marker")
+            expect(SessionActionTextPolicy.detail(summary) == summary, "Oversized (prefix) marker is idempotent")
+        }
+        for input in [
+            "prefix password: embedded-password-secret suffix",
+            "prefix Cookie: embedded-cookie-secret suffix",
+            #"{"headers":"Cookie: session=compact-first-secret; csrf=compact-second-secret"}"#,
+            #"{"headers":"Cookie: session=compact-first-secret, csrf=compact-second-secret"}"#,
+            #"{"headers":"Cookie: session=compact-first-secret&csrf=compact-second-secret"}"#,
+            "prefix token=first-secret; second-secret",
+            "prefix password=first-secret, second-secret",
+            "prefix --token first-secret, second-secret",
+            "prefix Authorization: Bearer first-secret, Basic second-secret",
+            "https://x.test/?password[]=bracket-query-secret",
+            "https://x.test/?password%5B%5D=encoded-bracket-secret",
+            "https://x.test/?pass%77ord=encoded-name-secret",
+            "https://x.test/?password%5B%5D=encoded-secret&broken=%ZZ",
+            "https://x.test/?pass%25252577ord=four-pass-secret",
+            #"{"headers":"Cookie: session=escaped-cookie-first-secret\",csrf=escaped-cookie-second-secret"}"#,
+            #"{"cmd":"OPENAI_API_KEY=escaped-env-first-secret\";escaped-env-second-secret"}"#,
+            #"{"pass\u0077ord":"unicode-key-secret"}"#,
+            #"prefix {"pass\u0077ord":"embedded-unicode-secret"} suffix"#,
+            #"""
+            {"keep":"yes"}
+            {"pass\u0077ord":"json-lines-secret"}
+            """#,
+            #"{"payload":"{\"pass\\u0077ord\":\"nested-unicode-secret\"}"}"#,
+            #"wrapper {\"token\":\"nested-token-secret\"} tail"#,
+            #"wrapper {\"session_id\":\"nested-session-secret\"} tail"#,
+            #"wrapper OPENAI_API_KEY=\"escaped-env-secret\" suffix"#,
+            #"wrapper --token \'escaped-cli-secret\' suffix"#
+        ] {
+            let summary = SessionActionTextPolicy.detail(input)
+            expect(summary == SessionActionTextPolicy.oversizedInputMarker && SessionActionTextPolicy.detail(summary) == summary, "Unresolved embedded sensitive suffix fails closed")
+        }
+        let cliSecret = "cli-boundary-password-secret"
+        let cliLine = String(repeating: "x", count: 4_090) + " password=\"\(cliSecret) trailing\""
+        let cliFailure = CLIActionStatusPolicy.failureMessage(prefix: "Install failed", output: Data((cliLine + "\n").utf8))
+        expect(cliLine.count > 4_096 && !cliFailure.contains(cliSecret) && cliFailure.contains(SessionActionTextPolicy.oversizedInputMarker), "CLI failure passes an over-limit line intact so sanitization fails closed")
+
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = SessionPersistence(fileURL: root.appendingPathComponent("sessions.json"))
         let responseMessage = ChatMessage(role: .assistant, text: "Done")
         let persistedAction = SessionAction(messageID: responseMessage.id, kind: .tool, toolKind: .write, title: "Edit App.swift", detail: "Sources/App.swift", status: .completed, workspaceScoped: true)
         let session = LatticeSession(title: "Real session", messages: [.init(role: .user, text: "Hello"), responseMessage], backend: .codex(model: "gpt-5.4"), harnessID: "pi", harnessThreadID: "thread", attachments: [.init(path: "/tmp/a")], actions: [persistedAction], draft: "keep me\nexactly", isPinned: true)
         try! store.save([session])
-        expect(store.load() == [session], "Session round trip")
-        expect(store.load().first?.actions == [persistedAction], "Canonical action trail round trip")
-        expect(store.load().first?.attachments.first?.name == "a", "Attachment metadata round trip")
-        expect(store.load().first?.harnessID == "pi", "Harness selection round trip")
-        expect(store.load().first?.isPinned == true, "Pinned chat state round trip")
-        expect(store.load().first?.draft == "keep me\nexactly", "Per-chat ordinary draft round trip")
+        var persistedSession = session
+        persistedSession.harnessThreadID = nil
+        let restoredSessionRoundTrip = try! store.load()
+        expect(restoredSessionRoundTrip == [persistedSession], "Session round trip without runtime provider handle")
+        expect(restoredSessionRoundTrip.first?.actions == [persistedAction], "Canonical action trail round trip")
+        expect(restoredSessionRoundTrip.first?.attachments.first?.name == "a", "Attachment metadata round trip")
+        expect(restoredSessionRoundTrip.first?.harnessID == "pi", "Harness selection round trip")
+        expect(restoredSessionRoundTrip.first?.isPinned == true, "Pinned chat state round trip")
+        expect(restoredSessionRoundTrip.first?.draft == "keep me\nexactly", "Per-chat ordinary draft round trip")
+        let antigravitySessionAction = SessionAction(
+            messageID: UUID(),
+            kind: .harness,
+            title: "Antigravity session",
+            detail: #"{"type":"init","session_id":"antigravity-session-byte-secret","client_secret":"two word secret","password":"correct horse battery staple"}"#,
+            status: .completed
+        )
+        let multiTokenHeaderAction = SessionAction(
+            messageID: UUID(),
+            kind: .diagnostic,
+            title: "Headers",
+            detail: "Cookie: session=first-secret; csrf=second-secret\npassword: correct horse battery staple",
+            status: .completed
+        )
+        let boundaryAction = SessionAction(
+            messageID: UUID(),
+            kind: .diagnostic,
+            title: "Boundary",
+            detail: boundaryInput,
+            status: .completed
+        )
+        let residualAction = SessionAction(
+            messageID: UUID(),
+            kind: .diagnostic,
+            title: "Residual secrets",
+            detail: "prefix password: embedded-password-secret suffix | Cookie: embedded-cookie-secret | {\\\"token\\\":\\\"nested-token-secret\\\"} | OPENAI_API_KEY=\\\"escaped-env-secret\\\" | --token \\'escaped-cli-secret\\'",
+            status: .completed
+        )
+        let compactCookieAction = SessionAction(
+            messageID: UUID(),
+            kind: .diagnostic,
+            title: "Compact cookie",
+            detail: #"{"headers":"Cookie: session=compact-first-secret; csrf=compact-second-secret"}"#,
+            status: .completed
+        )
+        let delimiterLeakAction = SessionAction(
+            messageID: UUID(),
+            kind: .diagnostic,
+            title: "Delimiter suffixes",
+            detail: #"token=first-delimiter-secret; second-delimiter-secret | password=third-delimiter-secret, fourth-delimiter-secret | --token fifth-delimiter-secret&sixth-delimiter-secret | https://x.test/?password[]=bracket-query-secret | https://x.test/?password%5B%5D=encoded-bracket-secret&broken=%ZZ | https://x.test/?pass%25252577ord=four-pass-secret | {"headers":"Cookie: session=cookie-comma-first-secret, csrf=cookie-comma-second-secret"} | {"headers":"Cookie: session=escaped-cookie-first-secret\",csrf=escaped-cookie-second-secret"} | prefix {"pass\u0077ord":"embedded-unicode-secret"} suffix | {"payload":"{\"pass\\u0077ord\":\"nested-unicode-secret\"}"}"#,
+            status: .completed
+        )
+        let runtimeHandleSession = LatticeSession(
+            title: "Runtime-only handle",
+            backend: .antigravity(model: "model"),
+            harnessThreadID: "runtime-provider-handle-secret",
+            actions: [antigravitySessionAction, multiTokenHeaderAction, boundaryAction, residualAction, compactCookieAction, delimiterLeakAction]
+        )
+        try! store.save([runtimeHandleSession])
+        let rawSessionBytes = String(decoding: try! Data(contentsOf: store.fileURL), as: UTF8.self)
+        expect(!rawSessionBytes.contains("harnessThreadID") && !rawSessionBytes.contains("runtime-provider-handle-secret"), "Session manifest omits runtime provider handle")
+        expect(!rawSessionBytes.contains("antigravity-session-byte-secret"), "Session manifest redacts Antigravity session_id action detail")
+        expect(!rawSessionBytes.contains("two word secret"), "Session manifest redacts a quoted multiword client secret")
+        expect(!rawSessionBytes.contains("correct horse battery staple"), "Session manifest redacts a quoted multiword password")
+        expect(!rawSessionBytes.contains("first-secret") && !rawSessionBytes.contains("second-secret"), "Session manifest redacts every Cookie header token")
+        expect(!rawSessionBytes.contains(boundarySentinel) && !rawSessionBytes.contains(String(repeating: "z", count: 16)), "Session manifest omits a credential crossing the input boundary")
+        for secret in ["embedded-password-secret", "embedded-cookie-secret", "nested-token-secret", "escaped-env-secret", "escaped-cli-secret", "compact-first-secret", "compact-second-secret", "first-delimiter-secret", "second-delimiter-secret", "third-delimiter-secret", "fourth-delimiter-secret", "fifth-delimiter-secret", "sixth-delimiter-secret", "bracket-query-secret", "encoded-bracket-secret", "four-pass-secret", "cookie-comma-first-secret", "cookie-comma-second-secret", "escaped-cookie-first-secret", "escaped-cookie-second-secret", "embedded-unicode-secret", "nested-unicode-secret"] {
+            expect(!rawSessionBytes.contains(secret), "Session manifest redacts unresolved sensitive suffix (secret)")
+        }
+        let restoredRuntimeHandleSession = try! store.load()
+        expect(restoredRuntimeHandleSession.first?.harnessThreadID == nil, "Session load never revives runtime provider handle")
+        var legacySessionObject = try! JSONSerialization.jsonObject(with: JSONEncoder().encode(runtimeHandleSession)) as! [String: Any]
+        legacySessionObject["harnessThreadID"] = "legacy-session-handle-secret"
+        let legacySessionData = try! JSONSerialization.data(withJSONObject: legacySessionObject)
+        let decodedLegacySession = try! JSONDecoder().decode(LatticeSession.self, from: legacySessionData)
+        expect(decodedLegacySession.harnessThreadID == nil, "Legacy session decode drops provider runtime handles")
+        let reencodedLegacySession = String(decoding: try! JSONEncoder().encode(decodedLegacySession), as: UTF8.self)
+        expect(!reencodedLegacySession.contains("harnessThreadID") && !reencodedLegacySession.contains("legacy-session-handle-secret"), "Legacy session reencode omits provider runtime handles")
+
+        let pathSecurityRoot = root.appendingPathComponent("store-path-security", isDirectory: true)
+        try! FileManager.default.createDirectory(at: pathSecurityRoot, withIntermediateDirectories: true)
+        let outsideSentinelURL = root.appendingPathComponent("outside-sentinel.txt")
+        let outsideSentinel = Data("outside-sentinel".utf8)
+        try! outsideSentinel.write(to: outsideSentinelURL)
+        let rawTraversal = URL(fileURLWithPath: pathSecurityRoot.path + "/../" + outsideSentinelURL.lastPathComponent)
+        var traversalReadRejected = false
+        do { _ = try LatticeStorePathSecurity.readData(at: rawTraversal, under: pathSecurityRoot) } catch { traversalReadRejected = true }
+        expect(traversalReadRejected, "Raw dot-dot store read is rejected")
+        var traversalWriteRejected = false
+        do { try LatticeStorePathSecurity.writeDataAtomically(Data("changed".utf8), to: rawTraversal, under: pathSecurityRoot) } catch { traversalWriteRejected = true }
+        expect(traversalWriteRejected, "Raw dot-dot store write is rejected")
+        var traversalRemoveRejected = false
+        do { try LatticeStorePathSecurity.removeItem(at: rawTraversal, under: pathSecurityRoot) } catch { traversalRemoveRejected = true }
+        expect(traversalRemoveRejected, "Raw dot-dot store remove is rejected")
+        expect((try? Data(contentsOf: outsideSentinelURL)) == outsideSentinel, "Rejected traversal leaves outside sentinel unchanged")
+
+        let rootChildURL = pathSecurityRoot.appendingPathComponent("keep.json")
+        try! LatticeStorePathSecurity.writeDataAtomically(Data("keep".utf8), to: rootChildURL, under: pathSecurityRoot)
+        var rootRemoveRejected = false
+        do { try LatticeStorePathSecurity.removeItem(at: pathSecurityRoot, under: pathSecurityRoot) } catch { rootRemoveRejected = true }
+        expect(rootRemoveRejected, "Store root removal is rejected before recursion")
+        expect(FileManager.default.fileExists(atPath: pathSecurityRoot.path) && (try? LatticeStorePathSecurity.readData(at: rootChildURL, under: pathSecurityRoot)) == Data("keep".utf8), "Rejected root removal preserves root contents")
+
+        let canonicalPathSecurityRoot = try! LatticeStorePathSecurity.canonicalDirectory(at: pathSecurityRoot)
+        let aliasDescendant = pathSecurityRoot.appendingPathComponent("alias-descendant.json")
+        try! LatticeStorePathSecurity.writeDataAtomically(Data("alias".utf8), to: aliasDescendant, under: pathSecurityRoot)
+        expect((try? LatticeStorePathSecurity.readData(at: canonicalPathSecurityRoot.appendingPathComponent("alias-descendant.json"), under: canonicalPathSecurityRoot)) == Data("alias".utf8), "Alias-spelled root and canonical descendant interoperate")
+        if canonicalPathSecurityRoot.path.hasPrefix("/private/var/") {
+            let varAliasPath = "/var/" + String(canonicalPathSecurityRoot.path.dropFirst("/private/var/".count))
+            let varAliasRoot = URL(fileURLWithPath: varAliasPath, isDirectory: true)
+            let varAliasDescendant = varAliasRoot.appendingPathComponent("var-alias-descendant.json")
+            try! LatticeStorePathSecurity.writeDataAtomically(Data("var-alias".utf8), to: varAliasDescendant, under: varAliasRoot)
+            expect((try? LatticeStorePathSecurity.readData(at: canonicalPathSecurityRoot.appendingPathComponent("var-alias-descendant.json"), under: canonicalPathSecurityRoot)) == Data("var-alias".utf8), "Explicit /var alias resolves inside canonical /private/var root")
+        } else {
+            expect(true, "Explicit /var alias check is not applicable on this temporary root")
+        }
+
+        let childSymlink = pathSecurityRoot.appendingPathComponent("outside-link")
+        try! FileManager.default.createSymbolicLink(at: childSymlink, withDestinationURL: outsideSentinelURL)
+        var childSymlinkRejected = false
+        do { _ = try LatticeStorePathSecurity.readData(at: childSymlink, under: pathSecurityRoot) } catch { childSymlinkRejected = true }
+        expect(childSymlinkRejected, "Store child symlink is denied")
+
         let draftChatA = LatticeSession(title: "Draft A", backend: .codex(model: "gpt-5.4"), draft: "alpha\n  spaced  ")
         let draftChatB = LatticeSession(title: "Draft B", backend: .codex(model: "gpt-5.4"), draft: "")
         try! store.save([draftChatA, draftChatB])
-        let restoredDrafts = store.load()
+        let restoredDrafts = try! store.load()
         expect(restoredDrafts.first(where: { $0.id == draftChatA.id })?.draft == "alpha\n  spaced  ", "Two-chat drafts restore independently with whitespace")
         expect(restoredDrafts.first(where: { $0.id == draftChatB.id })?.draft == "", "Empty chat draft restores exact empty state")
         var legacyDraftObject = try! JSONSerialization.jsonObject(with: JSONEncoder().encode(LatticeSession(title: "Legacy", backend: .codex(model: "gpt-5.4")))) as! [String: Any]
@@ -490,14 +851,16 @@ struct CoreVerification {
         expect(draftBranch?.draft == "", "Branch starts with empty ordinary draft and does not copy source draft")
         let privateSession = LatticeSession(title: "Private", backend: .ollama(model: "llama3.2:latest"), privacyMode: .localOnly)
         try! store.save([privateSession])
-        expect(store.load().first?.privacyMode == .localOnly, "Session privacy mode round trip")
+        let restoredPrivateSession = try! store.load()
+        expect(restoredPrivateSession.first?.privacyMode == .localOnly, "Session privacy mode round trip")
         let olderPinned = LatticeSession(title: "Older pinned", backend: .codex(model: "gpt-5.4"), isPinned: true, lastUpdated: Date(timeIntervalSince1970: 1))
         let newerUnpinned = LatticeSession(title: "Newer unpinned", backend: .codex(model: "gpt-5.4"), lastUpdated: Date(timeIntervalSince1970: 2))
         expect(LatticeSessionListOrdering.sorted([newerUnpinned, olderPinned]).map(\.id) == [olderPinned.id, newerUnpinned.id], "Pinned chats sort before newer unpinned chats")
         let queuedFollowUp = QueuedFollowUp(text: "Then compare the calmer logo options")
         let queuedSession = LatticeSession(title: "Queued chat", messages: [.init(role: .user, text: "Start")], backend: .codex(model: "gpt-5.4"), queuedFollowUps: [queuedFollowUp])
         try! store.save([queuedSession])
-        expect(store.load().first?.queuedFollowUps == [queuedFollowUp], "Queued follow-ups round trip with the session")
+        let restoredQueuedSession = try! store.load()
+        expect(restoredQueuedSession.first?.queuedFollowUps == [queuedFollowUp], "Queued follow-ups round trip with the session")
         expect(queuedFollowUp.context == nil && queuedFollowUp.lifecycle == .blocked(.missingCapturedContext), "Legacy queued follow-ups without context require explicit review")
 
         // Session input outbox: secret-free context, FIFO claim/dequeue, restart review, no auto-advance past head failure.
@@ -672,7 +1035,54 @@ struct CoreVerification {
                 } else {
                     expect(false, "Asynchronous transcript hydration preserves exact content")
                 }
-                expect(TranscriptHydrationApplyPolicy.shouldApply(request: request, selectedSessionID: lazySession.id, currentSession: lazySession), "Clean selected transcript accepts current hydration generation")
+                expect(TranscriptHydrationApplyPolicy.shouldApply(request: request, activeRequest: request, selectedSessionID: lazySession.id, currentSession: lazySession), "Clean selected transcript accepts current hydration generation")
+                let oldA = TranscriptHydrationRequest(sessionID: lazySession.id, storage: storage)
+                let requestB = TranscriptHydrationRequest(sessionID: UUID(), storage: storage)
+                let freshA = TranscriptHydrationRequest(sessionID: lazySession.id, storage: storage)
+                expect(oldA != freshA && oldA.requestID != freshA.requestID, "Repeated A hydration receives a unique request identity")
+                expect(!TranscriptHydrationApplyPolicy.shouldApply(request: oldA, activeRequest: freshA, selectedSessionID: lazySession.id, currentSession: lazySession), "Apply policy rejects stale same-storage request identity")
+                let generationGate = TranscriptHydrationFallbackGate()
+                let generationCoordinator = TranscriptHydrationCoordinator()
+                let oldATask = Task {
+                    await generationCoordinator.hydrate(oldA) {
+                        await generationGate.suspend("old-a")
+                        return .loaded([.init(role: .assistant, text: "old-a")])
+                    }
+                }
+                await generationGate.waitUntilStarted("old-a")
+                let bTask = Task {
+                    await generationCoordinator.hydrate(requestB) {
+                        await generationGate.suspend("b")
+                        return .loaded([.init(role: .assistant, text: "b")])
+                    }
+                }
+                await generationGate.waitUntilStarted("b")
+                let freshATask = Task {
+                    await generationCoordinator.hydrate(freshA) {
+                        await generationGate.suspend("fresh-a")
+                        return .loaded([.init(role: .assistant, text: "fresh-a")])
+                    }
+                }
+                await generationGate.waitUntilStarted("fresh-a")
+                await generationCoordinator.cancel(oldA)
+                await generationGate.release("fresh-a")
+                if case .loaded(let completedRequest, let content) = await freshATask.value {
+                    expect(completedRequest == freshA && content.messages.map(\.text) == ["fresh-a"], "Delayed old-A cancellation cannot cancel fresh A")
+                } else {
+                    expect(false, "Delayed old-A cancellation cannot cancel fresh A")
+                }
+                await generationGate.release("old-a")
+                await generationGate.release("b")
+                if case .cancelled(let cancelledRequest) = await oldATask.value {
+                    expect(cancelledRequest == oldA, "Old A cancellation retains exact request identity")
+                } else {
+                    expect(false, "Old A cancellation retains exact request identity")
+                }
+                if case .cancelled(let cancelledRequest) = await bTask.value {
+                    expect(cancelledRequest == requestB, "B is cancelled by the fresh A generation")
+                } else {
+                    expect(false, "B is cancelled by the fresh A generation")
+                }
                 var hydrationLRU = TranscriptHydrationLRU(maximumCount: 2)
                 let cachedIDs = [UUID(), UUID(), UUID()]
                 cachedIDs.forEach { hydrationLRU.recordAccess($0) }
@@ -711,7 +1121,7 @@ struct CoreVerification {
             expect(issue.kind == .corrupt, "Corrupt sessions JSON is .corrupt failure")
             expect(issue.storeID == SessionPersistence.storeID, "Corrupt issue names sessions store")
             expect((try? Data(contentsOf: corruptURL)) == corruptBytes, "Corrupt load never mutates original bytes")
-            expect(corruptStore.load().isEmpty, "Compatibility load still returns empty for corrupt without writing")
+            expect((try? corruptStore.load()) == nil, "Throwing compatibility load never converts corrupt bytes into an empty store")
         } else {
             expect(false, "Corrupt sessions JSON is .corrupt failure")
         }
@@ -741,6 +1151,14 @@ struct CoreVerification {
         }
         expect(DurableStoreRecovery.isUnreadableError(NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoPermissionError)), "Cocoa no-permission is unreadable")
         expect(DurableStoreRecovery.isNotFoundError(NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoSuchFileError)), "Cocoa no-such-file is not-found")
+        expect(
+            DurableStoreRecovery.isNotFoundError(LatticeStorePathError.fileSystem(URL(fileURLWithPath: "/tmp/missing.json"), ENOENT)),
+            "Secure-path ENOENT is not-found"
+        )
+        expect(
+            DurableStoreRecovery.isUnreadableError(LatticeStorePathError.fileSystem(URL(fileURLWithPath: "/tmp/denied.json"), EACCES)),
+            "Secure-path EACCES is unreadable"
+        )
         let backupNow = Date(timeIntervalSince1970: 1_800_000_000)
         let backupResult = try! DurableStoreRecovery.preserveCopy(of: corruptURL, kind: .backup, now: backupNow, uniqueToken: "aabbccdd")
         expect(backupResult.preservedURL.lastPathComponent.contains(".corrupt-"), "Backup uses corrupt-timestamp suffix")
@@ -1140,6 +1558,7 @@ struct CoreVerification {
             title: "First",
             messages: [firstUser, firstAssistant, secondUser, secondAssistant],
             backend: .codex(model: "gpt-5.4"),
+            executionRoute: ExecutionRoute(mode: .code, providerID: "codex", modelID: "gpt-5.4", runtimeID: "codex"),
             harnessID: "pi",
             harnessThreadID: "provider-thread",
             workspacePath: "/tmp/Lattice",
@@ -1155,10 +1574,58 @@ struct CoreVerification {
         expect(branch.messages.map(\.id) == [firstUser.id, firstAssistant.id, secondUser.id], "Branching copies visible transcript up to the selected message")
         expect(branch.messages.first(where: { $0.id == firstAssistant.id })?.isPinned == true, "Branching preserves retained pinned messages")
         expect(branch.actions == [retainedAction] && branch.harnessThreadID == nil, "Branching prunes later actions and resets hidden provider context")
-        expect(branch.backend == deletionSession.backend && branch.harnessID == deletionSession.harnessID && branch.workspacePath == deletionSession.workspacePath && branch.policy == deletionSession.policy && branch.privacyMode == deletionSession.privacyMode, "Branching preserves route, workspace, policy, and privacy")
+        expect(branch.backend == deletionSession.backend && branch.executionRoute == deletionSession.executionRoute && branch.harnessID == deletionSession.harnessID && branch.workspacePath == deletionSession.workspacePath && branch.policy == deletionSession.policy && branch.privacyMode == deletionSession.privacyMode, "Branching preserves declared route, workspace, policy, and privacy")
         expect(branch.attachments == deletionSession.attachments && branch.queuedFollowUps.isEmpty && !branch.isPinned && !branch.isStreaming, "Branching preserves context but clears queue, pin, and streaming state")
         expect(SessionTranscriptMutation.branchFromMessage(messageID: UUID(), in: deletionSession) == nil, "Branching ignores stale message identifiers")
         expect(SessionTranscriptMutation.branchFromMessage(messageID: firstUser.id, in: LatticeSession(title: "Running", messages: [firstUser], backend: .codex(model: "gpt-5.4"), isStreaming: true)) == nil, "Branching is disabled while streaming")
+        var unloadedBranchSession = LatticeSession(
+            title: "Lazy",
+            messages: [],
+            transcriptStorage: SessionTranscriptStorage(fileName: "placeholder.json", messageCount: 1, contentFingerprint: "fingerprint"),
+            isTranscriptLoaded: false,
+            backend: .codex(model: "gpt-5.4")
+        )
+        let unloadedBranchSnapshot = unloadedBranchSession
+        expect(!SessionTranscriptMutation.canMutateContent(in: unloadedBranchSession), "Unloaded transcript content is not mutable")
+        expect(SessionTranscriptMutation.branchFromMessage(messageID: firstUser.id, in: unloadedBranchSession) == nil, "Branching fails closed until the transcript is materialized")
+        expect(!SessionTranscriptMutation.deleteMessageAndFollowing(messageID: firstUser.id, in: &unloadedBranchSession) && unloadedBranchSession == unloadedBranchSnapshot, "Deletion fails closed without mutating an unloaded transcript")
+        var unloadedArtifactSession = LatticeSession(
+            title: "Lazy artifacts",
+            messages: [firstUser],
+            artifactStorage: SessionArtifactStorage(fileName: "placeholder.json", artifactCount: 1, contentFingerprint: "fingerprint"),
+            isArtifactsLoaded: false,
+            backend: .codex(model: "gpt-5.4")
+        )
+        let unloadedArtifactSnapshot = unloadedArtifactSession
+        expect(!SessionTranscriptMutation.canMutateContent(in: unloadedArtifactSession), "Unloaded artifact metadata blocks transcript mutation")
+        expect(SessionTranscriptMutation.branchFromMessage(messageID: firstUser.id, in: unloadedArtifactSession) == nil, "Branching fails closed until artifact metadata is materialized")
+        expect(!SessionTranscriptMutation.deleteMessageAndFollowing(messageID: firstUser.id, in: &unloadedArtifactSession) && unloadedArtifactSession == unloadedArtifactSnapshot, "Deletion fails closed without pruning unloaded artifact metadata")
+        let hydrationMessage = ChatMessage(role: .assistant, text: "Stored")
+        let hydrationTranscriptReference = SessionTranscriptStorage(fileName: "transcript.json", messageCount: 1, contentFingerprint: "transcript")
+        let hydrationArtifactReference = SessionArtifactStorage(fileName: "artifacts.json", artifactCount: 1, contentFingerprint: "artifacts")
+        let hydrationArtifact = AssistantArtifact(messageID: hydrationMessage.id, status: .available, displayName: "stored.png", mimeType: "image/png", byteCount: 8, canonicalPath: "/tmp/stored.png", provenance: .init(provider: "Test", origin: .codexImageView))
+        var evictedHydrationSession = LatticeSession(title: "Cached", messages: [hydrationMessage], transcriptStorage: hydrationTranscriptReference, artifacts: [hydrationArtifact], artifactStorage: hydrationArtifactReference, backend: .codex(model: "gpt-5.4"))
+        expect(TranscriptHydrationEvictionPolicy.evictCleanContent(in: &evictedHydrationSession), "Clean sidecar-backed transcript is evictable")
+        expect(evictedHydrationSession.messages.isEmpty && !evictedHydrationSession.isTranscriptLoaded && !evictedHydrationSession.isTranscriptDirty, "Transcript eviction preserves a clean hydratable state")
+        expect(evictedHydrationSession.artifacts.isEmpty && !evictedHydrationSession.isArtifactsLoaded && !evictedHydrationSession.isArtifactsDirty, "Artifact eviction preserves a clean hydratable state")
+        let evictedHydrationRequest = TranscriptHydrationRequest(sessionID: evictedHydrationSession.id, storage: hydrationTranscriptReference)
+        expect(TranscriptHydrationApplyPolicy.shouldApply(request: evictedHydrationRequest, activeRequest: evictedHydrationRequest, selectedSessionID: evictedHydrationSession.id, currentSession: evictedHydrationSession), "Evicted transcript remains eligible for hydration")
+        var lazyLegacySelfEdit = LatticeSession(title: "Older conversation", transcriptStorage: hydrationTranscriptReference, backend: .codex(model: "gpt-5.4"))
+        expect(!LegacySelfEditMigrationPolicy.shouldClassify(lazyLegacySelfEdit), "Lazy legacy self-edit remains inconclusive before transcript hydration")
+        lazyLegacySelfEdit.messages = [.init(role: .user, text: "Please change this app sidebar color")]
+        lazyLegacySelfEdit.isTranscriptLoaded = true
+        lazyLegacySelfEdit.isTranscriptDirty = false
+        expect(LegacySelfEditMigrationPolicy.shouldClassify(lazyLegacySelfEdit), "Hydrated legacy self-edit is reclassified from message content")
+        let normalizedPlaceholder = LatticeSession(title: "Placeholder", transcriptStorage: hydrationTranscriptReference, isTranscriptLoaded: true, backend: .codex(model: "gpt-5.4"))
+        expect(!normalizedPlaceholder.isTranscriptLoaded && !normalizedPlaceholder.isTranscriptDirty, "Nonempty sidecar cannot masquerade as an authoritative empty loaded transcript")
+        let normalizedMemory = LatticeSession(title: "Memory", messages: [firstUser], transcriptStorage: hydrationTranscriptReference, isTranscriptLoaded: false, backend: .codex(model: "gpt-5.4"))
+        expect(normalizedMemory.isTranscriptLoaded && normalizedMemory.isTranscriptDirty && normalizedMemory.messages == [firstUser], "Nonempty in-memory transcript wins contradictory unloaded flags without data loss")
+        var transitionalHydrationObject = try! JSONSerialization.jsonObject(with: JSONEncoder().encode(LatticeSession(title: "Transitional", messages: [firstUser], artifacts: [hydrationArtifact], backend: .codex(model: "gpt-5.4")))) as! [String: Any]
+        transitionalHydrationObject["transcriptStorage"] = ["fileName": "transcript.json", "messageCount": 1, "contentFingerprint": "transcript"]
+        transitionalHydrationObject["artifactStorage"] = ["fileName": "artifacts.json", "artifactCount": 1, "contentFingerprint": "artifacts"]
+        let transitionalHydration = try! JSONDecoder().decode(LatticeSession.self, from: JSONSerialization.data(withJSONObject: transitionalHydrationObject))
+        expect(transitionalHydration.messages == [firstUser] && transitionalHydration.isTranscriptLoaded && transitionalHydration.isTranscriptDirty, "Decoder preserves inline transcript when a contradictory sidecar reference also exists")
+        expect(transitionalHydration.artifacts == [hydrationArtifact] && transitionalHydration.isArtifactsLoaded && transitionalHydration.isArtifactsDirty, "Decoder preserves inline artifacts when a contradictory sidecar reference also exists")
         expect(SessionTranscriptMutation.deleteMessageAndFollowing(messageID: secondUser.id, in: &deletionSession), "Message deletion truncates a transcript branch")
         expect(deletionSession.messages.map(\.id) == [firstUser.id, firstAssistant.id], "Message deletion removes the selected message and every later message")
         expect(deletionSession.actions == [retainedAction] && deletionSession.harnessThreadID == nil, "Message deletion prunes orphaned actions and resets hidden provider context")
@@ -1187,11 +1654,12 @@ struct CoreVerification {
         expect(completedTurnActions.map(\.status) == [.completed, .cancelled, .failed], "Completed turn marks tools complete and stale approvals cancelled")
         let interruptedAction = SessionAction(messageID: responseMessage.id, kind: .tool, toolKind: .command, title: "Build", detail: "$ swift build", status: .running)
         try! store.save([LatticeSession(title: "Interrupted action", messages: [responseMessage], backend: .codex(model: "gpt-5.4"), actions: [interruptedAction], isStreaming: true)])
-        let recovered = store.load().first
+        let recovered = try! store.load().first
         expect(recovered?.isStreaming == false && recovered?.actions.first?.status == .interrupted, "Restoration closes orphaned running actions")
         let selfEditSession = LatticeSession(title: "Lattice self-edit", backend: .grok(model: "grok"), intent: .selfEdit)
         try! store.save([selfEditSession])
-        expect(store.load().first?.intent == .selfEdit, "Self-edit intent round trip")
+        let restoredSelfEditSession = try! store.load()
+        expect(restoredSelfEditSession.first?.intent == .selfEdit, "Self-edit intent round trip")
         expect(LatticeSelfEditCommand.prompt(in: "/self-edit make the composer calmer") == "make the composer calmer", "Self-edit slash command parses prompt")
         expect(LatticeSelfEditCommand.prompt(in: "/self-editor nope") == nil, "Self-edit slash command requires exact command")
         expect(LatticeSelfEditCommand.prompt(in: "make Lattice glassy") == nil, "Plain Lattice wording does not trigger self-edit")
@@ -1206,8 +1674,49 @@ struct CoreVerification {
         expect(CommandSuggestionLayoutPolicy.height(resultCount: 0) == 0, "Empty slash suggestions reserve no height")
         expect(CommandSuggestionLayoutPolicy.height(resultCount: 100) == 378, "Large slash catalogs use a bounded viewport")
         let modeScopedOpenCodeRoute = ExecutionRoute(mode: .code, providerID: "opencode", modelID: "opencode-go/model", runtimeID: "pi")
+        let piUnavailableFallback = PiFirstCodeRoutingPolicy.resolve(
+            preferredRoute: modeScopedOpenCodeRoute,
+            preferredReadiness: .missingRuntime,
+            directReadiness: .runnable,
+            routeLocked: false
+        )
+        expect(piUnavailableFallback.isRunnable && piUnavailableFallback.route.runtimeID == "opencode" && piUnavailableFallback.route.fallbackFromRuntimeID == "pi", "Code materializes an explicit direct provider fallback only when Pi is unavailable")
+        expect(ExecutionRouteResolver.isDeclared(piUnavailableFallback.route) && !LegacyOpenCodeBridgePolicy.allows(piUnavailableFallback.route), "Pi fallback provenance is declared and cannot use the legacy OpenCode auth bridge")
+        let lockedPiFallback = PiFirstCodeRoutingPolicy.resolve(
+            preferredRoute: modeScopedOpenCodeRoute,
+            preferredReadiness: .missingRuntime,
+            directReadiness: .runnable,
+            routeLocked: true
+        )
+        expect(!lockedPiFallback.isRunnable && lockedPiFallback.route == modeScopedOpenCodeRoute, "Existing Pi chats never auto-switch to a provider fallback")
         expect(OpenCodeCredentialPolicy.allowsKeychainCredential(for: modeScopedOpenCodeRoute, enabledModes: [.code]), "OpenCode key may be injected only after Code consent")
         expect(!OpenCodeCredentialPolicy.allowsKeychainCredential(for: modeScopedOpenCodeRoute, enabledModes: [.work]), "OpenCode Work consent does not authorize Code injection")
+        expect(CredentialReadPolicy.shouldConsultLegacy(after: .missing), "Only an authoritative missing credential read consults the legacy service")
+        for state in [CredentialReadState.value, .locked, .denied, .unavailable, .invalidData] {
+            expect(!CredentialReadPolicy.shouldConsultLegacy(after: state), "Credential read (state) fails closed without legacy fallback")
+        }
+        expect(CredentialReadPolicy.availability(for: .invalidData) == .unavailable, "Unreadable credential data is unavailable, not sign-out")
+        expect(CredentialReadPolicy.failureMessage(for: .locked, provider: "OpenCode") == "The Keychain is locked. Unlock it, then try OpenCode again.", "Locked Keychain gets exact actionable provider copy")
+        expect(CredentialReadPolicy.failureMessage(for: .denied, provider: "OpenCode") == "Keychain access was denied. Allow access for Lattice, then try OpenCode again.", "Denied Keychain gets exact actionable provider copy")
+        let blockedCredentialSession = LatticeSession(
+            title: "Blocked credential",
+            messages: [.init(role: .user, text: "Continue")],
+            backend: .openCode(model: "opencode-go/model"),
+            executionRoute: ExecutionRoute(mode: .code, providerID: "opencode", modelID: "opencode-go/model", runtimeID: "pi"),
+            harnessThreadID: "thread-abc",
+            compactContextOnNextSend: true
+        )
+        let blockedCredentialPlan = RunLaunchPlanner.plan(.init(
+            session: blockedCredentialSession,
+            submittedText: "Continue",
+            additionalContext: "",
+            tokenLimit: 8_000,
+            effectiveRuntimeID: "pi"
+        ))
+        let blockedCredentialState = RunLaunchOneShotState(harnessThreadID: "thread-abc", compactContextOnNextSend: true)
+        expect(RunLaunchCommitPolicy.applying(blockedCredentialPlan, admission: .blocked, to: blockedCredentialState) == blockedCredentialState, "Blocked credential admission preserves provider thread and pending compact")
+        let admittedCredentialState = RunLaunchCommitPolicy.applying(blockedCredentialPlan, admission: .admitted, to: blockedCredentialState)
+        expect(admittedCredentialState.harnessThreadID == nil && !admittedCredentialState.compactContextOnNextSend, "Admitted launch atomically consumes provider thread reset and pending compact")
         expect(RuntimeInstallDescriptor.pi.installReference.hasSuffix("@0.80.6"), "Pi first-use setup is pinned")
         expect(RuntimeArtifactVerification.registryIntegrityMatches(reported: "\"\(RuntimeInstallDescriptor.pi.registryIntegrity!)\"", expected: RuntimeInstallDescriptor.pi.registryIntegrity!), "Pi registry integrity accepts only exact pinned metadata")
         expect(!RuntimeArtifactVerification.registryIntegrityMatches(reported: "sha512-wrong", expected: RuntimeInstallDescriptor.pi.registryIntegrity!), "Pi registry integrity mismatch fails closed")
@@ -1231,11 +1740,22 @@ struct CoreVerification {
         expect(!RuntimeOwnershipPolicy.canUninstall(.pi, managedRuntimeIDs: []), "External runtimes cannot be removed by Lattice")
         expect(!RuntimeOwnershipPolicy.shouldRecordOwnership(after: .update, status: 0, executableAvailable: true), "Updating an external runtime does not transfer ownership")
         let safeProviderEnvironment = ChildProcessEnvironmentPolicy.providerOwnedRuntime(
-            from: ["PATH": "/usr/bin", "HOME": "/Users/example", "OPENAI_API_KEY": "synthetic-secret"],
+            from: [
+                "PATH": "/usr/bin",
+                "HOME": "/Users/example",
+                "LANG": "en_US.UTF-8",
+                "OPENAI_API_KEY": "synthetic-secret",
+                "DYLD_INSERT_LIBRARIES": "/tmp/hostile.dylib",
+                "GIT_CONFIG_GLOBAL": "/tmp/hostile.gitconfig",
+                "HTTPS_PROXY": "http://127.0.0.1:1",
+                "BASH_ENV": "/tmp/hostile-shell-startup"
+            ],
             temporaryDirectory: URL(fileURLWithPath: "/tmp/lattice-provider")
         )
         expect(safeProviderEnvironment["PATH"] == "/usr/bin", "Provider child environment preserves required executable search path")
+        expect(safeProviderEnvironment["LANG"] == "en_US.UTF-8", "Provider child environment preserves locale")
         expect(safeProviderEnvironment["OPENAI_API_KEY"] == nil, "Provider child environment excludes ambient credentials")
+        expect(safeProviderEnvironment["DYLD_INSERT_LIBRARIES"] == nil && safeProviderEnvironment["GIT_CONFIG_GLOBAL"] == nil && safeProviderEnvironment["HTTPS_PROXY"] == nil && safeProviderEnvironment["BASH_ENV"] == nil, "Provider child environment excludes dynamic-loader, Git, proxy, and shell-startup injection")
         let legacyOpenCodeRoute = ExecutionRoute(mode: .code, providerID: "opencode", modelID: "legacy", runtimeID: "opencode")
         expect(LegacyOpenCodeBridgePolicy.allows(legacyOpenCodeRoute), "OpenCode bridge remains limited to direct legacy routes")
         expect(!LegacyOpenCodeBridgePolicy.allows(modeScopedOpenCodeRoute), "New Pi OpenCode routes cannot use legacy auth-file bridge")
@@ -1311,6 +1831,9 @@ struct CoreVerification {
         expect(busyFailureAction.kind == .diagnostics && !busyFailureAction.isEnabled, "Failed readiness resolves to diagnostics and rejects duplicate activation while busy")
         expect(!SessionPrivacyPolicy.allows(.codex(model: "gpt-5.5"), in: .localOnly), "Local-only blocks cloud route")
         expect(SessionPrivacyPolicy.allows(.ollama(model: "qwen3:8b"), in: .localOnly), "Local-only accepts local route")
+        expect(OllamaModelInstaller.isValidTag("qwen3:8b") && !OllamaModelInstaller.isValidTag("--help") && !OllamaModelInstaller.isValidTag("model\nother"), "Ollama model installer rejects option and control injection")
+        let boundedInstallProgress = OllamaModelInstaller.progressText(from: "\u{001B}[31m" + String(repeating: "x", count: 8_000))
+        expect(boundedInstallProgress?.contains("\u{001B}") == false && (boundedInstallProgress?.count ?? 0) <= OllamaModelInstaller.maximumProgressCharacters, "Ollama model installer bounds and sanitizes progress")
         let instructionEnvelope = try! LatticeInstructionEnvelope(selectedMode: .work, workspaceInstructionsTrusted: true, trustedWorkspaceInstructionNames: ["AGENTS.md"], workUserAddOn: "work")
         expect(instructionEnvelope.activeUserAddOn == "work" && instructionEnvelope.renderedSystemInstructions.contains("not a permission boundary"), "Instruction envelope preserves Work guidance hierarchy")
         let installerTrust = RemoteInstallerScriptPolicy.trust(for: Data("#!/bin/sh\n".utf8), expectedSHA256Hex: String(repeating: "0", count: 64))
@@ -2840,7 +3363,7 @@ struct CoreVerification {
         let jobStore = LatticeExtensionJobStore(fileURL: extensionRoot.appendingPathComponent("self-edit-jobs.json"))
         let job = LatticeExtensionJobRecord(
             sessionID: UUID(),
-            harnessThreadID: "thread-1",
+            harnessThreadID: "runtime-job-handle-secret",
             request: "Make Lattice warmer",
             manifestID: replacement.id,
             manifestName: replacement.name,
@@ -2853,6 +3376,9 @@ struct CoreVerification {
         )
         let recordedJobs = try! jobStore.record(job, in: [])
         expect(recordedJobs.first?.manifestID == replacement.id, "Self-edit job persisted")
+        let rawJobBytes = String(decoding: try! Data(contentsOf: jobStore.fileURL), as: UTF8.self)
+        expect(!rawJobBytes.contains("harnessThreadID") && !rawJobBytes.contains("runtime-job-handle-secret"), "Self-edit job store omits runtime provider handles")
+        expect(recordedJobs.first?.harnessThreadID == nil, "Self-edit job load never revives runtime provider handle")
         expect(recordedJobs.first?.previousEnabled == false, "Self-edit job persisted previous enabled state")
         expect(recordedJobs.first?.previousSkillSnapshots.isEmpty == true, "Self-edit job persists empty skill rollback snapshots")
         expect(recordedJobs.first?.previousDisabledSkillIDs == ["subagents"], "Self-edit job persists prior skill enablement")
@@ -2878,8 +3404,12 @@ struct CoreVerification {
         legacyJobObject.removeValue(forKey: "appliedManifestData")
         legacyJobObject.removeValue(forKey: "appliedSkillSnapshots")
         legacyJobObject.removeValue(forKey: "appliedEnabled")
+        legacyJobObject["harnessThreadID"] = "legacy-job-handle-secret"
         let legacyJobData = try! JSONSerialization.data(withJSONObject: legacyJobObject)
         let legacyJob = try! JSONDecoder().decode(LatticeExtensionJobRecord.self, from: legacyJobData)
+        expect(legacyJob.harnessThreadID == nil, "Legacy self-edit job decode drops provider runtime handles")
+        let reencodedLegacyJob = String(decoding: try! JSONEncoder().encode(legacyJob), as: UTF8.self)
+        expect(!reencodedLegacyJob.contains("harnessThreadID") && !reencodedLegacyJob.contains("legacy-job-handle-secret"), "Legacy self-edit job reencode omits provider runtime handles")
         expect(legacyJob.previousEnabled == nil, "Legacy self-edit jobs decode without previous enabled state")
         expect(legacyJob.previousSkillSnapshots.isEmpty, "Legacy self-edit jobs decode without skill snapshots")
         expect(legacyJob.previousDisabledSkillIDs == nil, "Legacy self-edit jobs decode without skill enablement snapshots")
@@ -2890,13 +3420,23 @@ struct CoreVerification {
         let previewStore = LatticeExtensionPreviewStore(fileURL: extensionRoot.appendingPathComponent("self-edit-previews.json"))
         let preview = LatticeExtensionPreviewRecord(
             sessionID: job.sessionID!,
-            harnessThreadID: job.harnessThreadID,
+            harnessThreadID: "runtime-preview-handle-secret",
             request: "Preview warmer UI",
             manifest: replacement,
             previousManifestData: previousData
         )
         let recordedPreviews = try! previewStore.record(preview, in: [])
         expect(recordedPreviews.first?.manifest == replacement, "Self-edit preview persisted")
+        let rawPreviewBytes = String(decoding: try! Data(contentsOf: previewStore.fileURL), as: UTF8.self)
+        expect(!rawPreviewBytes.contains("harnessThreadID") && !rawPreviewBytes.contains("runtime-preview-handle-secret"), "Self-edit preview store omits runtime provider handles")
+        expect(recordedPreviews.first?.harnessThreadID == nil, "Self-edit preview load never revives runtime provider handle")
+        var legacyHandlePreviewObject = try! JSONSerialization.jsonObject(with: JSONEncoder().encode(preview)) as! [String: Any]
+        legacyHandlePreviewObject["harnessThreadID"] = "legacy-preview-handle-secret"
+        let legacyHandlePreviewData = try! JSONSerialization.data(withJSONObject: legacyHandlePreviewObject)
+        let legacyHandlePreview = try! JSONDecoder().decode(LatticeExtensionPreviewRecord.self, from: legacyHandlePreviewData)
+        expect(legacyHandlePreview.harnessThreadID == nil, "Legacy self-edit preview decode drops provider runtime handles")
+        let reencodedLegacyPreview = String(decoding: try! JSONEncoder().encode(legacyHandlePreview), as: UTF8.self)
+        expect(!reencodedLegacyPreview.contains("harnessThreadID") && !reencodedLegacyPreview.contains("legacy-preview-handle-secret"), "Legacy self-edit preview reencode omits provider runtime handles")
         expect(previewStore.load().first?.previousManifestData == previousData, "Self-edit preview rollback baseline persisted")
         let editableManifest = LatticeExtensionManifest(
             id: "com.lattice.skills",
@@ -3710,6 +4250,91 @@ struct CoreVerification {
         expect(boundaryCoord.flush([LatticeSession(title: "Selected", backend: .codex(model: "gpt-5.4"), draft: exactTermination)]) == .saved, "Termination flush succeeds")
         expect(boundaryWrites.value.last == exactTermination, "Termination flush writes exact latest draft snapshot")
 
+        let staleDebounceWrites = Box<[String]>([])
+        let staleDebounceEntered = DispatchSemaphore(value: 0)
+        let releaseStaleDebounce = DispatchSemaphore(value: 0)
+        let staleDebounceCoord = SessionSaveCoordinator(
+            filePath: "/tmp/lattice-verify-stale-debounce.json",
+            writeGate: DurableStoreWriteGate(),
+            debounceNanoseconds: 0,
+            saveHandler: { sessions in staleDebounceWrites.value.append(sessions.first?.title ?? "") },
+            debounceQueue: DispatchQueue(label: "com.lattice.verify.stale-debounce")
+        )
+        staleDebounceCoord.beforeDebouncedSaveLockHook = {
+            staleDebounceEntered.signal()
+            _ = releaseStaleDebounce.wait(timeout: .now() + 5)
+        }
+        staleDebounceCoord.scheduleDebounced([LatticeSession(title: "old", backend: .codex(model: "gpt-5.4"))])
+        expect(staleDebounceEntered.wait(timeout: .now() + 5) == .success, "Fired debounce reaches deterministic serialization window")
+        expect(staleDebounceCoord.saveNow([LatticeSession(title: "new", backend: .codex(model: "gpt-5.4"))]) == .saved, "Immediate save supersedes fired stale debounce")
+        releaseStaleDebounce.signal()
+        for _ in 0..<100 where staleDebounceCoord.hasPendingDebouncedSave {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        expect(staleDebounceWrites.value == ["new"], "Stale debounce revalidates after save lock and cannot overwrite newer state")
+
+        let orderedConcurrentWrites = Box<[String]>([])
+        let immediateWriteEntered = DispatchSemaphore(value: 0)
+        let releaseImmediateWrite = DispatchSemaphore(value: 0)
+        let scheduleInvoked = DispatchSemaphore(value: 0)
+        let scheduleReturned = DispatchSemaphore(value: 0)
+        let orderedConcurrentCoord = SessionSaveCoordinator(
+            filePath: "/tmp/lattice-verify-concurrent-save.json",
+            writeGate: DurableStoreWriteGate(),
+            debounceNanoseconds: 0,
+            saveHandler: { sessions in
+                let title = sessions.first?.title ?? ""
+                if title == "old" {
+                    immediateWriteEntered.signal()
+                    _ = releaseImmediateWrite.wait(timeout: .now() + 5)
+                }
+                orderedConcurrentWrites.value.append(title)
+            },
+            debounceQueue: DispatchQueue(label: "com.lattice.verify.concurrent-save")
+        )
+        DispatchQueue.global().async {
+            _ = orderedConcurrentCoord.saveNow([LatticeSession(title: "old", backend: .codex(model: "gpt-5.4"))])
+        }
+        expect(immediateWriteEntered.wait(timeout: .now() + 5) == .success, "Immediate write holds serialization lock for schedule ordering check")
+        DispatchQueue.global().async {
+            scheduleInvoked.signal()
+            orderedConcurrentCoord.scheduleDebounced([LatticeSession(title: "new", backend: .codex(model: "gpt-5.4"))])
+            scheduleReturned.signal()
+        }
+        expect(scheduleInvoked.wait(timeout: .now() + 5) == .success, "Newer schedule is invoked while older immediate write is active")
+        releaseImmediateWrite.signal()
+        expect(scheduleReturned.wait(timeout: .now() + 5) == .success, "Newer schedule registers after older immediate write")
+        for _ in 0..<500 where orderedConcurrentWrites.value.count < 2 {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        expect(orderedConcurrentWrites.value == ["old", "new"], "Concurrent newer schedule cannot be overtaken by older immediate save")
+
+        let reentrantAttempts = Box(0)
+        let reentrantFinished = DispatchSemaphore(value: 0)
+        let reentrantCoordinator = Box<SessionSaveCoordinator?>(nil)
+        let reentrantObserverEntered = Box(false)
+        let reentrantCoord = SessionSaveCoordinator(
+            filePath: "/tmp/lattice-verify-reentrant-save.json",
+            writeGate: DurableStoreWriteGate(),
+            saveHandler: { _ in
+                reentrantAttempts.value += 1
+                if reentrantAttempts.value == 1 { throw permission }
+            },
+            failureObserver: { failure in
+                guard failure != nil, !reentrantObserverEntered.value else { return }
+                reentrantObserverEntered.value = true
+                _ = reentrantCoordinator.value?.saveNow([LatticeSession(title: "retry", backend: .codex(model: "gpt-5.4"))])
+                reentrantFinished.signal()
+            }
+        )
+        reentrantCoordinator.value = reentrantCoord
+        if case .failed = reentrantCoord.saveNow([LatticeSession(title: "first", backend: .codex(model: "gpt-5.4"))]) {
+            expect(reentrantFinished.wait(timeout: .now() + 5) == .success, "Failure observer can synchronously reenter without deadlock")
+            expect(reentrantAttempts.value == 2 && reentrantCoord.currentFailure == nil, "Reentrant retry clears failure with exactly one newer write")
+        } else {
+            expect(false, "Reentrant observer fixture starts with a failed save")
+        }
+
         let gateBlocked = DurableStoreWriteGate()
         gateBlocked.block()
         let gateWrites = Box(0)
@@ -4078,6 +4703,236 @@ struct CoreVerification {
             expect(migrated.checkpoints.count == 1 && migrated.checkpoints[0].id == legacyID, "Legacy checkpoint rows survive migration")
             expect(migrated.checkpoints[0].untrackedFiles.isEmpty, "Missing untracked metadata defaults empty on migration")
             expect(migrated.checkpoints[0].hasTrackedDirtiness == false, "Missing dirtiness defaults false on migration")
+            expect(
+                WorkspaceCheckpointStore.normalizedDefaultStoreFileName("../escape.json") == WorkspaceCheckpointStore.defaultFileName,
+                "Default checkpoint store rejects traversal filenames"
+            )
+            let futureCheckpointData = try JSONSerialization.data(withJSONObject: [
+                "version": WorkspaceCheckpointStoreDocument.currentVersion + 1,
+                "checkpoints": [],
+                "notes": []
+            ])
+            do {
+                _ = try WorkspaceCheckpointStore.decodeMigrating(futureCheckpointData)
+                expect(false, "Future checkpoint schemas fail closed")
+            } catch let error as WorkspaceCheckpointError {
+                if case .storeUnreadable(let detail) = error, detail.contains("newer than supported") {
+                    checks += 1
+                } else {
+                    expect(false, "Future checkpoint schemas map to unreadable")
+                }
+            }
+            let malformedLegacyNotes = try JSONSerialization.data(withJSONObject: [
+                "version": 1,
+                "checkpoints": [],
+                "notes": [["unexpected": true]]
+            ])
+            do {
+                _ = try WorkspaceCheckpointStore.decodeMigrating(malformedLegacyNotes)
+                expect(false, "Malformed legacy checkpoint notes fail closed")
+            } catch let error as WorkspaceCheckpointError {
+                if case .storeUnreadable(let detail) = error, detail.contains("review notes are malformed") {
+                    checks += 1
+                } else {
+                    expect(false, "Malformed legacy checkpoint notes map to unreadable")
+                }
+            }
+
+            // Concurrent store instances must serialize the full read/modify/write
+            // cycle; atomic replacement alone would otherwise lose rows.
+            let concurrentStoreURL = storeRoot.appendingPathComponent("concurrent-checkpoints.json")
+            let concurrentStores = (0..<3).map { _ in WorkspaceCheckpointStore(fileURL: concurrentStoreURL) }
+            let concurrentSessionID = UUID()
+            let concurrentRunID = UUID()
+            let concurrentIDs = (0..<12).map { _ in UUID() }
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for index in concurrentIDs.indices {
+                    let store = concurrentStores[index % concurrentStores.count]
+                    let row = WorkspaceCheckpoint(
+                        id: concurrentIDs[index],
+                        ownership: WorkspaceCheckpointOwnership(
+                            worktreePath: "/tmp/verify-worktree",
+                            worktreeIdentity: "verify-identity",
+                            sessionID: concurrentSessionID,
+                            runID: concurrentRunID
+                        ),
+                        boundary: .beforeRun,
+                        status: .captured
+                    )
+                    group.addTask { try store.upsert(row) }
+                }
+                try await group.waitForAll()
+            }
+            let concurrentDocument = try concurrentStores[0].load()
+            expect(
+                Set(concurrentDocument.checkpoints.map(\.id)) == Set(concurrentIDs),
+                "Concurrent checkpoint upserts preserve every row"
+            )
+            let aliasRoot = storeRoot.deletingLastPathComponent()
+                .appendingPathComponent("lattice-verify-checkpoint-alias-\(UUID().uuidString)")
+            try FileManager.default.createSymbolicLink(at: aliasRoot, withDestinationURL: storeRoot)
+            defer { try? FileManager.default.removeItem(at: aliasRoot) }
+            let aliasRealURL = storeRoot.appendingPathComponent("alias-concurrent.json")
+            let aliasLinkURL = aliasRoot.appendingPathComponent("alias-concurrent.json")
+            let aliasStores = [
+                WorkspaceCheckpointStore(fileURL: aliasRealURL),
+                WorkspaceCheckpointStore(fileURL: aliasLinkURL)
+            ]
+            let aliasIDs = (0..<8).map { _ in UUID() }
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for (index, id) in aliasIDs.enumerated() {
+                    let aliasStore = aliasStores[index % aliasStores.count]
+                    let row = WorkspaceCheckpoint(
+                        id: id,
+                        ownership: ownership,
+                        boundary: .beforeRun,
+                        status: .captured
+                    )
+                    group.addTask { try aliasStore.upsert(row) }
+                }
+                try await group.waitForAll()
+            }
+            let aliasLoadedIDs = try Set(aliasStores[0].load().checkpoints.map(\.id))
+            expect(
+                aliasLoadedIDs == Set(aliasIDs),
+                "Canonical checkpoint locks serialize symlink parent aliases"
+            )
+
+            let idempotentNote = WorkspaceReviewNote(
+                id: UUID(),
+                checkpointID: legacyID,
+                sessionID: ownership.sessionID,
+                runID: ownership.runID,
+                path: "Sources/Feature.swift",
+                body: "Review once"
+            )
+            try store.appendNote(idempotentNote)
+            try store.appendNote(idempotentNote)
+            let idempotentNoteCount = try store.notes().filter { $0.id == idempotentNote.id }.count
+            expect(idempotentNoteCount == 1, "Checkpoint note append is idempotent by ID")
+
+            let preserveURL = storeRoot.appendingPathComponent("preserve-checkpoints.json")
+            let preserveStore = WorkspaceCheckpointStore(fileURL: preserveURL)
+            let preserveID = UUID()
+            let preserveRow = WorkspaceCheckpoint(
+                id: preserveID,
+                ownership: ownership,
+                boundary: .beforeRun,
+                status: .captured
+            )
+            try preserveStore.save(.init(checkpoints: [preserveRow]))
+            var oversizedRow = preserveRow
+            oversizedRow.id = UUID()
+            oversizedRow.failureSummary = String(repeating: "x", count: DurableStoreRecovery.maximumStoreByteCount + 1)
+            do {
+                try preserveStore.save(.init(checkpoints: [oversizedRow]))
+                expect(false, "Oversized encoded checkpoint writes fail")
+            } catch let error as WorkspaceCheckpointError {
+                if case .storeWriteFailed(let detail) = error, detail.contains("Existing data was preserved") {
+                    checks += 1
+                } else {
+                    expect(false, "Oversized encoded checkpoint writes map to write failure")
+                }
+            }
+            let preservedIDs = try preserveStore.load().checkpoints.map(\.id)
+            expect(preservedIDs == [preserveID], "Oversized checkpoint write preserves existing file")
+            let preserveChildren = try FileManager.default.contentsOfDirectory(atPath: storeRoot.path)
+            expect(
+                !preserveChildren.contains(where: { $0.hasPrefix(".preserve-checkpoints.json.tmp-") }),
+                "Oversized checkpoint write creates no temporary file"
+            )
+
+            let oversizedCheckpointURL = storeRoot.appendingPathComponent("oversized-checkpoints.json")
+            try Data(repeating: 0x7B, count: DurableStoreRecovery.maximumStoreByteCount + 1).write(to: oversizedCheckpointURL)
+            do {
+                _ = try WorkspaceCheckpointStore(fileURL: oversizedCheckpointURL).load()
+                expect(false, "Oversized checkpoint stores fail closed")
+            } catch let error as WorkspaceCheckpointError {
+                if case .storeUnreadable(let detail) = error, detail.contains("limit") {
+                    checks += 1
+                } else {
+                    expect(false, "Oversized checkpoint stores map to unreadable")
+                }
+            }
+            let checkpointTargetURL = storeRoot.appendingPathComponent("checkpoint-target.json")
+            try Data("{}".utf8).write(to: checkpointTargetURL)
+            let checkpointLinkURL = storeRoot.appendingPathComponent("checkpoint-link.json")
+            try FileManager.default.createSymbolicLink(at: checkpointLinkURL, withDestinationURL: checkpointTargetURL)
+            do {
+                _ = try WorkspaceCheckpointStore(fileURL: checkpointLinkURL).load()
+                expect(false, "Symlinked checkpoint stores are rejected")
+            } catch let error as WorkspaceCheckpointError {
+                if case .storeUnreadable = error {
+                    checks += 1
+                } else {
+                    expect(false, "Symlinked checkpoint stores map to unreadable")
+                }
+            }
+            let checkpointFIFOURL = storeRoot.appendingPathComponent("checkpoint-pipe.json")
+            expect(mkfifo(checkpointFIFOURL.path, mode_t(0o600)) == 0, "Checkpoint special target fixture is created")
+            do {
+                _ = try WorkspaceCheckpointStore(fileURL: checkpointFIFOURL).load()
+                expect(false, "Special checkpoint stores are rejected without blocking")
+            } catch let error as WorkspaceCheckpointError {
+                if case .storeUnreadable = error {
+                    checks += 1
+                } else {
+                    expect(false, "Special checkpoint stores map to unreadable")
+                }
+            }
+            let lockedCheckpointURL = storeRoot.appendingPathComponent("locked-checkpoints.json")
+            let checkpointLockURL = storeRoot.appendingPathComponent(".locked-checkpoints.json.lock")
+            let checkpointLockTargetURL = storeRoot.appendingPathComponent("checkpoint-lock-target")
+            try Data().write(to: checkpointLockTargetURL)
+            try FileManager.default.createSymbolicLink(at: checkpointLockURL, withDestinationURL: checkpointLockTargetURL)
+            do {
+                _ = try WorkspaceCheckpointStore(fileURL: lockedCheckpointURL).load()
+                expect(false, "Symlinked checkpoint store locks are rejected")
+            } catch let error as WorkspaceCheckpointError {
+                if case .storeUnreadable = error {
+                    checks += 1
+                } else {
+                    expect(false, "Symlinked checkpoint store locks map to unreadable")
+                }
+            }
+            try FileManager.default.removeItem(at: checkpointLockURL)
+            expect(mkfifo(checkpointLockURL.path, mode_t(0o600)) == 0, "Checkpoint special lock fixture is created")
+            do {
+                _ = try WorkspaceCheckpointStore(fileURL: lockedCheckpointURL).load()
+                expect(false, "Special checkpoint store locks are rejected without blocking")
+            } catch let error as WorkspaceCheckpointError {
+                if case .storeUnreadable = error {
+                    checks += 1
+                } else {
+                    expect(false, "Special checkpoint store locks map to unreadable")
+                }
+            }
+            let contendedCheckpointURL = storeRoot.appendingPathComponent("contended-checkpoints.json")
+            let contendedCheckpointLockURL = storeRoot.appendingPathComponent(".contended-checkpoints.json.lock")
+            let contendedDescriptor = Darwin.open(
+                contendedCheckpointLockURL.path,
+                O_RDWR | O_CREAT | O_CLOEXEC,
+                mode_t(0o600)
+            )
+            expect(contendedDescriptor >= 0, "Checkpoint contention fixture opens lock")
+            if contendedDescriptor >= 0 {
+                defer { _ = Darwin.close(contendedDescriptor) }
+                expect(flock(contendedDescriptor, LOCK_EX | LOCK_NB) == 0, "Checkpoint contention fixture holds lock")
+                defer { _ = flock(contendedDescriptor, LOCK_UN) }
+                let contentionStarted = DispatchTime.now().uptimeNanoseconds
+                do {
+                    _ = try WorkspaceCheckpointStore(fileURL: contendedCheckpointURL).load()
+                    expect(false, "Contended checkpoint reads time out")
+                } catch let error as WorkspaceCheckpointError {
+                    if case .storeUnreadable(let detail) = error, detail.contains("Timed out after 0.5 seconds") {
+                        checks += 1
+                    } else {
+                        expect(false, "Contended checkpoint reads return truthful timeout errors")
+                    }
+                }
+                let contentionElapsed = Double(DispatchTime.now().uptimeNanoseconds - contentionStarted) / 1_000_000_000
+                expect(contentionElapsed < 1.5, "Checkpoint lock wait stays synchronously bounded")
+            }
 
             guard let gitURL = ExecutableDiscovery.locate("git") else {
                 expect(false, "Git executable is required for checkpoint verification")
@@ -4112,6 +4967,11 @@ struct CoreVerification {
             _ = try await runGit(repo, ["config", "user.email", "verify@lattice.local"])
             _ = try await runGit(repo, ["config", "user.name", "Lattice Verify"])
             _ = try await runGit(repo, ["config", "commit.gpgsign", "false"])
+            // Repository-local diff/hooks configuration must not escape into
+            // checkpoint subprocesses. The service supplies an explicit safe
+            // Git configuration and a minimal environment.
+            _ = try await runGit(repo, ["config", "diff.external", "/bin/false"])
+            _ = try await runGit(repo, ["config", "core.hooksPath", "/definitely-missing-hooks"])
             try "hello\n".write(to: repo.appendingPathComponent("tracked.txt"), atomically: true, encoding: .utf8)
             _ = try await runGit(repo, ["add", "tracked.txt"])
             _ = try await runGit(repo, ["commit", "-m", "init"])
@@ -4121,6 +4981,13 @@ struct CoreVerification {
             let service = WorkspaceCheckpointService(store: liveStore, gitExecutableURL: gitURL, deadline: 30)
             let sessionID = UUID()
             let runID = UUID()
+
+            do {
+                _ = try WorkspaceCheckpointService.validateGitOID("--not-an-object", label: "test")
+                expect(false, "Checkpoint Git object IDs reject option-shaped revisions")
+            } catch let error as WorkspaceCheckpointError {
+                if case .checkpointPairInvalid = error { checks += 1 } else { expect(false, "Checkpoint Git object IDs reject option-shaped revisions") }
+            }
 
             let clean = try await service.capture(
                 worktreeURL: repo,
@@ -4177,6 +5044,25 @@ struct CoreVerification {
             } else {
                 expect(false, "Untracked hash-object does not write objects into the repository")
             }
+
+            let hugeUntracked = repo.appendingPathComponent("huge-untracked.bin")
+            try Data(repeating: 0x41, count: WorkspaceCheckpointService.maximumUntrackedFileBytes + 1).write(to: hugeUntracked)
+            do {
+                _ = try await service.capture(
+                    worktreeURL: repo,
+                    sessionID: UUID(),
+                    runID: UUID(),
+                    boundary: .beforeRun
+                )
+                expect(false, "Oversized untracked files fail checkpoint capture before unbounded hashing")
+            } catch let error as WorkspaceCheckpointError {
+                if case .captureFailed(let detail) = error, detail.contains("capture limit") {
+                    checks += 1
+                } else {
+                    expect(false, "Oversized untracked files fail checkpoint capture before unbounded hashing")
+                }
+            }
+            try FileManager.default.removeItem(at: hugeUntracked)
 
             // Restore clean content then exercise before/after + guarded revert.
             try "hello\n".write(to: repo.appendingPathComponent("tracked.txt"), atomically: true, encoding: .utf8)
@@ -4356,25 +5242,28 @@ struct CoreVerification {
         var frameAccumulator = ComputerFrameAccumulator(minimumInterval: 1, recentCapacity: 2)
         let frameT0 = Date(timeIntervalSince1970: 2_000)
         expect(frameAccumulator.offer(ComputerFrame(provider: "codex", imagePath: "https://example.com/x.png"), observedAt: frameT0) == .rejectedInvalidPath, "Frame accumulator rejects non-file URLs")
-        expect(frameAccumulator.offer(ComputerFrame(provider: "codex", imagePath: "/tmp/f1.png"), observedAt: frameT0) == .accepted, "Frame accumulator accepts local file paths")
-        expect(frameAccumulator.offer(ComputerFrame(provider: "codex", imagePath: "/tmp/f2.png"), observedAt: frameT0.addingTimeInterval(0.2)) == .rejectedRateLimited, "Frame accumulator rate-limits excess frames")
-        expect(frameAccumulator.offer(ComputerFrame(provider: "codex", imagePath: "/tmp/f3.png"), observedAt: frameT0.addingTimeInterval(1.0)) == .accepted, "Frame accumulator accepts frames after interval")
+        expect(frameAccumulator.offer(ComputerFrame(provider: "codex", imagePath: "/tmp/f1.png", imageData: Data([1])), observedAt: frameT0) == .accepted, "Frame accumulator accepts admitted local frame bytes")
+        expect(frameAccumulator.offer(ComputerFrame(provider: "codex", imagePath: "/tmp/f2.png", imageData: Data([2])), observedAt: frameT0.addingTimeInterval(0.2)) == .rejectedRateLimited, "Frame accumulator rate-limits excess frames")
+        expect(frameAccumulator.offer(ComputerFrame(provider: "codex", imagePath: "/tmp/f3.png", imageData: Data([3])), observedAt: frameT0.addingTimeInterval(1.0)) == .accepted, "Frame accumulator accepts frames after interval")
         frameAccumulator.stop()
-        expect(frameAccumulator.offer(ComputerFrame(provider: "codex", imagePath: "/tmp/f4.png"), observedAt: frameT0.addingTimeInterval(3.0)) == .rejectedStopped, "Stopped frame accumulator rejects new frames")
+        expect(frameAccumulator.offer(ComputerFrame(provider: "codex", imagePath: "/tmp/f4.png", imageData: Data([4])), observedAt: frameT0.addingTimeInterval(3.0)) == .rejectedStopped, "Stopped frame accumulator rejects new frames")
         let framePresentation = ComputerFramePresentationPolicy.presentation(for: frameAccumulator)
         expect(framePresentation.isStopped && framePresentation.controlsRemainProviderOwned, "Frame presentation marks stopped streams and provider-owned controls")
         let frameID = UUID(uuidString: "00000000-0000-0000-0000-0000000000cf")!
-        let typedFrame = ComputerFrame(id: frameID, provider: "codex", timestamp: Date(timeIntervalSince1970: 1), imagePath: "/tmp/f.png")
+        let typedFrame = ComputerFrame(id: frameID, provider: "codex", timestamp: Date(timeIntervalSince1970: 1), imagePath: "/tmp/f.png", imageData: Data([1]))
         expect(AgentEvent.computerFrame(typedFrame) == .computerFrame(typedFrame), "AgentEvent.computerFrame is typed and equatable")
+        let providerFrameURL = FileManager.default.temporaryDirectory.appendingPathComponent("lattice-provider-frame-\(UUID().uuidString).png")
+        try? Data([0x89, 0x50, 0x4e, 0x47]).write(to: providerFrameURL)
+        defer { try? FileManager.default.removeItem(at: providerFrameURL) }
         let codexComputerEvent = CodexExecHarness.appServerEvent(from: [
             "method": "item/completed",
             "params": ["item": [
                 "type": "dynamicToolCall", "id": "computer-1", "tool": "computer_use", "status": "completed",
-                "contentItems": [["type": "inputImage", "imageUrl": "file:///tmp/provider-frame.png"]]
+                "contentItems": [["type": "inputImage", "imageUrl": providerFrameURL.absoluteString]]
             ]]
-        ], workspace: URL(fileURLWithPath: "/tmp"))
+        ], workspace: FileManager.default.temporaryDirectory)
         if case .computerFrame(let frame)? = codexComputerEvent {
-            expect(frame.imageURL?.path == "/tmp/provider-frame.png" && frame.controlBoundary.state == .observeOnly, "Codex maps only structured local computer image output to observe-only frames")
+            expect(frame.imageURL?.path == providerFrameURL.path && frame.imageData != nil && frame.controlBoundary.state == .observeOnly, "Codex maps only authorized structured computer image bytes to observe-only frames")
         } else {
             expect(false, "Codex maps only structured local computer image output to observe-only frames")
         }

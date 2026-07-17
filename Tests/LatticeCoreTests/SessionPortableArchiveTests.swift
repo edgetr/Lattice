@@ -201,6 +201,24 @@ struct SessionPortableArchiveTests {
         }
     }
 
+    @Test func providerFallbackProvenanceSurvivesPortableRoundTrip() throws {
+        var source = sampleSession()
+        source.executionRoute = ExecutionRoute(
+            mode: .code,
+            providerID: "codex",
+            modelID: "gpt-5.5",
+            runtimeID: "codex",
+            fallbackFromRuntimeID: "pi"
+        )
+        source.harnessID = "codex"
+        let data = try SessionPortableArchiveExporter.exportData(from: source)
+        let text = try #require(String(data: data, encoding: .utf8))
+        #expect(text.contains("\"fallbackFromRuntimeID\" : \"pi\""))
+        let imported = try SessionPortableArchiveImporter.prepareImport(data: data, existingSessions: []).session
+        #expect(imported.executionRoute == source.executionRoute)
+        #expect(!LegacyOpenCodeBridgePolicy.allows(imported.executionRoute))
+    }
+
     @Test func exportsCodePhaseAndPlanButNeverCompactFlag() throws {
         var source = sampleSession(includeQueued: false)
         source.codePhase = .planAwaitingApproval

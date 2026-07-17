@@ -181,18 +181,30 @@ public final class SessionSaveCoordinator: @unchecked Sendable {
 
     private let saveHandler: SaveHandler
     private let debounceQueue: DispatchQueue
+    private let failureNotificationQueue: DispatchQueue
+    private let failureNotificationQueueKey = DispatchSpecificKey<UInt8>()
     private let now: Clock
     private let lock = NSLock()
     /// Serializes filesystem writes even when tests or a future caller invoke the coordinator
     /// from more than one executor. This also guarantees a safe-boundary save that races a
     /// fired debounce is the final (latest) write.
     private let saveLock = NSLock()
+    /// Bridges write serialization to failure-notification enqueueing. A writer
+    /// acquires this while it still owns `saveLock`, releases `saveLock`, then
+    /// enqueues. This preserves write order without allowing observer code to
+    /// begin while the corresponding write lock is held.
+    private let notificationOrderLock = NSLock()
 
     private var pendingSnapshot: [LatticeSession]?
     private var pendingWorkItem: DispatchWorkItem?
     private var debounceGeneration: UInt64 = 0
     private var activeFailure: SessionSaveFailure?
     private var failureObserver: FailureObserver?
+
+    /// Test seam used to deterministically pause a fired debounce between its
+    /// generation check and the save serialization lock. Production callers
+    /// leave this nil.
+    internal var beforeDebouncedSaveLockHook: (@Sendable () -> Void)? = nil
 
     public init(
         storeID: String = SessionPersistence.storeID,
@@ -215,8 +227,15 @@ public final class SessionSaveCoordinator: @unchecked Sendable {
         self.debounceNanoseconds = debounceNanoseconds
         self.saveHandler = saveHandler
         self.debounceQueue = debounceQueue
+        // Always own the callback queue so FIFO ordering cannot be weakened by
+        // a caller injecting a concurrent target.
+        self.failureNotificationQueue = DispatchQueue(
+            label: "com.lattice.session-save-failure-notifications",
+            qos: .userInitiated
+        )
         self.now = now
         self.failureObserver = failureObserver
+        self.failureNotificationQueue.setSpecific(key: failureNotificationQueueKey, value: 1)
     }
 
     /// Convenience that saves through a `SessionPersistence` instance.
@@ -269,6 +288,9 @@ public final class SessionSaveCoordinator: @unchecked Sendable {
     /// Used for drafts and high-frequency streaming/action progress where writing every delta would
     /// amplify full-store JSON serialization. Semantic wrappers below keep call sites explicit.
     public func scheduleDebounced(_ sessions: [LatticeSession]) {
+        // Linearize schedule registration with immediate writes. Whichever
+        // operation takes saveLock first defines the authoritative order.
+        saveLock.lock()
         lock.lock()
         pendingSnapshot = sessions
         pendingWorkItem?.cancel()
@@ -280,6 +302,7 @@ public final class SessionSaveCoordinator: @unchecked Sendable {
         }
         pendingWorkItem = workItem
         lock.unlock()
+        saveLock.unlock()
 
         let clampedDelay = Int(min(delay, UInt64(Int.max)))
         debounceQueue.asyncAfter(
@@ -302,28 +325,27 @@ public final class SessionSaveCoordinator: @unchecked Sendable {
     /// when the caller passes the latest exact snapshot (pending is dropped because caller supersedes it).
     @discardableResult
     public func saveNow(_ sessions: [LatticeSession]) -> SessionSaveAttemptResult {
-        cancelPendingLocked()
-        return performSave(sessions)
+        performImmediateSave(sessions)
     }
 
     /// Synchronous termination/lifecycle flush of the latest exact snapshot.
     /// Cancels pending debounced work; the provided snapshot is authoritative.
     @discardableResult
     public func flush(_ sessions: [LatticeSession]) -> SessionSaveAttemptResult {
-        cancelPendingLocked()
-        return performSave(sessions)
+        performImmediateSave(sessions)
     }
 
     /// Retry must write the latest snapshot, never the stale snapshot that originally failed.
     @discardableResult
     public func retry(_ latestSessions: [LatticeSession]) -> SessionSaveAttemptResult {
-        cancelPendingLocked()
-        return performSave(latestSessions)
+        performImmediateSave(latestSessions)
     }
 
     /// Drop pending debounced work without writing.
     public func cancelPending() {
+        saveLock.lock()
         cancelPendingLocked()
+        saveLock.unlock()
     }
 
     // MARK: - Internals
@@ -339,32 +361,68 @@ public final class SessionSaveCoordinator: @unchecked Sendable {
 
     private func performPendingDebouncedSave(ifGenerationIs generation: UInt64) {
         lock.lock()
+        guard generation == debounceGeneration, pendingSnapshot != nil else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+
+        // A safe-boundary save can invalidate this generation while the debounce
+        // waits for the filesystem serialization lock. Revalidate after taking
+        // that lock, immediately before consuming the snapshot and doing IO.
+        beforeDebouncedSaveLockHook?()
+        saveLock.lock()
+
+        lock.lock()
         guard generation == debounceGeneration, let snapshot = pendingSnapshot else {
             lock.unlock()
+            saveLock.unlock()
             return
         }
         pendingSnapshot = nil
         pendingWorkItem = nil
         lock.unlock()
-        _ = performSave(snapshot)
+        let completion = performSaveLocked(snapshot)
+        notificationOrderLock.lock()
+        saveLock.unlock()
+        completion.enqueueNotification(on: failureNotificationQueue)
+        notificationOrderLock.unlock()
     }
 
-    private func performSave(_ sessions: [LatticeSession]) -> SessionSaveAttemptResult {
+    private func performImmediateSave(_ sessions: [LatticeSession]) -> SessionSaveAttemptResult {
         saveLock.lock()
-        defer { saveLock.unlock() }
+        cancelPendingLocked()
+        let completion = performSaveLocked(sessions)
+        notificationOrderLock.lock()
+        saveLock.unlock()
+        completion.enqueueNotification(on: failureNotificationQueue)
+        notificationOrderLock.unlock()
+        drainFailureNotificationsIfPossible()
+        return completion.result
+    }
+
+    /// Preserve the historical synchronous observer contract for ordinary
+    /// callers. A callback that reenters the coordinator is already executing
+    /// on this queue and must not synchronously wait on itself.
+    private func drainFailureNotificationsIfPossible() {
+        guard DispatchQueue.getSpecific(key: failureNotificationQueueKey) == nil else { return }
+        failureNotificationQueue.sync {}
+    }
+
+    /// Performs one write while `saveLock` is held by the caller.
+    private func performSaveLocked(_ sessions: [LatticeSession]) -> SaveCompletion {
 
         if writeGate.isBlocked {
             // Never write while load-recovery gate is blocked; do not surface as save-failure UI.
-            return .blockedByWriteGate
+            return SaveCompletion(result: .blockedByWriteGate)
         }
 
         do {
             try saveHandler(sessions)
-            clearFailure()
-            return .saved
+            return clearFailureAfterSuccessfulSave()
         } catch {
             if SessionSaveFailureClassifier.isWriteBlocked(error) {
-                return .blockedByWriteGate
+                return SaveCompletion(result: .blockedByWriteGate)
             }
             let failure = SessionSaveFailureClassifier.makeFailure(
                 storeID: storeID,
@@ -377,29 +435,56 @@ public final class SessionSaveCoordinator: @unchecked Sendable {
         }
     }
 
-    private func recordFailure(_ failure: SessionSaveFailure) -> SessionSaveAttemptResult {
+    private func recordFailure(_ failure: SessionSaveFailure) -> SaveCompletion {
         lock.lock()
         let previous = activeFailure
         if let previous, previous.fingerprint == failure.fingerprint {
             // Keep original occurredAt so the status does not thrash; suppress re-notify storms.
             lock.unlock()
-            return .coalescedFailure(previous)
+            return SaveCompletion(result: .coalescedFailure(previous))
         }
         activeFailure = failure
         let observer = failureObserver
         lock.unlock()
-        observer?(failure)
-        return .failed(failure)
+        return SaveCompletion(result: .failed(failure), observer: observer, observedFailure: failure)
     }
 
-    private func clearFailure() {
+    private func clearFailureAfterSuccessfulSave() -> SaveCompletion {
         lock.lock()
         let hadFailure = activeFailure != nil
         activeFailure = nil
         let observer = failureObserver
         lock.unlock()
-        if hadFailure {
-            observer?(nil)
+        return SaveCompletion(
+            result: .saved,
+            observer: hadFailure ? observer : nil,
+            observedFailure: nil
+        )
+    }
+}
+
+private struct SaveCompletion {
+    let result: SessionSaveAttemptResult
+    let observer: SessionSaveCoordinator.FailureObserver?
+    let observedFailure: SessionSaveFailure?
+
+    init(
+        result: SessionSaveAttemptResult,
+        observer: SessionSaveCoordinator.FailureObserver? = nil,
+        observedFailure: SessionSaveFailure? = nil
+    ) {
+        self.result = result
+        self.observer = observer
+        self.observedFailure = observedFailure
+    }
+
+    /// Enqueued after the caller releases `saveLock`, while the handoff lock
+    /// still guarantees the same total order as the writes.
+    func enqueueNotification(on queue: DispatchQueue) {
+        guard let observer else { return }
+        let failure = observedFailure
+        queue.async {
+            observer(failure)
         }
     }
 }

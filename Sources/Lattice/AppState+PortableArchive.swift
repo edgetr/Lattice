@@ -46,10 +46,10 @@ extension AppState {
             return
         }
         do {
-            try persistence.materializeTranscript(in: &session)
+            try persistence.materializeSessionContent(in: &session)
         } catch {
             cancelExportChatSheet()
-            presentImportError("Export failed because the stored transcript could not be loaded. Existing chats were not changed.")
+            presentImportError("Export failed because the stored conversation content could not be loaded. Existing chats were not changed.")
             return
         }
         let format = exportChatFormat
@@ -138,6 +138,57 @@ extension AppState {
 
         let previousSessions = sessions
         let previousSelected = selectedSessionID
+        let previousSection = selectedSection
+        let previousSearchText = searchText
+        let previousDraft = draft
+        let previousTransientNewChat = isTransientNewChat
+        let previousComposerMode = composerSelectionMode
+        let previousComposerBackend = composerSelectionBackend
+        let previousComposerRoutePopoverPresented = composerRoutePopoverPresented
+        let previousComposerModelSearchText = composerModelSearchText
+        let previousEditingMessageContext = editingMessageContext
+        let previousPreservedComposerDraft = preservedComposerDraftBeforeEdit
+        let previousRunUIStates = runUIStates
+        let previousThreadActivityLanes = threadActivityLanes
+        let previousConversationScrollStates = conversationScrollStates
+        let previousConversationOutgoingSequences = conversationOutgoingActionSequence
+        let previousConversationJumpAffordances = conversationJumpAffordances
+        let previousWorkOriginJumpTarget = workOriginJumpTarget
+        let previousWorkQuestionAnswers = workQuestionAnswers
+        let previousHarnessPermissionNotices = harnessPermissionNotices
+        let previousIsOverlayVisible = isOverlayVisible
+
+        // Selection changes intentionally update composer and activity state through didSet.
+        // Keep a complete UI snapshot so a rejected durable commit cannot leave the imported
+        // chat selected, clear an edit, or discard unrelated search/activity state.
+        func restorePreImportState() {
+            sessions = previousSessions
+            selectedSessionID = previousSelected
+            selectedSection = previousSection
+            searchText = previousSearchText
+            applyComposerDraft(previousDraft)
+            isTransientNewChat = previousTransientNewChat
+            composerSelectionMode = previousComposerMode
+            composerSelectionBackend = previousComposerBackend
+            composerRoutePopoverPresented = previousComposerRoutePopoverPresented
+            composerModelSearchText = previousComposerModelSearchText
+            editingMessageContext = previousEditingMessageContext
+            preservedComposerDraftBeforeEdit = previousPreservedComposerDraft
+            runUIStates = previousRunUIStates
+            threadActivityLanes = previousThreadActivityLanes
+            conversationScrollStates = previousConversationScrollStates
+            conversationOutgoingActionSequence = previousConversationOutgoingSequences
+            conversationJumpAffordances = previousConversationJumpAffordances
+            workOriginJumpTarget = previousWorkOriginJumpTarget
+            workQuestionAnswers = previousWorkQuestionAnswers
+            harnessPermissionNotices = previousHarnessPermissionNotices
+            isOverlayVisible = previousIsOverlayVisible
+            // The selection didSet may have queued a snapshot based on the temporary imported
+            // selection. Invalidate it after restoring the exact pre-import state.
+            sessionSaveCoordinator.cancelPending()
+            refreshSearchIndexForLoadedSessions()
+        }
+
         let commit = SessionPortableArchiveImporter.commit(
             plan: plan,
             into: sessions,
@@ -160,14 +211,10 @@ extension AppState {
                 : "Imported a new chat. Provider was not started."
             sessionSaveFailure = sessionSaveCoordinator.currentFailure
         case .blockedByWriteGate:
-            sessions = previousSessions
-            threadActivityLanes.remove(commit.importedSessionID)
-            selectedSessionID = previousSelected
+            restorePreImportState()
             presentImportError("Chat store recovery is active, so import was cancelled. Existing chats were not changed.")
         case .failed(let failure), .coalescedFailure(let failure):
-            sessions = previousSessions
-            threadActivityLanes.remove(commit.importedSessionID)
-            selectedSessionID = previousSelected
+            restorePreImportState()
             sessionSaveFailure = failure
             presentImportError("Could not save the imported chat (\(failure.kind.displayName)). Existing chats were not changed. \(failure.summary)")
         }
@@ -207,14 +254,19 @@ extension AppState {
               let sessionIndex = sessions.firstIndex(where: { $0.id == id }),
               let messageIndex = sessions[sessionIndex].messages.firstIndex(where: { $0.id == message.id }),
               !sessions[sessionIndex].messages[messageIndex].text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let previousSession = sessions[sessionIndex]
         sessions[sessionIndex].messages[messageIndex].isPinned.toggle()
         sessions[sessionIndex].lastUpdated = .now
-        persist()
+        if persist() != .saved {
+            sessions[sessionIndex] = previousSession
+        }
     }
 
     func canBranchFromMessage(_ message: ChatMessage) -> Bool {
         guard let session = selectedSession,
-              !session.isStreaming else { return false }
+              !session.isStreaming,
+              session.isTranscriptLoaded,
+              session.isArtifactsLoaded else { return false }
         return session.messages.contains(where: { $0.id == message.id })
     }
 
@@ -223,13 +275,17 @@ extension AppState {
               let index = sessions.firstIndex(where: { $0.id == id }),
               let branch = SessionTranscriptMutation.branchFromMessage(messageID: message.id, in: sessions[index]) else { return }
         sessions.insert(branch, at: 0)
+        guard persist() == .saved else {
+            sessions.removeAll { $0.id == branch.id }
+            refreshSearchIndexForLoadedSessions()
+            return
+        }
         // Branch starts with zero pending new-content and fresh tail-follow, independent of the source.
         conversationScrollStates[branch.id] = ConversationScrollPolicy.freshBranchState()
         publishConversationJumpAffordance(for: branch.id)
         selectedSessionID = branch.id
         selectedSection = .conversations
         clearError()
-        persist()
     }
 
     /// Store a measured scroll-policy result and publish jump affordance only when it changes.
@@ -271,6 +327,8 @@ extension AppState {
         guard let sessionID = selectedSessionID,
               let session = sessions.first(where: { $0.id == sessionID }),
               !session.isStreaming,
+              session.isTranscriptLoaded,
+              session.isArtifactsLoaded,
               session.messages.contains(where: { $0.id == message.id }) else { return }
         pendingDeleteMessageContext = MessageDeletionContext(sessionID: sessionID, messageID: message.id)
         showDeleteMessageConfirmation = true
@@ -285,10 +343,42 @@ extension AppState {
 
         pendingDeleteMessageContext = nil
         showDeleteMessageConfirmation = false
+        let previousSession = sessions[sessionIndex]
         guard SessionTranscriptMutation.deleteMessageAndFollowing(
             messageID: context.messageID,
             in: &sessions[sessionIndex]
         ) else { return }
+
+        // A preview is scoped to the pre-deletion transcript. Remove it durably
+        // before committing the truncation so it can never be applied against a
+        // conversation branch that no longer exists.
+        let previousPreviews = selfEditPreviews
+        let hadPreviews = previousPreviews.contains { $0.sessionID == context.sessionID }
+        if hadPreviews {
+            do {
+                selfEditPreviews = try extensionPreviewStore.removePreviews(
+                    for: context.sessionID,
+                    from: previousPreviews
+                )
+            } catch {
+                sessions[sessionIndex] = previousSession
+                setError("Could not remove the pending self-edit preview before deleting this message: \(error.localizedDescription)", sessionID: context.sessionID)
+                return
+            }
+        }
+        guard persist() == .saved else {
+            sessions[sessionIndex] = previousSession
+            selfEditPreviews = previousPreviews
+            if hadPreviews {
+                do {
+                    try extensionPreviewStore.save(previousPreviews)
+                } catch {
+                    setError("The message was kept, but its pending self-edit preview could not be restored: \(error.localizedDescription)", sessionID: context.sessionID)
+                }
+            }
+            refreshSearchIndexForLoadedSessions()
+            return
+        }
 
         if let edit = editingMessageContext,
            edit.sessionID == context.sessionID,
@@ -299,13 +389,9 @@ extension AppState {
            !sessions[sessionIndex].messages.contains(where: { $0.id == copiedMessageID }) {
             self.copiedMessageID = nil
         }
-        if let updated = try? extensionPreviewStore.removePreviews(for: context.sessionID, from: selfEditPreviews) {
-            selfEditPreviews = updated
-        }
         harnessPermissionNotices[context.sessionID] = nil
         clearActivity(for: context.sessionID)
         clearError()
-        persist()
     }
 
     func cancelPendingMessageDeletion() {
@@ -358,8 +444,10 @@ extension AppState {
         }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        if editingMessageID == nil, handleSelfEditReviewDecision(text) {
+        if editingMessageID == nil, LatticeSelfEditReviewDecision.parse(text) != nil {
+            let preservedDraft = draft
             draft = ComposerSessionDraftTransition.clearingOrdinaryDraft()
+            if !send(text) { draft = preservedDraft }
             return
         }
         if let prompt = LatticeSelfEditCommand.prompt(in: text), prompt.isEmpty {
@@ -389,8 +477,9 @@ extension AppState {
             sendEditedDraft(text)
             return
         }
+        let preservedDraft = draft
         draft = ComposerSessionDraftTransition.clearingOrdinaryDraft()
-        send(text)
+        if !send(text) { draft = preservedDraft }
     }
 
     func insertAppCommand(_ command: LatticeAppCommand) {

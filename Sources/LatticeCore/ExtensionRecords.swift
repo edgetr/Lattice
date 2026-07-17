@@ -155,14 +155,16 @@ public struct LatticeExtensionJobRecord: Identifiable, Codable, Hashable, Sendab
     public var canRollback: Bool { status == .applied || status == .recorded }
 
     private enum CodingKeys: String, CodingKey {
-        case id, sessionID, harnessThreadID, request, manifestID, manifestName, summary, previousManifestData, previousSkillSnapshots, previousDisabledSkillIDs, previousEnabled, appliedManifestData, appliedSkillSnapshots, appliedEnabled, createdAt, status, statusDetail
+        case id, sessionID, request, manifestID, manifestName, summary, previousManifestData, previousSkillSnapshots, previousDisabledSkillIDs, previousEnabled, appliedManifestData, appliedSkillSnapshots, appliedEnabled, createdAt, status, statusDetail
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
         sessionID = try container.decodeIfPresent(UUID.self, forKey: .sessionID)
-        harnessThreadID = try container.decodeIfPresent(String.self, forKey: .harnessThreadID)
+        // Legacy provider handles are ignored. Runtime job objects may still carry
+        // one while active, but durable records never revive or encode it.
+        harnessThreadID = nil
         request = try container.decode(String.self, forKey: .request)
         manifestID = try container.decode(String.self, forKey: .manifestID)
         manifestName = try container.decode(String.self, forKey: .manifestName)
@@ -217,14 +219,15 @@ public struct LatticeExtensionPreviewRecord: Identifiable, Codable, Hashable, Se
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, sessionID, harnessThreadID, request, manifest, previousManifestData, previousSkillSnapshots, previousDisabledSkillIDs, previousEnabled, createdAt
+        case id, sessionID, request, manifest, previousManifestData, previousSkillSnapshots, previousDisabledSkillIDs, previousEnabled, createdAt
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
         sessionID = try container.decode(UUID.self, forKey: .sessionID)
-        harnessThreadID = try container.decodeIfPresent(String.self, forKey: .harnessThreadID)
+        // Legacy provider handles are ignored during preview restore.
+        harnessThreadID = nil
         request = try container.decode(String.self, forKey: .request)
         manifest = try container.decode(LatticeExtensionManifest.self, forKey: .manifest)
         previousManifestData = try container.decodeIfPresent(Data.self, forKey: .previousManifestData)

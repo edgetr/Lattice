@@ -12,6 +12,7 @@ private final class CheckpointReviewViewModel: ObservableObject {
     @Published var selectedEndLine: Int?
     @Published var noteKind: WorkspaceReviewNoteKind = .note
     @Published var noteBody = ""
+    @Published var isSavingNote = false
     @Published var showsRevertConfirmation = false
     @Published var expandedPaths: Set<String> = []
 }
@@ -337,9 +338,10 @@ struct CheckpointReviewView: View {
         let disabled = model.selectedPath == nil
             || model.noteBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || invalidLineRange
+            || model.isSavingNote
         HStack(spacing: 8) {
             if model.noteKind == .note {
-                Button("Save Note") { saveCurrentNote() }
+                Button(model.isSavingNote ? "Saving…" : "Save Note") { saveCurrentNote() }
                     .buttonStyle(LatticePrimaryButtonStyle())
                     .disabled(disabled)
                     .accessibilityHint(model.selectedPath == nil ? "Select a file or hunk first." : "Persists this item with the selected repository path and line range.")
@@ -348,7 +350,7 @@ struct CheckpointReviewView: View {
                     .disabled(disabled)
                     .help("Insert this review into the composer draft. Notes never enter the composer automatically.")
             } else {
-                Button("Save Follow-up") { saveCurrentNote() }
+                Button(model.isSavingNote ? "Saving…" : "Save Follow-up") { saveCurrentNote() }
                     .buttonStyle(LatticeSecondaryButtonStyle())
                     .disabled(disabled)
                     .accessibilityHint(model.selectedPath == nil ? "Select a file or hunk first." : "Persists this item with the selected repository path and line range.")
@@ -362,15 +364,21 @@ struct CheckpointReviewView: View {
     }
 
     private func saveCurrentNote() {
-        guard let selectedPath = model.selectedPath else { return }
+        guard let selectedPath = model.selectedPath, !model.isSavingNote else { return }
+        let submittedBody = model.noteBody
+        model.isSavingNote = true
         state.addSelectedCheckpointReviewNote(
             path: selectedPath,
-            body: model.noteBody,
+            body: submittedBody,
             kind: model.noteKind,
             lineRange: validLineRange,
             hunkHeader: model.selectedHunkHeader
-        )
-        model.noteBody = ""
+        ) { succeeded in
+            model.isSavingNote = false
+            if succeeded, model.noteBody == submittedBody {
+                model.noteBody = ""
+            }
+        }
     }
 
     private func addCurrentNoteToComposer() {

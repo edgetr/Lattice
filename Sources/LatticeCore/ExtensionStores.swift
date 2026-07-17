@@ -82,10 +82,13 @@ public struct LatticeExtensionStore: Sendable {
         let canonicalRoot = try LatticeStorePathSecurity.canonicalDirectory(at: rootURL)
         let bundleURL = try LatticeStorePathSecurity.createChildDirectory(named: manifest.id, under: canonicalRoot)
         let manifestURL = bundleURL.appendingPathComponent("lattice-extension.json")
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(manifest)
-        try LatticeStorePathSecurity.writeDataAtomically(data, to: manifestURL, under: canonicalRoot)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(manifest)
+            guard data.count <= DurableStoreRecovery.maximumStoreByteCount else {
+                throw NSError(domain: "LatticeExtensionStore", code: 6, userInfo: [NSLocalizedDescriptionKey: "Generated extension manifest exceeds the safe storage limit."])
+            }
+            try LatticeStorePathSecurity.writeDataAtomically(data, to: manifestURL, under: canonicalRoot)
         return manifestURL
     }
 
@@ -97,9 +100,7 @@ public struct LatticeExtensionStore: Sendable {
         if let existing = firstExistingManifest(in: bundle) {
             return try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(at: existing)
         }
-        return try? LatticeStorePathSecurity.readDataWithoutFollowingSymlinks(
-            at: bundle.appendingPathComponent("lattice-extension.json")
-        )
+        return nil
     }
 
     public func restoreExtension(manifestID: String, previousManifestData: Data?) throws {
@@ -132,14 +133,14 @@ public struct LatticeExtensionStore: Sendable {
 
     private func manifestCandidates() throws -> [(manifest: URL, bundle: URL)] {
         let canonicalRoot = try LatticeStorePathSecurity.canonicalDirectory(at: rootURL)
-        let children = try FileManager.default.contentsOfDirectory(at: canonicalRoot, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
         var results: [(URL, URL)] = []
-        for child in children {
-            if LatticeStorePathSecurity.isDirectoryWithoutFollowingSymlinks(at: child) {
+        for entry in try LatticeStorePathSecurity.directoryEntriesWithoutFollowingSymlinks(in: canonicalRoot) {
+            let child = canonicalRoot.appendingPathComponent(entry.name, isDirectory: entry.isDirectory)
+            if entry.isDirectory {
                 if let manifest = firstExistingManifest(in: child) {
                     results.append((manifest, child))
                 }
-            } else if LatticeStorePathSecurity.isRegularFileWithoutFollowingSymlinks(at: child),
+            } else if entry.isRegularFile,
                       (child.lastPathComponent.hasSuffix(".latticeextension.json")
                         || child.lastPathComponent == "lattice-extension.json"
                         || child.lastPathComponent.hasSuffix(LatticeLegacyBrandCompatibility.extensionManifestSuffix)
@@ -151,10 +152,12 @@ public struct LatticeExtensionStore: Sendable {
     }
 
     private func firstExistingManifest(in bundle: URL) -> URL? {
-        let primary = bundle.appendingPathComponent("lattice-extension.json")
-        if LatticeStorePathSecurity.isRegularFileWithoutFollowingSymlinks(at: primary) { return primary }
-        let legacy = bundle.appendingPathComponent(LatticeLegacyBrandCompatibility.extensionManifestFileName)
-        if LatticeStorePathSecurity.isRegularFileWithoutFollowingSymlinks(at: legacy) { return legacy }
+        guard let entries = try? LatticeStorePathSecurity.directoryEntriesWithoutFollowingSymlinks(in: bundle) else { return nil }
+        let names = Set(entries.filter(\.isRegularFile).map(\.name))
+        if names.contains("lattice-extension.json") { return bundle.appendingPathComponent("lattice-extension.json") }
+        if names.contains(LatticeLegacyBrandCompatibility.extensionManifestFileName) {
+            return bundle.appendingPathComponent(LatticeLegacyBrandCompatibility.extensionManifestFileName)
+        }
         return nil
     }
 
@@ -481,7 +484,7 @@ public struct LatticeExtensionStore: Sendable {
 
     private static func isSafeManifestID(_ id: String) -> Bool {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed == id else { return false }
+        guard !trimmed.isEmpty, trimmed == id, trimmed != ".", trimmed != ".." else { return false }
         let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
         return trimmed.rangeOfCharacter(from: allowed.inverted) == nil
     }
@@ -556,11 +559,24 @@ public struct LatticeExtensionJobStore: Sendable {
     }
 
     public func save(_ records: [LatticeExtensionJobRecord]) throws {
-        try DurableStoreRecovery.enforceWritable(gate: writeGate, storeName: Self.storeName)
-        try io.createDirectory(fileURL.deletingLastPathComponent())
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try io.writeDataAtomically(encoder.encode(records.sorted { $0.createdAt > $1.createdAt }), fileURL)
+        try writeGate.withExclusiveWrite {
+            try DurableStoreRecovery.enforceWritable(gate: writeGate, storeName: Self.storeName)
+            try io.createDirectory(fileURL.deletingLastPathComponent())
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(records.sorted { $0.createdAt > $1.createdAt })
+            guard data.count <= DurableStoreRecovery.maximumStoreByteCount else {
+                throw NSError(domain: "LatticeExtensionStore", code: 7, userInfo: [NSLocalizedDescriptionKey: "Self-edit history exceeds the safe storage limit."])
+            }
+            do {
+                try io.writeDataAtomically(data, fileURL)
+            } catch {
+                if (try? io.readDataUpTo(fileURL, DurableStoreRecovery.maximumStoreByteCount)) == data {
+                    throw NSError(domain: "LatticeExtensionStore", code: 8, userInfo: [NSLocalizedDescriptionKey: "Self-edit history was published, but write durability could not be confirmed. (error.localizedDescription)"])
+                }
+                throw error
+            }
+        }
     }
 
     public func record(_ record: LatticeExtensionJobRecord, in records: [LatticeExtensionJobRecord]) throws -> [LatticeExtensionJobRecord] {

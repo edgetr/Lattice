@@ -399,6 +399,8 @@ extension AppState {
     }
 
     func acceptSelfEditPreview(_ preview: LatticeExtensionPreviewRecord) {
+        guard let index = sessions.firstIndex(where: { $0.id == preview.sessionID }),
+              requireLoadedSessionContent(for: preview.sessionID, at: index) else { return }
         do {
             let acceptedPreview = try materializedSelfEditPreview(preview)
             let validation = extensionStore.validate(acceptedPreview.manifest)
@@ -472,6 +474,8 @@ extension AppState {
     }
 
     func applySelfEditPreview(_ preview: LatticeExtensionPreviewRecord) {
+        guard let sessionIndex = sessions.firstIndex(where: { $0.id == preview.sessionID }),
+              requireLoadedSessionContent(for: preview.sessionID, at: sessionIndex) else { return }
         guard !hasUnsavedSelfEditPreviewEdits(preview) else {
             setError("The pending review edits could not be applied.", sessionID: preview.sessionID)
             return
@@ -539,7 +543,6 @@ extension AppState {
             )
             selfEditJobs = try extensionJobStore.record(record, in: selfEditJobs)
             selfEditPreviews = try extensionPreviewStore.remove(preview.id, from: selfEditPreviews)
-            clearExpandedSkillPreviews(for: preview)
             if preview.manifest.hasRuntimePatches {
                 enabledExtensionIDs.insert(preview.manifest.id)
             } else {
@@ -548,48 +551,156 @@ extension AppState {
             UserDefaults.standard.set(Array(enabledExtensionIDs).sorted(), forKey: Self.enabledExtensionIDsKey)
             UserDefaults.standard.set(Array(disabledSkillIDs).sorted(), forKey: Self.disabledSkillIDsKey)
             refreshExtensions()
-            appendSelfEditStatus(applyStatus, to: preview.sessionID)
+            guard appendSelfEditStatus(applyStatus, to: preview.sessionID) else {
+                throw NSError(
+                    domain: "LatticeSelfEdit",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "The extension change was rolled back because its chat status could not be saved."]
+                )
+            }
+            clearExpandedSkillPreviews(for: preview)
             clearError()
         } catch {
-            try? extensionStore.restoreExtension(manifestID: preview.manifest.id, previousManifestData: preview.previousManifestData)
+            let applyError = error
+            var compensationFailures: [String] = []
+            var manifestRestored = false
+            do {
+                try extensionStore.restoreExtension(
+                    manifestID: preview.manifest.id,
+                    previousManifestData: preview.previousManifestData
+                )
+                manifestRestored = true
+            } catch {
+                compensationFailures.append("extension manifest: \(error.localizedDescription)")
+            }
+
+            var skillsRestored = true
             if preview.previousSkillSnapshots.isEmpty {
                 for skillID in writtenSkillIDs {
-                    _ = try? skillStore.deleteSkill(id: skillID, ownedByExtensionID: preview.manifest.id)
+                    do {
+                        _ = try skillStore.deleteSkill(id: skillID, ownedByExtensionID: preview.manifest.id)
+                    } catch {
+                        skillsRestored = false
+                        compensationFailures.append("skill \(skillID): \(error.localizedDescription)")
+                    }
                 }
             } else {
                 for snapshot in preview.previousSkillSnapshots {
-                    try? skillStore.restoreSkill(snapshot, removingCurrentIfOwnedBy: preview.manifest.id)
+                    do {
+                        try skillStore.restoreSkill(snapshot, removingCurrentIfOwnedBy: preview.manifest.id)
+                    } catch {
+                        skillsRestored = false
+                        compensationFailures.append("skill \(snapshot.id): \(error.localizedDescription)")
+                    }
                 }
             }
-            try? extensionJobStore.save(originalJobs)
-            try? extensionPreviewStore.save(originalPreviews)
-            selfEditJobs = originalJobs
-            selfEditPreviews = originalPreviews
-            enabledExtensionIDs = originalEnabledExtensionIDs
-            disabledSkillIDs = originalDisabledSkillIDs
+
+            do {
+                try extensionJobStore.save(originalJobs)
+                selfEditJobs = originalJobs
+            } catch {
+                compensationFailures.append("self-edit history: \(error.localizedDescription)")
+                recordSelfEditCompensationStoreIssue(
+                    storeID: LatticeExtensionJobStore.storeID,
+                    storeName: LatticeExtensionJobStore.storeName,
+                    fileURL: extensionJobStore.fileURL,
+                    error: error
+                )
+                requestPersistenceGateBlock(extensionJobStore.writeGate)
+            }
+            do {
+                try extensionPreviewStore.save(originalPreviews)
+                selfEditPreviews = originalPreviews
+            } catch {
+                compensationFailures.append("self-edit previews: \(error.localizedDescription)")
+                recordSelfEditCompensationStoreIssue(
+                    storeID: LatticeExtensionPreviewStore.storeID,
+                    storeName: LatticeExtensionPreviewStore.storeName,
+                    fileURL: extensionPreviewStore.fileURL,
+                    error: error
+                )
+                requestPersistenceGateBlock(extensionPreviewStore.writeGate)
+            }
+            if manifestRestored {
+                enabledExtensionIDs = originalEnabledExtensionIDs
+            }
             UserDefaults.standard.set(Array(enabledExtensionIDs).sorted(), forKey: Self.enabledExtensionIDsKey)
+            if skillsRestored {
+                disabledSkillIDs = originalDisabledSkillIDs
+            }
             UserDefaults.standard.set(Array(disabledSkillIDs).sorted(), forKey: Self.disabledSkillIDsKey)
             refreshExtensions()
-            setError(error.localizedDescription, sessionID: preview.sessionID)
+            if compensationFailures.isEmpty {
+                setError(applyError.localizedDescription, sessionID: preview.sessionID)
+            } else {
+                let detail = compensationFailures.joined(separator: " ")
+                let message = "The self-edit failed and rollback was only partial. Some durable changes may remain. \(detail)"
+                persistenceRecoveryStatusMessage = message
+                setError(message, sessionID: preview.sessionID)
+            }
         }
     }
 
     func discardSelfEditPreview(_ preview: LatticeExtensionPreviewRecord) {
+        guard let sessionIndex = sessions.firstIndex(where: { $0.id == preview.sessionID }),
+              requireLoadedSessionContent(for: preview.sessionID, at: sessionIndex) else { return }
+        let originalPreviews = selfEditPreviews
         do {
             selfEditPreviews = try extensionPreviewStore.remove(preview.id, from: selfEditPreviews)
+            guard appendSelfEditStatus("Discarded \(preview.manifest.name).", to: preview.sessionID) else {
+                do {
+                    try extensionPreviewStore.save(originalPreviews)
+                    selfEditPreviews = originalPreviews
+                } catch {
+                    recordSelfEditCompensationStoreIssue(
+                        storeID: LatticeExtensionPreviewStore.storeID,
+                        storeName: LatticeExtensionPreviewStore.storeName,
+                        fileURL: extensionPreviewStore.fileURL,
+                        error: error
+                    )
+                    requestPersistenceGateBlock(extensionPreviewStore.writeGate)
+                    let message = "The discard status could not be saved, and the durable preview rollback also failed. The preview may remain removed; use Local data recovery before retrying. \(error.localizedDescription)"
+                    persistenceRecoveryStatusMessage = message
+                    setError(message, sessionID: preview.sessionID)
+                }
+                return
+            }
             clearExpandedSkillPreviews(for: preview)
-            appendSelfEditStatus("Discarded \(preview.manifest.name).", to: preview.sessionID)
             clearError()
         } catch {
+            selfEditPreviews = originalPreviews
             setError(error.localizedDescription, sessionID: preview.sessionID)
         }
     }
 
-    func appendSelfEditStatus(_ text: String, to sessionID: UUID) {
-        guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
+    func recordSelfEditCompensationStoreIssue(
+        storeID: String,
+        storeName: String,
+        fileURL: URL,
+        error: Error
+    ) {
+        replacePersistenceRecoveryIssue(DurableStoreIssue(
+            storeID: storeID,
+            storeName: storeName,
+            filePath: fileURL.path,
+            kind: .unreadable,
+            summary: "A self-edit rollback could not restore this durable store. Lattice paused writes so the remaining state is not overwritten.",
+            technicalDetails: String(reflecting: error)
+        ))
+    }
+
+    @discardableResult
+    func appendSelfEditStatus(_ text: String, to sessionID: UUID) -> Bool {
+        guard let index = sessions.firstIndex(where: { $0.id == sessionID }),
+              requireLoadedSessionContent(for: sessionID, at: index) else { return false }
+        let previousSession = sessions[index]
         sessions[index].messages.append(.init(role: .system, text: text))
         sessions[index].lastUpdated = .now
-        persist()
+        guard persist() == .saved else {
+            sessions[index] = previousSession
+            return false
+        }
+        return true
     }
 
     func selfEditApplyStatus(for manifest: LatticeExtensionManifest) -> String {
@@ -1474,6 +1585,8 @@ extension AppState {
         switch OpenCodeAuthBridge.syncGoAPIKeyFromKeychainResult() {
         case .success:
             cliActionMessages["opencode"] = "Credential copied to OpenCode for legacy direct chats."
+        case .successWithWarning(let detail):
+            cliActionMessages["opencode"] = "Credential copied to OpenCode for legacy direct chats, but durability could not be fully confirmed: \(detail)"
         case .failure(let error):
             cliActionMessages["opencode"] = error.message
         }
@@ -1684,7 +1797,9 @@ extension AppState {
                 syncExecutionRoute(from: valid)
             }
         }
-        for index in sessions.indices where !sessions[index].isStreaming && !sessions[index].messages.contains(where: { $0.role == .user }) {
+        for index in sessions.indices where !sessions[index].isStreaming
+            && sessions[index].isTranscriptLoaded
+            && sessions[index].totalMessageCount == 0 {
             let priorBackend = sessions[index].backend
             let priorRoute = sessions[index].executionRoute
             if sessions[index].privacyMode == .localOnly {

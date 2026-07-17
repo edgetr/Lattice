@@ -138,19 +138,33 @@ struct RuntimeReadinessTests {
             from: [
                 "PATH": "/usr/bin",
                 "HOME": "/Users/example",
+                "LANG": "en_US.UTF-8",
+                "SHELL": "/bin/zsh",
                 "OPENAI_API_KEY": "synthetic-secret",
                 "GITHUB_TOKEN": "synthetic-token",
-                "AWS_SECRET_ACCESS_KEY": "synthetic-aws-secret"
+                "AWS_SECRET_ACCESS_KEY": "synthetic-aws-secret",
+                "DYLD_INSERT_LIBRARIES": "/tmp/hostile.dylib",
+                "GIT_CONFIG_GLOBAL": "/tmp/hostile.gitconfig",
+                "GIT_SSH_COMMAND": "hostile-helper",
+                "HTTPS_PROXY": "http://127.0.0.1:1",
+                "BASH_ENV": "/tmp/hostile-shell-startup"
             ],
             temporaryDirectory: URL(fileURLWithPath: "/tmp/lattice-child")
         )
 
         #expect(environment["PATH"] == "/usr/bin")
         #expect(environment["HOME"] == "/Users/example")
+        #expect(environment["LANG"] == "en_US.UTF-8")
+        #expect(environment["SHELL"] == "/bin/zsh")
         #expect(environment["TMPDIR"] == "/tmp/lattice-child/")
         #expect(environment["OPENAI_API_KEY"] == nil)
         #expect(environment["GITHUB_TOKEN"] == nil)
         #expect(environment["AWS_SECRET_ACCESS_KEY"] == nil)
+        #expect(environment["DYLD_INSERT_LIBRARIES"] == nil)
+        #expect(environment["GIT_CONFIG_GLOBAL"] == nil)
+        #expect(environment["GIT_SSH_COMMAND"] == nil)
+        #expect(environment["HTTPS_PROXY"] == nil)
+        #expect(environment["BASH_ENV"] == nil)
     }
 
     @Test func legacyOpenCodeBridgeCannotServeNewPiOrHermesRoutes() {

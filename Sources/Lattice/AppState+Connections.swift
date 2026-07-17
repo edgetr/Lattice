@@ -8,6 +8,35 @@ import LatticeCore
 
 @MainActor
 extension AppState {
+    /// Records a secret-free Keychain observation. Only an authoritative
+    /// missing item clears the user's consent; access failures retain consent
+    /// while preventing credential injection.
+    func applyOpenCodeCredentialReadResult(_ result: KeychainStoreReadResult) {
+        let availability = result.availability
+        let resolution = CredentialPresenceReconciler.resolve(
+            availability,
+            previouslyRecorded: openCodeAPIKeySaved
+        )
+        openCodeCredentialAvailability = availability
+        openCodeAPIKeySaved = resolution.recorded
+        guard resolution.shouldInvalidateConsent else { return }
+        openCodeCredentialEnabledModes.removeAll()
+        validatedPiOpenCodeModels.removeAll()
+        validatedHermesOpenCodeModels.removeAll()
+        UserDefaults.standard.removeObject(forKey: Self.openCodeCredentialModesKey)
+    }
+
+    func openCodeCredentialReadFailureMessage(_ result: KeychainStoreReadResult) -> String {
+        if case .value(let rawValue) = result,
+           !rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return ""
+        }
+        if case .value = result {
+            return CredentialReadPolicy.failureMessage(for: .invalidData, provider: "OpenCode")
+        }
+        return result.failureMessage(provider: "OpenCode")
+    }
+
     // MARK: - Map-driven provider accessors (sole source of truth: ProviderConnectionStore)
 
     var codexReady: Bool { providerConnections.ready(.codex) }
@@ -819,9 +848,20 @@ extension AppState {
         guard beginCLIAction(provider: actionID, progress: "Checking Lattice Agent \(providerID)…", estimatedSeconds: 30) else { return }
         let refreshGeneration = connectionRefreshGeneration.current()
         Task {
-            let key = providerID == "opencode" && openCodeCredentialEnabledModes.contains(.code)
-                ? KeychainStore.read(account: OpenCodeCredentialPolicy.keychainAccount)
-                : nil
+            let key: String?
+            if providerID == "opencode" && openCodeCredentialEnabledModes.contains(.code) {
+                let readResult = KeychainStore.read(account: OpenCodeCredentialPolicy.keychainAccount)
+                applyOpenCodeCredentialReadResult(readResult)
+                guard case .value(let rawValue) = readResult,
+                      !rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    cliActionMessages["pi"] = openCodeCredentialReadFailureMessage(readResult)
+                    finishCLIAction(actionID)
+                    return
+                }
+                key = rawValue
+            } else {
+                key = nil
+            }
             let valid = await pi.validateIsolatedAuthentication(
                 provider: candidate.provider,
                 model: candidate.model,
@@ -915,12 +955,19 @@ extension AppState {
                 providerID: "opencode",
                 modelID: candidate.id
               ),
-              let provider = hermesProvider(for: route),
-              let key = KeychainStore.read(account: OpenCodeCredentialPolicy.keychainAccount),
-              beginCLIAction(provider: "hermes-opencode", progress: "Checking Hermes OpenCode…", estimatedSeconds: 30) else {
+              let provider = hermesProvider(for: route) else {
             cliActionMessages["hermes"] = "Enable the saved OpenCode key for Work and discover a Hermes OpenCode model first."
             return
         }
+        let readResult = KeychainStore.read(account: OpenCodeCredentialPolicy.keychainAccount)
+        applyOpenCodeCredentialReadResult(readResult)
+        guard case .value(let rawValue) = readResult,
+              !rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            cliActionMessages["hermes"] = openCodeCredentialReadFailureMessage(readResult)
+            return
+        }
+        let key = rawValue
+        guard beginCLIAction(provider: "hermes-opencode", progress: "Checking Hermes OpenCode…", estimatedSeconds: 30) else { return }
         let refreshGeneration = connectionRefreshGeneration.current()
         Task {
             let result = await hermes.modelsResult(
@@ -1312,21 +1359,11 @@ extension AppState {
     }
 
     static func isLegacySelfEditSession(_ session: LatticeSession) -> Bool {
-        session.title.range(of: "Lattice self-edit", options: [.caseInsensitive, .anchored]) != nil
-        || session.messages.contains { message in
-            message.role == .user && legacyLooksLikeSelfEditRequest(message.text)
-        }
+        LegacySelfEditMigrationPolicy.shouldClassify(session)
     }
 
     static func legacyLooksLikeSelfEditRequest(_ text: String) -> Bool {
-        let normalized = text.lowercased()
-        let mentionsLattice = normalized.contains("lattice") || normalized.contains("this app") || normalized.contains("the app")
-        let looksLikeSelfEdit = [
-            "self edit", "self-edit", "change", "make", "restyle", "glassy",
-            "liquid glass", "overlay", "sidebar", "chat", "composer", "color",
-            "pink", "green", "ui", "interface", "text bubble", "message bubble"
-        ].contains { normalized.contains($0) }
-        return mentionsLattice && looksLikeSelfEdit
+        LegacySelfEditMigrationPolicy.looksLikeSelfEditRequest(text)
     }
 
     func selfEditContext(for text: String, isExtensionSelfEdit: Bool, sessionID: UUID) -> String {

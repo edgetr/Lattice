@@ -58,4 +58,98 @@ struct RouteRuntimeMapTests {
         #expect(!ExecutionRouteResolver.isDeclared(route))
         #expect(RouteRuntimeMap.cancelTarget(for: route, legacyHarnessID: "codex") == "codex")
     }
+
+    @Test func piFirstCodeRouteFallsBackOnlyBeforeRuntimeLock() {
+        let preferred = ExecutionRoute(mode: .code, providerID: "codex", modelID: "gpt-5.6", runtimeID: "pi")
+        let fallback = PiFirstCodeRoutingPolicy.resolve(
+            preferredRoute: preferred,
+            preferredReadiness: .missingRuntime,
+            directReadiness: .runnable,
+            routeLocked: false
+        )
+        #expect(fallback.isRunnable)
+        #expect(fallback.usesProviderFallback)
+        #expect(fallback.route.runtimeID == "codex")
+        #expect(fallback.route.fallbackFromRuntimeID == "pi")
+        #expect(ExecutionRouteResolver.isDeclared(fallback.route))
+        #expect(RouteRuntimeMap.cancelTarget(for: fallback.route) == "codex")
+
+        let locked = PiFirstCodeRoutingPolicy.resolve(
+            preferredRoute: preferred,
+            preferredReadiness: .missingRuntime,
+            directReadiness: .runnable,
+            routeLocked: true
+        )
+        #expect(!locked.isRunnable)
+        #expect(locked.route == preferred)
+    }
+
+    @Test func piFirstWaitsForPreferredReadinessAndRequiresDirectReadiness() {
+        let preferred = ExecutionRoute(mode: .code, providerID: "opencode", modelID: "opencode-go/model", runtimeID: "pi")
+        let checking = PiFirstCodeRoutingPolicy.resolve(
+            preferredRoute: preferred,
+            preferredReadiness: .validating,
+            directReadiness: .runnable,
+            routeLocked: false
+        )
+        #expect(!checking.isRunnable)
+        #expect(!checking.usesProviderFallback)
+
+        let unavailable = PiFirstCodeRoutingPolicy.resolve(
+            preferredRoute: preferred,
+            preferredReadiness: .failed("Pi unavailable"),
+            directReadiness: .authenticationRequired,
+            routeLocked: false
+        )
+        #expect(!unavailable.isRunnable)
+        #expect(unavailable.route == preferred)
+    }
+
+    @Test func providerFallbackDoesNotUseLegacyOpenCodeCredentialBridge() {
+        let preferred = ExecutionRoute(mode: .code, providerID: "opencode", modelID: "opencode-go/model", runtimeID: "pi")
+        let fallback = PiFirstCodeRoutingPolicy.fallbackRoute(for: preferred)
+        #expect(fallback != nil)
+        #expect(fallback.map(LegacyOpenCodeBridgePolicy.allows) == false)
+        let legacy = ExecutionRoute(mode: .code, providerID: "opencode", modelID: "legacy", runtimeID: "opencode")
+        #expect(LegacyOpenCodeBridgePolicy.allows(legacy))
+    }
+
+    @Test func markedFallbackCanRestorePreferredPiOnlyBeforeLock() {
+        let fallback = ExecutionRoute(
+            mode: .code,
+            providerID: "opencode",
+            modelID: "opencode-go/model",
+            runtimeID: "opencode",
+            fallbackFromRuntimeID: "pi"
+        )
+        #expect(PiFirstCodeRoutingPolicy.preferredRoute(for: fallback)?.runtimeID == "pi")
+        #expect(PiFirstCodeRoutingPolicy.preferredRoute(for: fallback)?.fallbackFromRuntimeID == nil)
+        let legacy = ExecutionRoute(mode: .code, providerID: "opencode", modelID: "legacy", runtimeID: "opencode")
+        #expect(PiFirstCodeRoutingPolicy.preferredRoute(for: legacy) == nil)
+    }
+
+    @Test func malformedProviderFallbackIsNotDeclared() {
+        let malformed = ExecutionRoute(
+            mode: .code,
+            providerID: "codex",
+            modelID: "gpt-5.6",
+            runtimeID: "codex",
+            fallbackFromRuntimeID: "hermes"
+        )
+        #expect(!PiFirstCodeRoutingPolicy.isDeclaredProviderFallback(malformed))
+        #expect(!ExecutionRouteResolver.isDeclared(malformed))
+    }
+
+    @Test func fallbackProvenanceRoundTripsDurably() throws {
+        let route = ExecutionRoute(
+            mode: .code,
+            providerID: "codex",
+            modelID: "gpt-5.6",
+            runtimeID: "codex",
+            fallbackFromRuntimeID: "pi"
+        )
+        let data = try JSONEncoder().encode(route)
+        #expect(try JSONDecoder().decode(ExecutionRoute.self, from: data) == route)
+        #expect(route.id != ExecutionRoute(mode: .code, providerID: "codex", modelID: "gpt-5.6", runtimeID: "codex").id)
+    }
 }

@@ -5,6 +5,7 @@ import LatticeCore
 
 enum OpenCodeAuthError: Error, Equatable, Sendable {
     case missingCredential
+    case credentialReadFailed(CredentialReadState)
     case malformedAuthFile(String)
     case conflict
     case writeFailed(String)
@@ -13,6 +14,8 @@ enum OpenCodeAuthError: Error, Equatable, Sendable {
         switch self {
         case .missingCredential:
             return "OpenCode Go API key is not available in the keychain."
+        case .credentialReadFailed(let state):
+            return CredentialReadPolicy.failureMessage(for: state, provider: "OpenCode")
         case .malformedAuthFile(let detail):
             return "OpenCode auth.json is malformed: \(detail)"
         case .conflict:
@@ -25,11 +28,19 @@ enum OpenCodeAuthError: Error, Equatable, Sendable {
 
 enum OpenCodeAuthMutationResult: Equatable, Sendable {
     case success
+    case successWithWarning(String)
     case failure(OpenCodeAuthError)
 
     var isSuccess: Bool {
-        if case .success = self { return true }
-        return false
+        switch self {
+        case .success, .successWithWarning: return true
+        case .failure: return false
+        }
+    }
+
+    var warningDetail: String? {
+        if case .successWithWarning(let detail) = self { return detail }
+        return nil
     }
 
     var error: OpenCodeAuthError? {
@@ -65,12 +76,22 @@ enum OpenCodeAuthBridge {
     }
 
     static func syncGoAPIKeyFromKeychainResult() -> OpenCodeAuthMutationResult {
-        guard let value = KeychainStore.read(account: goAPIKeyAccount)?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-              !value.isEmpty else {
+        switch KeychainStore.read(account: goAPIKeyAccount) {
+        case .value(let rawValue):
+            let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else { return .failure(.credentialReadFailed(.invalidData)) }
+            return writeGoAPIKeyResult(value)
+        case .missing:
             return .failure(.missingCredential)
+        case .locked:
+            return .failure(.credentialReadFailed(.locked))
+        case .denied:
+            return .failure(.credentialReadFailed(.denied))
+        case .unavailable:
+            return .failure(.credentialReadFailed(.unavailable))
+        case .invalidData:
+            return .failure(.credentialReadFailed(.invalidData))
         }
-        return writeGoAPIKeyResult(value)
     }
 
     static func hasGoCredential() -> Bool {
@@ -128,6 +149,8 @@ private extension AtomicJSONFileWriteResult {
         switch self {
         case .success:
             return .success
+        case .publishedButDurabilityUnconfirmed(let detail):
+            return .successWithWarning(detail)
         case .conflict:
             return .failure(.conflict)
         case .failure(let message):

@@ -139,6 +139,43 @@ struct HermesACPHarnessTests {
         try verifyInstalledHermesIsNotAuthenticated()
     }
 
+    @Test func profileRejectsSymlinkHomesAndTemporaryDirectories() throws {
+        let root = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let outside = root.deletingLastPathComponent().appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let linkedHome = root.appendingPathComponent("linked-home", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: linkedHome, withDestinationURL: outside)
+        let linkedProfile = LatticeHermesProfile(hermesHome: linkedHome)
+        #expect(throws: LatticeHermesProfileError.invalidHome(linkedHome.path)) {
+            try linkedProfile.ensureHome()
+        }
+
+        let profile = LatticeHermesProfile(hermesHome: root.appendingPathComponent("safe-home", isDirectory: true))
+        let linkedTemporary = root.appendingPathComponent("linked-tmp", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: linkedTemporary, withDestinationURL: outside)
+        #expect(throws: LatticeHermesProfileError.invalidTemporaryDirectory(linkedTemporary.path)) {
+            _ = try profile.launchEnvironment(temporaryDirectory: linkedTemporary)
+        }
+    }
+
+    @Test func profileBoundsModelAndSystemIdentityPayloads() throws {
+        let root = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let profile = LatticeHermesProfile(hermesHome: root.appendingPathComponent("home", isDirectory: true))
+        let oversizedModel = String(repeating: "m", count: LatticeHermesWorkRoute.maximumModelByteCount + 1)
+        #expect(throws: LatticeHermesProfileError.invalidModel(oversizedModel)) {
+            try LatticeHermesWorkRoute(provider: "openai-codex", model: oversizedModel).validate()
+        }
+        let oversizedIdentity = String(repeating: "i", count: LatticeHermesProfile.maximumSystemIdentityByteCount + 1)
+        #expect(throws: LatticeHermesProfileError.systemIdentityTooLarge(LatticeHermesProfile.maximumSystemIdentityByteCount)) {
+            _ = try profile.configure(
+                systemIdentity: oversizedIdentity,
+                route: LatticeHermesWorkRoute(provider: "openai-codex", model: "openai-codex:model")
+            )
+        }
+    }
+
     private func verifyWorkProfileCreatesOnlyPrivateLatticeState() throws {
         let root = try makeWorkspace()
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }

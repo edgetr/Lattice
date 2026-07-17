@@ -6,6 +6,12 @@ public extension WorkspaceCheckpointService {
 
     /// Builds a revert preview from an after-run checkpoint back to its paired before-run checkpoint.
     func previewRevert(afterCheckpointID: UUID) async throws -> WorkspaceCheckpointRevertPreview {
+        try await withWorkspaceMutationLock {
+            try await self.previewRevertUnlocked(afterCheckpointID: afterCheckpointID)
+        }
+    }
+
+    private func previewRevertUnlocked(afterCheckpointID: UUID) async throws -> WorkspaceCheckpointRevertPreview {
         let after = try requireCaptured(id: afterCheckpointID)
         guard after.boundary == .afterRun else {
             throw WorkspaceCheckpointError.checkpointPairInvalid(
@@ -18,6 +24,18 @@ public extension WorkspaceCheckpointService {
 
     /// Applies a previously previewed revert using the confirmation token from that preview.
     func confirmRevert(
+        afterCheckpointID: UUID,
+        confirmationToken: String
+    ) async throws -> WorkspaceCheckpointRevertResult {
+        try await withWorkspaceMutationLock {
+            try await self.confirmRevertUnlocked(
+                afterCheckpointID: afterCheckpointID,
+                confirmationToken: confirmationToken
+            )
+        }
+    }
+
+    private func confirmRevertUnlocked(
         afterCheckpointID: UUID,
         confirmationToken: String
     ) async throws -> WorkspaceCheckpointRevertResult {
@@ -57,77 +75,141 @@ public extension WorkspaceCheckpointService {
                 }
             }
         )
-        try await assertUntrackedDeleteStillMatches(
-            git: git,
-            context: context,
-            after: after,
-            operations: preview.operations
-        )
+        let afterUntracked = try Self.validatedUntrackedMap(after, label: "after-run checkpoint")
+        var preparedDeletes: [PreparedUntrackedDeletion] = []
+        var preparedBytes = 0
+        for operation in preview.operations where operation.kind == .deleteRunCreatedUntracked {
+            guard let metadata = afterUntracked[operation.path], !metadata.isSymbolicLink else {
+                throw WorkspaceCheckpointError.revertDivergence(
+                    "Missing regular-file metadata for " + operation.path + "."
+                )
+            }
+            if let prepared = try prepareRegularRepoFile(
+                context: context,
+                relativePath: operation.path,
+                expectedFingerprint: metadata.contentOID
+            ) {
+                guard preparedBytes <= Self.maximumUntrackedAggregateBytes - prepared.bytes.count else {
+                    throw WorkspaceCheckpointError.revertApplyFailed(
+                        "Run-created files exceed the bounded revert backup limit."
+                    )
+                }
+                preparedBytes += prepared.bytes.count
+                preparedDeletes.append(prepared)
+            }
+        }
 
-        // Recompute the binary reverse patch and apply under check-then-apply.
+        // Preflight every destructive operation before mutating either tracked
+        // or untracked state. Deleted regular files remain in bounded memory
+        // until the tracked patch and every unlink have succeeded.
+        let preApplyTrackedTree = try await writeCurrentTrackedTree(git: git, context: context)
+        var forwardPatch = Data()
+        var compensationPatch = Data()
         if let beforeTree = before.treeOID, let afterTree = after.treeOID, beforeTree != afterTree {
-            let patch = try await runGitData(
+            let validatedBeforeTree = try Self.validateGitOID(beforeTree, label: "before tree")
+            let validatedAfterTree = try Self.validateGitOID(afterTree, label: "after tree")
+            forwardPatch = try await runGitData(
                 git: git,
                 context: context,
-                arguments: ["diff", "--binary", afterTree, beforeTree],
+                arguments: ["diff", "--no-ext-diff", "--no-textconv", "--binary", validatedAfterTree, validatedBeforeTree, "--"],
                 operation: "diff --binary"
             )
-            if !patch.isEmpty {
+            compensationPatch = try await runGitData(
+                git: git,
+                context: context,
+                arguments: ["diff", "--no-ext-diff", "--no-textconv", "--binary", validatedBeforeTree, validatedAfterTree, "--"],
+                operation: "diff compensation --binary"
+            )
+            if !forwardPatch.isEmpty {
                 _ = try await runGitCommand(
                     git: git,
                     context: context,
                     arguments: ["apply", "--check", "--whitespace=nowarn"],
                     operation: "apply --check",
-                    stdinData: patch
+                    stdinData: forwardPatch
                 )
+            }
+        }
+        let revalidatedTree = try await writeCurrentTrackedTree(git: git, context: context)
+        guard revalidatedTree == preApplyTrackedTree else {
+            throw WorkspaceCheckpointError.revertDivergence(
+                "Tracked worktree changed during revert preflight."
+            )
+        }
+
+        var trackedPatchAttempted = false
+        var deleted: [PreparedUntrackedDeletion] = []
+        do {
+            if !forwardPatch.isEmpty {
+                trackedPatchAttempted = true
                 _ = try await runGitCommand(
                     git: git,
                     context: context,
                     arguments: ["apply", "--whitespace=nowarn"],
                     operation: "apply",
-                    stdinData: patch
+                    stdinData: forwardPatch
                 )
             }
-        }
-
-        var applied: [WorkspaceCheckpointRevertOperation] = []
-        for operation in preview.operations where operation.kind == .deleteRunCreatedUntracked {
-            let url = URL(fileURLWithPath: context.toplevelPath, isDirectory: true)
-                .appendingPathComponent(operation.path)
-            // Re-verify OID immediately before delete.
-            if Self.pathExistsWithoutFollowingSymlink(url) {
-                guard let metadata = after.untrackedFiles.first(where: { $0.path == operation.path }) else {
-                    throw WorkspaceCheckpointError.revertDivergence("Missing untracked metadata for \(operation.path).")
-                }
-                let fingerprint = try await untrackedFingerprint(
-                    git: git,
+            for (index, prepared) in preparedDeletes.enumerated() {
+                try unlinkPreparedRegularRepoFile(
                     context: context,
-                    path: operation.path,
-                    isSymbolicLink: metadata.isSymbolicLink
+                    prepared: prepared,
+                    ordinal: index + 1
                 )
-                guard fingerprint == metadata.contentOID else {
-                    throw WorkspaceCheckpointError.revertDivergence(
-                        "Untracked file \(operation.path) changed before delete."
-                    )
-                }
+                deleted.append(prepared)
+            }
+        } catch {
+            let original = (error as? WorkspaceCheckpointError)?.message ?? error.localizedDescription
+            var recoveryFailures: [String] = []
+            if trackedPatchAttempted {
                 do {
-                    try FileManager.default.removeItem(at: url)
+                    let current = try await writeCurrentTrackedTree(git: git, context: context)
+                    if current != preApplyTrackedTree {
+                        guard !compensationPatch.isEmpty else {
+                            throw WorkspaceCheckpointError.revertApplyFailed("No compensation patch was available.")
+                        }
+                        _ = try await runGitCommand(
+                            git: git,
+                            context: context,
+                            arguments: ["apply", "--check", "--whitespace=nowarn"],
+                            operation: "compensation apply --check",
+                            stdinData: compensationPatch
+                        )
+                        _ = try await runGitCommand(
+                            git: git,
+                            context: context,
+                            arguments: ["apply", "--whitespace=nowarn"],
+                            operation: "compensation apply",
+                            stdinData: compensationPatch
+                        )
+                    }
                 } catch {
-                    throw WorkspaceCheckpointError.revertApplyFailed(
-                        "Failed to delete untracked file \(operation.path): \(error.localizedDescription)"
-                    )
+                    recoveryFailures.append("tracked files: " + error.localizedDescription)
                 }
             }
-            applied.append(operation)
-        }
-        for operation in preview.operations where operation.kind == .applyTrackedReversePatch {
-            applied.append(operation)
+            for prepared in deleted.reversed() {
+                do {
+                    try restorePreparedRegularRepoFile(context: context, prepared: prepared)
+                } catch {
+                    recoveryFailures.append(prepared.path + ": " + error.localizedDescription)
+                }
+            }
+            if recoveryFailures.isEmpty {
+                throw WorkspaceCheckpointError.revertApplyFailed(
+                    "Revert failed; all mutations were restored. Original failure: " + original
+                )
+            }
+            throw WorkspaceCheckpointError.revertApplyFailed(
+                "Revert failed and recovery is incomplete. Original failure: " + original
+                    + " Recovery failures: " + recoveryFailures.joined(separator: "; ")
+                    + ". Manual recovery is required."
+            )
         }
 
         return WorkspaceCheckpointRevertResult(
             beforeCheckpointID: before.id,
             afterCheckpointID: after.id,
-            appliedOperations: applied,
+            appliedOperations: preview.operations,
             summary: "Reverted run \(after.ownership.runID.uuidString) from after-run checkpoint to before-run checkpoint."
         )
     }
@@ -162,6 +244,39 @@ public extension WorkspaceCheckpointService {
                 "before/after ownership mismatch (session, run, or worktree)."
             )
         }
+        if let value = before.treeOID { _ = try Self.validateGitOID(value, label: "before tree") }
+        if let value = after.treeOID { _ = try Self.validateGitOID(value, label: "after tree") }
+        if let value = before.snapshotCommitOID { _ = try Self.validateGitOID(value, label: "before snapshot commit") }
+        if let value = after.snapshotCommitOID { _ = try Self.validateGitOID(value, label: "after snapshot commit") }
+        _ = try Self.validatedUntrackedMap(before, label: "before-run checkpoint")
+        _ = try Self.validatedUntrackedMap(after, label: "after-run checkpoint")
+    }
+
+    static func validatedUntrackedMap(
+        _ checkpoint: WorkspaceCheckpoint,
+        label: String
+    ) throws -> [String: WorkspaceUntrackedFileMetadata] {
+        var result: [String: WorkspaceUntrackedFileMetadata] = [:]
+        for metadata in checkpoint.untrackedFiles {
+            let path = try WorkspaceCheckpointValidation.validateRepoRelativePath(metadata.path)
+            guard path == metadata.path else {
+                throw WorkspaceCheckpointError.checkpointPairInvalid(
+                    label + " contains a non-canonical untracked path."
+                )
+            }
+            guard result[path] == nil else {
+                throw WorkspaceCheckpointError.checkpointPairInvalid(
+                    label + " contains duplicate untracked path " + path + "."
+                )
+            }
+            guard !metadata.contentOID.isEmpty, metadata.contentOID.utf8.count <= 160 else {
+                throw WorkspaceCheckpointError.checkpointPairInvalid(
+                    label + " contains an invalid untracked fingerprint for " + path + "."
+                )
+            }
+            result[path] = metadata
+        }
+        return result
     }
 
     func pairedBeforeCheckpoint(for after: WorkspaceCheckpoint) throws -> WorkspaceCheckpoint {
@@ -197,9 +312,11 @@ public extension WorkspaceCheckpointService {
             )
         }
 
-        guard let beforeTree = before.treeOID, let afterTree = after.treeOID else {
+        guard let rawBeforeTree = before.treeOID, let rawAfterTree = after.treeOID else {
             throw WorkspaceCheckpointError.checkpointPairInvalid("Missing tree OIDs.")
         }
+        let beforeTree = try Self.validateGitOID(rawBeforeTree, label: "before tree")
+        let afterTree = try Self.validateGitOID(rawAfterTree, label: "after tree")
 
         var operations: [WorkspaceCheckpointRevertOperation] = []
         var warnings: [String] = []
@@ -227,8 +344,8 @@ public extension WorkspaceCheckpointService {
             }
         }
 
-        let beforeUntracked = Dictionary(uniqueKeysWithValues: before.untrackedFiles.map { ($0.path, $0) })
-        let afterUntracked = Dictionary(uniqueKeysWithValues: after.untrackedFiles.map { ($0.path, $0) })
+        let beforeUntracked = try Self.validatedUntrackedMap(before, label: "before-run checkpoint")
+        let afterUntracked = try Self.validatedUntrackedMap(after, label: "after-run checkpoint")
 
         // Pre-existing untracked that changed during the run cannot be restored.
         var unrestorable: [String] = []
@@ -247,21 +364,17 @@ public extension WorkspaceCheckpointService {
 
         // Run-created untracked (in after, not in before): delete only if current OID matches after.
         for (path, afterMeta) in afterUntracked where beforeUntracked[path] == nil {
-            let fileURL = URL(fileURLWithPath: context.toplevelPath, isDirectory: true)
-                .appendingPathComponent(path)
-            if Self.pathExistsWithoutFollowingSymlink(fileURL) {
-                let currentOID = try await untrackedFingerprint(
-                    git: git,
-                    context: context,
-                    path: path,
-                    isSymbolicLink: afterMeta.isSymbolicLink
+            if afterMeta.isSymbolicLink {
+                warnings.append(
+                    "Run-created symlink " + path + " is non-revertible and will be left unchanged."
                 )
-                if currentOID != afterMeta.contentOID {
-                    throw WorkspaceCheckpointError.revertDivergence(
-                        "Run-created untracked file \(path) was modified after the after-run checkpoint."
-                    )
-                }
+                continue
             }
+            _ = try prepareRegularRepoFile(
+                context: context,
+                relativePath: path,
+                expectedFingerprint: afterMeta.contentOID
+            )
             targetPaths.append(path)
             operations.append(
                 WorkspaceCheckpointRevertOperation(
@@ -287,14 +400,14 @@ public extension WorkspaceCheckpointService {
         if operations.isEmpty {
             warnings.append("No tracked or untracked changes to revert between before/after checkpoints.")
         }
-        warnings.append("Untracked file contents are not restorable; only exact run-created deletes are supported.")
+        warnings.append("Only bounded, exact run-created regular files are deleted; symlinks and pre-existing untracked content remain untouched.")
 
         var patchFingerprint = ""
         if beforeTree != afterTree {
             let patch = try await runGitData(
                 git: git,
                 context: context,
-                arguments: ["diff", "--binary", afterTree, beforeTree],
+                arguments: ["diff", "--no-ext-diff", "--no-textconv", "--binary", afterTree, beforeTree, "--"],
                 operation: "diff --binary"
             )
             patchFingerprint = SHA256.hash(data: patch).map { String(format: "%02x", $0) }.joined()
@@ -366,7 +479,7 @@ public extension WorkspaceCheckpointService {
         let output = try await runGitString(
             git: git,
             currentDirectory: URL(fileURLWithPath: context.toplevelPath, isDirectory: true),
-            arguments: ["diff", "--cached", "--name-only", "-z", "--"] + targetPaths,
+            arguments: ["diff", "--no-ext-diff", "--no-textconv", "--cached", "--name-only", "-z", "--"] + targetPaths,
             operation: "diff --cached --name-only"
         )
         let staged = output.split(separator: "\0", omittingEmptySubsequences: true).map(String.init)
@@ -379,7 +492,7 @@ public extension WorkspaceCheckpointService {
         let output = try await runGitString(
             git: git,
             currentDirectory: URL(fileURLWithPath: context.toplevelPath, isDirectory: true),
-            arguments: ["diff", "--name-only", "--diff-filter=U", "-z"],
+            arguments: ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--diff-filter=U", "-z", "--"],
             operation: "diff unmerged paths"
         )
         let paths = output.split(separator: "\0", omittingEmptySubsequences: true).map(String.init)
@@ -396,13 +509,14 @@ public extension WorkspaceCheckpointService {
         after: WorkspaceCheckpoint,
         targetPaths: [String]
     ) async throws {
-        guard let afterTree = after.treeOID, !targetPaths.isEmpty else { return }
+        guard let rawAfterTree = after.treeOID, !targetPaths.isEmpty else { return }
+        let afterTree = try Self.validateGitOID(rawAfterTree, label: "after tree")
 
         let currentTree = try await writeCurrentTrackedTree(git: git, context: context)
         let changed = try await runGitString(
             git: git,
             currentDirectory: URL(fileURLWithPath: context.toplevelPath, isDirectory: true),
-            arguments: ["diff", "--name-only", "-z", afterTree, currentTree, "--"] + targetPaths,
+            arguments: ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", afterTree, currentTree, "--"] + targetPaths,
             operation: "diff current tracked tree"
         )
         let divergentPaths = changed.split(separator: "\0", omittingEmptySubsequences: true).map(String.init)
@@ -420,60 +534,13 @@ public extension WorkspaceCheckpointService {
         try fileManager.createDirectory(at: tempRoot, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: tempRoot) }
         let indexURL = tempRoot.appendingPathComponent("index")
-        let indexTreeOID = try await runGitString(
-            git: git,
-            currentDirectory: URL(fileURLWithPath: context.toplevelPath, isDirectory: true),
-            arguments: ["write-tree"],
-            operation: "write-tree current index"
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
-        _ = try await runGitCommand(
+        let indexTreeOID = try await currentIndexTreeOID(git: git, context: context)
+        return try await writeTrackedWorktreeTree(
             git: git,
             context: context,
-            arguments: ["read-tree", indexTreeOID],
-            operation: "read-tree current index",
-            environmentOverrides: ["GIT_INDEX_FILE": indexURL.path]
+            temporaryIndexURL: indexURL,
+            sourceIndexTreeOID: indexTreeOID
         )
-        _ = try await runGitCommand(
-            git: git,
-            context: context,
-            arguments: ["add", "-u"],
-            operation: "add -u",
-            environmentOverrides: ["GIT_INDEX_FILE": indexURL.path]
-        )
-        return try await runGitString(
-            git: git,
-            currentDirectory: URL(fileURLWithPath: context.toplevelPath, isDirectory: true),
-            arguments: ["write-tree"],
-            operation: "write-tree current worktree",
-            environmentOverrides: ["GIT_INDEX_FILE": indexURL.path]
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    func assertUntrackedDeleteStillMatches(
-        git: URL,
-        context: WorktreeContext,
-        after: WorkspaceCheckpoint,
-        operations: [WorkspaceCheckpointRevertOperation]
-    ) async throws {
-        for operation in operations where operation.kind == .deleteRunCreatedUntracked {
-            let fileURL = URL(fileURLWithPath: context.toplevelPath, isDirectory: true)
-                .appendingPathComponent(operation.path)
-            guard Self.pathExistsWithoutFollowingSymlink(fileURL) else { continue }
-            guard let metadata = after.untrackedFiles.first(where: { $0.path == operation.path }) else {
-                throw WorkspaceCheckpointError.revertDivergence("Missing untracked metadata for \(operation.path).")
-            }
-            let current = try await untrackedFingerprint(
-                git: git,
-                context: context,
-                path: operation.path,
-                isSymbolicLink: metadata.isSymbolicLink
-            )
-            guard current == metadata.contentOID else {
-                throw WorkspaceCheckpointError.revertDivergence(
-                    "Untracked path \(operation.path) no longer matches the after-run checkpoint."
-                )
-            }
-        }
     }
 
 }

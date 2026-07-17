@@ -21,6 +21,12 @@ struct ComposerView: View {
                session.executionRoute.mode == .code,
                session.executionRoute.runtimeID == "pi",
                session.codePhase.restrictsMutatingTools {
+                let canMutatePlan = !session.isStreaming
+                    && session.isTranscriptLoaded
+                    && session.isArtifactsLoaded
+                let unavailablePlanControlHelp = session.isStreaming
+                    ? "Stop the current response before changing the plan phase"
+                    : "Wait for this chat's conversation and plan details to finish loading"
                 HStack(spacing: 8) {
                     Image(systemName: "list.bullet.clipboard")
                     Text(session.codePhase == .planAwaitingApproval
@@ -30,12 +36,18 @@ struct ComposerView: View {
                     Spacer(minLength: 4)
                     if session.codePhase == .planAwaitingApproval {
                         Button("Approve") { state.approveCodePlan() }
-                            .disabled(session.isStreaming)
+                            .disabled(!canMutatePlan)
+                            .help(canMutatePlan ? "Approve the proposed code plan" : unavailablePlanControlHelp)
+                            .accessibilityHint(canMutatePlan ? "Approves the proposed code plan." : unavailablePlanControlHelp)
                         Button("Exit") { state.exitCodePlanPhase() }
-                            .disabled(session.isStreaming)
+                            .disabled(!canMutatePlan)
+                            .help(canMutatePlan ? "Exit the code plan phase" : unavailablePlanControlHelp)
+                            .accessibilityHint(canMutatePlan ? "Exits the code plan phase." : unavailablePlanControlHelp)
                     } else {
                         Button("Exit plan") { state.exitCodePlanPhase() }
-                            .disabled(session.isStreaming)
+                            .disabled(!canMutatePlan)
+                            .help(canMutatePlan ? "Exit the code plan phase" : unavailablePlanControlHelp)
+                            .accessibilityHint(canMutatePlan ? "Exits the code plan phase." : unavailablePlanControlHelp)
                     }
                 }
                 .padding(.horizontal, 10)
@@ -303,7 +315,7 @@ struct ComputerFrameCard: View {
                 .foregroundStyle(.secondary)
                 switch presentation.content {
                 case .latestFrameOnly(let frame):
-                    if let url = frame.imageURL, let image = NSImage(contentsOf: url) {
+                    if let data = frame.imageData, let image = NSImage(data: data) {
                         Image(nsImage: image)
                             .resizable()
                             .scaledToFit()
@@ -621,4 +633,3 @@ struct ReasoningMenu: View {
         .menuStyle(.borderlessButton).fixedSize().help("Reasoning effort")
     }
 }
-
